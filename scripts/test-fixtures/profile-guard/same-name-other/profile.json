@@ -1,0 +1,12 @@
+{
+  "rust-suites": {
+    "other-provider::r_interop": {
+      "package-name": "other-provider",
+      "binary-id": "other-provider::r_interop",
+      "binary-name": "r_interop",
+      "package-id": "path+file:///workspace/crates/other-provider#0.1.0",
+      "kind": "test",
+      "status": "listed"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/nrr-provider#0.1.0",
+      "name": "nrr-provider",
+      "targets": [
+        {
+          "name": "r_interop",
+          "kind": ["test"],
+          "crate_types": ["bin"]
+        }
+      ]
+    },
+    {
+      "id": "path+file:///workspace/crates/other-provider#0.1.0",
+      "name": "other-provider",
+      "targets": [
+        {
+          "name": "r_interop",
+          "kind": ["test"],
+          "crate_types": ["bin"]
+        }
+      ]
+    }
+  ]
+}

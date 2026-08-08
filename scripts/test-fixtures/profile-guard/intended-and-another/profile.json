@@ -1,0 +1,20 @@
+{
+  "rust-suites": {
+    "nrr-provider::r_interop": {
+      "package-name": "nrr-provider",
+      "binary-id": "nrr-provider::r_interop",
+      "binary-name": "r_interop",
+      "package-id": "path+file:///workspace/crates/nrr-provider#0.1.0",
+      "kind": "test",
+      "status": "listed"
+    },
+    "nrr-provider::catalog": {
+      "package-name": "nrr-provider",
+      "binary-id": "nrr-provider::catalog",
+      "binary-name": "catalog",
+      "package-id": "path+file:///workspace/crates/nrr-provider#0.1.0",
+      "kind": "test",
+      "status": "listed"
+    }
+  }
+}

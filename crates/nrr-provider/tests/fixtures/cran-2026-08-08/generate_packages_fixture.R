@@ -1,17 +1,34 @@
-# Generate deterministic synthetic DCF fixtures.
+# Check or update deterministic synthetic DCF fixtures.
 # Provenance: R 4.6.1; generated from hand-constructed fictional records
 # without network access, CRAN input, or tools::write_PACKAGES.
+
+args <- commandArgs(trailingOnly = TRUE)
+mode <- if (length(args) == 0L) "--check" else args[[1L]]
+if (length(args) > 1L || !mode %in% c("--check", "--update")) {
+    stop("use --check or --update")
+}
 
 script_path <- sub("^--file=", "", commandArgs(trailingOnly = FALSE)[
     grep("^--file=", commandArgs(trailingOnly = FALSE))
 ])
-setwd(dirname(normalizePath(script_path)))
+root <- dirname(normalizePath(script_path, mustWork = TRUE))
 
 stopifnot(getRversion() == "4.6.1")
 
 write_fixture <- function(name, records) {
     bytes <- charToRaw(enc2utf8(paste0(records, collapse = "")))
-    writeBin(bytes, name)
+    target <- file.path(root, name)
+    if (mode == "--update") {
+        writeBin(bytes, target)
+        return(invisible(NULL))
+    }
+    if (!file.exists(target)) {
+        stop("fixture is missing: ", name, "; run --update")
+    }
+    expected <- readBin(target, what = "raw", n = file.info(target)$size)
+    if (!identical(expected, bytes)) {
+        stop("fixture differs: ", name, "; run --update")
+    }
 }
 
 folded_suggests <- paste0(
@@ -86,3 +103,5 @@ description <- paste0(
     "Published: 2026-06-28 19:14:59 UTC\n\n"
 )
 write_fixture("synthetic-DESCRIPTION", description)
+
+cat("Fixture", mode, "passed for synthetic-PACKAGES and synthetic-DESCRIPTION.\n")
