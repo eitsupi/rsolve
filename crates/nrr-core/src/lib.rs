@@ -9,6 +9,7 @@ mod metadata;
 mod names;
 mod r_versions;
 mod request;
+mod resolution;
 mod target;
 
 pub use constraints::{
@@ -31,4 +32,7 @@ pub use names::{
 };
 pub use r_versions::{RPackageVersion, RPackageVersionError};
 pub use request::{LockedIdentities, ResolutionRequest, SolverKey};
+pub use resolution::{
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, Resolution, ResolvedPackage,
+};
 pub use target::{ResolutionTarget, Target};

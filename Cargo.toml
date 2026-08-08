@@ -9,3 +9,4 @@ publish = false
 
 [workspace.dependencies]
 deb822-fast = "0.2"
+pubgrub = "0.4"
