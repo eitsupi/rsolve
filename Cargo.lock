@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "deb822-fast"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "114c474fa4cd5d6d24bb5e68b36fa4ef70f5b830e3cc14a9b66a12e71a15aeb9"
+
+[[package]]
 name = "nrr"
 version = "0.1.0"
 dependencies = [
@@ -20,6 +26,7 @@ version = "0.1.0"
 name = "nrr-provider"
 version = "0.1.0"
 dependencies = [
+ "deb822-fast",
  "nrr-core",
 ]
 

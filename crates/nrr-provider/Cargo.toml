@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 nrr-core = { path = "../nrr-core" }
+deb822-fast = { workspace = true }

@@ -1,0 +1,63 @@
+# Synthetic DCF fixture provenance
+
+These files contain fictional records written by
+`generate_packages_fixture.R`. They are not extracts from a repository index,
+and the generator does not access the network or call `tools::write_PACKAGES()`.
+The generator requires R 4.6.1 and writes UTF-8 bytes with explicit LF line
+endings. Regenerate them with:
+
+```sh
+Rscript crates/nrr-provider/tests/fixtures/cran-2026-08-08/generate_packages_fixture.R
+```
+
+The reviewer checks a regeneration by running that command in a clean working
+copy, verifying the exact SHA-256 values below, and reviewing the generator
+diff if the bytes change. Package names use the `nrrfixture.` namespace and
+every `License:` value is a fictional phrase.
+
+| File | SHA-256 | Records | Purpose |
+| --- | --- | ---: | --- |
+| `synthetic-PACKAGES` | `06058a7c0f0ec4d2f1d1b4d6d787eec9daee51092d3e91b17c0e8cba5971149c` | 4 | Multi-record PACKAGES-like input |
+| `synthetic-DESCRIPTION` | `8c553d900b770b2686b4cdfb8276296deebb83503b2b80dbc9c01669300a5563` | 1 | Single-record DESCRIPTION-like input |
+
+## Record coverage
+
+| Record | Structural reason |
+| --- | --- |
+| `nrrfixture.core` | Exercises all five dependency fields (`Depends`, `Imports`, `LinkingTo`, `Suggests`, `Enhances`), unknown `Published`, and `Priority`, `Path`, `OS_type`, `Archs`, and both license metadata fields. |
+| `nrrfixture.folded` | Has exactly 24 continuation lines in one value, plus UTF-8 text and an unknown `Published` field. |
+| `nrrfixture.rare` | Keeps the rare-field values together and uses fictional license metadata, including a positive `License_restricts_use` value. |
+| `nrrfixture.plain` | Provides an ordinary record with the common required index fields. |
+| `nrrfixture.description` | Is a separate one-record input with UTF-8 values, including a non-ASCII `Description`. |
+
+## CRAN measurements used for shape selection
+
+The following are measurements of CRAN's live `src/contrib/PACKAGES` index,
+not fixture content and not redistributed records. They justify the synthetic
+shapes above. The measured file was 7,099,756 bytes and contained 24,691
+records; its measured SHA-256 was
+`1dbd6da0e253a2f34b209b33eaae11431504213fb38e2904899d8c358e00eb19`; it was
+ASCII-only. Every record carried `Package`, `Version`,
+`License`, `MD5sum`, `NeedsCompilation`, and `Published`.
+
+| Field | Records | Field | Records |
+| --- | ---: | --- | ---: |
+| `Imports` | 20,493 | `OS_type` | 41 |
+| `Depends` | 18,608 | `Priority` | 38 |
+| `Suggests` | 17,881 | `Archs` | 21 |
+| `LinkingTo` | 3,460 | `License_is_FOSS` | 17 |
+| `Enhances` | 234 | `Path` | 15 |
+| `License_restricts_use` | 12 | | |
+
+The most folded measured record had 24 continuation lines. `Published` is not
+among the fields documented by `tools::write_PACKAGES()`, so preserving
+unknown fields is intentional. The measured index being ASCII does not narrow
+the reader contract: package `DESCRIPTION` data can contain UTF-8.
+
+## External data policy
+
+No upstream CRAN `PACKAGES`, `PACKAGES.rds`, archive metadata, or package
+tarball bytes are committed. Later interoperability tests receive a corpus at
+runtime and compare observable behavior; normal tests use generated fictional
+fixtures. The same generate-plus-corpus rule applies to every future CRAN
+artifact, not only the current plain `PACKAGES` index.
