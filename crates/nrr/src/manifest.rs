@@ -174,7 +174,10 @@ pub fn compose_resolution_request_with_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nrr_core::{PackageName, RelationOp, VersionClause};
+    use nrr_core::{
+        PackageName, PackageNamespace, Provenance, RelationOp, ReleaseIdentity, SolverKey,
+        VersionClause,
+    };
 
     fn version(value: &str) -> RPackageVersion {
         RPackageVersion::parse(value).unwrap()
@@ -218,10 +221,24 @@ mod tests {
 
     #[test]
     fn composition_preserves_owned_lock_identity_mapping() {
-        let locked = LockedIdentities::new();
+        let key = SolverKey::Registry {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            name: package("example"),
+        };
+        let identity = ReleaseIdentity::new(
+            package("example"),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.2.3"),
+            },
+        );
+        let mut locked = LockedIdentities::new();
+        locked.insert(key.clone(), identity.clone());
+
         let request =
             compose_resolution_request_with_locked(minimal_manifest(), locked.clone()).unwrap();
         assert_eq!(request.locked, locked);
+        assert_eq!(request.locked.get(&key), Some(&identity));
     }
 
     #[test]
