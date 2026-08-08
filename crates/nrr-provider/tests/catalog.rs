@@ -128,6 +128,47 @@ Package: later\nVersion: 2.0.0\n\n",
 }
 
 #[test]
+fn duplicate_fields_are_rejected_case_insensitively() {
+    for (first, second) in [
+        ("Package", "package"),
+        ("Version", "VERSION"),
+        ("Depends", "depends"),
+        ("Imports", "IMPORTS"),
+        ("LinkingTo", "linkingto"),
+        ("Suggests", "SUGGESTS"),
+        ("Enhances", "enhances"),
+        ("License", "license"),
+    ] {
+        let input =
+            format!("Package: demo\nVersion: 1.0.0\n{first}: value-one\n{second}: value-two\n");
+        let catalog = CranCatalog::from_packages(input.as_bytes()).unwrap();
+
+        assert!(catalog.is_empty(), "duplicate {first} should be rejected");
+        assert!(matches!(
+            catalog.diagnostics()[0].error(),
+            CranRecordError::DuplicateField(_)
+        ));
+    }
+}
+
+#[test]
+fn single_equals_dependency_constraint_is_rejected() {
+    let catalog =
+        CranCatalog::from_packages(b"Package: demo\nVersion: 1.0.0\nDepends: foo (= 1.0)\n")
+            .unwrap();
+
+    assert!(catalog.is_empty());
+    assert!(matches!(
+        catalog.diagnostics()[0].error(),
+        CranRecordError::Dependency {
+            field: "Depends",
+            source: DependencyParseError::InvalidConstraintSyntax,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn missing_required_fields_are_skipped_but_dcf_errors_fail_the_index() {
     let catalog = CranCatalog::from_packages(
         b"Package: missing-version\nLicense: fictional\n\nPackage: valid\nVersion: 1.0.0\n\n",

@@ -46,6 +46,10 @@ if [ "$default_statuses" != '["skipped-default-filter"]' ]; then
     exit 1
 fi
 
+# Original safety property: profile.default must exclude the opt-in target.
+# Additional exactness property: the dedicated profile must select no suite
+# other than that target. Here U is every suite nextest reports; only status
+# narrows U to form S(p), so kind, package, and binary name do not filter U.
 expected_set=$(printf '%s\n' "$expected" | jq -S -c '[.]')
 selected_set=$(jq -S -c '
     def identity:
@@ -53,7 +57,7 @@ selected_set=$(jq -S -c '
     [."rust-suites"? // {}
      | to_entries[]
      | .value
-     | select(.status == "listed" and .kind == "test")
+     | select(.status == "listed")
      | identity]
     | sort_by([.package_id, .binary_id, .kind])
 ' "$profile_list")

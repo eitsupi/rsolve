@@ -1,6 +1,6 @@
 //! Conversion of a current CRAN `PACKAGES` DCF index into domain candidates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -183,6 +183,7 @@ impl fmt::Display for CranDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CranRecordError {
     MissingField(&'static str),
+    DuplicateField(String),
     InvalidPackageName(PackageNameError),
     InvalidVersion(RPackageVersionError),
     InvalidMetadata(ReleaseMetadataError),
@@ -198,6 +199,7 @@ impl fmt::Display for CranRecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingField(field) => write!(f, "missing required field {field}"),
+            Self::DuplicateField(field) => write!(f, "duplicate field {field}"),
             Self::InvalidPackageName(error) => error.fmt(f),
             Self::InvalidVersion(error) => error.fmt(f),
             Self::InvalidMetadata(error) => error.fmt(f),
@@ -238,6 +240,7 @@ impl fmt::Display for DependencyParseError {
 impl Error for DependencyParseError {}
 
 fn observation_from_record(record: &DcfRecord) -> Result<ReleaseObservation, CranRecordError> {
+    reject_duplicate_fields(record)?;
     let package_value = required_field(record, "Package")?;
     let version_value = required_field(record, "Version")?;
     let package =
@@ -316,6 +319,17 @@ fn required_field<'a>(
         .ok_or(CranRecordError::MissingField(name))
 }
 
+fn reject_duplicate_fields(record: &DcfRecord) -> Result<(), CranRecordError> {
+    let mut names = BTreeSet::new();
+    for field in record.fields() {
+        let normalized = field.name().to_ascii_lowercase();
+        if !names.insert(normalized) {
+            return Err(CranRecordError::DuplicateField(field.name().to_owned()));
+        }
+    }
+    Ok(())
+}
+
 fn is_reserved_field(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -370,7 +384,6 @@ fn parse_constraint(input: &str) -> Result<VersionConstraint, DependencyParseErr
         ("!=", RelationOp::Ne),
         (">", RelationOp::Gt),
         ("<", RelationOp::Lt),
-        ("=", RelationOp::Eq),
     ];
     let (operator, op) = operators
         .iter()
