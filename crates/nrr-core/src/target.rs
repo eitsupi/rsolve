@@ -21,3 +21,12 @@ pub struct ResolutionTarget {
     pub r_version: RPackageVersion,
     pub platform: Target,
 }
+
+impl ResolutionTarget {
+    pub fn new(r_version: RPackageVersion, platform: Target) -> Self {
+        Self {
+            r_version,
+            platform,
+        }
+    }
+}

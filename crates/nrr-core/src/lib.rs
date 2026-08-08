@@ -8,6 +8,7 @@ mod identity;
 mod metadata;
 mod names;
 mod r_versions;
+mod request;
 mod target;
 
 pub use constraints::{
@@ -29,4 +30,5 @@ pub use names::{
     SnapshotId, SourceScheme,
 };
 pub use r_versions::{RPackageVersion, RPackageVersionError};
+pub use request::{LockedIdentities, ResolutionRequest, SolverKey};
 pub use target::{ResolutionTarget, Target};
