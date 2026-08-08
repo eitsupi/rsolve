@@ -40,7 +40,7 @@ fn reads_synthetic_packages_and_preserves_record_values() {
     let folded = document.records()[1].field("Suggests").unwrap().value();
     assert_eq!(folded.lines().count(), 25);
     assert_eq!(folded.matches('\n').count(), 24);
-    assert!(folded.contains("nrrfixture.suggest-24"));
+    assert!(folded.contains("nrrfixture.suggest.24"));
     assert!(
         document.records()[1]
             .field("Description")
@@ -147,7 +147,6 @@ fn malformed_inputs_return_typed_errors_without_panicking() {
         Continuation,
         MissingColon,
         EmptyFieldName,
-        TruncatedFinalRecord,
     }
     let malformed = [
         (
@@ -164,11 +163,6 @@ fn malformed_inputs_return_typed_errors_without_panicking() {
             b": value\n".as_slice(),
             "empty field",
             ExpectedError::EmptyFieldName,
-        ),
-        (
-            b"Package: demo".as_slice(),
-            "truncated final record",
-            ExpectedError::TruncatedFinalRecord,
         ),
     ];
     for (input, label, expected) in malformed {
@@ -187,10 +181,6 @@ fn malformed_inputs_return_typed_errors_without_panicking() {
                     ExpectedError::EmptyFieldName,
                     DcfError::EmptyFieldName { .. }
                 )
-                | (
-                    ExpectedError::TruncatedFinalRecord,
-                    DcfError::TruncatedFinalRecord
-                )
         );
         assert!(matches_expected, "{label} got wrong error");
     }
@@ -201,6 +191,20 @@ fn malformed_inputs_return_typed_errors_without_panicking() {
         invalid_utf8.unwrap(),
         Err(DcfError::InvalidUtf8 { .. })
     ));
+}
+
+#[test]
+fn accepts_empty_and_eof_terminated_documents_like_r() {
+    assert_eq!(DcfDocument::parse(b"").unwrap().len(), 0);
+    assert_eq!(DcfDocument::parse(b"\n").unwrap().len(), 0);
+    assert_eq!(DcfDocument::parse(b"Package: one").unwrap().len(), 1);
+    assert_eq!(
+        DcfDocument::parse(b"Package: one\n\nPackage: two")
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(DcfDocument::parse(b"Package: one\n\n\n").unwrap().len(), 1);
 }
 
 #[test]

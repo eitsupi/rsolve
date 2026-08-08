@@ -1,45 +1,69 @@
 #!/bin/sh
 # Guard the nextest opt-in boundary.
 #
-# `.config/nextest.toml` currently uses `default-filter = "all()"` because nextest
-# validates `binary(...)` names while loading the file, and the opt-in test binaries
-# do not exist yet. That placeholder is safe only while those binaries are absent:
-# the moment one is added, the default profile would run it in the normal local
-# suite, which is exactly what the design forbids (a pak gate silently joining the
-# hermetic run). A comment cannot enforce that, so this check does.
+# Test target paths are not authoritative: an explicit [[test]] target may use
+# any source path. Cargo metadata and nextest's list output are the authorities
+# for target existence and profile selection.
 
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-config="$root/.config/nextest.toml"
+metadata=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-metadata.XXXXXX")
+default_list=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-default.XXXXXX")
+profile_list=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-opt-in.XXXXXX")
+trap 'rm -f "$metadata" "$default_list" "$profile_list"' EXIT
 
 opt_in_binaries='r_interop pak_isolated live_network'
 
+cargo metadata --format-version 1 --all-features --no-deps --locked --offline \
+    --manifest-path "$root/Cargo.toml" >"$metadata"
+
 found=''
 for name in $opt_in_binaries; do
-    for candidate in "$root"/crates/*/tests/"$name".rs; do
-        [ -e "$candidate" ] || continue
+    if jq -e --arg name "$name" '
+        any(.packages[]?.targets[]?; (.kind | index("test")) and .name == $name)
+    ' "$metadata" >/dev/null; then
         found="$found $name"
-        break
-    done
+    fi
 done
 
 if [ -z "$found" ]; then
-    echo "nextest profiles: opt-in binaries absent; placeholder filters still valid"
+    echo "nextest profiles: opt-in binaries absent"
     exit 0
 fi
 
-if grep -q '^default-filter = "all()"' "$config"; then
-    echo "nextest profile filters are still placeholders, but opt-in test binaries now exist:$found" >&2
-    echo "" >&2
-    echo "Replace the placeholder filters in $config:" >&2
-    echo "  [profile.default]      not binary(r_interop) & not binary(pak_isolated) & not binary(live_network)" >&2
-    echo "  [profile.r-interop]    binary(r_interop)" >&2
-    echo "  [profile.pak-isolated] binary(pak_isolated)" >&2
-    echo "  [profile.live-network] binary(live_network)" >&2
-    echo "" >&2
-    echo "Leaving them as all() would run the opt-in suites in the default local run." >&2
-    exit 1
-fi
+cargo nextest list --workspace --all-targets --profile default --locked --offline \
+    --message-format json >"$default_list"
 
-echo "nextest profiles: opt-in binaries present ($found) and filters are no longer placeholders"
+for name in $found; do
+    case "$name" in
+        r_interop) profile='r-interop' ;;
+        pak_isolated) profile='pak-isolated' ;;
+        live_network) profile='live-network' ;;
+        *) echo "nextest profiles: no profile mapping for $name" >&2; exit 1 ;;
+    esac
+
+    default_status=$(jq -r --arg name "$name" '
+        [."rust-suites" | to_entries[]
+         | select(.value.kind == "test" and .value."binary-name" == $name)
+         | .value.status] | if length == 1 then .[0] else "ambiguous-or-missing" end
+    ' "$default_list")
+    if [ "$default_status" != skipped-default-filter ]; then
+        echo "nextest profiles: $name is not excluded by profile.default (status: $default_status)" >&2
+        exit 1
+    fi
+
+    cargo nextest list --workspace --all-targets --profile "$profile" --locked --offline \
+        --message-format json >"$profile_list"
+    selected_status=$(jq -r --arg name "$name" '
+        [."rust-suites" | to_entries[]
+         | select(.value.kind == "test" and .value."binary-name" == $name)
+         | .value.status] | if length == 1 then .[0] else "ambiguous-or-missing" end
+    ' "$profile_list")
+    if [ "$selected_status" != listed ]; then
+        echo "nextest profiles: $name is not selected by profile.$profile (status: $selected_status)" >&2
+        exit 1
+    fi
+done
+
+echo "nextest profiles: every existing opt-in target is excluded by default and selected by its dedicated profile:$found"

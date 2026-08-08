@@ -33,8 +33,6 @@ pub enum DcfError {
     EmptyFieldName { line: usize },
     /// A bare carriage return was used as a line ending.
     InvalidLineEnding { line: usize },
-    /// The input ended in the middle of a record line.
-    TruncatedFinalRecord,
     /// The recoverable DCF parser rejected already validated input.
     ParserRejected(String),
 }
@@ -56,7 +54,6 @@ impl fmt::Display for DcfError {
                     "unsupported bare carriage-return line ending at line {line}"
                 )
             }
-            Self::TruncatedFinalRecord => f.write_str("truncated final DCF record"),
             Self::ParserRejected(message) => write!(f, "DCF parser rejected input: {message}"),
         }
     }
@@ -134,10 +131,10 @@ pub struct DcfDocument {
 impl DcfDocument {
     /// Parses UTF-8 DCF bytes as either a multi-record index or one record.
     ///
-    /// Both LF and CRLF line endings are accepted. A final line ending is
-    /// required so an interrupted final record cannot be mistaken for a
-    /// complete one. A record is not required to contain `Package`; that is
-    /// metadata validation for the domain-conversion layer, not DCF syntax.
+    /// Both LF and CRLF line endings are accepted. EOF terminates the final
+    /// record, just as R's `read.dcf()` does. A record is not required to
+    /// contain `Package`; that is metadata validation for the domain-
+    /// conversion layer, not DCF syntax.
     pub fn parse(input: &[u8]) -> Result<Self, DcfError> {
         let input = std::str::from_utf8(input).map_err(|source| DcfError::InvalidUtf8 {
             offset: source.valid_up_to(),
@@ -186,10 +183,6 @@ impl DcfDocument {
 }
 
 fn normalize_line_endings(input: &str) -> Result<String, DcfError> {
-    if !input.ends_with(['\n', '\r']) {
-        return Err(DcfError::TruncatedFinalRecord);
-    }
-
     let mut normalized = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut index = 0;
@@ -219,6 +212,9 @@ fn normalize_line_endings(input: &str) -> Result<String, DcfError> {
                 index += character.len_utf8();
             }
         }
+    }
+    if !normalized.is_empty() && !normalized.ends_with('\n') {
+        normalized.push('\n');
     }
     Ok(normalized)
 }

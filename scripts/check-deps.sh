@@ -9,7 +9,8 @@ metadata_file=$(mktemp "${TMPDIR:-/tmp}/nrr-cargo-metadata.XXXXXX")
 edges_file=$(mktemp "${TMPDIR:-/tmp}/nrr-cargo-edges.XXXXXX")
 trap 'rm -f "$metadata_file" "$edges_file"' EXIT
 
-cargo metadata --format-version 1 --locked --offline --manifest-path "$repo_dir/Cargo.toml" >"$metadata_file"
+cargo metadata --format-version 1 --all-features --locked --offline \
+    --manifest-path "$repo_dir/Cargo.toml" >"$metadata_file"
 
 jq -r '
   . as $metadata
@@ -79,48 +80,64 @@ check_forbidden_path() {
     fi
 }
 
-# Initial transport/runtime denylist. It covers the HTTP and async stacks the
-# design explicitly excludes and common lower-level async runtimes that could
-# otherwise enter core transitively. Extend this list when a new transport or
-# runtime is admitted to the workspace dependency universe.
-FORBIDDEN_CORE_CRATES=(
-    reqwest
-    hyper
-    hyper-util
-    tokio
-    async-std
-    smol
-    surf
-)
-
 check_forbidden_path "1 (resolver -> repository)" nrr-resolver nrr-repository
 check_forbidden_path "2 (repository -> resolver)" nrr-repository nrr-resolver
 check_forbidden_path "3 (resolver -> provider)" nrr-resolver nrr-provider
 
-for forbidden in "${FORBIDDEN_CORE_CRATES[@]}"; do
-    check_forbidden_path "4 (core -> HTTP client/async runtime: $forbidden)" nrr-core "$forbidden"
-done
+# Invariant 4 is an allowlist, not a finite denylist: nrr-core currently has
+# no dependencies at all. This catches every HTTP client, runtime, and other
+# future external crate, including optional dependencies resolved by
+# --all-features. An allowlist is complete; a denylist would only improve
+# wording while inevitably missing a new crate name.
+ALLOWED_CORE_CRATES=()
+while IFS=$'\t' read -r source target; do
+    if [[ "$source" == nrr-core ]]; then
+        allowed=false
+        for permitted in "${ALLOWED_CORE_CRATES[@]}"; do
+            if [[ "$target" == "$permitted" ]]; then
+                allowed=true
+                break
+            fi
+        done
+        if [[ "$allowed" != true ]]; then
+            printf 'nrr-core dependency allowlist violated: %s -> %s\n' "$source" "$target" >&2
+            exit 1
+        fi
+    fi
+done < <(awk -F '\t' '$1 == "nrr-core" { print }' "$edges_file")
 
-# Invariant 5's mechanical boundary check: core may not resolve any provider
-# implementation, transport, or runtime crate. This is intentionally only a
-# crate-level dependency boundary check; public trait semantics still require
-# mandatory review (see the report emitted by this script).
-for forbidden in nrr-provider nrr-resolver nrr-repository "${FORBIDDEN_CORE_CRATES[@]}"; do
+# Invariant 5's mechanical boundary check: core may not resolve another
+# workspace implementation. Public trait semantics still require mandatory
+# review, which is reported below.
+for forbidden in nrr-provider nrr-resolver nrr-repository; do
     check_forbidden_path "5 mechanical type boundary (core -> provider/transport/runtime: $forbidden)" nrr-core "$forbidden"
 done
 
-# Enforce the complete workspace-local allowlist from the architecture. This
-# also catches a new local edge that is not one of the five explicit checks.
+# Enforce the complete workspace-local allowlist from the architecture. Use
+# metadata.workspace_members rather than a name prefix so the nrr binary and
+# any future differently named member are covered too.
 while IFS=$'\t' read -r source target; do
     case "$source->$target" in
-        nrr-provider\>nrr-core|nrr-resolver\>nrr-core|nrr-repository\>nrr-core|nrr\>nrr-core|nrr\>nrr-provider|nrr\>nrr-resolver|nrr\>nrr-repository)
+        nrr-provider-\>nrr-core|nrr-resolver-\>nrr-core|nrr-repository-\>nrr-core|nrr-\>nrr-core|nrr-\>nrr-provider|nrr-\>nrr-resolver|nrr-\>nrr-repository)
             ;;
-        nrr-core\>*|nrr-provider\>*|nrr-resolver\>*|nrr-repository\>*)
+        *)
             printf 'workspace dependency allowlist violated: %s -> %s\n' "$source" "$target" >&2
             exit 1
             ;;
     esac
-done < <(awk -F '\t' '$1 ~ /^nrr-/ && $2 ~ /^nrr-/ { print }' "$edges_file")
+done < <(
+    jq -r '
+      . as $metadata
+      | ($metadata.workspace_members | map({key: ., value: true}) | from_entries) as $workspace
+      | ($metadata.packages | map({key: .id, value: .name}) | from_entries) as $names
+      | $metadata.resolve.nodes[] as $node
+      | select($workspace[$node.id] == true)
+      | $node.deps[] as $dependency
+      | select($workspace[$dependency.pkg] == true)
+      | [$names[$node.id], $names[$dependency.pkg]]
+      | @tsv
+    ' "$metadata_file" | sort -u
+)
 
 printf '%s\n' 'dependency invariants passed (resolved graph)'
 printf '%s\n' 'invariant 5: crate-level boundary passed; provider-trait URL/error semantics require mandatory semantic review'

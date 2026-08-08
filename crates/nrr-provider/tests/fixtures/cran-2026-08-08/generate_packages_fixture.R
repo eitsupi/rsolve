@@ -15,8 +15,8 @@ write_fixture <- function(name, records) {
 }
 
 folded_suggests <- paste0(
-    "Suggests: nrrfixture.suggest-00,\n ",
-    paste(sprintf("nrrfixture.suggest-%02d", 1:24), collapse = ",\n ")
+    "Suggests: nrrfixture.suggest.00,\n ",
+    paste(sprintf("nrrfixture.suggest.%02d", 1:24), collapse = ",\n ")
 )
 
 packages <- c(
@@ -24,7 +24,7 @@ packages <- c(
         "Package: nrrfixture.core\n",
         "Version: 0.1.0\n",
         "Depends: R (>= 4.6.0), nrrfixture.base\n",
-        "Imports: nrrfixture.import\n nrrfixture.import-helper\n",
+        "Imports: nrrfixture.import\n nrrfixture.import.helper\n",
         "LinkingTo: nrrfixture.link\n",
         "Suggests: nrrfixture.suggest\n",
         "Enhances: nrrfixture.enhance\n",
