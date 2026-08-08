@@ -1,0 +1,52 @@
+# nextest 0.9.143 validates binary(...) names while loading this file. The
+# opt-in binaries do not exist in step0, so all() is the valid temporary
+# selection. Replace these filters when the corresponding binary is added:
+#   not binary(r_interop) & not binary(pak_isolated) & not binary(live_network)
+#   binary(r_interop), binary(pak_isolated), binary(live_network)
+# scripts/check-test-profiles.sh fails the build if an opt-in binary is added while
+# these placeholders remain, so this comment cannot be silently outlived.
+[profile.default]
+default-filter = "all()"
+slow-timeout = { period = "10s", terminate-after = 12 }
+fail-fast = false
+
+[profile.ci]
+inherits = "default"
+failure-output = "immediate-final"
+final-status-level = "slow"
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[profile.r-interop]
+inherits = "ci"
+default-filter = "all()"
+
+[profile.pak-isolated]
+inherits = "ci"
+default-filter = "all()"
+
+[profile.live-network]
+inherits = "ci"
+default-filter = "all()"
+
+[test-groups]
+r-process = { max-threads = 1 }
+pak-isolated = { max-threads = 1 }
+live-network = { max-threads = 1 }
+
+[[profile.r-interop.overrides]]
+filter = "all()"
+test-group = "r-process"
+slow-timeout = { period = "30s", terminate-after = 10 }
+
+[[profile.pak-isolated.overrides]]
+filter = "all()"
+test-group = "pak-isolated"
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+[[profile.live-network.overrides]]
+filter = "all()"
+test-group = "live-network"
+slow-timeout = { period = "30s", terminate-after = 20 }

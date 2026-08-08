@@ -1,0 +1,15 @@
+[package]
+name = "nrr"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nrr"
+path = "src/main.rs"
+
+[dependencies]
+nrr-core = { path = "../nrr-core" }
+nrr-provider = { path = "../nrr-provider" }
+nrr-resolver = { path = "../nrr-resolver" }
+nrr-repository = { path = "../nrr-repository" }
