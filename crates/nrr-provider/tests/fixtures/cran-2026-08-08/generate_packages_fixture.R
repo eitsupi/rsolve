@@ -24,7 +24,7 @@ packages <- c(
         "Package: nrrfixture.core\n",
         "Version: 0.1.0\n",
         "Depends: R (>= 4.6.0), nrrfixture.base\n",
-        "Imports: nrrfixture.import\n nrrfixture.import.helper\n",
+        "Imports: nrrfixture.import,\n nrrfixture.import.helper\n",
         "LinkingTo: nrrfixture.link\n",
         "Suggests: nrrfixture.suggest\n",
         "Enhances: nrrfixture.enhance\n",

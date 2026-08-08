@@ -4,6 +4,8 @@
 # Test target paths are not authoritative: an explicit [[test]] target may use
 # any source path. Cargo metadata and nextest's list output are the authorities
 # for target existence and profile selection.
+# Invariant: each existing opt-in binary is skipped by profile.default, listed
+# by its dedicated profile, and the dedicated profile skips every other suite.
 
 set -eu
 
@@ -62,6 +64,16 @@ for name in $found; do
     ' "$profile_list")
     if [ "$selected_status" != listed ]; then
         echo "nextest profiles: $name is not selected by profile.$profile (status: $selected_status)" >&2
+        exit 1
+    fi
+
+    unexpected_other_suites=$(jq -r --arg name "$name" '
+        [."rust-suites" | to_entries[]
+         | select(.value."binary-name" != $name and .value.status != "skipped-default-filter")
+         | (.value["binary-name"] + "=" + .value.status)] | join(", ")
+    ' "$profile_list")
+    if [ -n "$unexpected_other_suites" ]; then
+        echo "nextest profiles: profile.$profile selects suites other than $name: $unexpected_other_suites" >&2
         exit 1
     fi
 done

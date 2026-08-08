@@ -1,7 +1,7 @@
 Package: nrrfixture.core
 Version: 0.1.0
 Depends: R (>= 4.6.0), nrrfixture.base
-Imports: nrrfixture.import
+Imports: nrrfixture.import,
  nrrfixture.import.helper
 LinkingTo: nrrfixture.link
 Suggests: nrrfixture.suggest

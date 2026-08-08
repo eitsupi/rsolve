@@ -138,6 +138,7 @@ pub enum NormalizedGitUrlError {
     InvalidHost,
     InvalidPort,
     InvalidPercentEscape,
+    InvalidPathCharacter,
     ControlOrWhitespace,
 }
 
@@ -154,6 +155,7 @@ impl fmt::Display for NormalizedGitUrlError {
             Self::InvalidHost => "normalized Git URL has an invalid host",
             Self::InvalidPort => "normalized Git URL has an invalid port",
             Self::InvalidPercentEscape => "normalized Git URL has an invalid percent escape",
+            Self::InvalidPathCharacter => "normalized Git URL has an invalid path character",
             Self::ControlOrWhitespace => "normalized Git URL contains control or whitespace",
         };
         f.write_str(message)
@@ -174,7 +176,7 @@ impl NormalizedGitUrl {
         }
         if input
             .chars()
-            .any(|character| character.is_control() || character.is_ascii_whitespace())
+            .any(|character| character.is_control() || character.is_whitespace())
         {
             return Err(NormalizedGitUrlError::ControlOrWhitespace);
         }
@@ -321,12 +323,11 @@ fn normalize_url_component(component: &str) -> Result<String, NormalizedGitUrlEr
             }
             index += 3;
         } else {
-            let character = component[index..]
-                .chars()
-                .next()
-                .ok_or(NormalizedGitUrlError::InvalidPercentEscape)?;
-            normalized.push(character);
-            index += character.len_utf8();
+            if !is_url_path_character(bytes[index]) {
+                return Err(NormalizedGitUrlError::InvalidPathCharacter);
+            }
+            normalized.push(char::from(bytes[index]));
+            index += 1;
         }
     }
     Ok(normalized)
@@ -343,6 +344,26 @@ fn hex_value(byte: u8) -> u8 {
 
 fn is_url_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn is_url_path_character(byte: u8) -> bool {
+    is_url_unreserved(byte)
+        || matches!(
+            byte,
+            b'/' | b':'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+        )
 }
 
 /// A resolved full Git object ID. References and abbreviated object IDs are
@@ -363,6 +384,7 @@ pub enum GitHashAlgorithm {
 pub enum GitCommitIdError {
     WrongLength { found: usize },
     NonHexadecimal,
+    NullObject,
 }
 
 impl fmt::Display for GitCommitIdError {
@@ -375,6 +397,7 @@ impl fmt::Display for GitCommitIdError {
                 )
             }
             Self::NonHexadecimal => f.write_str("Git commit OID is not hexadecimal"),
+            Self::NullObject => f.write_str("Git commit OID must not be Git's null object"),
         }
     }
 }
@@ -391,6 +414,9 @@ impl GitCommitId {
         };
         if !input.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(GitCommitIdError::NonHexadecimal);
+        }
+        if input.bytes().all(|byte| byte == b'0') {
+            return Err(GitCommitIdError::NullObject);
         }
         Ok(Self {
             algorithm,
@@ -489,6 +515,8 @@ mod tests {
             &"a".repeat(63),
             &"a".repeat(65),
             &"g".repeat(40),
+            &"0".repeat(40),
+            &"0".repeat(64),
         ] {
             assert!(GitCommitId::new(invalid).is_err(), "accepted {invalid:?}");
         }
@@ -525,6 +553,10 @@ mod tests {
             "https://example.test/repo#fragment",
             "https://example.test:bad/repo",
             "https://example.test/repo%2",
+            "https://example.test/ま/foo",
+            "https://example.test/repo\u{2003}backup",
+            "https://example.test/repo\\backup",
+            "https://example.test/repo[backup",
         ] {
             assert!(
                 NormalizedGitUrl::new(invalid).is_err(),
