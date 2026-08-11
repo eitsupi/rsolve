@@ -143,6 +143,13 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
                     });
                 }
             }
+            Provenance::RBasePackage { r_version } => {
+                if r_version != &observation.observed_version {
+                    return Err(PackageReleaseError::ConflictingMetadata {
+                        field: "provenance version",
+                    });
+                }
+            }
             Provenance::GitCommit { .. } | Provenance::ImmutableSource { .. } => {
                 // For immutable sources the observed DESCRIPTION version is
                 // validated metadata, not an identity coordinate.
@@ -181,6 +188,10 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
 impl PackageRelease {
     pub fn identity(&self) -> &ReleaseIdentity {
         &self.identity
+    }
+
+    pub fn is_r_base_package(&self) -> bool {
+        self.identity.provenance().is_r_base_package()
     }
 
     pub fn version(&self) -> &RPackageVersion {
@@ -593,5 +604,43 @@ mod tests {
         });
         identities.insert(id.clone());
         assert!(identities.contains(&id));
+    }
+
+    #[test]
+    fn r_base_provenance_requires_target_version_match() {
+        let package = package("methods");
+        let target = version("4.4.0");
+        let identity = ReleaseIdentity::new(
+            package.clone(),
+            Provenance::RBasePackage {
+                r_version: target.clone(),
+            },
+        );
+        let release = PackageRelease::try_from(ReleaseObservation {
+            identity: identity.clone(),
+            observed_package: package.clone(),
+            observed_version: target.clone(),
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            dependencies: Vec::new(),
+            distributions: Vec::new(),
+        })
+        .unwrap();
+        assert!(release.is_r_base_package());
+        assert!(identity.provenance().is_r_base_package());
+
+        let mismatch = PackageRelease::try_from(ReleaseObservation {
+            identity,
+            observed_package: package,
+            observed_version: version("4.3.0"),
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            dependencies: Vec::new(),
+            distributions: Vec::new(),
+        });
+        assert!(matches!(
+            mismatch,
+            Err(PackageReleaseError::ConflictingMetadata {
+                field: "provenance version"
+            })
+        ));
     }
 }

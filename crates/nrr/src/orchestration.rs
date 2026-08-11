@@ -1,13 +1,121 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use nrr_core::{CandidateLoadError, CandidateLoader, Resolution};
+use nrr_core::{
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
+    Provenance, ReleaseMetadata, ReleaseObservation, Resolution, SolverKey,
+};
 use nrr_provider::cran::{
     CranCandidateSnapshot, CranRefreshDiagnostic, CranSnapshotRefresher, CranSnapshotRefresherError,
 };
 use nrr_resolver::{DefaultCandidatePreference, PreferLocked, ResolutionFailure, Resolver};
 
 use crate::manifest::{Manifest, ManifestError, compose_resolution_request};
+
+// These are R base packages only. Recommended packages such as Matrix are
+// intentionally absent; without runtime inventory, nrr must not infer that a
+// recommended package is environment-provided.
+const R_BASE_PACKAGE_NAMES: [&str; 14] = [
+    "base",
+    "compiler",
+    "datasets",
+    "graphics",
+    "grDevices",
+    "grid",
+    "methods",
+    "parallel",
+    "splines",
+    "stats",
+    "stats4",
+    "tcltk",
+    "tools",
+    "utils",
+];
+
+fn is_r_base_package_name(name: &PackageName) -> bool {
+    R_BASE_PACKAGE_NAMES
+        .iter()
+        .any(|candidate| *candidate == name.as_str())
+}
+
+struct RuntimeSnapshot {
+    cran: CranCandidateSnapshot,
+    base: HashMap<PackageName, Vec<PackageRelease>>,
+    r_version: nrr_core::RPackageVersion,
+}
+
+impl RuntimeSnapshot {
+    fn new(
+        cran: CranCandidateSnapshot,
+        r_version: nrr_core::RPackageVersion,
+    ) -> Result<Self, CandidateLoadError> {
+        let mut base = HashMap::new();
+        for name in R_BASE_PACKAGE_NAMES {
+            let package = PackageName::new(name).map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("invalid R base package name {name}: {error}"),
+                )
+            })?;
+            let release = PackageRelease::try_from(ReleaseObservation {
+                identity: nrr_core::ReleaseIdentity::new(
+                    package.clone(),
+                    Provenance::RBasePackage {
+                        r_version: r_version.clone(),
+                    },
+                ),
+                observed_package: package.clone(),
+                observed_version: r_version.clone(),
+                metadata: ReleaseMetadata::new(std::collections::BTreeMap::new()).map_err(
+                    |error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::MetadataInvalid,
+                            format!("invalid R base package metadata: {error}"),
+                        )
+                    },
+                )?,
+                dependencies: Vec::new(),
+                distributions: Vec::new(),
+            })
+            .map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("invalid R base package release {name}: {error}"),
+                )
+            })?;
+            base.insert(package, vec![release]);
+        }
+        Ok(Self {
+            cran,
+            base,
+            r_version,
+        })
+    }
+
+    fn needs_refresh(&self, package: &SolverKey) -> bool {
+        match package {
+            SolverKey::InstalledName(name) if is_r_base_package_name(name) => false,
+            SolverKey::InstalledName(_) => self.cran.needs_refresh(package),
+            _ => false,
+        }
+    }
+
+    fn r_version(&self) -> &nrr_core::RPackageVersion {
+        &self.r_version
+    }
+}
+
+impl CandidateLoader for RuntimeSnapshot {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        if let SolverKey::InstalledName(name) = package
+            && let Some(releases) = self.base.get(name)
+        {
+            return Ok(releases.clone());
+        }
+        self.cran.releases(package)
+    }
+}
 
 /// The failure stage of a CRAN-backed resolution orchestration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,7 +192,7 @@ fn resolve_request(
 
 fn resolve_request_with_snapshot_refresh<F>(
     request: nrr_core::ResolutionRequest,
-    mut snapshot: CranCandidateSnapshot,
+    mut snapshot: RuntimeSnapshot,
     mut refresh: F,
 ) -> Result<Resolution, CranResolutionError>
 where
@@ -99,9 +207,13 @@ where
             })) if source.category() == nrr_core::CandidateLoadErrorCategory::NotFound
                 && snapshot.needs_refresh(&nrr_core::SolverKey::InstalledName(name.clone())) =>
             {
-                let next_snapshot =
-                    refresh(std::slice::from_ref(&name)).map_err(CranResolutionError::Refresh)?;
-                if !next_snapshot.contains_package(&name) {
+                let next_snapshot = refresh(std::slice::from_ref(&name))
+                    .map_err(CranResolutionError::Refresh)
+                    .and_then(|next| {
+                        RuntimeSnapshot::new(next, snapshot.r_version().clone())
+                            .map_err(CranResolutionError::Refresh)
+                    })?;
+                if next_snapshot.needs_refresh(&SolverKey::InstalledName(name.clone())) {
                     return Err(CranResolutionError::Refresh(CandidateLoadError::new(
                         nrr_core::CandidateLoadErrorCategory::SnapshotInvalid,
                         format!("refresh did not produce a result for package {name}"),
@@ -129,10 +241,15 @@ pub fn resolve_from_cran(
         .requirements
         .iter()
         .map(|requirement| requirement.name.clone())
+        .filter(|name| !is_r_base_package_name(name))
         .collect::<Vec<_>>();
     let snapshot = refresher
         .refresh_packages(&roots)
-        .map_err(CranResolutionError::Refresh)?;
+        .map_err(CranResolutionError::Refresh)
+        .and_then(|snapshot| {
+            RuntimeSnapshot::new(snapshot, request.target.r_version.clone())
+                .map_err(CranResolutionError::Refresh)
+        })?;
     let resolution = resolve_request_with_snapshot_refresh(request, snapshot, |packages| {
         refresher.refresh_packages(packages)
     })?;
@@ -279,10 +396,14 @@ mod tests {
         .unwrap();
         let request = compose_resolution_request(manifest).unwrap();
         let mut refreshed = Vec::new();
-        let resolution = resolve_request_with_snapshot_refresh(request, initial, |names| {
-            refreshed.push(names.to_vec());
-            Ok(complete.clone())
-        })
+        let resolution = resolve_request_with_snapshot_refresh(
+            request,
+            RuntimeSnapshot::new(initial, RPackageVersion::parse("4.4.0").unwrap()).unwrap(),
+            |names| {
+                refreshed.push(names.to_vec());
+                Ok(complete.clone())
+            },
+        )
         .unwrap();
         assert_eq!(refreshed, vec![vec![dependency.clone()]]);
         assert!(resolution.selected(&root).is_some());
@@ -336,10 +457,14 @@ mod tests {
         )
         .unwrap();
         let mut empty_refreshes = 0;
-        let error = resolve_request_with_snapshot_refresh(request, initial, |_| {
-            empty_refreshes += 1;
-            Ok(empty.clone())
-        })
+        let error = resolve_request_with_snapshot_refresh(
+            request,
+            RuntimeSnapshot::new(initial, RPackageVersion::parse("4.4.0").unwrap()).unwrap(),
+            |_| {
+                empty_refreshes += 1;
+                Ok(empty.clone())
+            },
+        )
         .unwrap_err();
         assert_eq!(empty_refreshes, 1);
         assert!(matches!(
@@ -366,10 +491,15 @@ mod tests {
         let initial = CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]);
         let request = compose_resolution_request(manifest_for(root)).unwrap();
         let mut refreshes = 0;
-        let error = resolve_request_with_snapshot_refresh(request, initial.clone(), |_| {
-            refreshes += 1;
-            Ok(initial.clone())
-        })
+        let error = resolve_request_with_snapshot_refresh(
+            request,
+            RuntimeSnapshot::new(initial.clone(), RPackageVersion::parse("4.4.0").unwrap())
+                .unwrap(),
+            |_| {
+                refreshes += 1;
+                Ok(initial.clone())
+            },
+        )
         .unwrap_err();
         assert_eq!(refreshes, 0);
         assert!(matches!(
@@ -398,19 +528,132 @@ mod tests {
             CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release.clone()])]);
         let request = compose_resolution_request(manifest_for(root.clone())).unwrap();
         let mut refreshes = 0;
-        let error = resolve_request_with_snapshot_refresh(request, initial, |_| {
-            refreshes += 1;
-            Ok(CranCandidateSnapshot::from_candidates([(
-                root.clone(),
-                vec![root_release.clone()],
-            )]))
-        })
+        let error = resolve_request_with_snapshot_refresh(
+            request,
+            RuntimeSnapshot::new(initial, RPackageVersion::parse("4.4.0").unwrap()).unwrap(),
+            |_| {
+                refreshes += 1;
+                Ok(CranCandidateSnapshot::from_candidates([(
+                    root.clone(),
+                    vec![root_release.clone()],
+                )]))
+            },
+        )
         .unwrap_err();
         assert_eq!(refreshes, 1);
         assert!(matches!(
             error,
             CranResolutionError::Refresh(error)
                 if error.category() == CandidateLoadErrorCategory::SnapshotInvalid
+        ));
+    }
+
+    #[test]
+    fn r_base_overlay_shadows_cran_base_names_but_not_matrix() {
+        let target = RPackageVersion::parse("4.4.0").unwrap();
+        let methods = PackageName::new("methods").unwrap();
+        let matrix = PackageName::new("Matrix").unwrap();
+        let cran = CranCandidateSnapshot::from_candidates([
+            (
+                methods.clone(),
+                vec![release_with_dependencies(&methods, Vec::new())],
+            ),
+            (
+                matrix.clone(),
+                vec![release_with_dependencies(&matrix, Vec::new())],
+            ),
+        ]);
+        let overlay = RuntimeSnapshot::new(cran, target.clone()).unwrap();
+        assert_eq!(R_BASE_PACKAGE_NAMES.len(), 14);
+        assert_eq!(
+            R_BASE_PACKAGE_NAMES
+                .iter()
+                .map(|name| PackageName::new(name).unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            14
+        );
+        let base_release = overlay
+            .releases(&SolverKey::InstalledName(methods.clone()))
+            .unwrap();
+        assert_eq!(base_release.len(), 1);
+        assert!(base_release[0].is_r_base_package());
+        assert_eq!(base_release[0].version(), &target);
+        assert!(!overlay.needs_refresh(&SolverKey::InstalledName(methods)));
+        assert!(
+            !overlay.releases(&SolverKey::InstalledName(matrix)).unwrap()[0].is_r_base_package()
+        );
+        let empty_overlay =
+            RuntimeSnapshot::new(CranCandidateSnapshot::from_candidates([]), target).unwrap();
+        assert!(empty_overlay.needs_refresh(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        )));
+    }
+
+    #[test]
+    fn methods_dependency_uses_target_r_base_without_refresh_or_resolution_output() {
+        let root = PackageName::new("fixture").unwrap();
+        let methods = PackageName::new("methods").unwrap();
+        let target = RPackageVersion::parse("4.4.0").unwrap();
+        let root_release = release_with_dependencies(
+            &root,
+            vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                methods.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(nrr_core::RelationOp::Eq, target.clone()),
+            )],
+        );
+        let initial = RuntimeSnapshot::new(
+            CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]),
+            target.clone(),
+        )
+        .unwrap();
+        let request = compose_resolution_request(manifest_for(root.clone())).unwrap();
+        let mut refreshes = 0;
+        let resolution = resolve_request_with_snapshot_refresh(request, initial, |_| {
+            refreshes += 1;
+            Ok(CranCandidateSnapshot::from_candidates([]))
+        })
+        .unwrap();
+        assert_eq!(refreshes, 0);
+        assert!(resolution.selected(&root).is_some());
+        assert!(resolution.selected(&methods).is_none());
+    }
+
+    #[test]
+    fn incompatible_methods_constraint_is_no_solution_without_refresh() {
+        let root = PackageName::new("fixture").unwrap();
+        let methods = PackageName::new("methods").unwrap();
+        let target = RPackageVersion::parse("4.4.0").unwrap();
+        let root_release = release_with_dependencies(
+            &root,
+            vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                methods,
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(
+                    nrr_core::RelationOp::Eq,
+                    RPackageVersion::parse("4.3.0").unwrap(),
+                ),
+            )],
+        );
+        let initial = RuntimeSnapshot::new(
+            CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]),
+            target,
+        )
+        .unwrap();
+        let request = compose_resolution_request(manifest_for(root)).unwrap();
+        let mut refreshes = 0;
+        let error = resolve_request_with_snapshot_refresh(request, initial, |_| {
+            refreshes += 1;
+            Ok(CranCandidateSnapshot::from_candidates([]))
+        })
+        .unwrap_err();
+        assert_eq!(refreshes, 0);
+        assert!(matches!(
+            error,
+            CranResolutionError::Resolution(ResolutionFailure::NoSolution { .. })
         ));
     }
 

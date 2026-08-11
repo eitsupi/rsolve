@@ -9,6 +9,9 @@ use crate::r_versions::RPackageVersion;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Provenance {
+    /// A base package supplied by the selected R runtime rather than a CRAN
+    /// distribution. The R version is part of its release identity.
+    RBasePackage { r_version: RPackageVersion },
     RegistryRelease {
         namespace: PackageNamespace,
         version: RPackageVersion,
@@ -27,6 +30,12 @@ pub enum Provenance {
         scheme: SourceScheme,
         digest: Sha256Digest,
     },
+}
+
+impl Provenance {
+    pub fn is_r_base_package(&self) -> bool {
+        matches!(self, Self::RBasePackage { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

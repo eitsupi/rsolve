@@ -432,6 +432,9 @@ pub(crate) fn solve(
                     package: error.package,
                     source: error.source,
                 })?;
+            if release.is_r_base_package() {
+                continue;
+            }
             packages.push(nrr_core::ResolvedPackage::new(subject, release));
         }
     }
