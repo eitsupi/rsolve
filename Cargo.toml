@@ -9,4 +9,5 @@ publish = false
 
 [workspace.dependencies]
 deb822-fast = "0.2"
+rd-rds = { version = "0.2.0", default-features = false, features = ["gzip", "zstd"] }
 pubgrub = "0.4"

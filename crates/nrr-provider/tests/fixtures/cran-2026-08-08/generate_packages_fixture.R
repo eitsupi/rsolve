@@ -1,4 +1,4 @@
-# Check or update deterministic synthetic DCF fixtures.
+# Check or update deterministic synthetic DCF and archive-index fixtures.
 # Provenance: R 4.6.1; generated from hand-constructed fictional records
 # without network access, CRAN input, or tools::write_PACKAGES.
 
@@ -92,6 +92,98 @@ packages <- c(
 
 write_fixture("synthetic-PACKAGES", packages)
 
+archive_columns <- c(
+    "Version", "Package", "Priority", "MD5sum", "Depends", "Imports",
+    "LinkingTo", "Suggests", "Enhances", "License", "License_is_FOSS",
+    "License_restricts_use", "OS_type", "Archs", "NeedsCompilation"
+)
+archive <- matrix(
+    NA_character_,
+    nrow = 4L,
+    ncol = length(archive_columns),
+    dimnames = list(NULL, archive_columns)
+)
+set_archive_row <- function(row, values) {
+    archive[row, names(values)] <<- unname(values)
+}
+
+set_archive_row(1L, c(
+    Package = "nrrfixture.history",
+    Version = "1.10.0",
+    Depends = "R (>= 4.6.0), nrrfixture.base",
+    Imports = paste0(
+        "nrrfixture.import,\n  nrrfixture.import.helper,\n  ",
+        "nrrfixture.import.extra"
+    ),
+    LinkingTo = "nrrfixture.link",
+    Suggests = "nrrfixture.suggest",
+    Enhances = "nrrfixture.enhance",
+    License = "NRR Fictional Terms – Archive",
+    License_is_FOSS = "yes",
+    License_restricts_use = "no",
+    MD5sum = "00000000000000000000000000000011",
+    NeedsCompilation = "yes"
+))
+set_archive_row(2L, c(
+    Package = "nrrfixture.history",
+    Version = "0.3.0",
+    License = "NRR Fictional Terms Older",
+    License_is_FOSS = "yes",
+    License_restricts_use = "no",
+    MD5sum = "00000000000000000000000000000012",
+    NeedsCompilation = "no"
+))
+set_archive_row(3L, c(
+    Package = "nrrfixture.utf8",
+    Version = "2.0.0",
+    License = "NRR Fictional Terms 日本語",
+    License_is_FOSS = "no",
+    License_restricts_use = "yes",
+    MD5sum = "00000000000000000000000000000013",
+    NeedsCompilation = "no"
+))
+set_archive_row(4L, c(
+    Package = "nrrfixture.broken",
+    Version = "not-a-version",
+    License = "NRR Fictional Terms Broken",
+    MD5sum = "00000000000000000000000000000014"
+))
+
+archive_bytes <- function(value) {
+    path <- tempfile("nrrfixture-archive-")
+    saveRDS(value, path, compress = "gzip", version = 3L)
+    bytes <- readBin(path, what = "raw", n = file.info(path)$size)
+    unlink(path)
+    # R's gzip writer records the current time in bytes 5:8 of the header.
+    # The serialized payload and all other header fields are deterministic.
+    bytes[5:8] <- as.raw(rep(0L, 4L))
+    bytes
+}
+
+write_binary_fixture <- function(name, value) {
+    bytes <- archive_bytes(value)
+    decompressed <- memDecompress(bytes, type = "gzip")
+    stopifnot(
+        identical(bytes[seq_len(2L)], as.raw(c(0x1f, 0x8b))),
+        identical(decompressed[seq_len(2L)], charToRaw("X\n")),
+        identical(decompressed[3:6], as.raw(c(0, 0, 0, 3)))
+    )
+    target <- file.path(root, name)
+    if (mode == "--update") {
+        writeBin(bytes, target)
+        return(invisible(NULL))
+    }
+    if (!file.exists(target)) {
+        stop("fixture is missing: ", name, "; run --update")
+    }
+    expected <- readBin(target, what = "raw", n = file.info(target)$size)
+    if (!identical(expected, bytes)) {
+        stop("fixture differs: ", name, "; run --update")
+    }
+}
+
+write_binary_fixture("synthetic-archive-PACKAGES.rds", archive)
+
 description <- paste0(
     "Package: nrrfixture.description\n",
     "Version: 0.4.0\n",
@@ -104,4 +196,4 @@ description <- paste0(
 )
 write_fixture("synthetic-DESCRIPTION", description)
 
-cat("Fixture", mode, "passed for synthetic-PACKAGES and synthetic-DESCRIPTION.\n")
+cat("Fixture", mode, "passed for synthetic-PACKAGES, synthetic-DESCRIPTION, and synthetic-archive-PACKAGES.rds.\n")

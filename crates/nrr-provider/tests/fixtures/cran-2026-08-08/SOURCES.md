@@ -1,11 +1,11 @@
-# Synthetic DCF fixture provenance
+# Synthetic CRAN-index fixture provenance
 
 These files contain fictional records written by
 `generate_packages_fixture.R`. They are not extracts from a repository index,
 and the generator does not access the network or call `tools::write_PACKAGES()`.
 The generator requires R 4.6.1 and writes UTF-8 bytes with explicit LF line
-endings. It defaults to an in-memory byte-for-byte check; pass `--update` to
-write regenerated files:
+endings for DCF and a gzip-compressed, format-3 RDS archive matrix. It defaults
+to an in-memory byte-for-byte check; pass `--update` to write regenerated files:
 
 ```sh
 Rscript crates/nrr-provider/tests/fixtures/cran-2026-08-08/generate_packages_fixture.R --check
@@ -20,6 +20,7 @@ fictional phrase.
 | --- | ---: | --- |
 | `synthetic-PACKAGES` | 4 | Multi-record PACKAGES-like input |
 | `synthetic-DESCRIPTION` | 1 | Single-record DESCRIPTION-like input |
+| `synthetic-archive-PACKAGES.rds` | 4 | Gzip, format-3 archive package matrix; SHA-256 `ab109b39be22067f3ee8cf0d149d2b15dd1a77c27a374d3778ef82d406998853` |
 
 ## Record coverage
 
@@ -30,6 +31,31 @@ fictional phrase.
 | `nrrfixture.rare` | Keeps the rare-field values together and uses fictional license metadata, including a positive `License_restricts_use` value. |
 | `nrrfixture.plain` | Provides an ordinary record with the common required index fields. |
 | `nrrfixture.description` | Is a separate one-record input with UTF-8 values, including a non-ASCII `Description`. |
+
+The archive matrix has 15 columns in the CRAN archive profile, including all
+five dependency fields. `nrrfixture.history` occurs at versions `1.10.0` and
+`0.3.0` in that non-version order; its `Imports` value is folded over long
+continuation-style lines. The matrix also contains UTF-8 license values and an
+R `NA` cell, while `nrrfixture.broken` has an invalid version and must be
+skipped with a diagnostic at source row 3 (zero-based).
+
+CRAN observation (2026-08-11): per-package archive indexes were observed to
+exclude the current package version and to store rows in archival order rather
+than semantic-version order. These are upstream observations, not guarantees
+made by this fixture or reader.
+
+The fixture's column order deliberately differs from the observed CRAN order so
+that a reader indexing by column position rather than by name fails against it.
+
+The gzip envelope in this fixture records what the per-package archive index was
+observed to use on 2026-08-11; it is not an assumption that the envelope is
+fixed. The envelope is chosen by whoever writes the file, and the same date's
+observations put the current `src/contrib` index at xz and R-universe's binary
+indexes at zstd. R 4.6.1 already accepts `saveRDS(compress = "zstd")` when the
+R build includes libzstd, and R's own NEWS signals zstd as a future default for
+package tooling. The reader therefore selects its envelope from the file's magic
+bytes and reports an envelope this build cannot decompress as a distinct,
+actionable capability limit rather than as corrupt input.
 
 ## CRAN measurements used for shape selection
 

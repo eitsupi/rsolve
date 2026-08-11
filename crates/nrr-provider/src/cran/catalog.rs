@@ -12,7 +12,7 @@ use nrr_core::{
     VersionConstraint,
 };
 
-use super::{DcfDocument, DcfError, DcfRecord};
+use super::{DcfDocument, DcfError};
 
 const CRAN_NAMESPACE: &str = "cran";
 const SOURCE_CHANNEL: &str = "source";
@@ -42,46 +42,22 @@ impl CranCatalog {
     }
 
     fn from_document(document: DcfDocument) -> Result<Self, CranCatalogError> {
-        let mut aggregation = ReleaseAggregation::new();
-        let mut diagnostics = Vec::new();
-
-        for (record_index, record) in document.records().iter().enumerate() {
-            let package = record
-                .field("Package")
-                .map(|field| field.value().to_owned());
-            match observation_from_record(record) {
-                Ok(observation) => {
-                    if let Err(error) = aggregation.observe(observation) {
-                        diagnostics.push(CranDiagnostic {
-                            record_index,
-                            package,
-                            error: CranRecordError::Domain(error),
-                        });
-                    }
-                }
-                Err(error) => diagnostics.push(CranDiagnostic {
-                    record_index,
-                    package,
-                    error,
-                }),
-            }
-        }
-
-        let mut candidates: BTreeMap<PackageName, Vec<PackageRelease>> = BTreeMap::new();
-        for release in aggregation.releases() {
-            candidates
-                .entry(release.identity().name().clone())
-                .or_default()
-                .push(release.clone());
-        }
-        for releases in candidates.values_mut() {
-            releases.sort_by(|left, right| left.version().cmp(right.version()));
-        }
-
-        Ok(Self {
-            candidates,
-            diagnostics,
-        })
+        let observations = document
+            .records()
+            .iter()
+            .enumerate()
+            .map(|(record_index, record)| {
+                let package = record
+                    .field("Package")
+                    .map(|field| field.value().to_owned());
+                let fields = record
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name(), field.value()))
+                    .collect::<Vec<_>>();
+                (record_index, package, observation_from_fields(&fields))
+            });
+        Ok(catalog_from_observations(observations))
     }
 
     /// Returns all candidates for a canonical package name in version order.
@@ -239,10 +215,60 @@ impl fmt::Display for DependencyParseError {
 
 impl Error for DependencyParseError {}
 
-fn observation_from_record(record: &DcfRecord) -> Result<ReleaseObservation, CranRecordError> {
-    reject_duplicate_fields(record)?;
-    let package_value = required_field(record, "Package")?;
-    let version_value = required_field(record, "Version")?;
+pub(super) fn catalog_from_observations<I>(observations: I) -> CranCatalog
+where
+    I: IntoIterator<
+        Item = (
+            usize,
+            Option<String>,
+            Result<ReleaseObservation, CranRecordError>,
+        ),
+    >,
+{
+    let mut aggregation = ReleaseAggregation::new();
+    let mut diagnostics = Vec::new();
+
+    for (record_index, package, observation) in observations {
+        match observation {
+            Ok(observation) => {
+                if let Err(error) = aggregation.observe(observation) {
+                    diagnostics.push(CranDiagnostic {
+                        record_index,
+                        package,
+                        error: CranRecordError::Domain(error),
+                    });
+                }
+            }
+            Err(error) => diagnostics.push(CranDiagnostic {
+                record_index,
+                package,
+                error,
+            }),
+        }
+    }
+
+    let mut candidates: BTreeMap<PackageName, Vec<PackageRelease>> = BTreeMap::new();
+    for release in aggregation.releases() {
+        candidates
+            .entry(release.identity().name().clone())
+            .or_default()
+            .push(release.clone());
+    }
+    for releases in candidates.values_mut() {
+        releases.sort_by(|left, right| left.version().cmp(right.version()));
+    }
+    CranCatalog {
+        candidates,
+        diagnostics,
+    }
+}
+
+pub(super) fn observation_from_fields(
+    fields: &[(&str, &str)],
+) -> Result<ReleaseObservation, CranRecordError> {
+    reject_duplicate_fields(fields)?;
+    let package_value = required_field(fields, "Package")?;
+    let version_value = required_field(fields, "Version")?;
     let package =
         PackageName::new(package_value.trim()).map_err(CranRecordError::InvalidPackageName)?;
     let version =
@@ -256,8 +282,8 @@ fn observation_from_record(record: &DcfRecord) -> Result<ReleaseObservation, Cra
         ("Suggests", DependencyKind::Suggests),
         ("Enhances", DependencyKind::Enhances),
     ] {
-        if let Some(field) = record.field(field_name) {
-            for entry in field.value().split(',') {
+        if let Some(value) = field(fields, field_name) {
+            for entry in value.split(',') {
                 let dependency = parse_dependency_entry(entry).map_err(|source| {
                     CranRecordError::Dependency {
                         field: field_name,
@@ -275,11 +301,10 @@ fn observation_from_record(record: &DcfRecord) -> Result<ReleaseObservation, Cra
         }
     }
 
-    let metadata_fields = record
-        .fields()
+    let metadata_fields = fields
         .iter()
-        .filter(|field| !is_reserved_field(field.name()))
-        .map(|field| (field.name().to_owned(), field.value().to_owned()))
+        .filter(|(name, _)| !is_reserved_field(name))
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
     let metadata =
         ReleaseMetadata::new(metadata_fields).map_err(CranRecordError::InvalidMetadata)?;
@@ -310,21 +335,25 @@ fn observation_from_record(record: &DcfRecord) -> Result<ReleaseObservation, Cra
 }
 
 fn required_field<'a>(
-    record: &'a DcfRecord,
+    fields: &'a [(&str, &str)],
     name: &'static str,
 ) -> Result<&'a str, CranRecordError> {
-    record
-        .field(name)
-        .map(|field| field.value())
-        .ok_or(CranRecordError::MissingField(name))
+    field(fields, name).ok_or(CranRecordError::MissingField(name))
 }
 
-fn reject_duplicate_fields(record: &DcfRecord) -> Result<(), CranRecordError> {
+fn field<'a>(fields: &'a [(&str, &str)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(field_name, _)| field_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| *value)
+}
+
+fn reject_duplicate_fields(fields: &[(&str, &str)]) -> Result<(), CranRecordError> {
     let mut names = BTreeSet::new();
-    for field in record.fields() {
-        let normalized = field.name().to_ascii_lowercase();
+    for (name, _) in fields {
+        let normalized = name.to_ascii_lowercase();
         if !names.insert(normalized) {
-            return Err(CranRecordError::DuplicateField(field.name().to_owned()));
+            return Err(CranRecordError::DuplicateField((*name).to_owned()));
         }
     }
     Ok(())
