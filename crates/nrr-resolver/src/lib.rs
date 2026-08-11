@@ -273,7 +273,10 @@ impl<'a> Resolver<'a> {
                 &resolution.target().r_version,
             );
             let assigned = candidate_for_subject(&subject, package.release());
-            let alternatives = candidates
+            // The loader's iteration order must not reach the public
+            // comparison, so each alternative carries the candidate's own
+            // version and identity as its sort key.
+            let mut keyed: Vec<_> = candidates
                 .iter()
                 .filter(|candidate| candidate.identity() != package.release().identity())
                 .filter_map(|candidate| {
@@ -286,13 +289,25 @@ impl<'a> Resolver<'a> {
                         &subject,
                         &selected,
                     )
-                    .map(|differs_by| AlternativeComparison {
-                        candidate: candidate_for_subject(&subject, candidate),
-                        differs_by,
+                    .map(|differs_by| {
+                        (
+                            (
+                                candidate.version().clone(),
+                                identity_sort_key(candidate.identity()),
+                            ),
+                            AlternativeComparison {
+                                candidate: candidate_for_subject(&subject, candidate),
+                                differs_by,
+                            },
+                        )
                     })
                 })
                 .collect();
-
+            keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let alternatives = keyed
+                .into_iter()
+                .map(|(_, alternative)| alternative)
+                .collect();
             assignments.push(SubjectAssignment {
                 subject: subject_to_decision_subject(&subject),
                 assigned,
@@ -377,7 +392,9 @@ fn assignment_basis(
         return AssignmentBasis::OnlyStaticallyCompatible;
     }
     if request.requirements.iter().any(|requirement| {
-        dependency_key(&requirement.name, &requirement.source) == *subject
+        dependency_key(&requirement.name, &requirement.source)
+            .as_ref()
+            .is_some_and(|key| key == subject)
             && requirement.constraint.clauses.iter().any(|clause| {
                 clause.op == nrr_core::RelationOp::Eq
                     && clause.version == *selected.release().version()
@@ -398,6 +415,11 @@ fn difference_for_candidate(
     subject: &SolverKey,
     selected_packages: &[nrr_core::ResolvedPackage],
 ) -> Option<AssignmentDifference> {
+    // TODO: This only checks a candidate's Depends: R constraint against the fixed R target. A
+    // candidate excluded by a root version requirement or by a dependency on another assigned
+    // package currently falls through to LowerPreference and is labelled with a false reason.
+    // Widening the statically checkable set, or adding a distinct not-explained difference, is
+    // deferred.
     if let LockDecision::Require(required) = decision
         && candidate.identity() != required
     {
@@ -476,11 +498,11 @@ fn subject_name(subject: &SolverKey) -> PackageName {
     }
 }
 
-fn dependency_key(name: &PackageName, source: &DependencySourceConstraint) -> SolverKey {
-    if name.as_str() == "R" {
-        return SolverKey::R;
+fn dependency_key(name: &PackageName, source: &DependencySourceConstraint) -> Option<SolverKey> {
+    if name.as_str() == "R" && !matches!(source, DependencySourceConstraint::Git { .. }) {
+        return Some(SolverKey::R);
     }
-    match source {
+    Some(match source {
         DependencySourceConstraint::Any => SolverKey::InstalledName(name.clone()),
         DependencySourceConstraint::Registry { namespace } => SolverKey::Registry {
             namespace: namespace.clone(),
@@ -493,13 +515,9 @@ fn dependency_key(name: &PackageName, source: &DependencySourceConstraint) -> So
                 name: name.clone(),
             }
         }
-        DependencySourceConstraint::Git { .. } | DependencySourceConstraint::Exact(_) => {
-            match source {
-                DependencySourceConstraint::Exact(identity) => SolverKey::Exact(identity.clone()),
-                _ => SolverKey::InstalledName(name.clone()),
-            }
-        }
-    }
+        DependencySourceConstraint::Exact(identity) => SolverKey::Exact(identity.clone()),
+        DependencySourceConstraint::Git { .. } => return None,
+    })
 }
 
 impl fmt::Display for LockDecision {

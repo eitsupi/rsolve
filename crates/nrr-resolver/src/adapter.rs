@@ -1,15 +1,15 @@
 //! Private PubGrub adapter.  No type from this module is part of nrr's API.
 
 use std::cell::RefCell;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
 use nrr_core::{
-    CandidateLoadError, CandidateLoader, DependencyKind, DependencyRequirement,
-    DependencySourceConstraint, PackageRelease, RPackageVersion, RelationOp, Resolution,
-    ResolutionRequest, SolverKey, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
+    DependencyRequirement, DependencySourceConstraint, PackageRelease, RPackageVersion, RelationOp,
+    Resolution, ResolutionRequest, SolverKey, VersionConstraint,
 };
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
@@ -121,11 +121,32 @@ impl<'a> Provider<'a> {
             .fold(Ranges::full(), |range, clause| range.intersection(&clause))
     }
 
-    fn subject_for_dependency(&self, dependency: &DependencyRequirement) -> SolverKey {
-        if dependency.name.as_str() == "R" {
-            return SolverKey::R;
+    // TODO: Source-qualified SolverKey::Registry, SolverKey::Bioconductor, and SolverKey::Exact
+    // subjects and installed-name subjects are independent solver packages, so requirements for
+    // one name can be satisfied by different releases at once. Modelling installed-name
+    // occupancy as a shared solver constraint is deferred pending the repository-priority and
+    // duplicate-package policy decision. The first slice exercises only one registry, so this
+    // problem is not currently reachable.
+    fn subject_for_dependency(
+        &self,
+        dependency: &DependencyRequirement,
+    ) -> Result<SolverKey, Box<AdapterError>> {
+        if let DependencySourceConstraint::Git { .. } = &dependency.source {
+            return Err(Box::new(AdapterError {
+                package: SolverKey::InstalledName(dependency.name.clone()),
+                source: Box::new(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!(
+                        "Git-sourced dependencies are not supported for package {}",
+                        dependency.name
+                    ),
+                )),
+            }));
         }
-        match &dependency.source {
+        if dependency.name.as_str() == "R" {
+            return Ok(SolverKey::R);
+        }
+        Ok(match &dependency.source {
             DependencySourceConstraint::Any => SolverKey::InstalledName(dependency.name.clone()),
             DependencySourceConstraint::Registry { namespace } => SolverKey::Registry {
                 namespace: namespace.clone(),
@@ -139,29 +160,90 @@ impl<'a> Provider<'a> {
                 }
             }
             DependencySourceConstraint::Exact(identity) => SolverKey::Exact(identity.clone()),
-            DependencySourceConstraint::Git { .. } => {
-                SolverKey::InstalledName(dependency.name.clone())
-            }
-        }
+            DependencySourceConstraint::Git { .. } => unreachable!("Git was rejected above"),
+        })
     }
 
+    fn with_eligible_candidates<T>(
+        &self,
+        subject: &SolverKey,
+        use_candidates: impl FnOnce(&mut Vec<PackageRelease>, &PreferenceContext<'_>) -> T,
+    ) -> Result<T, Box<AdapterError>> {
+        let candidates = self.candidates(subject)?;
+        let decision = self.lock_decision(subject);
+        let required = match &decision {
+            LockDecision::Require(identity) => Some(identity),
+            _ => None,
+        };
+        let locked = match &decision {
+            LockDecision::Prefer(identity) | LockDecision::Require(identity) => {
+                Some(identity.clone())
+            }
+            LockDecision::Unlocked => None,
+        };
+        let current = self
+            .current(&candidates)
+            .map(|candidate| candidate.identity().clone());
+        let context = PreferenceContext {
+            locked: locked.as_ref(),
+            repository_current: current.as_ref(),
+        };
+        let mut eligible = candidates
+            .into_iter()
+            .filter(|candidate| {
+                required
+                    .as_ref()
+                    .is_none_or(|identity| candidate.identity() == *identity)
+            })
+            .collect();
+        Ok(use_candidates(&mut eligible, &context))
+    }
+
+    fn compare_candidates(
+        &self,
+        subject: &SolverKey,
+        left: &PackageRelease,
+        right: &PackageRelease,
+        context: &PreferenceContext<'_>,
+    ) -> Ordering {
+        self.preference
+            .compare(subject, left, right, context)
+            .then_with(|| left.version().cmp(right.version()))
+            .then_with(|| format!("{:?}", left.identity()).cmp(&format!("{:?}", right.identity())))
+    }
+
+    fn sort_candidates(
+        &self,
+        subject: &SolverKey,
+        candidates: &mut [PackageRelease],
+        context: &PreferenceContext<'_>,
+    ) {
+        candidates.sort_by(|left, right| self.compare_candidates(subject, left, right, context));
+    }
+
+    // TODO: Identity is canonicalized per (subject, version), so a same-version alternative from
+    // a different provenance is not independently selectable. Making candidate identity a
+    // first-class part of the solver package/version domain is deferred pending the
+    // repository/provider-priority design decision.
     fn candidate_for_version(
         &self,
         subject: &SolverKey,
         version: &RPackageVersion,
     ) -> Result<PackageRelease, Box<AdapterError>> {
-        self.candidates(subject)?
-            .into_iter()
-            .find(|candidate| candidate.version() == version)
-            .ok_or_else(|| {
-                Box::new(AdapterError {
-                    package: subject.clone(),
-                    source: Box::new(CandidateLoadError::new(
-                        nrr_core::CandidateLoadErrorCategory::MetadataInvalid,
-                        format!("selected version {version} was not in the loaded catalog"),
-                    )),
-                })
+        let candidate = self.with_eligible_candidates(subject, |eligible, context| {
+            eligible.retain(|candidate| candidate.version() == version);
+            self.sort_candidates(subject, eligible, context);
+            eligible.pop()
+        })?;
+        candidate.ok_or_else(|| {
+            Box::new(AdapterError {
+                package: subject.clone(),
+                source: Box::new(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("selected version {version} was not in the loaded catalog"),
+                )),
             })
+        })
     }
 }
 
@@ -208,45 +290,11 @@ impl DependencyProvider for Provider<'_> {
                 .contains(self.r_version())
                 .then(|| self.r_version().clone())),
             PackageId::Subject(subject) => {
-                let candidates = self.candidates(subject)?;
-                let decision = self.lock_decision(subject);
-                let required = match &decision {
-                    LockDecision::Require(identity) => Some(identity),
-                    _ => None,
-                };
-                let locked = match &decision {
-                    LockDecision::Prefer(identity) | LockDecision::Require(identity) => {
-                        Some(identity)
-                    }
-                    LockDecision::Unlocked => None,
-                };
-                let current = self
-                    .current(&candidates)
-                    .map(|candidate| candidate.identity().clone());
-                let context = PreferenceContext {
-                    locked,
-                    repository_current: current.as_ref(),
-                };
-                let mut compatible: Vec<_> = candidates
-                    .into_iter()
-                    .filter(|candidate| range.contains(candidate.version()))
-                    .filter(|candidate| {
-                        required
-                            .as_ref()
-                            .is_none_or(|identity| candidate.identity() == *identity)
-                    })
-                    .collect();
-                compatible.sort_by(|left, right| {
-                    self.preference
-                        .compare(subject, left, right, &context)
-                        .then_with(|| left.version().cmp(right.version()))
-                        .then_with(|| {
-                            format!("{:?}", left.identity()).cmp(&format!("{:?}", right.identity()))
-                        })
-                });
-                Ok(compatible
-                    .pop()
-                    .map(|candidate| candidate.version().clone()))
+                self.with_eligible_candidates(subject, |eligible, context| {
+                    eligible.retain(|candidate| range.contains(candidate.version()));
+                    self.sort_candidates(subject, eligible, context);
+                    eligible.pop().map(|candidate| candidate.version().clone())
+                })
             }
         }
     }
@@ -269,7 +317,7 @@ impl DependencyProvider for Provider<'_> {
                 ));
                 for requirement in &self.request.requirements {
                     dependencies.push((
-                        PackageId::Subject(self.subject_for_dependency(requirement)),
+                        PackageId::Subject(self.subject_for_dependency(requirement)?),
                         self.ranges_for(&requirement.constraint),
                     ));
                 }
@@ -282,23 +330,20 @@ impl DependencyProvider for Provider<'_> {
             }
             PackageId::Subject(subject) => {
                 let release = self.candidate_for_version(subject, version)?;
-                let dependencies = release
-                    .dependencies()
-                    .iter()
-                    .filter(|dependency| {
-                        matches!(
-                            dependency.kind,
-                            DependencyKind::Depends
-                                | DependencyKind::Imports
-                                | DependencyKind::LinkingTo
-                        )
-                    })
-                    .map(|dependency| {
-                        (
-                            PackageId::Subject(self.subject_for_dependency(dependency)),
-                            self.ranges_for(&dependency.constraint),
-                        )
-                    });
+                let mut dependencies = Vec::new();
+                for dependency in release.dependencies().iter().filter(|dependency| {
+                    matches!(
+                        dependency.kind,
+                        DependencyKind::Depends
+                            | DependencyKind::Imports
+                            | DependencyKind::LinkingTo
+                    )
+                }) {
+                    dependencies.push((
+                        PackageId::Subject(self.subject_for_dependency(dependency)?),
+                        self.ranges_for(&dependency.constraint),
+                    ));
+                }
                 Ok(Dependencies::Available(DependencyConstraints::from_iter(
                     dependencies,
                 )))
