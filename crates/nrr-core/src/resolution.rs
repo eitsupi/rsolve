@@ -69,6 +69,26 @@ impl ResolvedPackage {
         &self.release
     }
 
+    pub fn identity(&self) -> &crate::ReleaseIdentity {
+        self.release.identity()
+    }
+
+    pub fn version(&self) -> &crate::RPackageVersion {
+        self.release.version()
+    }
+
+    pub fn dependencies(&self) -> &[crate::DependencyRequirement] {
+        self.release.dependencies()
+    }
+
+    pub fn distributions(&self) -> &[crate::Distribution] {
+        self.release.distributions()
+    }
+
+    pub fn metadata_digest(&self) -> Option<&crate::Sha256Digest> {
+        self.release.metadata_digest()
+    }
+
     pub fn name(&self) -> &PackageName {
         self.release.identity().name()
     }
@@ -89,7 +109,12 @@ pub struct Resolution {
 
 impl Resolution {
     #[doc(hidden)]
-    pub fn new(target: ResolutionTarget, packages: Vec<ResolvedPackage>) -> Self {
+    pub fn new(target: ResolutionTarget, mut packages: Vec<ResolvedPackage>) -> Self {
+        // R and the R base packages are runtime-provided subjects, not
+        // installable entries in a logical resolution.  Keep this invariant at
+        // the successful-result boundary as well as in the resolver adapter.
+        packages.retain(|package| !package.release.is_r_base_package());
+        packages.sort_by(|left, right| left.name().cmp(right.name()));
         Self { target, packages }
     }
 

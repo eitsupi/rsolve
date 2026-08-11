@@ -3,13 +3,19 @@
 //! This crate must not move domain, provider, resolver, or repository
 //! implementation into the binary beyond composition responsibilities.
 
+pub mod lock;
 pub mod manifest;
 pub mod orchestration;
 
+pub use lock::{
+    EnvironmentId, EnvironmentIdError, LockError, LockedDependencyEdge, LockedDistributionRef,
+    LockedPackage, LockedResolution, Lockfile,
+};
 pub use manifest::{
     Manifest, ManifestDependency, ManifestError, ManifestTarget, compose_resolution_request,
     compose_resolution_request_with_locked,
 };
 pub use orchestration::{
-    CranResolutionError, CranResolutionOutcome, resolve_from_cran, resolve_with_loader,
+    CranResolutionError, CranResolutionOutcome, ResolutionMode, resolve_from_cran,
+    resolve_with_loader, resolve_with_lock,
 };

@@ -4,6 +4,7 @@
 //! cache, or CLI implementation details.
 
 mod constraints;
+mod environment;
 mod identity;
 mod metadata;
 mod names;
@@ -16,6 +17,7 @@ pub use constraints::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, RelationOp, VersionClause,
     VersionConstraint,
 };
+pub use environment::{EnvironmentId, EnvironmentIdError};
 pub use identity::{
     Artifact, Distribution, DistributionMetadata, Provenance, ReleaseIdentity, SourceArtifact,
     UpstreamChecksum,

@@ -186,6 +186,15 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
 }
 
 impl PackageRelease {
+    /// Attach a provider-neutral digest of the release metadata.
+    ///
+    /// Artifact bytes and their checksums are deliberately not part of this
+    /// value.  The digest is optional because not every provider supplies one.
+    pub fn with_metadata_digest(mut self, digest: Sha256Digest) -> Self {
+        self.metadata_digest = Some(digest);
+        self
+    }
+
     pub fn identity(&self) -> &ReleaseIdentity {
         &self.identity
     }
