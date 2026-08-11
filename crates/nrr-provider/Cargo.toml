@@ -11,3 +11,5 @@ path = "src/lib.rs"
 nrr-core = { path = "../nrr-core" }
 deb822-fast = { workspace = true }
 rd-rds = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }

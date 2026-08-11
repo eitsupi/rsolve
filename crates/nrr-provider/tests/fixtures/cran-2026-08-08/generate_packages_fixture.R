@@ -182,7 +182,131 @@ write_binary_fixture <- function(name, value) {
     }
 }
 
+write_raw_fixture <- function(name, bytes) {
+    target <- file.path(root, name)
+    if (mode == "--update") {
+        writeBin(bytes, target)
+        return(invisible(NULL))
+    }
+    if (!file.exists(target)) {
+        stop("fixture is missing: ", name, "; run --update")
+    }
+    expected <- readBin(target, what = "raw", n = file.info(target)$size)
+    if (!identical(expected, bytes)) {
+        stop("fixture differs: ", name, "; run --update")
+    }
+}
+
 write_binary_fixture("synthetic-archive-PACKAGES.rds", archive)
+
+matrix_archive <- matrix(
+    NA_character_,
+    nrow = 2L,
+    ncol = length(archive_columns),
+    dimnames = list(NULL, archive_columns)
+)
+set_matrix_archive_row <- function(row, values) {
+    matrix_archive[row, names(values)] <<- unname(values)
+}
+set_matrix_archive_row(1L, c(
+    Package = "Matrix",
+    Version = "1.6-5",
+    Depends = "R (>= 3.5.0)",
+    Imports = "methods",
+    License = "NRR Fictional Terms Matrix",
+    MD5sum = "00000000000000000000000000000021",
+    NeedsCompilation = "yes"
+))
+set_matrix_archive_row(2L, c(
+    Package = "Matrix",
+    Version = "1.7-0",
+    Depends = "R (>= 4.4.0)",
+    Imports = "methods",
+    License = "NRR Fictional Terms Matrix",
+    MD5sum = "00000000000000000000000000000022",
+    NeedsCompilation = "yes"
+))
+write_binary_fixture("synthetic-matrix-archive-PACKAGES.rds", matrix_archive)
+write_binary_fixture("synthetic-matrix-archive-wrong-root.rds", "wrong root")
+write_binary_fixture(
+    "synthetic-matrix-archive-missing-version.rds",
+    matrix_archive[, setdiff(colnames(matrix_archive), "Version"), drop = FALSE]
+)
+
+tar_field <- function(value, width) {
+    bytes <- charToRaw(enc2utf8(value))
+    if (length(bytes) >= width) {
+        stop("tar field is too long")
+    }
+    c(bytes, as.raw(rep(0L, width - length(bytes))))
+}
+
+octal_field <- function(value, width) {
+    text <- sprintf("%0*o", width - 1L, as.integer(value))
+    c(charToRaw(text), as.raw(0L))
+}
+
+tar_entry <- function(path, contents) {
+    header <- as.raw(rep(0L, 512L))
+    header[seq_along(tar_field(path, 100L))] <- tar_field(path, 100L)
+    header[101:108] <- tar_field("0000644", 8L)
+    header[109:116] <- tar_field("0000000", 8L)
+    header[117:124] <- tar_field("0000000", 8L)
+    header[125:136] <- octal_field(length(contents), 12L)
+    header[137:148] <- octal_field(0L, 12L)
+    header[149:156] <- as.raw(rep(32L, 8L))
+    header[157] <- as.raw(charToRaw("0"))
+    header[258:265] <- tar_field("ustar  ", 8L)
+    checksum <- sum(as.integer(header))
+    header[149:156] <- tar_field(sprintf("%06o ", checksum), 8L)
+    padding <- (512L - (length(contents) %% 512L)) %% 512L
+    c(header, contents, as.raw(rep(0L, padding)), as.raw(rep(0L, 1024L)))
+}
+
+matrix_tarball <- function(version, r_constraint) {
+    description <- charToRaw(enc2utf8(paste0(
+        "Package: Matrix\n",
+        "Version: ", version, "\n",
+        "Depends: R (", r_constraint, ")\n",
+        "Imports: methods\n",
+        "License: NRR Fictional Terms Matrix\n",
+        "NeedsCompilation: yes\n\n"
+    )))
+    tar <- tar_entry("Matrix/DESCRIPTION", description)
+    path <- tempfile("nrrfixture-tar-")
+    connection <- gzfile(path, open = "wb")
+    writeBin(tar, connection)
+    close(connection)
+    bytes <- readBin(path, what = "raw", n = file.info(path)$size)
+    unlink(path)
+    bytes[5:8] <- as.raw(rep(0L, 4L))
+    bytes
+}
+
+matrix_old_tar <- matrix_tarball("1.6-5", ">= 3.5.0")
+matrix_new_tar <- matrix_tarball("1.7-0", ">= 4.4.0")
+write_raw_fixture("synthetic-Matrix_1.6-5.tar.gz", matrix_old_tar)
+write_raw_fixture("synthetic-Matrix_1.7-0.tar.gz", matrix_new_tar)
+
+archive_history <- list(
+    Matrix = data.frame(
+        size = c(length(matrix_old_tar), length(matrix_new_tar)),
+        isdir = c(FALSE, FALSE),
+        mode = c(420L, 420L),
+        mtime = c(1790000000, 1790000001),
+        ctime = c(1790000000, 1790000001),
+        atime = c(1790000000, 1790000001),
+        uid = c(1000L, 1000L),
+        gid = c(1000L, 1000L),
+        uname = c("fixture", "fixture"),
+        grname = c("fixture", "fixture"),
+        row.names = c(
+            "src/contrib/Archive/Matrix/Matrix_1.6-5.tar.gz",
+            "src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz"
+        )
+    )
+)
+write_binary_fixture("synthetic-meta-archive.rds", archive_history)
 
 description <- paste0(
     "Package: nrrfixture.description\n",
@@ -196,4 +320,4 @@ description <- paste0(
 )
 write_fixture("synthetic-DESCRIPTION", description)
 
-cat("Fixture", mode, "passed for synthetic-PACKAGES, synthetic-DESCRIPTION, and synthetic-archive-PACKAGES.rds.\n")
+cat("Fixture", mode, "passed for CRAN DCF, archive RDS, history RDS, and source tarball fixtures.\n")

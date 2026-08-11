@@ -11,3 +11,5 @@ publish = false
 deb822-fast = "0.2"
 rd-rds = { version = "0.2.0", default-features = false, features = ["gzip", "zstd"] }
 pubgrub = "0.4"
+flate2 = "1"
+tar = "0.4"

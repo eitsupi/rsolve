@@ -4,7 +4,8 @@ These files contain fictional records written by
 `generate_packages_fixture.R`. They are not extracts from a repository index,
 and the generator does not access the network or call `tools::write_PACKAGES()`.
 The generator requires R 4.6.1 and writes UTF-8 bytes with explicit LF line
-endings for DCF and a gzip-compressed, format-3 RDS archive matrix. It defaults
+endings for DCF, gzip-compressed format-3 RDS values, and fictional gzip source
+tarballs. It defaults
 to an in-memory byte-for-byte check; pass `--update` to write regenerated files:
 
 ```sh
@@ -21,6 +22,12 @@ fictional phrase.
 | `synthetic-PACKAGES` | 4 | Multi-record PACKAGES-like input |
 | `synthetic-DESCRIPTION` | 1 | Single-record DESCRIPTION-like input |
 | `synthetic-archive-PACKAGES.rds` | 4 | Gzip, format-3 archive package matrix; SHA-256 `ab109b39be22067f3ee8cf0d149d2b15dd1a77c27a374d3778ef82d406998853` |
+| `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `99f03d1851d3739cce9a10138aa5871804629ce50300b6b66b0af8bbdad423a1` |
+| `synthetic-matrix-archive-wrong-root.rds` | 1 | Invalid fast-path wrong root type fixture; SHA-256 `715f0358ada164c6b70b892b14b21ba58b5b30cfb8aac581a4aa2cca84231a57` |
+| `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `b5f4a4f8444308c682bfd56a874371c929cad763fb1a9852e7c73170780317d9` |
+| `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration; SHA-256 `98da9178a9269ef36e153b8ebca58b61dcb81e062f3ec60dd3586659081def9d` |
+| `synthetic-Matrix_1.6-5.tar.gz` | 1 | Fictional source archive with root DESCRIPTION; SHA-256 `71afa67726a640ed1c11b97cc48f28eedf79990bcced285e526013b2daa4d83b` |
+| `synthetic-Matrix_1.7-0.tar.gz` | 1 | Fictional source archive with root DESCRIPTION; SHA-256 `c13fa0dcfcd5c900d0657ab9aa3a14be703ce1f3fa50247f4006313439a30918` |
 
 ## Record coverage
 
