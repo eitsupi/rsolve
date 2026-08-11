@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use nrr_core::{CandidateLoader, Resolution};
+use nrr_core::{CandidateLoadError, CandidateLoader, Resolution};
 use nrr_provider::cran::{CranCandidateLoader, CranCandidateLoaderError, CranRefreshDiagnostic};
 use nrr_resolver::{DefaultCandidatePreference, PreferLocked, ResolutionFailure, Resolver};
 
@@ -12,6 +12,7 @@ use crate::manifest::{Manifest, ManifestError, compose_resolution_request};
 pub enum CranResolutionError {
     Composition(ManifestError),
     Provider(CranCandidateLoaderError),
+    Refresh(CandidateLoadError),
     Resolution(ResolutionFailure),
 }
 
@@ -22,6 +23,7 @@ impl fmt::Display for CranResolutionError {
             Self::Provider(error) => {
                 write!(formatter, "CRAN provider construction failed: {error}")
             }
+            Self::Refresh(error) => write!(formatter, "CRAN refresh failed: {error}"),
             Self::Resolution(error) => write!(formatter, "resolution failed: {error}"),
         }
     }
@@ -32,6 +34,7 @@ impl Error for CranResolutionError {
         match self {
             Self::Composition(error) => Some(error),
             Self::Provider(error) => Some(error),
+            Self::Refresh(error) => Some(error),
             Self::Resolution(error) => Some(error),
         }
     }
@@ -88,7 +91,15 @@ pub fn resolve_from_cran(
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
     let request = compose_resolution_request(manifest).map_err(CranResolutionError::Composition)?;
     let loader = CranCandidateLoader::new(base_url).map_err(CranResolutionError::Provider)?;
-    let resolution = resolve_request(request, &loader)?;
+    let roots = request
+        .requirements
+        .iter()
+        .map(|requirement| requirement.name.clone())
+        .collect::<Vec<_>>();
+    let snapshot = loader
+        .refresh_closure(&roots)
+        .map_err(CranResolutionError::Refresh)?;
+    let resolution = resolve_request(request, &snapshot)?;
     Ok(CranResolutionOutcome {
         resolution,
         diagnostics: loader.diagnostics(),

@@ -225,7 +225,13 @@ impl ReleaseAggregation {
     }
 
     pub fn observe(&mut self, observation: ReleaseObservation) -> Result<(), PackageReleaseError> {
-        let release = PackageRelease::try_from(observation)?;
+        self.observe_release(PackageRelease::try_from(observation)?)
+    }
+
+    /// Adds an already canonical release while preserving identity-keyed
+    /// metadata consistency checks. Providers use this when combining
+    /// independently parsed representations of one registry snapshot.
+    pub fn observe_release(&mut self, release: PackageRelease) -> Result<(), PackageReleaseError> {
         if let Some(existing) = self.releases.get_mut(release.identity()) {
             if existing.version != release.version {
                 return Err(PackageReleaseError::ConflictingMetadata { field: "version" });

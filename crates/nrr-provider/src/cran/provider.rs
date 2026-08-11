@@ -1,7 +1,7 @@
 //! CRAN archive refresh and lazy DESCRIPTION fallback.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
@@ -9,11 +9,13 @@ use std::path::Component;
 use std::rc::Rc;
 
 use super::catalog::CranCatalog;
-use super::history::{ArchiveEntry, CranHistoryError, enumerate_archive_rds};
+#[cfg(test)]
+use super::history::CranHistoryError;
+use super::history::{ArchiveEntry, enumerate_archive_rds};
 use flate2::read::GzDecoder;
 use nrr_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
-    SolverKey,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind, PackageName,
+    PackageRelease, ReleaseAggregation, SolverKey,
 };
 
 /// A provider-local response used by both real and fixture transports.
@@ -57,6 +59,7 @@ impl<T: Transport + ?Sized> Transport for Rc<T> {
 }
 
 /// A failure before a provider snapshot can be constructed.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CranProviderError {
     Transport {
@@ -66,6 +69,7 @@ pub(crate) enum CranProviderError {
     History(CranHistoryError),
 }
 
+#[cfg(test)]
 impl fmt::Display for CranProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -77,6 +81,7 @@ impl fmt::Display for CranProviderError {
     }
 }
 
+#[cfg(test)]
 impl Error for CranProviderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -94,12 +99,28 @@ pub enum CranFastPathStatus {
     Invalid { status: u16, diagnostic: Box<str> },
 }
 
+/// The representation attempted for the shared current CRAN index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CranCurrentIndexRepresentation {
+    Rds,
+    Gzip,
+    PlainDcf,
+}
+
+/// The transport-neutral source of a refresh diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CranRefreshSource {
+    ArchiveFastPath,
+    CurrentIndex(CranCurrentIndexRepresentation),
+}
+
 /// A transport-neutral diagnostic from refreshing one package's CRAN source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CranRefreshDiagnostic {
     endpoint: Box<str>,
     status: Option<u16>,
     status_detail: CranFastPathStatus,
+    source: CranRefreshSource,
 }
 
 impl CranRefreshDiagnostic {
@@ -114,11 +135,15 @@ impl CranRefreshDiagnostic {
     pub fn status_detail(&self) -> &CranFastPathStatus {
         &self.status_detail
     }
+
+    pub fn source(&self) -> CranRefreshSource {
+        self.source
+    }
 }
 
 enum CandidateSource {
     Fast(CranCatalog),
-    Fallback(Vec<ArchiveEntry>),
+    Fallback(Rc<[ArchiveEntry]>),
 }
 
 /// A refreshed CRAN candidate source.
@@ -134,6 +159,7 @@ pub(crate) struct CranProvider<T> {
 impl<T: Transport> CranProvider<T> {
     /// Refresh one package's archive source.  The fast-path endpoint is
     /// requested exactly once per provider instance.
+    #[cfg(test)]
     pub(crate) fn refresh(
         transport: T,
         base_url: impl AsRef<str>,
@@ -158,6 +184,7 @@ impl<T: Transport> CranProvider<T> {
                         endpoint: endpoint.clone().into_boxed_str(),
                         status: Some(response.status),
                         status_detail: CranFastPathStatus::Available,
+                        source: CranRefreshSource::ArchiveFastPath,
                     });
                     CandidateSource::Fast(catalog)
                 }
@@ -169,6 +196,7 @@ impl<T: Transport> CranProvider<T> {
                             status: response.status,
                             diagnostic: error.to_string().into_boxed_str(),
                         },
+                        source: CranRefreshSource::ArchiveFastPath,
                     });
                     Self::fallback_source(&transport, &base_url)?
                 }
@@ -187,6 +215,7 @@ impl<T: Transport> CranProvider<T> {
                         diagnostic: "unexpected fast-path status".into(),
                     }
                 },
+                source: CranRefreshSource::ArchiveFastPath,
             });
             Self::fallback_source(&transport, &base_url)?
         };
@@ -205,6 +234,24 @@ impl<T: Transport> CranProvider<T> {
         &self.diagnostics
     }
 
+    fn from_source(
+        transport: T,
+        base_url: impl AsRef<str>,
+        package: PackageName,
+        source: CandidateSource,
+        diagnostics: Vec<CranRefreshDiagnostic>,
+    ) -> Self {
+        Self {
+            package,
+            transport: RefCell::new(transport),
+            base_url: base_url.as_ref().trim_end_matches('/').into(),
+            source,
+            diagnostics,
+            loaded: RefCell::new(None),
+        }
+    }
+
+    #[cfg(test)]
     fn fallback_source(
         transport: &T,
         base_url: &str,
@@ -226,7 +273,9 @@ impl<T: Transport> CranProvider<T> {
             });
         }
         let entries = enumerate_archive_rds(&response.body).map_err(CranProviderError::History)?;
-        Ok(CandidateSource::Fallback(entries))
+        Ok(CandidateSource::Fallback(Rc::from(
+            entries.into_boxed_slice(),
+        )))
     }
 
     fn load_fallback(
@@ -316,12 +365,14 @@ impl<T: Transport> CandidateLoader for CranProvider<T> {
     }
 }
 
+#[cfg(test)]
 enum CachedProvider<T> {
     Ready(CranProvider<Rc<T>>),
     Failed(CandidateLoadError),
 }
 
 /// The shared lazy runtime path used by fixture and concrete transports.
+#[cfg(test)]
 pub(crate) struct CranRuntimeLoader<T> {
     base_url: Box<str>,
     transport: Rc<T>,
@@ -329,6 +380,7 @@ pub(crate) struct CranRuntimeLoader<T> {
     diagnostics: RefCell<HashMap<PackageName, Vec<CranRefreshDiagnostic>>>,
 }
 
+#[cfg(test)]
 impl<T: Transport> CranRuntimeLoader<T> {
     pub(crate) fn new(transport: T, base_url: impl AsRef<str>) -> Self {
         Self {
@@ -363,6 +415,7 @@ impl<T: Transport> CranRuntimeLoader<T> {
     }
 }
 
+#[cfg(test)]
 impl<T: Transport> CandidateLoader for CranRuntimeLoader<T> {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
@@ -392,6 +445,332 @@ impl<T: Transport> CandidateLoader for CranRuntimeLoader<T> {
     }
 }
 
+/// A transport-free, process-local view handed to the resolver after refresh.
+#[derive(Clone, Debug, Default)]
+pub struct CranCandidateSnapshot {
+    candidates: HashMap<PackageName, Vec<PackageRelease>>,
+}
+
+impl CandidateLoader for CranCandidateSnapshot {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let SolverKey::InstalledName(name) = package else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("CRAN snapshot has no candidates for {package:?}"),
+            ));
+        };
+        Ok(self.candidates.get(name).cloned().unwrap_or_default())
+    }
+}
+
+/// A single refresh session. All network and parsing state is discarded from
+/// the resolver-facing snapshot once `freeze` returns.
+struct CranRefreshSession<T> {
+    base_url: Box<str>,
+    transport: Rc<T>,
+    current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
+    history: Option<Result<Rc<[ArchiveEntry]>, CandidateLoadError>>,
+    packages: HashMap<PackageName, Vec<PackageRelease>>,
+    diagnostics: Vec<CranRefreshDiagnostic>,
+}
+
+impl<T: Transport> CranRefreshSession<T> {
+    fn new(transport: Rc<T>, base_url: impl AsRef<str>) -> Self {
+        Self {
+            base_url: base_url.as_ref().trim_end_matches('/').into(),
+            transport,
+            current: None,
+            history: None,
+            packages: HashMap::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn ensure_current(&mut self) -> Result<Rc<CranCatalog>, CandidateLoadError> {
+        if let Some(result) = &self.current {
+            return result.clone();
+        }
+        let representations = [
+            (CranCurrentIndexRepresentation::Rds, "PACKAGES.rds"),
+            (CranCurrentIndexRepresentation::Gzip, "PACKAGES.gz"),
+            (CranCurrentIndexRepresentation::PlainDcf, "PACKAGES"),
+        ];
+        let mut failures = Vec::new();
+        let mut saw_metadata_invalid = false;
+        for (representation, filename) in representations {
+            let endpoint = format!("{}/src/contrib/{filename}", self.base_url);
+            let response = match self.transport.get(&endpoint) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.push_current_diagnostic(
+                        endpoint.clone(),
+                        representation,
+                        None,
+                        format!("transport failure: {error}"),
+                    );
+                    failures.push(error.to_string());
+                    continue;
+                }
+            };
+            if response.status != 200 {
+                let diagnostic = format!("unexpected current index status {}", response.status);
+                self.push_current_diagnostic(
+                    endpoint,
+                    representation,
+                    Some(response.status),
+                    diagnostic.clone(),
+                );
+                failures.push(diagnostic);
+                continue;
+            }
+            let parsed = match representation {
+                CranCurrentIndexRepresentation::Rds => {
+                    CranCatalog::from_archive_index_rds(&response.body)
+                        .map_err(|error| error.to_string())
+                }
+                CranCurrentIndexRepresentation::Gzip => {
+                    decode_gzip(&response.body).and_then(|body| {
+                        CranCatalog::from_packages(&body).map_err(|error| error.to_string())
+                    })
+                }
+                CranCurrentIndexRepresentation::PlainDcf => {
+                    CranCatalog::from_packages(&response.body).map_err(|error| error.to_string())
+                }
+            };
+            match parsed {
+                Ok(catalog) => {
+                    self.diagnostics.push(CranRefreshDiagnostic {
+                        endpoint: endpoint.into(),
+                        status: Some(response.status),
+                        status_detail: CranFastPathStatus::Available,
+                        source: CranRefreshSource::CurrentIndex(representation),
+                    });
+                    let catalog = Rc::new(catalog);
+                    self.current = Some(Ok(Rc::clone(&catalog)));
+                    return Ok(catalog);
+                }
+                Err(error) => {
+                    self.push_current_diagnostic(
+                        endpoint,
+                        representation,
+                        Some(response.status),
+                        error.clone(),
+                    );
+                    failures.push(error);
+                    saw_metadata_invalid = true;
+                }
+            }
+        }
+        let error = CandidateLoadError::new(
+            if saw_metadata_invalid {
+                CandidateLoadErrorCategory::MetadataInvalid
+            } else {
+                CandidateLoadErrorCategory::TransportFailure
+            },
+            format!(
+                "all CRAN current index representations failed: {}",
+                failures.join("; ")
+            ),
+        );
+        self.current = Some(Err(error.clone()));
+        Err(error)
+    }
+
+    fn push_current_diagnostic(
+        &mut self,
+        endpoint: String,
+        representation: CranCurrentIndexRepresentation,
+        status: Option<u16>,
+        diagnostic: String,
+    ) {
+        self.diagnostics.push(CranRefreshDiagnostic {
+            endpoint: endpoint.into_boxed_str(),
+            status,
+            status_detail: CranFastPathStatus::Invalid {
+                status: status.unwrap_or_default(),
+                diagnostic: diagnostic.into_boxed_str(),
+            },
+            source: CranRefreshSource::CurrentIndex(representation),
+        });
+    }
+
+    fn ensure_history(&mut self) -> Result<Rc<[ArchiveEntry]>, CandidateLoadError> {
+        if let Some(result) = &self.history {
+            return result.clone();
+        }
+        let endpoint = format!("{}/Meta/archive.rds", self.base_url);
+        let result = self
+            .transport
+            .get(&endpoint)
+            .map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::TransportFailure,
+                    format!("failed to refresh {endpoint}: {error}"),
+                )
+            })
+            .and_then(|response| {
+                if response.status != 200 {
+                    return Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::TransportFailure,
+                        format!("failed to refresh {endpoint}: HTTP {}", response.status),
+                    ));
+                }
+                enumerate_archive_rds(&response.body)
+                    .map(|entries| Rc::from(entries.into_boxed_slice()))
+                    .map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::MetadataInvalid,
+                            format!("invalid CRAN archive history: {error}"),
+                        )
+                    })
+            });
+        self.history = Some(result.clone());
+        result
+    }
+
+    fn refresh_package(
+        &mut self,
+        package: &PackageName,
+    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        if let Some(candidates) = self.packages.get(package) {
+            return Ok(candidates.clone());
+        }
+        let current = self.ensure_current()?.candidates(package).to_vec();
+        let endpoint = format!(
+            "{}/src/contrib/Archive/{}/PACKAGES.rds",
+            self.base_url,
+            package.as_str()
+        );
+        let mut package_diagnostics = Vec::new();
+        let source = match self.transport.get(&endpoint) {
+            Err(error) => {
+                package_diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: None,
+                    status_detail: CranFastPathStatus::Invalid {
+                        status: 0,
+                        diagnostic: format!("transport failure: {error}").into_boxed_str(),
+                    },
+                    source: CranRefreshSource::ArchiveFastPath,
+                });
+                CandidateSource::Fallback(self.ensure_history()?)
+            }
+            Ok(response) if response.status == 200 => {
+                match CranCatalog::from_archive_index_rds(&response.body) {
+                    Ok(catalog) => {
+                        package_diagnostics.push(CranRefreshDiagnostic {
+                            endpoint: endpoint.clone().into_boxed_str(),
+                            status: Some(response.status),
+                            status_detail: CranFastPathStatus::Available,
+                            source: CranRefreshSource::ArchiveFastPath,
+                        });
+                        CandidateSource::Fast(catalog)
+                    }
+                    Err(error) => {
+                        package_diagnostics.push(CranRefreshDiagnostic {
+                            endpoint: endpoint.clone().into_boxed_str(),
+                            status: Some(response.status),
+                            status_detail: CranFastPathStatus::Invalid {
+                                status: response.status,
+                                diagnostic: error.to_string().into_boxed_str(),
+                            },
+                            source: CranRefreshSource::ArchiveFastPath,
+                        });
+                        CandidateSource::Fallback(self.ensure_history()?)
+                    }
+                }
+            }
+            Ok(response) => {
+                let status = response.status;
+                let status_detail = if matches!(status, 404 | 410) {
+                    CranFastPathStatus::Absent { status }
+                } else {
+                    CranFastPathStatus::Invalid {
+                        status,
+                        diagnostic: "unexpected fast-path status".into(),
+                    }
+                };
+                package_diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: Some(status),
+                    status_detail,
+                    source: CranRefreshSource::ArchiveFastPath,
+                });
+                CandidateSource::Fallback(self.ensure_history()?)
+            }
+        };
+        let provider = CranProvider::from_source(
+            Rc::clone(&self.transport),
+            &self.base_url,
+            package.clone(),
+            source,
+            package_diagnostics,
+        );
+        self.diagnostics
+            .extend(provider.diagnostics().iter().cloned());
+        let archived = provider.releases(&SolverKey::InstalledName(package.clone()))?;
+        let mut aggregation = ReleaseAggregation::new();
+        for release in current.into_iter().chain(archived) {
+            aggregation.observe_release(release).map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("conflicting CRAN release metadata for {package}: {error}"),
+                )
+            })?;
+        }
+        let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.version().cmp(right.version()));
+        self.packages.insert(package.clone(), candidates.clone());
+        Ok(candidates)
+    }
+
+    fn refresh_closure(
+        &mut self,
+        roots: &[PackageName],
+    ) -> Result<CranCandidateSnapshot, CandidateLoadError> {
+        let mut queue = roots.iter().cloned().collect::<VecDeque<_>>();
+        while let Some(package) = queue.pop_front() {
+            let candidates = self.refresh_package(&package)?;
+            for release in &candidates {
+                for dependency in release.dependencies().iter().filter(|dependency| {
+                    matches!(
+                        dependency.kind,
+                        DependencyKind::Depends
+                            | DependencyKind::Imports
+                            | DependencyKind::LinkingTo
+                    ) && dependency.name.as_str() != "R"
+                }) {
+                    if !self.packages.contains_key(&dependency.name) {
+                        queue.push_back(dependency.name.clone());
+                    }
+                }
+            }
+        }
+        Ok(CranCandidateSnapshot {
+            candidates: self.packages.clone(),
+        })
+    }
+}
+
+fn decode_gzip(input: &[u8]) -> Result<Vec<u8>, String> {
+    let decoder = GzDecoder::new(input);
+    let mut output = Vec::new();
+    decoder
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut output)
+        .map_err(|error| format!("invalid gzip current index: {error}"))?;
+    if output.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "gzip current index exceeds {MAX_RESPONSE_BYTES}-byte limit"
+        ));
+    }
+    Ok(output)
+}
+
+// This is a CRAN transport defense limit, not a generic artifact-size contract.
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
 fn provider_error(error: CranProviderError) -> CandidateLoadError {
     match error {
         CranProviderError::Transport { endpoint, source } => CandidateLoadError::new(
@@ -404,9 +783,6 @@ fn provider_error(error: CranProviderError) -> CandidateLoadError {
         ),
     }
 }
-
-// This is a CRAN transport defense limit, not a generic artifact-size contract.
-const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 struct UreqTransport {
     agent: ureq::Agent,
@@ -462,12 +838,12 @@ impl fmt::Display for CranCandidateLoaderError {
 
 impl Error for CranCandidateLoaderError {}
 
-/// A synchronous, lazy CRAN candidate loader backed by one reusable ureq agent.
+/// A synchronous CRAN refresh owner backed by one reusable ureq agent.
 ///
 /// This loader blocks while performing network I/O. Async callers should
 /// invoke it through a blocking worker boundary.
 pub struct CranCandidateLoader {
-    inner: CranRuntimeLoader<UreqTransport>,
+    session: RefCell<CranRefreshSession<UreqTransport>>,
 }
 
 impl CranCandidateLoader {
@@ -481,17 +857,28 @@ impl CranCandidateLoader {
             .tls_config(tls_config)
             .build();
         Ok(Self {
-            inner: CranRuntimeLoader::new(
-                UreqTransport {
+            session: RefCell::new(CranRefreshSession::new(
+                Rc::new(UreqTransport {
                     agent: config.new_agent(),
-                },
+                }),
                 base_url,
-            ),
+            )),
         })
     }
 
     pub fn diagnostics(&self) -> Vec<CranRefreshDiagnostic> {
-        self.inner.diagnostics()
+        let mut diagnostics = self.session.borrow().diagnostics.clone();
+        diagnostics.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+        diagnostics
+    }
+
+    /// Refreshes the current index and the strong-dependency closure rooted at
+    /// these package names, then freezes a transport-free candidate snapshot.
+    pub fn refresh_closure(
+        &self,
+        roots: &[PackageName],
+    ) -> Result<CranCandidateSnapshot, CandidateLoadError> {
+        self.session.borrow_mut().refresh_closure(roots)
     }
 }
 
@@ -529,12 +916,6 @@ fn canonical_base_url(input: &str) -> Result<Box<str>, CranCandidateLoaderError>
     let path = url.path().trim_end_matches('/').to_owned();
     url.set_path(if path.is_empty() { "/" } else { &path });
     Ok(url.to_string().trim_end_matches('/').into())
-}
-
-impl CandidateLoader for CranCandidateLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
-        self.inner.releases(package)
-    }
 }
 
 fn extract_description(input: &[u8]) -> Result<Vec<u8>, String> {
@@ -588,6 +969,7 @@ mod tests {
     use super::*;
     use nrr_core::{CandidateLoadErrorCategory, PackageName, SolverKey};
     use std::collections::HashMap;
+    use std::io::Write;
     use std::rc::Rc;
 
     const FAST: &[u8] = include_bytes!(
@@ -683,6 +1065,22 @@ mod tests {
         "https://cran.invalid/src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz".to_owned()
     }
 
+    fn current_rds_url() -> String {
+        "https://cran.invalid/src/contrib/PACKAGES.rds".to_owned()
+    }
+
+    fn current_gzip_url() -> String {
+        "https://cran.invalid/src/contrib/PACKAGES.gz".to_owned()
+    }
+
+    fn current_plain_url() -> String {
+        "https://cran.invalid/src/contrib/PACKAGES".to_owned()
+    }
+
+    fn fast_url_for(package: &str) -> String {
+        format!("https://cran.invalid/src/contrib/Archive/{package}/PACKAGES.rds")
+    }
+
     fn provider(transport: FixtureTransport) -> CranProvider<FixtureTransport> {
         CranProvider::refresh(
             transport,
@@ -694,6 +1092,58 @@ mod tests {
 
     fn runtime_loader(transport: FixtureTransport) -> CranRuntimeLoader<FixtureTransport> {
         CranRuntimeLoader::new(transport, "https://cran.invalid")
+    }
+
+    fn session_transport(
+        current_rds: TransportResponse,
+        current_gzip: TransportResponse,
+        current_plain: TransportResponse,
+    ) -> FixtureTransport {
+        let mut responses = HashMap::new();
+        responses.insert(current_rds_url(), current_rds);
+        responses.insert(current_gzip_url(), current_gzip);
+        responses.insert(current_plain_url(), current_plain);
+        responses.insert(
+            fast_url(),
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+        );
+        for package in ["methods", "nrrfixture.plain"] {
+            responses.insert(
+                fast_url_for(package),
+                TransportResponse {
+                    status: 404,
+                    body: Vec::new(),
+                },
+            );
+        }
+        responses.insert(
+            history_url(),
+            TransportResponse {
+                status: 200,
+                body: HISTORY.to_vec(),
+            },
+        );
+        responses.insert(
+            old_url(),
+            TransportResponse {
+                status: 200,
+                body: OLD_TAR.to_vec(),
+            },
+        );
+        responses.insert(
+            new_url(),
+            TransportResponse {
+                status: 200,
+                body: NEW_TAR.to_vec(),
+            },
+        );
+        FixtureTransport {
+            responses,
+            requests: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
     #[test]
@@ -867,6 +1317,352 @@ mod tests {
                 CranFastPathStatus::Invalid { status: 200, .. }
             ));
         }
+    }
+
+    #[test]
+    fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
+        let current = b"Package: Matrix\nVersion: 1.8-0\nLicense: NRR Fictional Current\n";
+        let transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: current.to_vec(),
+            },
+        );
+        let requests = Rc::clone(&transport.requests);
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let snapshot = session
+            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .unwrap();
+        let before = requests.borrow().len();
+        let releases = snapshot
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(releases.len(), 3);
+        assert_eq!(requests.borrow().len(), before);
+        assert_eq!(requests.borrow()[0], current_rds_url());
+        assert_eq!(requests.borrow()[1], current_gzip_url());
+        assert_eq!(requests.borrow()[2], current_plain_url());
+        assert_eq!(
+            requests
+                .borrow()
+                .iter()
+                .filter(|url| *url == &history_url())
+                .count(),
+            1
+        );
+        assert!(session.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source()
+                == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::PlainDcf)
+        }));
+    }
+
+    #[test]
+    fn invalid_gzip_current_index_falls_back_to_plain_once() {
+        let current = b"Package: nrrfixture.plain\nVersion: 3.0.0\n";
+        let transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: b"not gzip".to_vec(),
+            },
+            TransportResponse {
+                status: 200,
+                body: current.to_vec(),
+            },
+        );
+        let requests = Rc::clone(&transport.requests);
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let snapshot = session
+            .refresh_closure(&[PackageName::new("nrrfixture.plain").unwrap()])
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .releases(&SolverKey::InstalledName(
+                    PackageName::new("nrrfixture.plain").unwrap()
+                ))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(requests.borrow()[0], current_rds_url());
+        assert_eq!(requests.borrow()[1], current_gzip_url());
+        assert_eq!(requests.borrow()[2], current_plain_url());
+        assert!(session.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source()
+                == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Gzip)
+                && matches!(
+                    diagnostic.status_detail(),
+                    CranFastPathStatus::Invalid { .. }
+                )
+        }));
+    }
+
+    #[test]
+    fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
+        let consistent = b"Package: Matrix\nVersion: 1.7-0\nDepends: R (>= 4.4.0)\nImports: methods\nLicense: NRR Fictional Terms Matrix\nNeedsCompilation: yes\n";
+        let transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: consistent.to_vec(),
+            },
+        );
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let snapshot = session
+            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .releases(&SolverKey::InstalledName(
+                    PackageName::new("Matrix").unwrap()
+                ))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let conflicting = b"Package: Matrix\nVersion: 1.7-0\nDepends: R (>= 4.4.0)\nImports: methods\nLicense: conflicting\nNeedsCompilation: yes\n";
+        let transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: conflicting.to_vec(),
+            },
+        );
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let error = session
+            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .unwrap_err();
+        assert_eq!(
+            error.category(),
+            CandidateLoadErrorCategory::MetadataInvalid
+        );
+        assert!(
+            error
+                .diagnostic()
+                .contains("conflicting CRAN release metadata")
+        );
+    }
+
+    #[test]
+    fn unsupported_rds_current_index_falls_back_to_gzip() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(b"Package: nrrfixture.plain\nVersion: 3.0.0\n")
+            .unwrap();
+        let transport = session_transport(
+            TransportResponse {
+                status: 200,
+                body: vec![0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00],
+            },
+            TransportResponse {
+                status: 200,
+                body: encoder.finish().unwrap(),
+            },
+            TransportResponse {
+                status: 500,
+                body: Vec::new(),
+            },
+        );
+        let requests = Rc::clone(&transport.requests);
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        session
+            .refresh_closure(&[PackageName::new("nrrfixture.plain").unwrap()])
+            .unwrap();
+        assert_eq!(requests.borrow()[0], current_rds_url());
+        assert_eq!(requests.borrow()[1], current_gzip_url());
+        assert_eq!(requests.borrow()[2], fast_url_for("nrrfixture.plain"));
+        assert!(session.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source()
+                == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Gzip)
+                && matches!(diagnostic.status_detail(), CranFastPathStatus::Available)
+        }));
+    }
+
+    #[test]
+    fn current_index_transport_or_status_failures_remain_transport_failures() {
+        for responses in [
+            HashMap::new(),
+            HashMap::from([
+                (
+                    current_rds_url(),
+                    TransportResponse {
+                        status: 404,
+                        body: Vec::new(),
+                    },
+                ),
+                (
+                    current_gzip_url(),
+                    TransportResponse {
+                        status: 410,
+                        body: Vec::new(),
+                    },
+                ),
+                (
+                    current_plain_url(),
+                    TransportResponse {
+                        status: 503,
+                        body: Vec::new(),
+                    },
+                ),
+            ]),
+        ] {
+            let transport = FixtureTransport {
+                responses,
+                requests: Rc::new(RefCell::new(Vec::new())),
+            };
+            let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+            let error = session.ensure_current().unwrap_err();
+            assert_eq!(
+                error.category(),
+                CandidateLoadErrorCategory::TransportFailure
+            );
+        }
+    }
+
+    #[test]
+    fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
+        let mut responses = HashMap::new();
+        responses.insert(
+            current_rds_url(),
+            TransportResponse {
+                status: 200,
+                body: WRONG_ROOT.to_vec(),
+            },
+        );
+        responses.insert(
+            current_gzip_url(),
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+        );
+        responses.insert(
+            current_plain_url(),
+            TransportResponse {
+                status: 503,
+                body: Vec::new(),
+            },
+        );
+        let transport = FixtureTransport {
+            responses,
+            requests: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let error = session.ensure_current().unwrap_err();
+        assert_eq!(
+            error.category(),
+            CandidateLoadErrorCategory::MetadataInvalid
+        );
+    }
+
+    #[test]
+    fn gone_fast_path_is_absent_and_shared_history_is_fetched_once() {
+        let current = b"Package: Matrix\nVersion: 1.8-0\n";
+        let mut transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: current.to_vec(),
+            },
+        );
+        transport.responses.insert(
+            fast_url(),
+            TransportResponse {
+                status: 410,
+                body: Vec::new(),
+            },
+        );
+        let requests = Rc::clone(&transport.requests);
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        session
+            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .unwrap();
+        assert_eq!(
+            session
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.endpoint() == fast_url())
+                .unwrap()
+                .status_detail(),
+            &CranFastPathStatus::Absent { status: 410 }
+        );
+        assert_eq!(
+            requests
+                .borrow()
+                .iter()
+                .filter(|url| *url == &history_url())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fast_path_transport_error_is_diagnostic_and_falls_back() {
+        let current = b"Package: Matrix\nVersion: 1.8-0\n";
+        let mut transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: current.to_vec(),
+            },
+        );
+        transport.responses.remove(&fast_url());
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        session
+            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .unwrap();
+        let diagnostic = session
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.endpoint() == fast_url())
+            .unwrap();
+        assert_eq!(diagnostic.status(), None);
+        assert!(matches!(
+            diagnostic.status_detail(),
+            CranFastPathStatus::Invalid { status: 0, .. }
+        ));
     }
 
     #[test]
