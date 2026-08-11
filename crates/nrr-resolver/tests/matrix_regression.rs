@@ -3,8 +3,8 @@ mod matrix_scenario;
 
 use matrix_scenario::MatrixCatalog;
 use matrix_scenario::regression_support::{
-    AlternativeCatalog, SameVersionCatalog, matrix_identity, require_locked_matrix_resolver,
-    with_locked_matrix,
+    AlternativeCatalog, GitDependencyCatalog, SameVersionCatalog, matrix_identity,
+    require_locked_matrix_resolver, with_locked_matrix,
 };
 use nrr_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl,
@@ -248,6 +248,27 @@ fn git_scoped_root_requirement_is_a_metadata_failure() {
         }
         other => panic!("expected candidate-load metadata failure, got {other:?}"),
     }
+}
+
+#[test]
+fn git_scoped_transitive_dependency_rejects_only_its_candidate() {
+    let catalog = GitDependencyCatalog::new();
+
+    let resolution = catalog.resolver().resolve(catalog.request()).unwrap();
+
+    assert_eq!(
+        resolution
+            .selected(&PackageName::new("Choice").unwrap())
+            .unwrap()
+            .version(),
+        &RPackageVersion::parse("1.0.0").unwrap(),
+        "the release without a Git-scoped dependency must be selected after backtracking"
+    );
+    assert!(
+        resolution
+            .selected(&PackageName::new("GitOnly").unwrap())
+            .is_none()
+    );
 }
 
 #[test]

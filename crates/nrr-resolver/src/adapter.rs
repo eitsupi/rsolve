@@ -131,6 +131,9 @@ impl<'a> Provider<'a> {
         &self,
         dependency: &DependencyRequirement,
     ) -> Result<SolverKey, Box<AdapterError>> {
+        // Root requirements still report unsupported Git scopes as typed metadata
+        // failures. Candidate dependencies handle this case in get_dependencies,
+        // where PubGrub can reject only the candidate that declared the scope.
         if let DependencySourceConstraint::Git { .. } = &dependency.source {
             return Err(Box::new(AdapterError {
                 package: SolverKey::InstalledName(dependency.name.clone()),
@@ -160,7 +163,9 @@ impl<'a> Provider<'a> {
                 }
             }
             DependencySourceConstraint::Exact(identity) => SolverKey::Exact(identity.clone()),
-            DependencySourceConstraint::Git { .. } => unreachable!("Git was rejected above"),
+            DependencySourceConstraint::Git { .. } => {
+                unreachable!("Git dependencies are rejected by the caller")
+            }
         })
     }
 
@@ -339,6 +344,12 @@ impl DependencyProvider for Provider<'_> {
                             | DependencyKind::LinkingTo
                     )
                 }) {
+                    if let DependencySourceConstraint::Git { .. } = &dependency.source {
+                        return Ok(Dependencies::Unavailable(format!(
+                            "Git-sourced dependencies are not supported for package {}",
+                            dependency.name
+                        )));
+                    }
                     dependencies.push((
                         PackageId::Subject(self.subject_for_dependency(dependency)?),
                         self.ranges_for(&dependency.constraint),

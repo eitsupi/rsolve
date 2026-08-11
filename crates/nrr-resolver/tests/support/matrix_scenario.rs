@@ -181,6 +181,7 @@ fn plain_release(name: &str, version: &str) -> ReleaseObservation {
 #[allow(dead_code)]
 pub mod regression_support {
     use super::*;
+    use nrr_core::NormalizedGitUrl;
     use nrr_resolver::RequireLocked;
     use std::collections::HashMap;
 
@@ -319,6 +320,66 @@ pub mod regression_support {
                     format!("same-version fixture has no package {name}"),
                 )),
             }
+        }
+    }
+
+    pub struct GitDependencyCatalog {
+        choice: Vec<PackageRelease>,
+    }
+
+    impl GitDependencyCatalog {
+        pub fn new() -> Self {
+            let git_dependency = DependencyRequirement::new(
+                DependencyKind::Depends,
+                PackageName::new("GitOnly").unwrap(),
+                DependencySourceConstraint::Git {
+                    repository: NormalizedGitUrl::new("https://example.test/git-only.git").unwrap(),
+                },
+                VersionConstraint::unconstrained(),
+            );
+            Self {
+                choice: vec![
+                    registry_candidate("Choice", "1.0.0", "cran", vec![]),
+                    registry_candidate("Choice", "2.0.0", "cran", vec![git_dependency]),
+                ],
+            }
+        }
+
+        pub fn resolver(&self) -> Resolver<'_> {
+            static PREFERENCE: DefaultCandidatePreference = DefaultCandidatePreference;
+            static LOCK_POLICY: PreferLocked = PreferLocked;
+            Resolver::new(self, &PREFERENCE, &LOCK_POLICY)
+        }
+
+        pub fn request(&self) -> ResolutionRequest {
+            ResolutionRequest::without_lock(
+                vec![DependencyRequirement::new(
+                    DependencyKind::Depends,
+                    PackageName::new("Choice").unwrap(),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                )],
+                ResolutionTarget::new(
+                    RPackageVersion::parse("4.4.0").unwrap(),
+                    Target::new("linux", "x86_64"),
+                ),
+                VersionConstraint::unconstrained(),
+            )
+        }
+    }
+
+    impl CandidateLoader for GitDependencyCatalog {
+        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+            if matches!(
+                package,
+                SolverKey::InstalledName(name) if name.as_str() == "Choice"
+            ) {
+                return Ok(self.choice.clone());
+            }
+            Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("Git dependency fixture has no candidates for {package:?}"),
+            ))
         }
     }
 
