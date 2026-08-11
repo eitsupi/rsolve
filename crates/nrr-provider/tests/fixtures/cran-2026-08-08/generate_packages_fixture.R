@@ -301,12 +301,42 @@ archive_history <- list(
         uname = c("fixture", "fixture"),
         grname = c("fixture", "fixture"),
         row.names = c(
-            "src/contrib/Archive/Matrix/Matrix_1.6-5.tar.gz",
-            "src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz"
+            "Matrix/Matrix_1.6-5.tar.gz",
+            "Matrix/Matrix_1.7-0.tar.gz"
         )
     )
 )
 write_binary_fixture("synthetic-meta-archive.rds", archive_history)
+
+invalid_history <- function(path) {
+    list(Matrix = data.frame(
+        size = 1,
+        isdir = FALSE,
+        mode = 420L,
+        mtime = 1790000000,
+        ctime = 1790000000,
+        atime = 1790000000,
+        uid = 1000L,
+        gid = 1000L,
+        uname = "fixture",
+        grname = "fixture",
+        row.names = path
+    ))
+}
+
+invalid_history_paths <- c(
+    "synthetic-meta-invalid-traversal.rds" = "Matrix/../Matrix_1.6-5.tar.gz",
+    "synthetic-meta-invalid-query.rds" = "Matrix/Matrix_1.6-5.tar.gz?download=1",
+    "synthetic-meta-invalid-fragment.rds" = "Matrix/Matrix_1.6-5.tar.gz#fragment",
+    "synthetic-meta-invalid-percent-traversal.rds" =
+        "Matrix/%2e%2e%2fMatrix_1.6-5.tar.gz",
+    "synthetic-meta-invalid-backslash.rds" = "Matrix\\Matrix_1.6-5.tar.gz",
+    "synthetic-meta-invalid-package-mismatch.rds" = "Other/Matrix_1.6-5.tar.gz",
+    "synthetic-meta-invalid-version.rds" = "Matrix/Matrix_latest.tar.gz"
+)
+for (name in names(invalid_history_paths)) {
+    write_binary_fixture(name, invalid_history(invalid_history_paths[[name]]))
+}
 
 description <- paste0(
     "Package: nrrfixture.description\n",

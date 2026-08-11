@@ -220,44 +220,43 @@ impl<T: Transport> CranProvider<T> {
         entries: &[ArchiveEntry],
     ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
         let mut releases = Vec::new();
-        for entry in entries.iter().filter(|entry| entry.package == self.package) {
-            let url = if entry.path.starts_with('/') {
-                format!("{}{}", self.base_url, entry.path)
-            } else {
-                format!("{}/{}", self.base_url, entry.path)
-            };
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.package() == &self.package)
+        {
+            let url = format!("{}/src/contrib/Archive/{}", self.base_url, entry.path());
             let transport = self.transport.borrow();
             let response = transport.get(&url).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
-                    format!("failed to fetch {}: {error}", entry.path),
+                    format!("failed to fetch {}: {error}", entry.path()),
                 )
             })?;
             if response.status != 200 {
                 return Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
-                    format!("failed to fetch {}: HTTP {}", entry.path, response.status),
+                    format!("failed to fetch {}: HTTP {}", entry.path(), response.status),
                 ));
             }
-            if response.body.len() as u64 != entry.size {
+            if response.body.len() as u64 != entry.size() {
                 return Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
-                    format!("size mismatch for {}", entry.path),
+                    format!("size mismatch for {}", entry.path()),
                 ));
             }
             let description = extract_description(&response.body).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("invalid DESCRIPTION in {}: {error}", entry.path),
+                    format!("invalid DESCRIPTION in {}: {error}", entry.path()),
                 )
             })?;
             let catalog = CranCatalog::from_packages(&description).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("invalid DESCRIPTION in {}: {error}", entry.path),
+                    format!("invalid DESCRIPTION in {}: {error}", entry.path()),
                 )
             })?;
-            releases.extend(catalog.candidates(&entry.package).iter().cloned());
+            releases.extend(catalog.candidates(entry.package()).iter().cloned());
         }
         Ok(releases)
     }
@@ -350,6 +349,19 @@ mod tests {
     );
     const HISTORY: &[u8] =
         include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-meta-archive.rds");
+    const INVALID_HISTORY_PATHS: &[&[u8]] = &[
+        include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-traversal.rds"),
+        include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-query.rds"),
+        include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-fragment.rds"),
+        include_bytes!(
+            "../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-traversal.rds"
+        ),
+        include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-backslash.rds"),
+        include_bytes!(
+            "../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-package-mismatch.rds"
+        ),
+        include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-version.rds"),
+    ];
     const OLD_TAR: &[u8] =
         include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-Matrix_1.6-5.tar.gz");
     const NEW_TAR: &[u8] =
@@ -545,13 +557,21 @@ mod tests {
     fn history_only_enumerates_file_info_facts() {
         let entries = enumerate_archive_rds(HISTORY).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].package.as_str(), "Matrix");
-        assert_eq!(
-            &*entries[0].path,
-            "src/contrib/Archive/Matrix/Matrix_1.6-5.tar.gz"
-        );
-        assert_eq!(entries[0].size, OLD_TAR.len() as u64);
-        assert_eq!(entries[0].mtime, 1_790_000_000);
+        assert_eq!(entries[0].package().as_str(), "Matrix");
+        assert_eq!(entries[0].path(), "Matrix/Matrix_1.6-5.tar.gz");
+        assert_eq!(entries[0].version().as_str(), "1.6-5");
+        assert_eq!(entries[0].size(), OLD_TAR.len() as u64);
+        assert_eq!(entries[0].mtime(), 1_790_000_000);
+    }
+
+    #[test]
+    fn history_rejects_non_canonical_archive_paths() {
+        for fixture in INVALID_HISTORY_PATHS {
+            assert!(matches!(
+                enumerate_archive_rds(fixture),
+                Err(CranHistoryError::InvalidArchivePath { .. })
+            ));
+        }
     }
 
     #[test]

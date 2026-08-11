@@ -25,7 +25,14 @@ fictional phrase.
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `99f03d1851d3739cce9a10138aa5871804629ce50300b6b66b0af8bbdad423a1` |
 | `synthetic-matrix-archive-wrong-root.rds` | 1 | Invalid fast-path wrong root type fixture; SHA-256 `715f0358ada164c6b70b892b14b21ba58b5b30cfb8aac581a4aa2cca84231a57` |
 | `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `b5f4a4f8444308c682bfd56a874371c929cad763fb1a9852e7c73170780317d9` |
-| `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration; SHA-256 `98da9178a9269ef36e153b8ebca58b61dcb81e062f3ec60dd3586659081def9d` |
+| `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration; SHA-256 `58f3d02d48f116217b0312f0788fded55db56d81bbf5b7031db67aed1593149c` |
+| `synthetic-meta-invalid-traversal.rds` | 1 | Invalid history path traversal fixture; SHA-256 `fea5fd7e683eb913986ba89ad1058ec0d22bc625e78ff44082af791ee31a6c12` |
+| `synthetic-meta-invalid-query.rds` | 1 | Invalid history query fixture; SHA-256 `2019b78dacf04763634ab6c4c4a7232c583b00edf7598205cc11497f802586d4` |
+| `synthetic-meta-invalid-fragment.rds` | 1 | Invalid history fragment fixture; SHA-256 `7f5cf493a324a85c5f3a89987e7035ad8969c53d08abeaf6953bb5d0c30d7c47` |
+| `synthetic-meta-invalid-percent-traversal.rds` | 1 | Invalid history percent-encoded traversal fixture; SHA-256 `43701bb0e53ba8214dcb736f2ec0b81ee6b7ce79a5457570332010ed2b3ad0b1` |
+| `synthetic-meta-invalid-backslash.rds` | 1 | Invalid history backslash fixture; SHA-256 `3e2a882f230793e495072e123c9def34e2963ca9b67388413e7ced6802080fc0` |
+| `synthetic-meta-invalid-package-mismatch.rds` | 1 | Invalid history package mismatch fixture; SHA-256 `22166d709fbc1df80d6de5b2682a519353a54f11bb1d2369aa9acde87e36b7d4` |
+| `synthetic-meta-invalid-version.rds` | 1 | Invalid history version fixture; SHA-256 `c87a2717a1ffeaa2f14f5958c984875de79443f189e4884996b11c6fd2ec66ea` |
 | `synthetic-Matrix_1.6-5.tar.gz` | 1 | Fictional source archive with root DESCRIPTION; SHA-256 `71afa67726a640ed1c11b97cc48f28eedf79990bcced285e526013b2daa4d83b` |
 | `synthetic-Matrix_1.7-0.tar.gz` | 1 | Fictional source archive with root DESCRIPTION; SHA-256 `c13fa0dcfcd5c900d0657ab9aa3a14be703ce1f3fa50247f4006313439a30918` |
 

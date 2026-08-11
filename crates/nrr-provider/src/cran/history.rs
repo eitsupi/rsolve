@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use nrr_core::PackageName;
+use nrr_core::{PackageName, RPackageVersion};
 use rd_rds::{RObject, RStr, RValue, file::ReadOptions};
 
 /// One historical source archive advertised by `Meta/archive.rds`.
@@ -12,10 +12,33 @@ use rd_rds::{RObject, RStr, RValue, file::ReadOptions};
 /// dependency metadata are read from the archive's `DESCRIPTION` instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveEntry {
-    pub package: PackageName,
-    pub path: Box<str>,
-    pub size: u64,
-    pub mtime: i64,
+    package: PackageName,
+    version: RPackageVersion,
+    path: Box<str>,
+    size: u64,
+    mtime: i64,
+}
+
+impl ArchiveEntry {
+    pub fn package(&self) -> &PackageName {
+        &self.package
+    }
+
+    pub fn version(&self) -> &RPackageVersion {
+        &self.version
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn mtime(&self) -> i64 {
+        self.mtime
+    }
 }
 
 /// A malformed or unsupported `Meta/archive.rds` enumeration.
@@ -32,6 +55,7 @@ pub enum CranHistoryError {
     InvalidString { field: &'static str, row: usize },
     InvalidColumnType { field: &'static str },
     InvalidPackage { value: String },
+    InvalidArchivePath { value: String },
     InvalidSize { row: usize },
     InvalidMtime { row: usize },
 }
@@ -57,6 +81,9 @@ impl fmt::Display for CranHistoryError {
                 write!(f, "archive history {field} column has an unsupported type")
             }
             Self::InvalidPackage { value } => write!(f, "invalid archive package name {value:?}"),
+            Self::InvalidArchivePath { value } => {
+                write!(f, "invalid archive path {value:?}")
+            }
             Self::InvalidSize { row } => write!(f, "invalid archive size at row {row}"),
             Self::InvalidMtime { row } => write!(f, "invalid archive mtime at row {row}"),
         }
@@ -150,10 +177,7 @@ fn enumerate_frame(
         .into_iter()
         .enumerate()
         .map(|(row, path)| {
-            let path_package =
-                package_from_path(&path).ok_or_else(|| CranHistoryError::InvalidPackage {
-                    value: path.clone(),
-                })?;
+            let (path_package, version) = parse_archive_path(&path)?;
             if package_hint.is_some_and(|package| package != &path_package) {
                 return Err(CranHistoryError::InvalidPackage {
                     value: path.clone(),
@@ -170,6 +194,7 @@ fn enumerate_frame(
             }
             Ok(ArchiveEntry {
                 package,
+                version,
                 path: path.into_boxed_str(),
                 size: size as u64,
                 mtime: mtime as i64,
@@ -215,8 +240,37 @@ fn string_value(value: &RStr) -> Option<String> {
     value.as_str()?.ok().map(|value| value.into_owned())
 }
 
-fn package_from_path(path: &str) -> Option<PackageName> {
-    let filename = path.rsplit('/').next()?;
-    let package = filename.split_once('_')?.0;
-    PackageName::new(package).ok()
+fn parse_archive_path(path: &str) -> Result<(PackageName, RPackageVersion), CranHistoryError> {
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.len() != 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(CranHistoryError::InvalidArchivePath {
+            value: path.to_owned(),
+        });
+    }
+    let package =
+        PackageName::new(segments[0]).map_err(|_| CranHistoryError::InvalidArchivePath {
+            value: path.to_owned(),
+        })?;
+    let filename = segments[1];
+    let stem =
+        filename
+            .strip_suffix(".tar.gz")
+            .ok_or_else(|| CranHistoryError::InvalidArchivePath {
+                value: path.to_owned(),
+            })?;
+    let (filename_package, version) =
+        stem.split_once('_')
+            .ok_or_else(|| CranHistoryError::InvalidArchivePath {
+                value: path.to_owned(),
+            })?;
+    if filename_package != package.as_str() {
+        return Err(CranHistoryError::InvalidArchivePath {
+            value: path.to_owned(),
+        });
+    }
+    let version =
+        RPackageVersion::parse(version).map_err(|_| CranHistoryError::InvalidArchivePath {
+            value: path.to_owned(),
+        })?;
+    Ok((package, version))
 }
