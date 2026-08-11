@@ -1,14 +1,12 @@
 //! CRAN archive refresh and lazy DESCRIPTION fallback.
-// The provider remains private until concrete runtime transport wiring is
-// added; its unit tests exercise the refresh seam without exposing transport
-// types through the public CRAN adapter API.
-#![allow(dead_code)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
 use std::path::Component;
+use std::rc::Rc;
 
 use super::catalog::CranCatalog;
 use super::history::{ArchiveEntry, CranHistoryError, enumerate_archive_rds};
@@ -52,21 +50,10 @@ pub(crate) trait Transport {
     fn get(&self, url: &str) -> Result<TransportResponse, TransportError>;
 }
 
-/// Observable result of probing the per-package archive fast path.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FastPathStatus {
-    Available,
-    Absent { status: u16 },
-    Invalid { status: u16, diagnostic: Box<str> },
-}
-
-/// A refresh diagnostic.  A 404 remains an endpoint observation rather than a
-/// portable "history none" result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CranRefreshDiagnostic {
-    pub(crate) endpoint: Box<str>,
-    pub(crate) status: Option<u16>,
-    pub status_detail: FastPathStatus,
+impl<T: Transport + ?Sized> Transport for Rc<T> {
+    fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
+        self.as_ref().get(url)
+    }
 }
 
 /// A failure before a provider snapshot can be constructed.
@@ -96,6 +83,36 @@ impl Error for CranProviderError {
             Self::Transport { source, .. } => Some(source),
             Self::History(source) => Some(source),
         }
+    }
+}
+
+/// The observed result of probing one package's CRAN archive fast path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CranFastPathStatus {
+    Available,
+    Absent { status: u16 },
+    Invalid { status: u16, diagnostic: Box<str> },
+}
+
+/// A transport-neutral diagnostic from refreshing one package's CRAN source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CranRefreshDiagnostic {
+    endpoint: Box<str>,
+    status: Option<u16>,
+    status_detail: CranFastPathStatus,
+}
+
+impl CranRefreshDiagnostic {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    pub fn status_detail(&self) -> &CranFastPathStatus {
+        &self.status_detail
     }
 }
 
@@ -140,7 +157,7 @@ impl<T: Transport> CranProvider<T> {
                     diagnostics.push(CranRefreshDiagnostic {
                         endpoint: endpoint.clone().into_boxed_str(),
                         status: Some(response.status),
-                        status_detail: FastPathStatus::Available,
+                        status_detail: CranFastPathStatus::Available,
                     });
                     CandidateSource::Fast(catalog)
                 }
@@ -148,7 +165,7 @@ impl<T: Transport> CranProvider<T> {
                     diagnostics.push(CranRefreshDiagnostic {
                         endpoint: endpoint.clone().into_boxed_str(),
                         status: Some(response.status),
-                        status_detail: FastPathStatus::Invalid {
+                        status_detail: CranFastPathStatus::Invalid {
                             status: response.status,
                             diagnostic: error.to_string().into_boxed_str(),
                         },
@@ -156,22 +173,19 @@ impl<T: Transport> CranProvider<T> {
                     Self::fallback_source(&transport, &base_url)?
                 }
             }
-        } else if response.status == 404 {
-            diagnostics.push(CranRefreshDiagnostic {
-                endpoint: endpoint.clone().into_boxed_str(),
-                status: Some(response.status),
-                status_detail: FastPathStatus::Absent {
-                    status: response.status,
-                },
-            });
-            Self::fallback_source(&transport, &base_url)?
         } else {
             diagnostics.push(CranRefreshDiagnostic {
                 endpoint: endpoint.clone().into_boxed_str(),
                 status: Some(response.status),
-                status_detail: FastPathStatus::Invalid {
-                    status: response.status,
-                    diagnostic: "unexpected fast-path status".into(),
+                status_detail: if response.status == 404 {
+                    CranFastPathStatus::Absent {
+                        status: response.status,
+                    }
+                } else {
+                    CranFastPathStatus::Invalid {
+                        status: response.status,
+                        diagnostic: "unexpected fast-path status".into(),
+                    }
                 },
             });
             Self::fallback_source(&transport, &base_url)?
@@ -299,6 +313,227 @@ impl<T: Transport> CandidateLoader for CranProvider<T> {
         };
         *self.loaded.borrow_mut() = Some(result.clone());
         result
+    }
+}
+
+enum CachedProvider<T> {
+    Ready(CranProvider<Rc<T>>),
+    Failed(CandidateLoadError),
+}
+
+/// The shared lazy runtime path used by fixture and concrete transports.
+pub(crate) struct CranRuntimeLoader<T> {
+    base_url: Box<str>,
+    transport: Rc<T>,
+    providers: RefCell<HashMap<PackageName, CachedProvider<T>>>,
+    diagnostics: RefCell<HashMap<PackageName, Vec<CranRefreshDiagnostic>>>,
+}
+
+impl<T: Transport> CranRuntimeLoader<T> {
+    pub(crate) fn new(transport: T, base_url: impl AsRef<str>) -> Self {
+        Self {
+            base_url: base_url.as_ref().trim_end_matches('/').into(),
+            transport: Rc::new(transport),
+            providers: RefCell::new(HashMap::new()),
+            diagnostics: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn refresh_provider(&self, package: &PackageName) -> CachedProvider<T> {
+        match CranProvider::refresh(Rc::clone(&self.transport), &self.base_url, package.clone()) {
+            Ok(provider) => {
+                self.diagnostics
+                    .borrow_mut()
+                    .insert(package.clone(), provider.diagnostics().to_vec());
+                CachedProvider::Ready(provider)
+            }
+            Err(error) => CachedProvider::Failed(provider_error(error)),
+        }
+    }
+
+    pub(crate) fn diagnostics(&self) -> Vec<CranRefreshDiagnostic> {
+        let mut diagnostics = self
+            .diagnostics
+            .borrow()
+            .values()
+            .flat_map(|items| items.iter().cloned())
+            .collect::<Vec<_>>();
+        diagnostics.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+        diagnostics
+    }
+}
+
+impl<T: Transport> CandidateLoader for CranRuntimeLoader<T> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let SolverKey::InstalledName(name) = package else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("CRAN provider has no candidates for {package:?}"),
+            ));
+        };
+        if !self.providers.borrow().contains_key(name) {
+            let state = self.refresh_provider(name);
+            self.providers
+                .borrow_mut()
+                .entry(name.clone())
+                .or_insert(state);
+        }
+        let mut providers = self.providers.borrow_mut();
+        let Some(provider) = providers.get_mut(name) else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                "CRAN provider cache insertion failed",
+            ));
+        };
+        match provider {
+            CachedProvider::Ready(provider) => provider.releases(package),
+            CachedProvider::Failed(error) => Err(error.clone()),
+        }
+    }
+}
+
+fn provider_error(error: CranProviderError) -> CandidateLoadError {
+    match error {
+        CranProviderError::Transport { endpoint, source } => CandidateLoadError::new(
+            CandidateLoadErrorCategory::TransportFailure,
+            format!("failed to refresh {endpoint}: {source}"),
+        ),
+        CranProviderError::History(error) => CandidateLoadError::new(
+            CandidateLoadErrorCategory::MetadataInvalid,
+            format!("invalid CRAN archive history: {error}"),
+        ),
+    }
+}
+
+// This is a CRAN transport defense limit, not a generic artifact-size contract.
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
+struct UreqTransport {
+    agent: ureq::Agent,
+}
+
+impl Transport for UreqTransport {
+    fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
+        let response = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|error| TransportError::new(format!("request failed: {error}")))?;
+        let status = response.status().as_u16();
+        let mut body = response.into_body();
+        let declared_size = body.content_length();
+        if declared_size.is_some_and(|length| length > MAX_RESPONSE_BYTES) {
+            return Err(TransportError::new(format!(
+                "response exceeds {MAX_RESPONSE_BYTES}-byte limit"
+            )));
+        }
+        let mut bytes = Vec::new();
+        body.as_reader()
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| TransportError::new(format!("failed to read response: {error}")))?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES
+            || declared_size.is_some_and(|length| length != bytes.len() as u64)
+        {
+            return Err(TransportError::new(format!(
+                "response size exceeds declared or {MAX_RESPONSE_BYTES}-byte limit"
+            )));
+        }
+        Ok(TransportResponse {
+            status,
+            body: bytes,
+        })
+    }
+}
+
+/// A transport-neutral failure constructing the concrete CRAN candidate loader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CranCandidateLoaderError {
+    InvalidBaseUrl { diagnostic: Box<str> },
+}
+
+impl fmt::Display for CranCandidateLoaderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBaseUrl { diagnostic } => formatter.write_str(diagnostic),
+        }
+    }
+}
+
+impl Error for CranCandidateLoaderError {}
+
+/// A synchronous, lazy CRAN candidate loader backed by one reusable ureq agent.
+///
+/// This loader blocks while performing network I/O. Async callers should
+/// invoke it through a blocking worker boundary.
+pub struct CranCandidateLoader {
+    inner: CranRuntimeLoader<UreqTransport>,
+}
+
+impl CranCandidateLoader {
+    pub fn new(base_url: impl AsRef<str>) -> Result<Self, CranCandidateLoaderError> {
+        let base_url = canonical_base_url(base_url.as_ref())?;
+        let tls_config = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build();
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .tls_config(tls_config)
+            .build();
+        Ok(Self {
+            inner: CranRuntimeLoader::new(
+                UreqTransport {
+                    agent: config.new_agent(),
+                },
+                base_url,
+            ),
+        })
+    }
+
+    pub fn diagnostics(&self) -> Vec<CranRefreshDiagnostic> {
+        self.inner.diagnostics()
+    }
+}
+
+fn canonical_base_url(input: &str) -> Result<Box<str>, CranCandidateLoaderError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must not be empty".into(),
+        });
+    }
+    let mut url =
+        url::Url::parse(input).map_err(|error| CranCandidateLoaderError::InvalidBaseUrl {
+            diagnostic: format!("invalid CRAN base URL: {error}").into(),
+        })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must use HTTP or HTTPS".into(),
+        });
+    }
+    if url.host_str().is_none() || url.cannot_be_a_base() {
+        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must be hierarchical and include a host".into(),
+        });
+    }
+    if url.query().is_some() {
+        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must not include a query".into(),
+        });
+    }
+    if url.fragment().is_some() {
+        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must not include a fragment".into(),
+        });
+    }
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.to_string().trim_end_matches('/').into())
+}
+
+impl CandidateLoader for CranCandidateLoader {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        self.inner.releases(package)
     }
 }
 
@@ -457,6 +692,31 @@ mod tests {
         .unwrap()
     }
 
+    fn runtime_loader(transport: FixtureTransport) -> CranRuntimeLoader<FixtureTransport> {
+        CranRuntimeLoader::new(transport, "https://cran.invalid")
+    }
+
+    #[test]
+    fn concrete_loader_validates_and_canonicalizes_base_without_requests() {
+        assert_eq!(
+            canonical_base_url(" https://cran.invalid/mirror/// ").unwrap(),
+            "https://cran.invalid/mirror".into()
+        );
+        assert!(CranCandidateLoader::new("https://cran.invalid/mirror///").is_ok());
+        for input in [
+            "",
+            "ftp://cran.invalid",
+            "https://",
+            "https://cran.invalid?mirror=1",
+            "https://cran.invalid/#mirror",
+        ] {
+            assert!(matches!(
+                CranCandidateLoader::new(input),
+                Err(CranCandidateLoaderError::InvalidBaseUrl { .. })
+            ));
+        }
+    }
+
     fn logical_signature(provider: &CranProvider<FixtureTransport>) -> Vec<String> {
         provider
             .releases(&SolverKey::InstalledName(
@@ -506,8 +766,8 @@ mod tests {
         let requests = Rc::clone(&transport.requests);
         let provider = provider(transport);
         assert!(matches!(
-            provider.diagnostics()[0].status_detail,
-            FastPathStatus::Absent { status: 404 }
+            provider.diagnostics()[0].status_detail(),
+            CranFastPathStatus::Absent { status: 404 }
         ));
         assert_eq!(requests.borrow().len(), 2);
         assert_eq!(requests.borrow()[0], fast_url());
@@ -557,6 +817,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_loader_caches_each_package_provider_and_its_candidates() {
+        let transport = FixtureTransport::fallback(Vec::new(), 404);
+        let requests = Rc::clone(&transport.requests);
+        let loader = runtime_loader(transport);
+        let package = SolverKey::InstalledName(PackageName::new("Matrix").unwrap());
+
+        assert_eq!(loader.releases(&package).unwrap().len(), 2);
+        assert!(matches!(
+            loader.diagnostics()[0].status_detail(),
+            CranFastPathStatus::Absent { status: 404 }
+        ));
+        assert_eq!(requests.borrow().len(), 4);
+        assert_eq!(requests.borrow()[0], fast_url());
+        assert_eq!(requests.borrow()[1], history_url());
+        assert_eq!(requests.borrow()[2], old_url());
+        assert_eq!(requests.borrow()[3], new_url());
+
+        assert_eq!(loader.releases(&package).unwrap().len(), 2);
+        assert_eq!(requests.borrow().len(), 4);
+    }
+
+    #[test]
+    fn runtime_loader_invalid_fast_path_falls_back_to_history() {
+        let transport = FixtureTransport::fallback(WRONG_ROOT.to_vec(), 200);
+        let requests = Rc::clone(&transport.requests);
+        let loader = runtime_loader(transport);
+        let package = SolverKey::InstalledName(PackageName::new("Matrix").unwrap());
+
+        assert_eq!(loader.releases(&package).unwrap().len(), 2);
+        assert!(matches!(
+            loader.diagnostics()[0].status_detail(),
+            CranFastPathStatus::Invalid { status: 200, .. }
+        ));
+        assert_eq!(requests.borrow().len(), 4);
+        assert_eq!(requests.borrow()[0], fast_url());
+        assert_eq!(requests.borrow()[1], history_url());
+    }
+
+    #[test]
     fn invalid_fast_path_shapes_match_fast_catalog() {
         let fast = provider(FixtureTransport::fallback(FAST.to_vec(), 200));
         let expected = logical_signature(&fast);
@@ -564,8 +863,8 @@ mod tests {
             let fallback = provider(FixtureTransport::fallback(invalid.to_vec(), 200));
             assert_eq!(logical_signature(&fallback), expected);
             assert!(matches!(
-                fallback.diagnostics()[0].status_detail,
-                FastPathStatus::Invalid { status: 200, .. }
+                fallback.diagnostics()[0].status_detail(),
+                CranFastPathStatus::Invalid { status: 200, .. }
             ));
         }
     }
@@ -605,6 +904,23 @@ mod tests {
             .pop();
         let size_provider = provider(size_transport);
         let error = size_provider
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap(),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.category(),
+            CandidateLoadErrorCategory::TransportFailure
+        );
+        assert!(error.diagnostic().contains("size mismatch"));
+    }
+
+    #[test]
+    fn runtime_loader_size_mismatch_is_a_hard_acquisition_error() {
+        let mut transport = FixtureTransport::fallback(Vec::new(), 404);
+        transport.responses.get_mut(&old_url()).unwrap().body.pop();
+        let loader = runtime_loader(transport);
+        let error = loader
             .releases(&SolverKey::InstalledName(
                 PackageName::new("Matrix").unwrap(),
             ))

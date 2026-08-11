@@ -12,3 +12,6 @@ pub use catalog::{
 };
 pub use dcf::{DcfDocument, DcfError, DcfField, DcfRecord};
 pub use history::{ArchiveEntry, CranHistoryError, enumerate_archive_rds};
+pub use provider::{
+    CranCandidateLoader, CranCandidateLoaderError, CranFastPathStatus, CranRefreshDiagnostic,
+};

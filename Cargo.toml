@@ -13,3 +13,5 @@ rd-rds = { version = "0.2.0", default-features = false, features = ["gzip", "zst
 pubgrub = "0.4"
 flate2 = "1"
 tar = "0.4"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+url = "2"
