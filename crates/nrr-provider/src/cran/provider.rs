@@ -1,7 +1,7 @@
 //! CRAN archive refresh and lazy DESCRIPTION fallback.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
@@ -14,8 +14,8 @@ use super::history::CranHistoryError;
 use super::history::{ArchiveEntry, enumerate_archive_rds};
 use flate2::read::GzDecoder;
 use nrr_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind, PackageName,
-    PackageRelease, ReleaseAggregation, SolverKey,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
+    ReleaseAggregation, SolverKey,
 };
 
 /// A provider-local response used by both real and fixture transports.
@@ -459,12 +459,40 @@ impl CandidateLoader for CranCandidateSnapshot {
                 format!("CRAN snapshot has no candidates for {package:?}"),
             ));
         };
-        Ok(self.candidates.get(name).cloned().unwrap_or_default())
+        self.candidates.get(name).cloned().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("CRAN snapshot has not refreshed package {name}"),
+            )
+        })
+    }
+}
+
+impl CranCandidateSnapshot {
+    /// Builds a transport-free snapshot from already validated candidates.
+    /// This is useful for hermetic orchestration tests and in-memory callers.
+    pub fn from_candidates<I>(candidates: I) -> Self
+    where
+        I: IntoIterator<Item = (PackageName, Vec<PackageRelease>)>,
+    {
+        Self {
+            candidates: candidates.into_iter().collect(),
+        }
+    }
+
+    /// Returns whether this snapshot contains a refresh result for `package`.
+    pub fn contains_package(&self, package: &PackageName) -> bool {
+        self.candidates.contains_key(package)
+    }
+
+    /// Returns whether an installed-name solver key still needs refreshing.
+    pub fn needs_refresh(&self, package: &SolverKey) -> bool {
+        matches!(package, SolverKey::InstalledName(name) if !self.contains_package(name))
     }
 }
 
 /// A single refresh session. All network and parsing state is discarded from
-/// the resolver-facing snapshot once `freeze` returns.
+/// the resolver-facing snapshot once refresh returns it.
 struct CranRefreshSession<T> {
     base_url: Box<str>,
     transport: Rc<T>,
@@ -724,27 +752,12 @@ impl<T: Transport> CranRefreshSession<T> {
         Ok(candidates)
     }
 
-    fn refresh_closure(
+    fn refresh_packages(
         &mut self,
         roots: &[PackageName],
     ) -> Result<CranCandidateSnapshot, CandidateLoadError> {
-        let mut queue = roots.iter().cloned().collect::<VecDeque<_>>();
-        while let Some(package) = queue.pop_front() {
-            let candidates = self.refresh_package(&package)?;
-            for release in &candidates {
-                for dependency in release.dependencies().iter().filter(|dependency| {
-                    matches!(
-                        dependency.kind,
-                        DependencyKind::Depends
-                            | DependencyKind::Imports
-                            | DependencyKind::LinkingTo
-                    ) && dependency.name.as_str() != "R"
-                }) {
-                    if !self.packages.contains_key(&dependency.name) {
-                        queue.push_back(dependency.name.clone());
-                    }
-                }
-            }
+        for package in roots {
+            self.refresh_package(package)?;
         }
         Ok(CranCandidateSnapshot {
             candidates: self.packages.clone(),
@@ -822,13 +835,13 @@ impl Transport for UreqTransport {
     }
 }
 
-/// A transport-neutral failure constructing the concrete CRAN candidate loader.
+/// A transport-neutral failure constructing the CRAN snapshot refresher.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CranCandidateLoaderError {
+pub enum CranSnapshotRefresherError {
     InvalidBaseUrl { diagnostic: Box<str> },
 }
 
-impl fmt::Display for CranCandidateLoaderError {
+impl fmt::Display for CranSnapshotRefresherError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBaseUrl { diagnostic } => formatter.write_str(diagnostic),
@@ -836,18 +849,19 @@ impl fmt::Display for CranCandidateLoaderError {
     }
 }
 
-impl Error for CranCandidateLoaderError {}
+impl Error for CranSnapshotRefresherError {}
 
 /// A synchronous CRAN refresh owner backed by one reusable ureq agent.
 ///
-/// This loader blocks while performing network I/O. Async callers should
-/// invoke it through a blocking worker boundary.
-pub struct CranCandidateLoader {
+/// Refreshing this owner blocks while performing network I/O. Async callers
+/// should invoke refresh methods through a blocking worker boundary; the
+/// returned snapshot itself performs no I/O.
+pub struct CranSnapshotRefresher {
     session: RefCell<CranRefreshSession<UreqTransport>>,
 }
 
-impl CranCandidateLoader {
-    pub fn new(base_url: impl AsRef<str>) -> Result<Self, CranCandidateLoaderError> {
+impl CranSnapshotRefresher {
+    pub fn new(base_url: impl AsRef<str>) -> Result<Self, CranSnapshotRefresherError> {
         let base_url = canonical_base_url(base_url.as_ref())?;
         let tls_config = ureq::tls::TlsConfig::builder()
             .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -872,44 +886,44 @@ impl CranCandidateLoader {
         diagnostics
     }
 
-    /// Refreshes the current index and the strong-dependency closure rooted at
-    /// these package names, then freezes a transport-free candidate snapshot.
-    pub fn refresh_closure(
+    /// Refreshes exactly these package names, then returns a transport-free
+    /// snapshot containing all package results cached by this refresher.
+    pub fn refresh_packages(
         &self,
         roots: &[PackageName],
     ) -> Result<CranCandidateSnapshot, CandidateLoadError> {
-        self.session.borrow_mut().refresh_closure(roots)
+        self.session.borrow_mut().refresh_packages(roots)
     }
 }
 
-fn canonical_base_url(input: &str) -> Result<Box<str>, CranCandidateLoaderError> {
+fn canonical_base_url(input: &str) -> Result<Box<str>, CranSnapshotRefresherError> {
     let input = input.trim();
     if input.is_empty() {
-        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: "CRAN base URL must not be empty".into(),
         });
     }
     let mut url =
-        url::Url::parse(input).map_err(|error| CranCandidateLoaderError::InvalidBaseUrl {
+        url::Url::parse(input).map_err(|error| CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: format!("invalid CRAN base URL: {error}").into(),
         })?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: "CRAN base URL must use HTTP or HTTPS".into(),
         });
     }
     if url.host_str().is_none() || url.cannot_be_a_base() {
-        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: "CRAN base URL must be hierarchical and include a host".into(),
         });
     }
     if url.query().is_some() {
-        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: "CRAN base URL must not include a query".into(),
         });
     }
     if url.fragment().is_some() {
-        return Err(CranCandidateLoaderError::InvalidBaseUrl {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: "CRAN base URL must not include a fragment".into(),
         });
     }
@@ -1152,7 +1166,7 @@ mod tests {
             canonical_base_url(" https://cran.invalid/mirror/// ").unwrap(),
             "https://cran.invalid/mirror".into()
         );
-        assert!(CranCandidateLoader::new("https://cran.invalid/mirror///").is_ok());
+        assert!(CranSnapshotRefresher::new("https://cran.invalid/mirror///").is_ok());
         for input in [
             "",
             "ftp://cran.invalid",
@@ -1161,8 +1175,8 @@ mod tests {
             "https://cran.invalid/#mirror",
         ] {
             assert!(matches!(
-                CranCandidateLoader::new(input),
-                Err(CranCandidateLoaderError::InvalidBaseUrl { .. })
+                CranSnapshotRefresher::new(input),
+                Err(CranSnapshotRefresherError::InvalidBaseUrl { .. })
             ));
         }
     }
@@ -1339,7 +1353,7 @@ mod tests {
         let requests = Rc::clone(&transport.requests);
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         let snapshot = session
-            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap();
         let before = requests.borrow().len();
         let releases = snapshot
@@ -1360,10 +1374,39 @@ mod tests {
                 .count(),
             1
         );
+        assert!(
+            !requests
+                .borrow()
+                .iter()
+                .any(|url| url.contains("/Archive/methods/PACKAGES.rds"))
+        );
         assert!(session.diagnostics.iter().any(|diagnostic| {
             diagnostic.source()
                 == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::PlainDcf)
         }));
+    }
+
+    #[test]
+    fn snapshot_distinguishes_unrefreshed_from_refreshed_empty_packages() {
+        let empty = PackageName::new("nrrfixture.empty").unwrap();
+        let unknown = PackageName::new("nrrfixture.unknown").unwrap();
+        let snapshot = CranCandidateSnapshot::from_candidates([(empty.clone(), Vec::new())]);
+        assert!(snapshot.contains_package(&empty));
+        assert!(!snapshot.needs_refresh(&SolverKey::InstalledName(empty.clone())));
+        assert!(
+            snapshot
+                .releases(&SolverKey::InstalledName(empty))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(snapshot.needs_refresh(&SolverKey::InstalledName(unknown.clone())));
+        assert_eq!(
+            snapshot
+                .releases(&SolverKey::InstalledName(unknown))
+                .unwrap_err()
+                .category(),
+            CandidateLoadErrorCategory::NotFound
+        );
     }
 
     #[test]
@@ -1386,7 +1429,7 @@ mod tests {
         let requests = Rc::clone(&transport.requests);
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         let snapshot = session
-            .refresh_closure(&[PackageName::new("nrrfixture.plain").unwrap()])
+            .refresh_packages(&[PackageName::new("nrrfixture.plain").unwrap()])
             .unwrap();
         assert_eq!(
             snapshot
@@ -1429,7 +1472,7 @@ mod tests {
         );
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         let snapshot = session
-            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap();
         assert_eq!(
             snapshot
@@ -1458,7 +1501,7 @@ mod tests {
         );
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         let error = session
-            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap_err();
         assert_eq!(
             error.category(),
@@ -1494,7 +1537,7 @@ mod tests {
         let requests = Rc::clone(&transport.requests);
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         session
-            .refresh_closure(&[PackageName::new("nrrfixture.plain").unwrap()])
+            .refresh_packages(&[PackageName::new("nrrfixture.plain").unwrap()])
             .unwrap();
         assert_eq!(requests.borrow()[0], current_rds_url());
         assert_eq!(requests.borrow()[1], current_gzip_url());
@@ -1610,7 +1653,7 @@ mod tests {
         let requests = Rc::clone(&transport.requests);
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         session
-            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap();
         assert_eq!(
             session
@@ -1651,7 +1694,7 @@ mod tests {
         transport.responses.remove(&fast_url());
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         session
-            .refresh_closure(&[PackageName::new("Matrix").unwrap()])
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap();
         let diagnostic = session
             .diagnostics
