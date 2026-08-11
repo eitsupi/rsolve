@@ -25,7 +25,7 @@ fictional phrase.
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `99f03d1851d3739cce9a10138aa5871804629ce50300b6b66b0af8bbdad423a1` |
 | `synthetic-matrix-archive-wrong-root.rds` | 1 | Invalid fast-path wrong root type fixture; SHA-256 `715f0358ada164c6b70b892b14b21ba58b5b30cfb8aac581a4aa2cca84231a57` |
 | `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `b5f4a4f8444308c682bfd56a874371c929cad763fb1a9852e7c73170780317d9` |
-| `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration; SHA-256 `58f3d02d48f116217b0312f0788fded55db56d81bbf5b7031db67aed1593149c` |
+| `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration, including canonical prefixed source path; SHA-256 `7d44bcbcc1650203c5c053bd91b005e9a2830b2036aa7f53a886ee24ba47d424` |
 | `synthetic-meta-invalid-traversal.rds` | 1 | Invalid history path traversal fixture; SHA-256 `fea5fd7e683eb913986ba89ad1058ec0d22bc625e78ff44082af791ee31a6c12` |
 | `synthetic-meta-invalid-query.rds` | 1 | Invalid history query fixture; SHA-256 `2019b78dacf04763634ab6c4c4a7232c583b00edf7598205cc11497f802586d4` |
 | `synthetic-meta-invalid-fragment.rds` | 1 | Invalid history fragment fixture; SHA-256 `7f5cf493a324a85c5f3a89987e7035ad8969c53d08abeaf6953bb5d0c30d7c47` |

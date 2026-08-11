@@ -224,36 +224,53 @@ impl<T: Transport> CranProvider<T> {
             .iter()
             .filter(|entry| entry.package() == &self.package)
         {
-            let url = format!("{}/src/contrib/Archive/{}", self.base_url, entry.path());
+            let url = format!(
+                "{}/src/contrib/Archive/{}",
+                self.base_url,
+                entry.source_archive_relative_path()
+            );
             let transport = self.transport.borrow();
             let response = transport.get(&url).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
-                    format!("failed to fetch {}: {error}", entry.path()),
+                    format!(
+                        "failed to fetch {}: {error}",
+                        entry.source_archive_relative_path()
+                    ),
                 )
             })?;
             if response.status != 200 {
                 return Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
-                    format!("failed to fetch {}: HTTP {}", entry.path(), response.status),
+                    format!(
+                        "failed to fetch {}: HTTP {}",
+                        entry.source_archive_relative_path(),
+                        response.status
+                    ),
                 ));
             }
             if response.body.len() as u64 != entry.size() {
                 return Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
-                    format!("size mismatch for {}", entry.path()),
+                    format!("size mismatch for {}", entry.source_archive_relative_path()),
                 ));
             }
             let description = extract_description(&response.body).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("invalid DESCRIPTION in {}: {error}", entry.path()),
+                    format!(
+                        "invalid DESCRIPTION in {}: {error}",
+                        entry.source_archive_relative_path()
+                    ),
                 )
             })?;
             let catalog = CranCatalog::from_packages(&description).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("invalid DESCRIPTION in {}: {error}", entry.path()),
+                    format!(
+                        "invalid DESCRIPTION in {}: {error}",
+                        entry.source_archive_relative_path()
+                    ),
                 )
             })?;
             releases.extend(catalog.candidates(entry.package()).iter().cloned());
@@ -558,7 +575,10 @@ mod tests {
         let entries = enumerate_archive_rds(HISTORY).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].package().as_str(), "Matrix");
-        assert_eq!(entries[0].path(), "Matrix/Matrix_1.6-5.tar.gz");
+        assert_eq!(
+            entries[0].source_archive_relative_path(),
+            "Matrix/Matrix_1.6-5.tar.gz"
+        );
         assert_eq!(entries[0].version().as_str(), "1.6-5");
         assert_eq!(entries[0].size(), OLD_TAR.len() as u64);
         assert_eq!(entries[0].mtime(), 1_790_000_000);

@@ -301,7 +301,7 @@ archive_history <- list(
         uname = c("fixture", "fixture"),
         grname = c("fixture", "fixture"),
         row.names = c(
-            "Matrix/Matrix_1.6-5.tar.gz",
+            "src/contrib/Archive/Matrix/Matrix_1.6-5.tar.gz",
             "Matrix/Matrix_1.7-0.tar.gz"
         )
     )

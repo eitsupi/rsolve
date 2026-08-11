@@ -9,12 +9,14 @@ use rd_rds::{RObject, RStr, RValue, file::ReadOptions};
 /// One historical source archive advertised by `Meta/archive.rds`.
 ///
 /// This is deliberately limited to file enumeration.  Package version and
-/// dependency metadata are read from the archive's `DESCRIPTION` instead.
+/// dependency metadata are read from the archive's DESCRIPTION instead.
+/// The path is relative to CRAN's source archive root; it is not a generic
+/// repository artifact path and does not describe binary layouts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveEntry {
     package: PackageName,
     version: RPackageVersion,
-    path: Box<str>,
+    source_archive_relative_path: Box<str>,
     size: u64,
     mtime: i64,
 }
@@ -28,8 +30,9 @@ impl ArchiveEntry {
         &self.version
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
+    /// Returns the package-relative source archive path.
+    pub fn source_archive_relative_path(&self) -> &str {
+        &self.source_archive_relative_path
     }
 
     pub fn size(&self) -> u64 {
@@ -177,7 +180,7 @@ fn enumerate_frame(
         .into_iter()
         .enumerate()
         .map(|(row, path)| {
-            let (path_package, version) = parse_archive_path(&path)?;
+            let (path_package, version, source_archive_relative_path) = parse_archive_path(&path)?;
             if package_hint.is_some_and(|package| package != &path_package) {
                 return Err(CranHistoryError::InvalidPackage {
                     value: path.clone(),
@@ -195,7 +198,7 @@ fn enumerate_frame(
             Ok(ArchiveEntry {
                 package,
                 version,
-                path: path.into_boxed_str(),
+                source_archive_relative_path,
                 size: size as u64,
                 mtime: mtime as i64,
             })
@@ -240,18 +243,28 @@ fn string_value(value: &RStr) -> Option<String> {
     value.as_str()?.ok().map(|value| value.into_owned())
 }
 
-fn parse_archive_path(path: &str) -> Result<(PackageName, RPackageVersion), CranHistoryError> {
+fn parse_archive_path(
+    path: &str,
+) -> Result<(PackageName, RPackageVersion, Box<str>), CranHistoryError> {
     let segments = path.split('/').collect::<Vec<_>>();
-    if segments.len() != 2 || segments.iter().any(|segment| segment.is_empty()) {
+    if segments.iter().any(|segment| segment.is_empty()) {
         return Err(CranHistoryError::InvalidArchivePath {
             value: path.to_owned(),
         });
     }
+    let (package_segment, filename) = match segments.as_slice() {
+        [package, filename] => (*package, *filename),
+        ["src", "contrib", "Archive", package, filename] => (*package, *filename),
+        _ => {
+            return Err(CranHistoryError::InvalidArchivePath {
+                value: path.to_owned(),
+            });
+        }
+    };
     let package =
-        PackageName::new(segments[0]).map_err(|_| CranHistoryError::InvalidArchivePath {
+        PackageName::new(package_segment).map_err(|_| CranHistoryError::InvalidArchivePath {
             value: path.to_owned(),
         })?;
-    let filename = segments[1];
     let stem =
         filename
             .strip_suffix(".tar.gz")
@@ -272,5 +285,6 @@ fn parse_archive_path(path: &str) -> Result<(PackageName, RPackageVersion), Cran
         RPackageVersion::parse(version).map_err(|_| CranHistoryError::InvalidArchivePath {
             value: path.to_owned(),
         })?;
-    Ok((package, version))
+    let normalized_path = format!("{package}/{filename}").into_boxed_str();
+    Ok((package, version, normalized_path))
 }
