@@ -6,6 +6,7 @@
 pub mod lock;
 pub mod manifest;
 pub mod orchestration;
+pub mod wire;
 
 pub use lock::{
     EnvironmentId, EnvironmentIdError, LockError, LockedDependencyEdge, LockedDistributionRef,
@@ -19,3 +20,4 @@ pub use orchestration::{
     CranResolutionError, CranResolutionOutcome, ResolutionMode, resolve_from_cran,
     resolve_with_loader, resolve_with_lock,
 };
+pub use wire::{LockWireError, from_toml, to_toml};

@@ -1,9 +1,10 @@
 //! Shared logical lock domain and projections.
 //!
-//! This module intentionally contains no artifact or filesystem state. TOML
-//! encoding is deferred until the canonical identity grammar is fixed.
+//! This module intentionally contains no artifact or filesystem state. The
+//! strict TOML codec lives in [`crate::wire`].
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -11,7 +12,7 @@ use nrr_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, Distribution,
     DistributionChannel, LockedIdentities, PackageName, PackageRelease, Provenance,
     RPackageVersion, RegistryId, ReleaseIdentity, Resolution, ResolutionRequest, ResolutionTarget,
-    Sha256Digest, SnapshotId, SolverKey, VersionConstraint,
+    Sha256Digest, SnapshotId, SolverKey, VersionClause, VersionConstraint,
 };
 
 pub use nrr_core::{EnvironmentId, EnvironmentIdError};
@@ -94,6 +95,12 @@ impl LockedPackage {
             .iter()
             .map(LockedDependencyEdge::from)
             .collect::<Vec<_>>();
+        for dependency in &mut dependencies {
+            dependency
+                .constraint
+                .clauses
+                .sort_by(compare_version_clauses);
+        }
         dependencies.sort_by(dependency_sort_cmp);
         dependencies.dedup();
         Self {
@@ -126,6 +133,16 @@ impl LockedPackage {
             | Provenance::RBasePackage { .. }
             | Provenance::RegistryRelease { .. }
             | Provenance::BioconductorRelease { .. } => {}
+        }
+        for (index, dependency) in self.dependencies.iter().enumerate() {
+            if let DependencySourceConstraint::Exact(identity) = &dependency.source
+                && identity.name() != &dependency.name
+            {
+                return Err(LockError::InvalidDependency {
+                    package: identity_key(&self.identity),
+                    index,
+                });
+            }
         }
         if let Some(spelling) = &self.published_version_spelling {
             let parsed = RPackageVersion::parse(spelling).map_err(|_| {
@@ -271,6 +288,12 @@ impl Lockfile {
                 package.validate()?;
                 package.distributions.sort_by(distribution_sort_cmp);
                 package.distributions.dedup();
+                for dependency in &mut package.dependencies {
+                    dependency
+                        .constraint
+                        .clauses
+                        .sort_by(compare_version_clauses);
+                }
                 package.dependencies.sort_by(dependency_sort_cmp);
                 package.dependencies.dedup();
             }
@@ -292,6 +315,7 @@ impl Lockfile {
                 unique.push(package);
             }
             resolution.packages = unique;
+            ensure_installed_names(&resolution.packages)?;
         }
         Ok(())
     }
@@ -310,6 +334,7 @@ impl Lockfile {
                     });
                 }
             }
+            ensure_installed_names(&packages)?;
         }
         Ok(())
     }
@@ -325,12 +350,32 @@ fn validate_resolution_count(found: usize) -> Result<(), LockError> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LockError {
-    UnsupportedResolutionCount { found: usize },
-    ConflictingMetadata { identity: String },
-    InvalidPublishedVersionSpelling { identity: String },
-    RBasePackage { identity: String },
+    UnsupportedResolutionCount {
+        found: usize,
+    },
+    ConflictingMetadata {
+        identity: String,
+    },
+    InvalidPublishedVersionSpelling {
+        identity: String,
+    },
+    RBasePackage {
+        identity: String,
+    },
+    InvalidDependency {
+        package: String,
+        index: usize,
+    },
+    InstalledNameConflict {
+        name: String,
+        first_identity: String,
+        second_identity: String,
+    },
     TargetMismatch,
-    EnvironmentMismatch { expected: String, found: String },
+    EnvironmentMismatch {
+        expected: String,
+        found: String,
+    },
     Manifest(ManifestError),
 }
 
@@ -349,6 +394,17 @@ impl fmt::Display for LockError {
             Self::RBasePackage { identity } => {
                 write!(f, "R base package is not lockable: {identity}")
             }
+            Self::InvalidDependency { package, index } => {
+                write!(f, "invalid dependency {index} in locked package {package}")
+            }
+            Self::InstalledNameConflict {
+                name,
+                first_identity,
+                second_identity,
+            } => write!(
+                f,
+                "installed package name {name} maps to distinct identities {first_identity} and {second_identity}"
+            ),
             Self::TargetMismatch => f.write_str("lock target does not match manifest target"),
             Self::EnvironmentMismatch { expected, found } => write!(
                 f,
@@ -357,6 +413,23 @@ impl fmt::Display for LockError {
             Self::Manifest(error) => write!(f, "manifest composition failed: {error}"),
         }
     }
+}
+
+fn ensure_installed_names(packages: &[LockedPackage]) -> Result<(), LockError> {
+    let mut identities = BTreeMap::<PackageName, &ReleaseIdentity>::new();
+    for package in packages {
+        let name = package.identity.name().clone();
+        if let Some(previous) = identities.insert(name.clone(), &package.identity)
+            && previous != &package.identity
+        {
+            return Err(LockError::InstalledNameConflict {
+                name: name.to_string(),
+                first_identity: identity_key(previous),
+                second_identity: identity_key(&package.identity),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Error for LockError {
@@ -415,6 +488,12 @@ fn dependency_sort_cmp(left: &LockedDependencyEdge, right: &LockedDependencyEdge
         .then_with(|| left.name.cmp(&right.name))
         .then_with(|| cmp_source(&left.source, &right.source))
         .then_with(|| cmp_constraint(&left.constraint, &right.constraint))
+}
+
+fn compare_version_clauses(left: &VersionClause, right: &VersionClause) -> Ordering {
+    relation_rank(left.op)
+        .cmp(&relation_rank(right.op))
+        .then_with(|| left.version.cmp(&right.version))
 }
 
 fn cmp_optional_snapshot(left: &Option<SnapshotId>, right: &Option<SnapshotId>) -> Ordering {
@@ -898,5 +977,79 @@ mod tests {
             Err(LockError::ConflictingMetadata { identity: value }) if value.contains("same")
         ));
         assert_eq!(identity.name().as_str(), "same");
+    }
+
+    #[test]
+    fn distinct_identities_with_one_installed_name_are_rejected() {
+        let name = package("collision");
+        let version = version("1.0.0");
+        let first = PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: name.clone(),
+            observed_version: version.clone(),
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            dependencies: Vec::new(),
+            distributions: Vec::new(),
+        })
+        .unwrap();
+        let second = PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new("other").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: name.clone(),
+            observed_version: version,
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            dependencies: Vec::new(),
+            distributions: Vec::new(),
+        })
+        .unwrap();
+        let resolution = Resolution::new(
+            target(),
+            vec![
+                nrr_core::ResolvedPackage::new(
+                    SolverKey::InstalledName(name.clone()),
+                    first.clone(),
+                ),
+                nrr_core::ResolvedPackage::new(SolverKey::InstalledName(name), second.clone()),
+            ],
+        );
+        assert!(matches!(
+            Lockfile::from_resolution(&resolution, environment()),
+            Err(LockError::InstalledNameConflict { .. })
+        ));
+        let first_lock = LockedPackage {
+            identity: first.identity().clone(),
+            version: first.version().clone(),
+            published_version_spelling: None,
+            distributions: Vec::new(),
+            dependencies: Vec::new(),
+            metadata_sha256: None,
+        };
+        let second_lock = LockedPackage {
+            identity: second.identity().clone(),
+            version: second.version().clone(),
+            published_version_spelling: None,
+            distributions: Vec::new(),
+            dependencies: Vec::new(),
+            metadata_sha256: None,
+        };
+        assert!(matches!(
+            Lockfile::new(vec![LockedResolution {
+                target: target(),
+                environment: environment(),
+                packages: vec![first_lock, second_lock],
+            }]),
+            Err(LockError::InstalledNameConflict { .. })
+        ));
     }
 }
