@@ -39,17 +39,22 @@ fn is_r_base_package_name(name: &PackageName) -> bool {
         .any(|candidate| *candidate == name.as_str())
 }
 
-struct RuntimeSnapshot {
-    cran: CranCandidateSnapshot,
+struct CandidateLoaderRef<'a>(&'a dyn CandidateLoader);
+
+impl CandidateLoader for CandidateLoaderRef<'_> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        self.0.releases(package)
+    }
+}
+
+struct BasePackageOverlay<L> {
+    loader: L,
     base: HashMap<PackageName, Vec<PackageRelease>>,
     r_version: nrr_core::RPackageVersion,
 }
 
-impl RuntimeSnapshot {
-    fn new(
-        cran: CranCandidateSnapshot,
-        r_version: nrr_core::RPackageVersion,
-    ) -> Result<Self, CandidateLoadError> {
+impl<L> BasePackageOverlay<L> {
+    fn new(loader: L, r_version: nrr_core::RPackageVersion) -> Result<Self, CandidateLoadError> {
         let mut base = HashMap::new();
         for name in R_BASE_PACKAGE_NAMES {
             let package = PackageName::new(name).map_err(|error| {
@@ -87,18 +92,10 @@ impl RuntimeSnapshot {
             base.insert(package, vec![release]);
         }
         Ok(Self {
-            cran,
+            loader,
             base,
             r_version,
         })
-    }
-
-    fn needs_refresh(&self, package: &SolverKey) -> bool {
-        match package {
-            SolverKey::InstalledName(name) if is_r_base_package_name(name) => false,
-            SolverKey::InstalledName(_) => self.cran.needs_refresh(package),
-            _ => false,
-        }
     }
 
     fn r_version(&self) -> &nrr_core::RPackageVersion {
@@ -106,14 +103,26 @@ impl RuntimeSnapshot {
     }
 }
 
-impl CandidateLoader for RuntimeSnapshot {
+impl<L: CandidateLoader> CandidateLoader for BasePackageOverlay<L> {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
         if let SolverKey::InstalledName(name) = package
             && let Some(releases) = self.base.get(name)
         {
             return Ok(releases.clone());
         }
-        self.cran.releases(package)
+        self.loader.releases(package)
+    }
+}
+
+type RuntimeSnapshot = BasePackageOverlay<CranCandidateSnapshot>;
+
+impl BasePackageOverlay<CranCandidateSnapshot> {
+    fn needs_refresh(&self, package: &SolverKey) -> bool {
+        match package {
+            SolverKey::InstalledName(name) if is_r_base_package_name(name) => false,
+            SolverKey::InstalledName(_) => self.loader.needs_refresh(package),
+            _ => false,
+        }
     }
 }
 
@@ -176,7 +185,10 @@ pub fn resolve_with_loader(
     loader: &dyn CandidateLoader,
 ) -> Result<Resolution, CranResolutionError> {
     let request = compose_resolution_request(manifest).map_err(CranResolutionError::Composition)?;
-    resolve_request(request, loader)
+    let overlay =
+        BasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
+            .map_err(CranResolutionError::Refresh)?;
+    resolve_request(request, &overlay)
 }
 
 fn resolve_request(
@@ -685,5 +697,60 @@ mod tests {
                 .version(),
             &RPackageVersion::parse("1.0.0").unwrap()
         );
+    }
+
+    #[test]
+    fn injected_loader_uses_target_r_base_package_without_loader_candidates() {
+        let root = PackageName::new("fixture").unwrap();
+        let methods = PackageName::new("methods").unwrap();
+        let target = RPackageVersion::parse("4.4.0").unwrap();
+        let root_release = release_with_dependencies(
+            &root,
+            vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                methods.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(nrr_core::RelationOp::Eq, target.clone()),
+            )],
+        );
+
+        let resolution = resolve_with_loader(
+            manifest_for(root.clone()),
+            &FixtureLoader {
+                package: root_release,
+            },
+        )
+        .unwrap();
+
+        assert!(resolution.selected(&root).is_some());
+        assert!(resolution.selected(&methods).is_none());
+    }
+
+    #[test]
+    fn injected_loader_does_not_infer_recommended_packages_as_runtime_provided() {
+        let root = PackageName::new("fixture").unwrap();
+        let matrix = PackageName::new("Matrix").unwrap();
+        let root_release = release_with_dependencies(
+            &root,
+            vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                matrix,
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )],
+        );
+
+        let error = resolve_with_loader(
+            manifest_for(root),
+            &FixtureLoader {
+                package: root_release,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CranResolutionError::Resolution(ResolutionFailure::NoSolution { .. })
+        ));
     }
 }
