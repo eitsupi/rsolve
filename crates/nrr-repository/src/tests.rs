@@ -1,10 +1,15 @@
 use crate::*;
 use flate2::{Compression, write::GzEncoder};
 use md5::{Digest as Md5Digest, Md5};
-use nrr_core::UpstreamChecksum;
+use nrr_core::{
+    BioconductorRelease, PackageName, PackageNamespace, Provenance, RPackageVersion,
+    ReleaseIdentity, UpstreamChecksum,
+};
 use sha2::Sha256;
 use std::cell::Cell;
+use std::fs::OpenOptions;
 use std::io::Cursor;
+use std::io::Write;
 use tar::{Builder, Header};
 
 fn temporary_root(label: &str) -> PathBuf {
@@ -57,6 +62,230 @@ fn empty_archive_bytes() -> Vec<u8> {
         .finish()
         .unwrap();
     encoded
+}
+
+fn registry_selected(
+    package: &str,
+    version: &str,
+    cached: CachedArtifact,
+) -> MaterializationArtifact {
+    let version = RPackageVersion::parse(version).unwrap();
+    MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            PackageName::new(package).unwrap(),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version.clone(),
+            },
+        ),
+        version,
+        cached,
+    )
+}
+
+#[test]
+fn rejects_provenance_version_mismatches() {
+    let cache_root = temporary_root("materialize-version-mismatch-cache");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected_version = RPackageVersion::parse("2.0.0").unwrap();
+    let provenance_version = RPackageVersion::parse("1.0.0").unwrap();
+    let identities = [
+        (
+            "registry",
+            PackageName::new("registrypkg").unwrap(),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: provenance_version.clone(),
+            },
+        ),
+        (
+            "bioconductor",
+            PackageName::new("biocpkg").unwrap(),
+            Provenance::BioconductorRelease {
+                namespace: PackageNamespace::new("bioc").unwrap(),
+                release: BioconductorRelease::new("3.20").unwrap(),
+                version: provenance_version.clone(),
+            },
+        ),
+        (
+            "r-base",
+            PackageName::new("R").unwrap(),
+            Provenance::RBasePackage {
+                r_version: provenance_version,
+            },
+        ),
+    ];
+    for (label, package, provenance) in identities {
+        let project_root = temporary_root(&format!("materialize-version-mismatch-{label}"));
+        let selected = MaterializationArtifact::new(
+            ReleaseIdentity::new(package, provenance),
+            selected_version.clone(),
+            cached.clone(),
+        );
+        assert!(matches!(
+            materialize(MaterializationRequest::new(
+                &project_root,
+                std::slice::from_ref(&selected),
+            )),
+            Err(MaterializationError::ProvenanceVersionMismatch { .. })
+        ));
+        fs::remove_dir_all(project_root).unwrap();
+    }
+    fs::remove_dir_all(cache_root).unwrap();
+}
+
+#[test]
+fn canonicalizes_set_order_for_state_and_reruns() {
+    let cache_root = temporary_root("materialize-order-cache");
+    let first_project = temporary_root("materialize-order-first");
+    let second_project = temporary_root("materialize-order-second");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let alpha = registry_selected("alpha", "1.0.0", cached.clone());
+    let zeta = registry_selected("zeta", "2.0.0", cached);
+    let reverse = [zeta.clone(), alpha.clone()];
+    let forward = [alpha, zeta];
+
+    let reverse_state = materialize(MaterializationRequest::new(&first_project, &reverse)).unwrap();
+    let forward_state =
+        materialize(MaterializationRequest::new(&second_project, &forward)).unwrap();
+    assert_eq!(reverse_state, forward_state);
+    assert_eq!(
+        fs::read(first_project.join(".nrr/materialization.toml")).unwrap(),
+        fs::read(second_project.join(".nrr/materialization.toml")).unwrap()
+    );
+
+    let rerun = materialize(MaterializationRequest::new(&first_project, &forward)).unwrap();
+    assert_eq!(rerun, reverse_state);
+
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(first_project).unwrap();
+    fs::remove_dir_all(second_project).unwrap();
+}
+
+#[test]
+fn materializes_with_local_gitignore_state_and_independent_bytes() {
+    let cache_root = temporary_root("materialize-cache");
+    let project_root = temporary_root("materialize-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes.clone()),
+    )
+    .unwrap();
+    let version = RPackageVersion::parse("1.2-3").unwrap();
+    let identity = ReleaseIdentity::new(
+        PackageName::new("example").unwrap(),
+        Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version.clone(),
+        },
+    );
+    let selected = MaterializationArtifact::new(identity, version, cached.clone());
+    let state = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+    assert_eq!(
+        fs::read(project_root.join(".nrr/.gitignore")).unwrap(),
+        b"*\n"
+    );
+    assert_eq!(state.records().len(), 1);
+    assert!(matches!(
+        state.records()[0].method,
+        MaterializationMethod::Clone | MaterializationMethod::Copy
+    ));
+    let destination = project_root.join(".nrr/repository/src/contrib/example_1.2-3.tar.gz");
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    let rerun = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+    assert_eq!(rerun, state);
+
+    let mut output = OpenOptions::new().write(true).open(&destination).unwrap();
+    output.write_all(b"changed project view").unwrap();
+    assert_eq!(fs::read(cached.path()).unwrap(), archive_bytes());
+
+    let rerun = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ));
+    assert!(matches!(
+        rerun,
+        Err(MaterializationError::ExistingConflict { .. })
+    ));
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn materialization_rejects_duplicate_packages_and_existing_repository() {
+    let cache_root = temporary_root("materialize-duplicate-cache");
+    let project_root = temporary_root("materialize-duplicate-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let package = PackageName::new("example").unwrap();
+    let first_version = RPackageVersion::parse("1.0.0").unwrap();
+    let second_version = RPackageVersion::parse("2.0.0").unwrap();
+    let first = MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            package.clone(),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: first_version.clone(),
+            },
+        ),
+        first_version,
+        cached.clone(),
+    );
+    let second = MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            package,
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: second_version.clone(),
+            },
+        ),
+        second_version,
+        cached,
+    );
+    assert!(matches!(
+        materialize(MaterializationRequest::new(
+            &project_root,
+            &[first.clone(), second],
+        )),
+        Err(MaterializationError::DuplicatePackage { .. })
+    ));
+    fs::create_dir_all(project_root.join(".nrr/repository")).unwrap();
+    assert!(matches!(
+        materialize(MaterializationRequest::new(
+            &project_root,
+            std::slice::from_ref(&first),
+        )),
+        Err(MaterializationError::ExistingConflict { .. })
+    ));
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
 }
 
 fn contains_file_named(root: &Path, suffix: &str) -> bool {

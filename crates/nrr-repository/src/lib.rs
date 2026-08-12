@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod archive;
 mod input;
+mod materialization;
 mod metadata;
 mod object;
 mod paths;
@@ -21,6 +22,11 @@ mod util;
 
 use paths::CachePaths;
 use util::unique_nonce;
+
+pub use materialization::{
+    MaterializationArtifact, MaterializationError, MaterializationMethod, MaterializationRecord,
+    MaterializationRequest, MaterializationState, SelectedArtifact, materialize,
+};
 
 #[cfg(test)]
 use input::copy_compressed_input;
