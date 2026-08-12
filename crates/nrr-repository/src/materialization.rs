@@ -116,11 +116,11 @@ pub struct MaterializationState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct MaterializationTransaction {
-    schema_version: u32,
-    state_temp: String,
-    staging_dir: String,
-    records: Vec<MaterializationRecord>,
+pub(crate) struct MaterializationTransaction {
+    pub(crate) schema_version: u32,
+    pub(crate) state_temp: String,
+    pub(crate) staging_dir: String,
+    pub(crate) records: Vec<MaterializationRecord>,
 }
 
 impl MaterializationState {
@@ -633,11 +633,14 @@ fn recover_transaction(
     let staging_paths = partial_paths(nrr, STAGING_PREFIX)?;
     let marker_exists = fs::symlink_metadata(transaction_path).is_ok();
     if !marker_exists {
-        if !state_temps.is_empty() || !transaction_temps.is_empty() || !staging_paths.is_empty() {
-            return Err(transaction_conflict(
-                nrr,
-                "orphaned transaction temporary exists without a marker",
-            ));
+        if reconstruct_orphan_transaction(
+            nrr,
+            &state_temps,
+            &transaction_temps,
+            &staging_paths,
+            requested,
+        )? {
+            return recover_transaction(nrr, state_path, transaction_path, repository, requested);
         }
         return Ok(());
     }
@@ -796,6 +799,113 @@ fn recover_transaction(
         source: error,
     })?;
     Ok(())
+}
+
+fn reconstruct_orphan_transaction(
+    nrr: &Path,
+    state_temps: &[PathBuf],
+    transaction_temps: &[PathBuf],
+    staging_paths: &[PathBuf],
+    requested: &[MaterializationArtifact],
+) -> Result<bool, MaterializationError> {
+    if state_temps.is_empty() && transaction_temps.is_empty() && staging_paths.is_empty() {
+        return Ok(false);
+    }
+    if state_temps.len() != 1 || staging_paths.len() != 1 || transaction_temps.len() > 1 {
+        return Err(transaction_conflict(
+            nrr,
+            "orphaned transaction temporaries are ambiguous",
+        ));
+    }
+    let state_temp = &state_temps[0];
+    let staging = &staging_paths[0];
+    if !is_regular_file(state_temp) || !is_directory(staging) {
+        return Err(transaction_conflict(
+            nrr,
+            "orphaned transaction temporary has an unsafe filesystem type",
+        ));
+    }
+    let state_name = state_temp
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| transaction_conflict(state_temp, "state temporary has an invalid name"))?;
+    let staging_name = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| transaction_conflict(staging, "staging temporary has an invalid name"))?;
+    let state = read_state(state_temp).map_err(|error| {
+        transaction_conflict(
+            state_temp,
+            format!("orphaned state temporary is invalid: {error}"),
+        )
+    })?;
+    if state.schema_version != 1 || !records_match_requested(&state.records, requested) {
+        return Err(transaction_conflict(
+            state_temp,
+            "orphaned state temporary does not match the requested artifact set",
+        ));
+    }
+    let transaction = if let Some(transaction_temp) = transaction_temps.first() {
+        if !is_regular_file(transaction_temp) {
+            return Err(transaction_conflict(
+                transaction_temp,
+                "orphaned transaction temporary has an unsafe filesystem type",
+            ));
+        }
+        let transaction = read_transaction(transaction_temp).map_err(|error| {
+            transaction_conflict(
+                transaction_temp,
+                format!("orphaned transaction marker is invalid: {error}"),
+            )
+        })?;
+        if transaction.schema_version != 1
+            || transaction.state_temp != state_name
+            || transaction.staging_dir != staging_name
+            || transaction.records != state.records
+            || !records_match_requested(&transaction.records, requested)
+        {
+            return Err(transaction_conflict(
+                transaction_temp,
+                "orphaned transaction temporary does not bind the validated siblings",
+            ));
+        }
+        transaction
+    } else {
+        MaterializationTransaction {
+            schema_version: 1,
+            state_temp: state_name.to_owned(),
+            staging_dir: staging_name.to_owned(),
+            records: state.records.clone(),
+        }
+    };
+    validate_repository_contents(staging, &transaction.records)?;
+
+    let transaction_path = nrr.join(TRANSACTION_NAME);
+    if let Some(transaction_temp) = transaction_temps.first() {
+        fs::rename(transaction_temp, &transaction_path).map_err(|source| {
+            io_error(
+                "publish reconstructed materialization transaction",
+                &transaction_path,
+                source,
+            )
+        })?;
+    } else {
+        let transaction_temp = nrr.join(format!("{TRANSACTION_NAME}.partial.{}", unique_nonce()));
+        write_transaction_temp(&transaction_temp, &transaction)?;
+        fs::rename(&transaction_temp, &transaction_path).map_err(|source| {
+            let _ = fs::remove_file(&transaction_temp);
+            io_error(
+                "publish reconstructed materialization transaction",
+                &transaction_path,
+                source,
+            )
+        })?;
+    }
+    sync_directory(nrr).map_err(|error| MaterializationError::Cache {
+        path: nrr.to_path_buf(),
+        source: error,
+    })?;
+    Ok(true)
 }
 
 fn partial_paths(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>, MaterializationError> {

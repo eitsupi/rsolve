@@ -1,3 +1,4 @@
+use crate::materialization::MaterializationTransaction;
 use crate::*;
 use flate2::{Compression, write::GzEncoder};
 use md5::{Digest as Md5Digest, Md5};
@@ -342,6 +343,112 @@ fn rejects_invalid_state_before_publishing_staging() {
     ));
     assert!(staging.is_dir());
     assert!(!repository.exists());
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn recovers_valid_pre_marker_orphan_without_transaction_temp() {
+    let cache_root = temporary_root("materialize-orphan-cleanup-cache");
+    let project_root = temporary_root("materialize-orphan-cleanup-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected = registry_selected("orphan", "1.0.0", cached);
+    materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+
+    let nrr = project_root.join(".nrr");
+    let repository = nrr.join("repository");
+    let staging_name = ".repository.partial.orphan";
+    let staging = nrr.join(staging_name);
+    let state_path = nrr.join("materialization.toml");
+    let state_temp_name = ".materialization.toml.partial.orphan";
+    let state_temp = nrr.join(state_temp_name);
+    let transaction_temp = nrr.join(".materialization.transaction.toml.partial.orphan");
+    let state_bytes = fs::read(&state_path).unwrap();
+    fs::rename(&repository, &staging).unwrap();
+    fs::rename(&state_path, &state_temp).unwrap();
+    let state: MaterializationState =
+        toml::from_str(std::str::from_utf8(&state_bytes).unwrap()).unwrap();
+    let transaction = MaterializationTransaction {
+        schema_version: 1,
+        state_temp: state_temp_name.to_owned(),
+        staging_dir: staging_name.to_owned(),
+        records: state.records.clone(),
+    };
+    fs::write(
+        &transaction_temp,
+        toml::to_string_pretty(&transaction).unwrap(),
+    )
+    .unwrap();
+    // Model the marker rename being non-durable: state temp and staging remain
+    // valid, but the transaction temp itself is absent.
+    fs::remove_file(&transaction_temp).unwrap();
+
+    let retried = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+    assert_eq!(retried.records(), state.records());
+    assert!(!state_temp.exists());
+    assert!(!transaction_temp.exists());
+    assert!(!staging.exists());
+    assert!(nrr.join("repository").is_dir());
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn does_not_remove_symlink_or_ambiguous_pre_marker_temps() {
+    use std::os::unix::fs::symlink;
+
+    let cache_root = temporary_root("materialize-orphan-safety-cache");
+    let project_root = temporary_root("materialize-orphan-safety-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected = registry_selected("unsafeorphan", "1.0.0", cached);
+    let nrr = project_root.join(".nrr");
+    fs::create_dir_all(&nrr).unwrap();
+    let target = temporary_root("materialize-orphan-symlink-target");
+    let state_link = nrr.join(".materialization.toml.partial.symlink");
+    symlink(&target, &state_link).unwrap();
+    assert!(matches!(
+        materialize(MaterializationRequest::new(
+            &project_root,
+            std::slice::from_ref(&selected),
+        )),
+        Err(MaterializationError::TransactionConflict { .. })
+    ));
+    assert!(state_link.exists());
+    fs::remove_file(state_link).unwrap();
+    fs::remove_dir_all(target).unwrap();
+
+    fs::write(nrr.join(".materialization.toml.partial.a"), b"").unwrap();
+    fs::write(nrr.join(".materialization.toml.partial.b"), b"").unwrap();
+    assert!(matches!(
+        materialize(MaterializationRequest::new(
+            &project_root,
+            std::slice::from_ref(&selected),
+        )),
+        Err(MaterializationError::TransactionConflict { .. })
+    ));
+    assert!(nrr.join(".materialization.toml.partial.a").exists());
+    assert!(nrr.join(".materialization.toml.partial.b").exists());
     fs::remove_dir_all(cache_root).unwrap();
     fs::remove_dir_all(project_root).unwrap();
 }
