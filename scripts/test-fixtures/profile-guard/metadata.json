@@ -21,6 +21,17 @@
           "crate_types": ["bin"]
         }
       ]
+    },
+    {
+      "id": "path+file:///workspace/crates/nrr-repository#0.1.0",
+      "name": "nrr-repository",
+      "targets": [
+        {
+          "name": "repository_r_interop",
+          "kind": ["test"],
+          "crate_types": ["bin"]
+        }
+      ]
     }
   ]
 }

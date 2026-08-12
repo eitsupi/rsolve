@@ -7,10 +7,14 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fixture_dir=$root/scripts/test-fixtures/profile-guard
 evaluator=$root/scripts/check-test-profiles-evaluate.sh
 metadata=$fixture_dir/metadata.json
-default_list=$fixture_dir/valid/default.json
-valid_profile=$fixture_dir/valid/profile.json
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/nrr-profile-negative.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
+jq '."rust-suites" |= with_entries(select(.value["package-name"] == "nrr-provider"))' \
+    "$fixture_dir/valid/default.json" >"$tmp_dir/default.json"
+jq '."rust-suites" |= with_entries(select(.value["package-name"] == "nrr-provider"))' \
+    "$fixture_dir/valid/profile.json" >"$tmp_dir/profile.json"
+default_list=$tmp_dir/default.json
+valid_profile=$tmp_dir/profile.json
 
 assert_rejected() {
     label=$1
@@ -32,6 +36,32 @@ for field in package-id binary-id kind; do
         "$default_list" >"$tmp_dir/default-null-$field.json"
     assert_rejected "default-null-$field" "$tmp_dir/default-null-$field.json" "$valid_profile"
 done
+
+# Repeat representative identity/status mutations for the repository opt-in
+# target so adding a second external-process suite cannot silently weaken the
+# exact-selection guard.
+repo_default=$tmp_dir/repository-default.json
+repo_profile=$tmp_dir/repository-profile.json
+jq '."rust-suites" |= with_entries(select(.value["package-name"] == "nrr-repository"))' \
+    "$fixture_dir/valid/default.json" >"$repo_default"
+jq '."rust-suites" |= with_entries(select(.value["package-name"] == "nrr-repository"))' \
+    "$fixture_dir/valid/profile.json" >"$repo_profile"
+assert_repository_rejected() {
+    label=$1
+    default_fixture=$2
+    profile_fixture=$3
+    if sh "$evaluator" "$metadata" "$default_fixture" "$profile_fixture" nrr-repository repository_r_interop >/dev/null 2>&1; then
+        echo "repository profile mutation unexpectedly passed: $label" >&2
+        exit 1
+    fi
+    echo "repository profile mutation rejected: $label"
+}
+jq '."rust-suites"["nrr-repository::repository_r_interop"].status = "listed"' \
+    "$repo_default" >"$tmp_dir/repository-status.json"
+assert_repository_rejected "default-status" "$tmp_dir/repository-status.json" "$repo_profile"
+jq '."rust-suites"["nrr-repository::repository_r_interop"]["binary-id"] = "nrr-repository::changed"' \
+    "$repo_profile" >"$tmp_dir/repository-binary-id.json"
+assert_repository_rejected "profile-binary-id" "$repo_default" "$tmp_dir/repository-binary-id.json"
 
 jq '."rust-suites"["nrr-provider::r_interop"].status = "listed"' \
     "$default_list" >"$tmp_dir/default-change-expected-status.json"

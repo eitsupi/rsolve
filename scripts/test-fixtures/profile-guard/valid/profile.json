@@ -7,6 +7,14 @@
       "package-id": "path+file:///workspace/crates/nrr-provider#0.1.0",
       "kind": "test",
       "status": "listed"
+    },
+    "nrr-repository::repository_r_interop": {
+      "package-name": "nrr-repository",
+      "binary-id": "nrr-repository::repository_r_interop",
+      "binary-name": "repository_r_interop",
+      "package-id": "path+file:///workspace/crates/nrr-repository#0.1.0",
+      "kind": "test",
+      "status": "listed"
     }
   }
 }

@@ -13,11 +13,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod archive;
+mod filesystem;
 mod input;
 mod materialization;
 mod metadata;
 mod object;
+mod packages;
 mod paths;
+mod state;
+mod transaction;
 mod util;
 
 use paths::CachePaths;
@@ -27,6 +31,7 @@ pub use materialization::{
     MaterializationArtifact, MaterializationError, MaterializationMethod, MaterializationRecord,
     MaterializationRequest, MaterializationState, SelectedArtifact, materialize,
 };
+pub use packages::PackagesError;
 
 #[cfg(test)]
 use input::copy_compressed_input;
@@ -257,5 +262,7 @@ impl PublishFs for RealPublishFs {
     }
 }
 
+#[cfg(test)]
+mod materialization_tests;
 #[cfg(test)]
 mod tests;
