@@ -19,8 +19,10 @@ use crate::{CacheError, CachedArtifact};
 const GITIGNORE: &[u8] = b"*\n";
 const GITIGNORE_NAME: &str = ".gitignore";
 const STATE_NAME: &str = "materialization.toml";
+const TRANSACTION_NAME: &str = ".materialization.transaction.toml";
 const LOCK_NAME: &str = "materialization.lock";
 const REPOSITORY_NAME: &str = "repository";
+const STAGING_PREFIX: &str = ".repository.partial.";
 
 /// One finally selected source artifact to put in the project repository.
 ///
@@ -112,6 +114,15 @@ pub struct MaterializationState {
     pub records: Vec<MaterializationRecord>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MaterializationTransaction {
+    schema_version: u32,
+    state_temp: String,
+    staging_dir: String,
+    records: Vec<MaterializationRecord>,
+}
+
 impl MaterializationState {
     pub fn records(&self) -> &[MaterializationRecord] {
         &self.records
@@ -146,6 +157,8 @@ pub enum MaterializationError {
     ExistingConflict { path: PathBuf },
     #[error("materialization state is invalid at {path}: {reason}")]
     InvalidState { path: PathBuf, reason: String },
+    #[error("materialization transaction cannot be recovered at {path}: {reason}")]
+    TransactionConflict { path: PathBuf, reason: String },
     #[error("cache object is invalid at {path}: {reason}")]
     InvalidCacheObject { path: PathBuf, reason: String },
     #[error("cache error while materializing {path}: {source}")]
@@ -183,8 +196,16 @@ pub fn materialize(
 
     validate_inputs(request.artifacts)?;
     let state_path = nrr.join(STATE_NAME);
+    let transaction_path = nrr.join(TRANSACTION_NAME);
     let repository = nrr.join(REPOSITORY_NAME);
 
+    recover_transaction(
+        &nrr,
+        &state_path,
+        &transaction_path,
+        &repository,
+        request.artifacts,
+    )?;
     if state_path.exists() {
         if !is_regular_file(&state_path) {
             return Err(MaterializationError::InvalidState {
@@ -201,7 +222,7 @@ pub fn materialize(
     }
 
     let artifacts = canonical_artifacts(request.artifacts);
-    let staging = nrr.join(format!(".{REPOSITORY_NAME}.partial.{}", unique_nonce()));
+    let staging = nrr.join(format!("{STAGING_PREFIX}{}", unique_nonce()));
     ensure_directory(&staging, "create repository staging directory")?;
     let contrib = staging.join("src").join("contrib");
     let methods = match materialize_files(&contrib, &artifacts) {
@@ -242,23 +263,82 @@ pub fn materialize(
         return Err(error);
     }
 
-    if let Err(source) = fs::rename(&staging, &repository) {
+    let state_temp_name = state_temp
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("materialization state temporary has an UTF-8 file name")
+        .to_owned();
+    let transaction = MaterializationTransaction {
+        schema_version: 1,
+        state_temp: state_temp_name,
+        staging_dir: staging
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("repository staging has an UTF-8 file name")
+            .to_owned(),
+        records: state.records.clone(),
+    };
+    let transaction_temp = nrr.join(format!("{TRANSACTION_NAME}.partial.{}", unique_nonce()));
+    if let Err(error) = write_transaction_temp(&transaction_temp, &transaction) {
         let _ = fs::remove_file(&state_temp);
         let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(source) = fs::rename(&transaction_temp, &transaction_path) {
+        let _ = fs::remove_file(&transaction_temp);
+        let _ = fs::remove_file(&state_temp);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(io_error(
+            "publish materialization transaction",
+            &transaction_path,
+            source,
+        ));
+    }
+    // The marker and state temp are durable before exposing the repository.
+    // If the process exits after the repository rename, the next invocation
+    // can validate these files and finish the state rename.
+    match sync_directory(&nrr).map_err(|error| MaterializationError::Cache {
+        path: nrr.clone(),
+        source: error,
+    }) {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+
+    if let Err(source) = fs::rename(&staging, &repository) {
+        // Keep marker, state temp, and staging intact.  The next invocation
+        // can diagnose an external repository conflict or resume safely.
         return Err(io_error("publish repository", &repository, source));
     }
+    // Make the repository directory entry durable before publishing the state
+    // pointer.  A crash before the next rename leaves a recoverable marker.
+    sync_directory(&nrr).map_err(|error| MaterializationError::Cache {
+        path: nrr.clone(),
+        source: error,
+    })?;
     if let Err(source) = fs::rename(&state_temp, &state_path) {
-        // No committed state means callers must not treat this repository as
-        // complete.  It is safe to remove because repository did not exist at
-        // the start of this operation.
-        let _ = fs::remove_dir_all(&repository);
-        let _ = fs::remove_file(&state_temp);
+        // Keep repository, state temp, and marker intact.  They form the
+        // recoverable transaction that the next invocation will validate.
         return Err(io_error(
             "publish materialization state",
             &state_path,
             source,
         ));
     }
+    // State is now durable before removing the marker.  If cleanup is
+    // interrupted, recovery sees the committed state and only removes the
+    // stale marker after validating it.
+    sync_directory(&nrr).map_err(|error| MaterializationError::Cache {
+        path: nrr.clone(),
+        source: error,
+    })?;
+    fs::remove_file(&transaction_path).map_err(|source| {
+        io_error(
+            "remove materialization transaction",
+            &transaction_path,
+            source,
+        )
+    })?;
     sync_directory(&nrr).map_err(|error| MaterializationError::Cache {
         path: nrr,
         source: error,
@@ -514,6 +594,372 @@ fn write_state_temp(path: &Path, state: &MaterializationState) -> Result<(), Mat
         ));
     }
     Ok(())
+}
+
+fn write_transaction_temp(
+    path: &Path,
+    transaction: &MaterializationTransaction,
+) -> Result<(), MaterializationError> {
+    let encoded = toml::to_string_pretty(transaction).map_err(|source| {
+        MaterializationError::InvalidState {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| io_error("create transaction temporary", path, source))?;
+    if let Err(error) = (|| -> io::Result<()> {
+        file.write_all(encoded.as_bytes())?;
+        file.sync_all()
+    })() {
+        let _ = fs::remove_file(path);
+        return Err(io_error("write transaction temporary", path, error));
+    }
+    Ok(())
+}
+
+fn recover_transaction(
+    nrr: &Path,
+    state_path: &Path,
+    transaction_path: &Path,
+    repository: &Path,
+    requested: &[MaterializationArtifact],
+) -> Result<(), MaterializationError> {
+    let state_temps = partial_paths(nrr, &format!(".{STATE_NAME}.partial."))?;
+    let transaction_temps = partial_paths(nrr, &format!("{TRANSACTION_NAME}.partial."))?;
+    let staging_paths = partial_paths(nrr, STAGING_PREFIX)?;
+    let marker_exists = fs::symlink_metadata(transaction_path).is_ok();
+    if !marker_exists {
+        if !state_temps.is_empty() || !transaction_temps.is_empty() || !staging_paths.is_empty() {
+            return Err(transaction_conflict(
+                nrr,
+                "orphaned transaction temporary exists without a marker",
+            ));
+        }
+        return Ok(());
+    }
+    if !is_regular_file(transaction_path) {
+        return Err(transaction_conflict(
+            transaction_path,
+            "transaction marker is not a regular file",
+        ));
+    }
+    if !transaction_temps.is_empty() {
+        return Err(transaction_conflict(
+            transaction_path,
+            "transaction marker has an ambiguous temporary sibling",
+        ));
+    }
+    let transaction = read_transaction(transaction_path)?;
+    if transaction.schema_version != 1 {
+        return Err(transaction_conflict(
+            transaction_path,
+            "unsupported transaction schema",
+        ));
+    }
+    if !records_match_requested(&transaction.records, requested) {
+        return Err(transaction_conflict(
+            transaction_path,
+            "transaction records do not match the requested artifact set",
+        ));
+    }
+    let state_temp = transaction_temp_path(nrr, &transaction.state_temp)
+        .ok_or_else(|| transaction_conflict(transaction_path, "invalid state temporary path"))?;
+    let staging = staging_path(nrr, &transaction.staging_dir)
+        .ok_or_else(|| transaction_conflict(transaction_path, "invalid staging directory path"))?;
+    if staging_paths.len() > 1 || (!staging_paths.is_empty() && staging_paths[0] != staging) {
+        return Err(transaction_conflict(
+            transaction_path,
+            "staging directory does not match the transaction marker",
+        ));
+    }
+    let repository_exists = fs::symlink_metadata(repository).is_ok();
+    let staging_exists = fs::symlink_metadata(&staging).is_ok();
+    if repository_exists && staging_exists {
+        return Err(transaction_conflict(
+            transaction_path,
+            "both repository and transaction staging directories exist",
+        ));
+    }
+    if !repository_exists && !staging_exists {
+        return Err(transaction_conflict(
+            &staging,
+            "transaction staging directory is missing",
+        ));
+    }
+    if state_path.exists() && !is_regular_file(state_path) {
+        return Err(transaction_conflict(
+            state_path,
+            "committed state is not a regular file",
+        ));
+    }
+
+    // Validate every transaction input before changing the repository name.
+    // In particular, a corrupt or mismatched state temp must never allow a
+    // valid-looking staging directory to become the published repository.
+    let temporary_state = if state_path.exists() && state_temps.is_empty() {
+        let committed_state = read_state(state_path)?;
+        if committed_state.schema_version != 1
+            || committed_state.records != transaction.records
+            || !records_match_requested(&committed_state.records, requested)
+        {
+            return Err(transaction_conflict(
+                state_path,
+                "committed state differs from the transaction state",
+            ));
+        }
+        None
+    } else {
+        if state_temps.len() != 1 || state_temps[0] != state_temp {
+            return Err(transaction_conflict(
+                transaction_path,
+                "state temporary does not match the transaction marker",
+            ));
+        }
+        if !is_regular_file(&state_temp) {
+            return Err(transaction_conflict(
+                &state_temp,
+                "state temporary is not a regular file",
+            ));
+        }
+        let temporary_state = read_state(&state_temp)?;
+        if temporary_state.schema_version != 1
+            || temporary_state.records != transaction.records
+            || !records_match_requested(&temporary_state.records, requested)
+        {
+            return Err(transaction_conflict(
+                &state_temp,
+                "state temporary does not match the transaction marker or request",
+            ));
+        }
+        if state_path.exists() {
+            let committed_state = read_state(state_path)?;
+            if committed_state != temporary_state {
+                return Err(transaction_conflict(
+                    state_path,
+                    "committed state differs from the transaction state",
+                ));
+            }
+        }
+        Some(temporary_state)
+    };
+
+    if repository_exists {
+        if !is_directory(repository) {
+            return Err(transaction_conflict(
+                repository,
+                "published repository is not a directory",
+            ));
+        }
+        validate_repository_contents(repository, &transaction.records)?;
+    } else {
+        if !is_directory(&staging) {
+            return Err(transaction_conflict(
+                &staging,
+                "transaction staging path is not a directory",
+            ));
+        }
+        validate_repository_contents(&staging, &transaction.records)?;
+        // The marker binds this exact staging basename to the requested
+        // records.  Only after strict validation is it safe to resume the
+        // directory publication.
+        fs::rename(&staging, repository)
+            .map_err(|source| io_error("recover repository publication", repository, source))?;
+        sync_directory(nrr).map_err(|error| MaterializationError::Cache {
+            path: nrr.to_path_buf(),
+            source: error,
+        })?;
+    }
+    if temporary_state.is_some() {
+        if state_path.exists() {
+            fs::remove_file(&state_temp).map_err(|source| {
+                io_error("remove recovered state temporary", &state_temp, source)
+            })?;
+        } else {
+            // The repository is already durable.  Finish only the state rename,
+            // then sync the parent directory before removing the marker.
+            fs::rename(&state_temp, state_path)
+                .map_err(|source| io_error("recover materialization state", state_path, source))?;
+            sync_directory(nrr).map_err(|error| MaterializationError::Cache {
+                path: nrr.to_path_buf(),
+                source: error,
+            })?;
+        }
+    }
+    fs::remove_file(transaction_path)
+        .map_err(|source| io_error("remove recovered transaction", transaction_path, source))?;
+    sync_directory(nrr).map_err(|error| MaterializationError::Cache {
+        path: nrr.to_path_buf(),
+        source: error,
+    })?;
+    Ok(())
+}
+
+fn partial_paths(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>, MaterializationError> {
+    let entries = fs::read_dir(directory)
+        .map_err(|source| io_error("scan transaction directory", directory, source))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| io_error("read transaction directory", directory, source))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(prefix))
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn transaction_temp_path(nrr: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || !name.starts_with(&format!(".{STATE_NAME}.partial."))
+    {
+        return None;
+    }
+    Some(nrr.join(name))
+}
+
+fn staging_path(nrr: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || !name.starts_with(STAGING_PREFIX)
+    {
+        return None;
+    }
+    Some(nrr.join(name))
+}
+
+fn read_transaction(path: &Path) -> Result<MaterializationTransaction, MaterializationError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| io_error("read materialization transaction", path, source))?;
+    toml::from_str(&text).map_err(|source| MaterializationError::InvalidState {
+        path: path.to_path_buf(),
+        reason: source.to_string(),
+    })
+}
+
+fn records_match_requested(
+    records: &[MaterializationRecord],
+    requested: &[MaterializationArtifact],
+) -> bool {
+    let canonical = canonical_artifacts(requested);
+    records.len() == canonical.len()
+        && canonical.iter().zip(records).all(|(selected, record)| {
+            record.identity == identity_key(&selected.identity)
+                && record.package == selected.package().to_string()
+                && record.version == selected.version.to_string()
+                && record.artifact_sha256 == selected.artifact.sha256.to_string()
+                && record.size == selected.artifact.size
+                && record.destination
+                    == format!(
+                        "repository/src/contrib/{}_{}.tar.gz",
+                        selected.package(),
+                        selected.version
+                    )
+        })
+}
+
+fn validate_repository_contents(
+    repository: &Path,
+    records: &[MaterializationRecord],
+) -> Result<(), MaterializationError> {
+    let src = repository.join("src");
+    let contrib = src.join("contrib");
+    if !is_directory(&src) || !is_directory(&contrib) {
+        return Err(transaction_conflict(
+            repository,
+            "repository layout is not src/contrib",
+        ));
+    }
+    let root_entries = directory_names(repository)?;
+    if root_entries != ["src".to_owned()].into_iter().collect() {
+        return Err(transaction_conflict(
+            repository,
+            "repository contains unexpected top-level entries",
+        ));
+    }
+    let src_entries = directory_names(&src)?;
+    if src_entries != ["contrib".to_owned()].into_iter().collect() {
+        return Err(transaction_conflict(
+            &src,
+            "repository src contains unexpected entries",
+        ));
+    }
+    let expected: HashSet<String> = records
+        .iter()
+        .map(|record| {
+            record
+                .destination
+                .strip_prefix("repository/src/contrib/")
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect();
+    let actual = directory_names(&contrib)?;
+    if actual != expected {
+        return Err(transaction_conflict(
+            &contrib,
+            "repository artifact destinations do not match the transaction",
+        ));
+    }
+    for record in records {
+        let Some(name) = record.destination.strip_prefix("repository/src/contrib/") else {
+            return Err(transaction_conflict(
+                &contrib,
+                "transaction destination escapes src/contrib",
+            ));
+        };
+        let path = contrib.join(name);
+        if !is_regular_file(&path) {
+            return Err(transaction_conflict(
+                &path,
+                "transaction destination is not a regular file",
+            ));
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|source| io_error("inspect recovered artifact", &path, source))?;
+        if metadata.len() != record.size || hash_file(&path)? != record.artifact_sha256 {
+            return Err(transaction_conflict(
+                &path,
+                "repository artifact digest or size differs from the transaction",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn directory_names(path: &Path) -> Result<HashSet<String>, MaterializationError> {
+    let entries =
+        fs::read_dir(path).map_err(|source| io_error("scan recovered repository", path, source))?;
+    let mut names = HashSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error("read recovered repository", path, source))?;
+        names.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+fn is_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn transaction_conflict(path: &Path, reason: impl Into<String>) -> MaterializationError {
+    MaterializationError::TransactionConflict {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
 }
 
 fn ensure_gitignore(nrr: &Path) -> Result<(), MaterializationError> {

@@ -175,6 +175,178 @@ fn canonicalizes_set_order_for_state_and_reruns() {
 }
 
 #[test]
+fn recovers_repository_published_before_state_rename() {
+    let cache_root = temporary_root("materialize-recovery-cache");
+    let project_root = temporary_root("materialize-recovery-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected = registry_selected("recovery", "1.0.0", cached);
+    let expected = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+
+    // Model process exit after repository rename but before state rename:
+    // move the committed state back to its durable temporary name and create
+    // the same marker that production writes before publishing repository.
+    let nrr = project_root.join(".nrr");
+    let state_path = nrr.join("materialization.toml");
+    let state_temp_name = ".materialization.toml.partial.crash";
+    let state_temp = nrr.join(state_temp_name);
+    let state_bytes = fs::read(&state_path).unwrap();
+    fs::rename(&state_path, &state_temp).unwrap();
+    let mut marker: toml::Value =
+        toml::from_str(std::str::from_utf8(&state_bytes).unwrap()).unwrap();
+    marker.as_table_mut().unwrap().insert(
+        "state_temp".to_owned(),
+        toml::Value::String(state_temp_name.to_owned()),
+    );
+    marker.as_table_mut().unwrap().insert(
+        "staging_dir".to_owned(),
+        toml::Value::String(".repository.partial.crash".to_owned()),
+    );
+    fs::write(
+        nrr.join(".materialization.transaction.toml"),
+        toml::to_string_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+
+    let recovered = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+    assert_eq!(recovered, expected);
+    assert!(state_path.is_file());
+    assert!(!state_temp.exists());
+    assert!(!nrr.join(".materialization.transaction.toml").exists());
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn recovers_marker_before_repository_rename() {
+    let cache_root = temporary_root("materialize-staging-recovery-cache");
+    let project_root = temporary_root("materialize-staging-recovery-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected = registry_selected("stagingrecovery", "1.0.0", cached);
+    let expected = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+
+    let nrr = project_root.join(".nrr");
+    let repository = nrr.join("repository");
+    let staging_name = ".repository.partial.crash";
+    let staging = nrr.join(staging_name);
+    let state_path = nrr.join("materialization.toml");
+    let state_temp_name = ".materialization.toml.partial.crash";
+    let state_temp = nrr.join(state_temp_name);
+    let state_bytes = fs::read(&state_path).unwrap();
+    fs::rename(&repository, &staging).unwrap();
+    fs::rename(&state_path, &state_temp).unwrap();
+    let mut marker: toml::Value =
+        toml::from_str(std::str::from_utf8(&state_bytes).unwrap()).unwrap();
+    marker.as_table_mut().unwrap().insert(
+        "state_temp".to_owned(),
+        toml::Value::String(state_temp_name.to_owned()),
+    );
+    marker.as_table_mut().unwrap().insert(
+        "staging_dir".to_owned(),
+        toml::Value::String(staging_name.to_owned()),
+    );
+    fs::write(
+        nrr.join(".materialization.transaction.toml"),
+        toml::to_string_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+
+    let recovered = materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+    assert_eq!(recovered, expected);
+    assert!(repository.is_dir());
+    assert!(!staging.exists());
+    assert!(!state_temp.exists());
+    assert!(!nrr.join(".materialization.transaction.toml").exists());
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn rejects_invalid_state_before_publishing_staging() {
+    let cache_root = temporary_root("materialize-invalid-state-cache");
+    let project_root = temporary_root("materialize-invalid-state-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected = registry_selected("invalidstate", "1.0.0", cached);
+    materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+
+    let nrr = project_root.join(".nrr");
+    let repository = nrr.join("repository");
+    let staging_name = ".repository.partial.crash";
+    let staging = nrr.join(staging_name);
+    let state_path = nrr.join("materialization.toml");
+    let state_temp_name = ".materialization.toml.partial.crash";
+    let state_temp = nrr.join(state_temp_name);
+    let state_bytes = fs::read(&state_path).unwrap();
+    fs::rename(&repository, &staging).unwrap();
+    fs::rename(&state_path, &state_temp).unwrap();
+    let mut marker: toml::Value =
+        toml::from_str(std::str::from_utf8(&state_bytes).unwrap()).unwrap();
+    marker.as_table_mut().unwrap().insert(
+        "state_temp".to_owned(),
+        toml::Value::String(state_temp_name.to_owned()),
+    );
+    marker.as_table_mut().unwrap().insert(
+        "staging_dir".to_owned(),
+        toml::Value::String(staging_name.to_owned()),
+    );
+    fs::write(
+        nrr.join(".materialization.transaction.toml"),
+        toml::to_string_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+    fs::write(&state_temp, "schema_version = 1\nrecords = []\n").unwrap();
+
+    assert!(matches!(
+        materialize(MaterializationRequest::new(
+            &project_root,
+            std::slice::from_ref(&selected),
+        )),
+        Err(MaterializationError::TransactionConflict { .. })
+    ));
+    assert!(staging.is_dir());
+    assert!(!repository.exists());
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
 fn materializes_with_local_gitignore_state_and_independent_bytes() {
     let cache_root = temporary_root("materialize-cache");
     let project_root = temporary_root("materialize-project");
