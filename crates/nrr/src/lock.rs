@@ -456,17 +456,23 @@ fn canonical_version(version: &RPackageVersion) -> String {
 fn identity_solver_keys(identity: &ReleaseIdentity) -> Vec<SolverKey> {
     let mut keys = vec![SolverKey::InstalledName(identity.name().clone())];
     match identity.provenance() {
-        Provenance::RegistryRelease { namespace, .. } => keys.push(SolverKey::Registry {
-            namespace: namespace.clone(),
-            name: identity.name().clone(),
-        }),
+        Provenance::RegistryRelease { namespace, .. } => {
+            keys.push(SolverKey::Registry {
+                namespace: namespace.clone(),
+                name: identity.name().clone(),
+            });
+            keys.push(SolverKey::Exact(identity.clone()));
+        }
         Provenance::BioconductorRelease {
             namespace, release, ..
-        } => keys.push(SolverKey::Bioconductor {
-            namespace: namespace.clone(),
-            release: release.clone(),
-            name: identity.name().clone(),
-        }),
+        } => {
+            keys.push(SolverKey::Bioconductor {
+                namespace: namespace.clone(),
+                release: release.clone(),
+                name: identity.name().clone(),
+            });
+            keys.push(SolverKey::Exact(identity.clone()));
+        }
         Provenance::GitCommit { .. } | Provenance::ImmutableSource { .. } => {
             keys.push(SolverKey::Exact(identity.clone()))
         }
@@ -1051,5 +1057,81 @@ mod tests {
             }]),
             Err(LockError::InstalledNameConflict { .. })
         ));
+    }
+
+    #[test]
+    fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
+        let registry = ReleaseIdentity::new(
+            package("registry.pin"),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.0.0"),
+            },
+        );
+        let bioconductor = ReleaseIdentity::new(
+            package("bioc.pin"),
+            Provenance::BioconductorRelease {
+                namespace: PackageNamespace::new("bioc").unwrap(),
+                release: nrr_core::BioconductorRelease::new("3.20").unwrap(),
+                version: version("2.0.0"),
+            },
+        );
+        let lock = Lockfile::new(vec![LockedResolution {
+            target: target(),
+            environment: environment(),
+            packages: vec![
+                LockedPackage {
+                    identity: registry.clone(),
+                    version: version("1.0.0"),
+                    published_version_spelling: None,
+                    distributions: Vec::new(),
+                    dependencies: Vec::new(),
+                    metadata_sha256: None,
+                },
+                LockedPackage {
+                    identity: bioconductor.clone(),
+                    version: version("2.0.0"),
+                    published_version_spelling: None,
+                    distributions: Vec::new(),
+                    dependencies: Vec::new(),
+                    metadata_sha256: None,
+                },
+            ],
+        }])
+        .unwrap();
+        let identities = lock.locked_identities().unwrap();
+
+        assert_eq!(
+            identities.get(&SolverKey::InstalledName(registry.name().clone())),
+            Some(&registry)
+        );
+        assert_eq!(
+            identities.get(&SolverKey::Registry {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                name: registry.name().clone(),
+            }),
+            Some(&registry)
+        );
+        assert_eq!(
+            identities.get(&SolverKey::Exact(registry.clone())),
+            Some(&registry)
+        );
+
+        assert_eq!(
+            identities.get(&SolverKey::InstalledName(bioconductor.name().clone())),
+            Some(&bioconductor)
+        );
+        assert_eq!(
+            identities.get(&SolverKey::Bioconductor {
+                namespace: PackageNamespace::new("bioc").unwrap(),
+                release: nrr_core::BioconductorRelease::new("3.20").unwrap(),
+                name: bioconductor.name().clone(),
+            }),
+            Some(&bioconductor)
+        );
+        assert_eq!(
+            identities.get(&SolverKey::Exact(bioconductor.clone())),
+            Some(&bioconductor)
+        );
     }
 }

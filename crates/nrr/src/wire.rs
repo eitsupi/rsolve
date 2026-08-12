@@ -220,7 +220,7 @@ impl Lockfile {
 fn decode_resolution(wire: WireResolution) -> Result<LockedResolution, LockWireError> {
     let environment = EnvironmentId::new(wire.environment)
         .map_err(|error| invalid_field("environment", error.to_string()))?;
-    let r_version = parse_canonical_version_field("r-version", &wire.r_version)?;
+    let r_version = parse_canonical_r_version_field("r-version", &wire.r_version)?;
     let os = wire.os.into_boxed_str();
     let arch = wire.arch.into_boxed_str();
     if os.is_empty() {
@@ -480,6 +480,21 @@ fn parse_canonical_version_field(
     value: &str,
 ) -> Result<RPackageVersion, LockWireError> {
     let version = parse_version(field, value)?;
+    if canonical_version(&version) != value {
+        return Err(LockWireError::NonCanonicalVersion {
+            field: field.to_owned(),
+            value: value.to_owned(),
+        });
+    }
+    Ok(version)
+}
+
+fn parse_canonical_r_version_field(
+    field: &str,
+    value: &str,
+) -> Result<RPackageVersion, LockWireError> {
+    let version = RPackageVersion::parse_bare(value)
+        .map_err(|error| invalid_field(field, error.to_string()))?;
     if canonical_version(&version) != value {
         return Err(LockWireError::NonCanonicalVersion {
             field: field.to_owned(),
@@ -925,6 +940,22 @@ mod tests {
             Err(LockWireError::NonCanonicalVersion { field, .. })
                 if field == "dependency.clauses.version"
         ));
+    }
+
+    #[test]
+    fn one_component_target_r_version_round_trips() {
+        let lock = Lockfile::new(vec![LockedResolution {
+            target: nrr_core::ResolutionTarget::new(
+                RPackageVersion::parse_bare("4").unwrap(),
+                nrr_core::Target::new("linux", "x86_64"),
+            ),
+            environment: EnvironmentId::new("default").unwrap(),
+            packages: Vec::new(),
+        }])
+        .unwrap();
+        let text = to_toml(&lock).unwrap();
+        assert!(text.contains("r-version = \"4\""));
+        assert_eq!(from_toml(&text).unwrap(), lock);
     }
 
     #[test]
