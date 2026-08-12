@@ -19,6 +19,13 @@ use thiserror::Error;
 
 const PARTIAL_PREFIX: &str = ".partial.";
 
+/// Maximum compressed input accepted when the source descriptor has no size.
+///
+/// A reader that produces more than this many bytes is stopped immediately and
+/// the artifact is not committed. Descriptors with a size use that declared
+/// size as their bound instead.
+pub const MAX_COMPRESSED_INPUT_BYTES: u64 = 1 << 30;
+
 /// The input to [`commit_artifact`].
 pub struct ArtifactCommitRequest<'a> {
     /// The root directory owned by this cache instance.
@@ -92,6 +99,8 @@ pub enum CacheError {
     },
     #[error("artifact size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
+    #[error("compressed input exceeds the configured {limit}-byte limit")]
+    InputTooLarge { limit: u64 },
     #[error("cache metadata is invalid at {path}: {reason}")]
     InvalidMetadata { path: PathBuf, reason: String },
     #[error("cache object is corrupt at {path}: expected {expected}, got {actual}")]
@@ -99,6 +108,15 @@ pub enum CacheError {
         path: PathBuf,
         expected: String,
         actual: String,
+    },
+    #[error(
+        "failed to publish replacement object at {object}: {replacement}; the corrupt object was retained at {quarantine}, but restoring it failed: {restore}"
+    )]
+    ReplacementRecovery {
+        object: PathBuf,
+        quarantine: PathBuf,
+        replacement: io::Error,
+        restore: io::Error,
     },
     #[error("cache object path already contains different bytes: {path}")]
     ObjectConflict { path: PathBuf },
@@ -139,6 +157,13 @@ struct MetadataFile {
 
 /// Commit one source artifact from a caller-supplied stream.
 pub fn commit_artifact(request: ArtifactCommitRequest<'_>) -> Result<CachedArtifact, CacheError> {
+    commit_artifact_with_fs(request, &RealPublishFs)
+}
+
+fn commit_artifact_with_fs(
+    request: ArtifactCommitRequest<'_>,
+    publish_fs: &dyn PublishFs,
+) -> Result<CachedArtifact, CacheError> {
     let checksums = validate_checksums(&request.artifact.upstream_checksums)?;
     let descriptor_key = descriptor_key(request.artifact, &checksums);
     let paths = CachePaths::new(request.cache_root, &descriptor_key);
@@ -174,6 +199,7 @@ pub fn commit_artifact(request: ArtifactCommitRequest<'_>) -> Result<CachedArtif
         &descriptor_key,
         request.reader,
         &partial,
+        publish_fs,
     );
     if result.is_err() {
         let _ = fs::remove_file(&partial);
@@ -261,32 +287,20 @@ fn commit_miss(
     descriptor_key: &str,
     reader: &mut dyn Read,
     partial: &Path,
+    publish_fs: &dyn PublishFs,
 ) -> Result<CachedArtifact, CacheError> {
     let mut output = open_file(partial, true, "create partial artifact")?;
     let mut sha256 = Sha256::new();
     let mut md5 = Md5::new();
-    let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).map_err(|source| CacheError::Io {
-            operation: "read artifact stream",
-            path: partial.to_path_buf(),
-            source,
-        })?;
-        if read == 0 {
-            break;
-        }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|source| CacheError::Io {
-                operation: "write partial artifact",
-                path: partial.to_path_buf(),
-                source,
-            })?;
-        Sha2Digest::update(&mut sha256, &buffer[..read]);
-        Md5Digest::update(&mut md5, &buffer[..read]);
-        size = size.saturating_add(read as u64);
-    }
+    let size = copy_compressed_input(
+        reader,
+        &mut output,
+        artifact.size,
+        MAX_COMPRESSED_INPUT_BYTES,
+        partial,
+        &mut sha256,
+        &mut md5,
+    )?;
     output.sync_all().map_err(|source| CacheError::Io {
         operation: "sync partial artifact",
         path: partial.to_path_buf(),
@@ -365,7 +379,7 @@ fn commit_miss(
         let _ = fs::remove_file(&final_partial);
         return Err(error);
     }
-    if let Err(error) = publish_object(&final_partial, &object, &sha256, size) {
+    if let Err(error) = publish_object_with_fs(&final_partial, &object, &sha256, size, publish_fs) {
         let _ = fs::remove_file(&final_partial);
         return Err(error);
     }
@@ -384,19 +398,102 @@ fn commit_miss(
     Ok(cached_artifact(paths, metadata))
 }
 
-fn publish_object(
+fn copy_compressed_input<W: Write>(
+    reader: &mut dyn Read,
+    output: &mut W,
+    expected: Option<u64>,
+    hard_limit: u64,
+    partial: &Path,
+    sha256: &mut Sha256,
+    md5: &mut Md5,
+) -> Result<u64, CacheError> {
+    let limit = expected.unwrap_or(hard_limit);
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        // Once the bound is reached, read exactly one byte to distinguish an
+        // exact boundary from an over-limit stream. Saturating arithmetic is
+        // intentional so a declared u64::MAX size cannot wrap.
+        let at_limit = size >= limit;
+        let capacity = if at_limit {
+            1
+        } else {
+            limit.saturating_sub(size).min(buffer.len() as u64) as usize
+        };
+        let read = reader
+            .read(&mut buffer[..capacity])
+            .map_err(|source| CacheError::Io {
+                operation: "read artifact stream",
+                path: partial.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            if let Some(expected) = expected
+                && size != expected
+            {
+                return Err(CacheError::SizeMismatch {
+                    expected,
+                    actual: size,
+                });
+            }
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|source| CacheError::Io {
+                operation: "write partial artifact",
+                path: partial.to_path_buf(),
+                source,
+            })?;
+        Sha2Digest::update(&mut *sha256, &buffer[..read]);
+        Md5Digest::update(&mut *md5, &buffer[..read]);
+        size = size.saturating_add(read as u64);
+        if at_limit {
+            return match expected {
+                Some(expected) => Err(CacheError::SizeMismatch {
+                    expected,
+                    actual: size,
+                }),
+                None => Err(CacheError::InputTooLarge { limit }),
+            };
+        }
+    }
+    Ok(size)
+}
+
+trait PublishFs {
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+}
+
+struct RealPublishFs;
+
+impl PublishFs for RealPublishFs {
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+}
+
+fn publish_object_with_fs(
     partial: &Path,
     object: &Path,
     expected: &Sha256Digest,
     expected_size: u64,
+    fs_ops: &dyn PublishFs,
 ) -> Result<(), CacheError> {
     if object.exists() {
         if validate_object(object, expected, expected_size).is_ok() {
-            fs::remove_file(partial).map_err(|source| CacheError::Io {
-                operation: "remove losing partial",
-                path: partial.to_path_buf(),
-                source,
-            })?;
+            fs_ops
+                .remove_file(partial)
+                .map_err(|source| CacheError::Io {
+                    operation: "remove losing partial",
+                    path: partial.to_path_buf(),
+                    source,
+                })?;
             return make_read_only(object);
         }
         let corrupt = object.with_file_name(format!(
@@ -404,24 +501,53 @@ fn publish_object(
             object.file_name().unwrap().to_string_lossy(),
             unique_nonce()
         ));
-        fs::rename(object, &corrupt).map_err(|source| CacheError::Io {
-            operation: "quarantine corrupt artifact object",
-            path: object.to_path_buf(),
-            source,
-        })?;
-        let result = fs::rename(partial, object);
-        let _ = fs::remove_file(&corrupt);
-        result.map_err(|source| CacheError::Io {
-            operation: "publish replacement artifact object",
-            path: object.to_path_buf(),
-            source,
-        })?;
+        if let Err(source) = fs_ops.rename(object, &corrupt) {
+            let _ = fs_ops.remove_file(partial);
+            return Err(CacheError::Io {
+                operation: "quarantine corrupt artifact object",
+                path: object.to_path_buf(),
+                source,
+            });
+        }
+        if let Err(replacement) = fs_ops.rename(partial, object) {
+            // The old bytes are still in `corrupt`. Remove only the moved
+            // final partial, then restore the old object when its path is free.
+            let _ = fs_ops.remove_file(partial);
+            if !object.exists()
+                && let Err(restore) = fs_ops.rename(&corrupt, object)
+            {
+                return Err(CacheError::ReplacementRecovery {
+                    object: object.to_path_buf(),
+                    quarantine: corrupt,
+                    replacement,
+                    restore,
+                });
+            }
+            return Err(CacheError::Io {
+                operation: "publish replacement artifact object",
+                path: object.to_path_buf(),
+                source: replacement,
+            });
+        }
+        // The replacement is published before quarantine is removed. If this
+        // cleanup fails, the new object remains committed and the old bytes
+        // remain available under the quarantine path for diagnosis.
+        fs_ops
+            .remove_file(&corrupt)
+            .map_err(|source| CacheError::Io {
+                operation: "remove quarantined corrupt artifact object",
+                path: corrupt,
+                source,
+            })?;
     } else {
-        fs::rename(partial, object).map_err(|source| CacheError::Io {
-            operation: "publish artifact object",
-            path: object.to_path_buf(),
-            source,
-        })?;
+        if let Err(source) = fs_ops.rename(partial, object) {
+            let _ = fs_ops.remove_file(partial);
+            return Err(CacheError::Io {
+                operation: "publish artifact object",
+                path: object.to_path_buf(),
+                source,
+            });
+        }
     }
     make_read_only(object)
 }
@@ -1219,6 +1345,262 @@ mod tests {
         assert!(matches!(error, CacheError::InvalidMetadata { .. }));
         assert!(!reads.get());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_copy_checks_exact_boundary_and_stops_on_first_excess_byte() {
+        for (input, expected, result, written, reads) in [
+            (b"abc".as_slice(), Some(3), Ok(3), b"abc".as_slice(), 2),
+            (
+                b"abcd".as_slice(),
+                Some(3),
+                Err(CacheError::SizeMismatch {
+                    expected: 3,
+                    actual: 4,
+                }),
+                b"abcd".as_slice(),
+                2,
+            ),
+            (
+                b"ab".as_slice(),
+                Some(3),
+                Err(CacheError::SizeMismatch {
+                    expected: 3,
+                    actual: 2,
+                }),
+                b"ab".as_slice(),
+                2,
+            ),
+        ] {
+            let mut reader = CountingReader::new(input);
+            let mut output = Vec::new();
+            let mut sha256 = Sha256::new();
+            let mut md5 = Md5::new();
+            let actual = copy_compressed_input(
+                &mut reader,
+                &mut output,
+                expected,
+                3,
+                Path::new("test-partial"),
+                &mut sha256,
+                &mut md5,
+            );
+            match result {
+                Ok(size) => assert_eq!(actual.unwrap(), size),
+                Err(expected_error) => {
+                    assert_eq!(actual.unwrap_err().to_string(), expected_error.to_string())
+                }
+            }
+            assert_eq!(output, written);
+            assert_eq!(reader.reads.get(), reads);
+        }
+    }
+
+    #[test]
+    fn bounded_copy_reports_unbounded_limit_and_handles_u64_max_without_overflow() {
+        let mut reader = CountingReader::new(b"abcd");
+        let mut output = Vec::new();
+        let mut sha256 = Sha256::new();
+        let mut md5 = Md5::new();
+        let error = copy_compressed_input(
+            &mut reader,
+            &mut output,
+            None,
+            3,
+            Path::new("test-partial"),
+            &mut sha256,
+            &mut md5,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::InputTooLarge { limit: 3 }));
+        assert_eq!(output, b"abcd");
+        assert_eq!(reader.reads.get(), 2);
+
+        let mut reader = CountingReader::new(b"");
+        let mut output = Vec::new();
+        let mut sha256 = Sha256::new();
+        let mut md5 = Md5::new();
+        let error = copy_compressed_input(
+            &mut reader,
+            &mut output,
+            Some(u64::MAX),
+            3,
+            Path::new("test-partial"),
+            &mut sha256,
+            &mut md5,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CacheError::SizeMismatch {
+                expected: u64::MAX,
+                actual: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_expected_input_does_not_commit_or_read_past_first_excess_byte() {
+        let root = temporary_root("bounded-input");
+        let bytes = archive_bytes();
+        let descriptor = artifact(vec![], Some(bytes.len() as u64));
+        let mut input = bytes.clone();
+        input.extend_from_slice(b"excess");
+        let mut reader = CountingReader::new(&input);
+        let error = commit_artifact(ArtifactCommitRequest {
+            cache_root: &root,
+            artifact: &descriptor,
+            reader: &mut reader,
+        })
+        .unwrap_err();
+        assert!(matches!(error, CacheError::SizeMismatch { .. }));
+        assert_eq!(reader.reads.get(), 2);
+        assert!(!contains_file_named(&root.join("artifacts"), ".json"));
+        assert!(!contains_file_prefix(
+            &root.join("objects/sources/sha256"),
+            PARTIAL_PREFIX
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_replacement_restores_corrupt_object_and_cleans_partial() {
+        let root = temporary_root("replacement-failure");
+        let bytes = archive_bytes();
+        let descriptor = artifact(vec![], Some(bytes.len() as u64));
+        let key = descriptor_key(
+            &descriptor,
+            &Checksums {
+                md5: None,
+                sha256: None,
+            },
+        );
+        let paths = CachePaths::new(&root, &key);
+        create_cache_directories(&paths).unwrap();
+        let digest = Sha256Digest::new(hex_lower(&Sha256::digest(&bytes))).unwrap();
+        let object = paths.object(&digest);
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        let old = b"old corrupt bytes";
+        fs::write(&object, old).unwrap();
+        let fs_ops = RenameFailureFs::new(2);
+        let error = commit_artifact_with_fs(
+            ArtifactCommitRequest {
+                cache_root: &root,
+                artifact: &descriptor,
+                reader: &mut Cursor::new(bytes),
+            },
+            &fs_ops,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::Io { .. }));
+        assert_eq!(fs::read(&object).unwrap(), old);
+        assert!(!contains_file_prefix(&root, ".corrupt."));
+        assert!(!contains_file_prefix(&root, PARTIAL_PREFIX));
+        assert!(!paths.metadata.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_replacement_restore_retains_quarantine_and_cleans_partial() {
+        let root = temporary_root("replacement-restore-failure");
+        let bytes = archive_bytes();
+        let descriptor = artifact(vec![], Some(bytes.len() as u64));
+        let key = descriptor_key(
+            &descriptor,
+            &Checksums {
+                md5: None,
+                sha256: None,
+            },
+        );
+        let paths = CachePaths::new(&root, &key);
+        create_cache_directories(&paths).unwrap();
+        let digest = Sha256Digest::new(hex_lower(&Sha256::digest(&bytes))).unwrap();
+        let object = paths.object(&digest);
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        let old = b"old corrupt bytes";
+        fs::write(&object, old).unwrap();
+        let fs_ops = RenameFailureFs::with_failures(2, 3);
+        let error = commit_artifact_with_fs(
+            ArtifactCommitRequest {
+                cache_root: &root,
+                artifact: &descriptor,
+                reader: &mut Cursor::new(bytes),
+            },
+            &fs_ops,
+        )
+        .unwrap_err();
+        let quarantine = match error {
+            CacheError::ReplacementRecovery { quarantine, .. } => quarantine,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(!object.exists());
+        assert_eq!(fs::read(&quarantine).unwrap(), old);
+        assert!(!contains_file_prefix(&root, PARTIAL_PREFIX));
+        assert!(!paths.metadata.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct CountingReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+        reads: Cell<usize>,
+    }
+
+    impl CountingReader<'_> {
+        fn new(bytes: &[u8]) -> CountingReader<'_> {
+            CountingReader {
+                bytes,
+                offset: 0,
+                reads: Cell::new(0),
+            }
+        }
+    }
+
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let available = self.bytes.len().saturating_sub(self.offset);
+            let count = available.min(buffer.len());
+            buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    struct RenameFailureFs {
+        fail_at: [usize; 2],
+        renames: Cell<usize>,
+    }
+
+    impl RenameFailureFs {
+        fn new(fail_at: usize) -> Self {
+            Self::with_failures(fail_at, usize::MAX)
+        }
+
+        fn with_failures(first: usize, second: usize) -> Self {
+            Self {
+                fail_at: [first, second],
+                renames: Cell::new(0),
+            }
+        }
+    }
+
+    impl PublishFs for RenameFailureFs {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let count = self.renames.get() + 1;
+            self.renames.set(count);
+            if self.fail_at.contains(&count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected rename failure",
+                ));
+            }
+            fs::rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            fs::remove_file(path)
+        }
     }
 
     struct TrackingReader<'a> {
