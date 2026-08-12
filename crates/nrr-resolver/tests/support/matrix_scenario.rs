@@ -327,6 +327,78 @@ pub mod regression_support {
         choice: Vec<PackageRelease>,
     }
 
+    pub struct StrongDependencyCatalog {
+        top: Vec<PackageRelease>,
+        dependency: PackageRelease,
+    }
+
+    impl StrongDependencyCatalog {
+        pub fn new() -> Self {
+            let dependency = registry_candidate("AssignedDep", "1.0.0", "cran", vec![]);
+            let strong = DependencyRequirement::new(
+                DependencyKind::Depends,
+                PackageName::new("AssignedDep").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(
+                    RelationOp::Ge,
+                    RPackageVersion::parse("2.0.0").unwrap(),
+                ),
+            );
+            let available = DependencyRequirement::new(
+                DependencyKind::Depends,
+                PackageName::new("AssignedDep").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            );
+            Self {
+                top: vec![
+                    registry_candidate("StrongTop", "1.0.0", "cran", vec![available]),
+                    registry_candidate("StrongTop", "2.0.0", "cran", vec![strong]),
+                ],
+                dependency,
+            }
+        }
+
+        pub fn resolver(&self) -> Resolver<'_> {
+            static PREFERENCE: DefaultCandidatePreference = DefaultCandidatePreference;
+            static LOCK_POLICY: PreferLocked = PreferLocked;
+            Resolver::new(self, &PREFERENCE, &LOCK_POLICY)
+        }
+
+        pub fn request(&self) -> ResolutionRequest {
+            ResolutionRequest::without_lock(
+                vec![DependencyRequirement::new(
+                    DependencyKind::Depends,
+                    PackageName::new("StrongTop").unwrap(),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                )],
+                ResolutionTarget::new(
+                    RPackageVersion::parse("4.4.0").unwrap(),
+                    Target::new("linux", "x86_64"),
+                ),
+                VersionConstraint::unconstrained(),
+            )
+        }
+    }
+
+    impl CandidateLoader for StrongDependencyCatalog {
+        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+            match package {
+                SolverKey::InstalledName(name) if name.as_str() == "StrongTop" => {
+                    Ok(self.top.clone())
+                }
+                SolverKey::InstalledName(name) if name.as_str() == "AssignedDep" => {
+                    Ok(vec![self.dependency.clone()])
+                }
+                _ => Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("strong dependency fixture has no candidates for {package:?}"),
+                )),
+            }
+        }
+    }
+
     impl GitDependencyCatalog {
         pub fn new() -> Self {
             let git_dependency = DependencyRequirement::new(

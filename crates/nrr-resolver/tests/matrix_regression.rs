@@ -3,8 +3,8 @@ mod matrix_scenario;
 
 use matrix_scenario::MatrixCatalog;
 use matrix_scenario::regression_support::{
-    AlternativeCatalog, GitDependencyCatalog, SameVersionCatalog, matrix_identity,
-    require_locked_matrix_resolver, with_locked_matrix,
+    AlternativeCatalog, GitDependencyCatalog, SameVersionCatalog, StrongDependencyCatalog,
+    matrix_identity, require_locked_matrix_resolver, with_locked_matrix,
 };
 use nrr_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl,
@@ -66,6 +66,75 @@ fn comparison_is_opt_in_and_does_not_change_the_matrix_resolution() {
             against: DecisionSubject::R,
             ..
         }
+    ));
+}
+
+#[test]
+fn comparison_marks_root_requirement_mismatch_before_lower_preference() {
+    let catalog = MatrixCatalog::new();
+    let request = catalog.constrained_request(
+        "4.4.0",
+        VersionConstraint::from_clause(RelationOp::Ge, RPackageVersion::parse("1.7-0").unwrap()),
+    );
+    let compared = catalog
+        .resolver()
+        .resolve_with_assignment_comparison(request)
+        .unwrap();
+    let assignment = compared
+        .comparison
+        .assignments
+        .iter()
+        .find(|assignment| {
+            assignment.subject
+                == DecisionSubject::InstalledName(PackageName::new("Matrix").unwrap())
+        })
+        .unwrap();
+    assert!(matches!(
+        assignment.alternatives.as_slice(),
+        [nrr_resolver::AlternativeComparison {
+            differs_by: AssignmentDifference::RootRequirementMismatch { requirement }
+                , ..
+        }] if requirement == &VersionConstraint::from_clause(
+            RelationOp::Ge,
+            RPackageVersion::parse("1.7-0").unwrap()
+        )
+    ));
+}
+
+#[test]
+fn comparison_marks_strong_dependency_violation_against_assigned_package() {
+    let catalog = StrongDependencyCatalog::new();
+    let compared = catalog
+        .resolver()
+        .resolve_with_assignment_comparison(catalog.request())
+        .unwrap();
+    let assigned_dependency = compared
+        .resolution
+        .selected(&PackageName::new("AssignedDep").unwrap())
+        .unwrap();
+    let assignment = compared
+        .comparison
+        .assignments
+        .iter()
+        .find(|assignment| {
+            assignment.subject
+                == DecisionSubject::InstalledName(PackageName::new("StrongTop").unwrap())
+        })
+        .unwrap();
+    let alternative = assignment.alternatives.first().unwrap();
+    assert!(matches!(
+        &alternative.differs_by,
+        AssignmentDifference::ConstraintViolatedByAssignment {
+            against: DecisionSubject::InstalledName(name),
+            requirement,
+            assigned: DecisionCandidate::Release { identity, version },
+        } if name == &PackageName::new("AssignedDep").unwrap()
+            && requirement == &VersionConstraint::from_clause(
+                RelationOp::Ge,
+                RPackageVersion::parse("2.0.0").unwrap()
+            )
+            && identity == assigned_dependency.identity()
+            && version == assigned_dependency.version()
     ));
 }
 

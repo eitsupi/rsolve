@@ -9,8 +9,8 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use nrr_core::{
-    CandidateLoader, DependencySourceConstraint, PackageName, PackageRelease, RPackageVersion,
-    ReleaseIdentity, Resolution, ResolutionRequest, SolverKey, VersionConstraint,
+    CandidateLoader, DependencyKind, DependencySourceConstraint, PackageName, PackageRelease,
+    RPackageVersion, ReleaseIdentity, Resolution, ResolutionRequest, SolverKey, VersionConstraint,
 };
 
 pub use adapter::{ResolutionDiagnostic, ResolutionFailure};
@@ -151,6 +151,9 @@ pub enum AssignmentBasis {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AssignmentDifference {
+    RootRequirementMismatch {
+        requirement: VersionConstraint,
+    },
     ConstraintViolatedByAssignment {
         against: DecisionSubject,
         requirement: VersionConstraint,
@@ -273,6 +276,15 @@ impl<'a> Resolver<'a> {
                 &resolution.target().r_version,
             );
             let assigned = candidate_for_subject(&subject, package.release());
+            let difference_context = DifferenceContext {
+                selected: package.release(),
+                r_version: resolution.target().r_version.clone(),
+                decision: &decision,
+                preference: &context,
+                subject: &subject,
+                selected_packages: &selected,
+                request,
+            };
             // The loader's iteration order must not reach the public
             // comparison, so each alternative carries the candidate's own
             // version and identity as its sort key.
@@ -280,16 +292,7 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .filter(|candidate| candidate.identity() != package.release().identity())
                 .filter_map(|candidate| {
-                    difference_for_candidate(
-                        candidate,
-                        package.release(),
-                        resolution.target().r_version.clone(),
-                        &decision,
-                        &context,
-                        &subject,
-                        &selected,
-                    )
-                    .map(|differs_by| {
+                    difference_for_candidate(candidate, &difference_context).map(|differs_by| {
                         (
                             (
                                 candidate.version().clone(),
@@ -406,29 +409,29 @@ fn assignment_basis(
     AssignmentBasis::HighestCompatible
 }
 
+struct DifferenceContext<'a> {
+    selected: &'a PackageRelease,
+    r_version: RPackageVersion,
+    decision: &'a LockDecision,
+    preference: &'a PreferenceContext<'a>,
+    subject: &'a SolverKey,
+    selected_packages: &'a [nrr_core::ResolvedPackage],
+    request: &'a ResolutionRequest,
+}
+
 fn difference_for_candidate(
     candidate: &PackageRelease,
-    selected: &PackageRelease,
-    r_version: RPackageVersion,
-    decision: &LockDecision,
-    context: &PreferenceContext<'_>,
-    subject: &SolverKey,
-    selected_packages: &[nrr_core::ResolvedPackage],
+    difference: &DifferenceContext<'_>,
 ) -> Option<AssignmentDifference> {
-    // TODO: This only checks a candidate's Depends: R constraint against the fixed R target. A
-    // candidate excluded by a root version requirement or by a dependency on another assigned
-    // package currently falls through to LowerPreference and is labelled with a false reason.
-    // Widening the statically checkable set, or adding a distinct not-explained difference, is
-    // deferred.
-    if let LockDecision::Require(required) = decision
+    if let LockDecision::Require(required) = difference.decision
         && candidate.identity() != required
     {
         return Some(AssignmentDifference::RequiredLockMismatch {
             required: required.clone(),
         });
     }
-    if let Some(other) = selected_packages.iter().find(|other| {
-        other.subject() != subject
+    if let Some(other) = difference.selected_packages.iter().find(|other| {
+        other.subject() != difference.subject
             && other.name() == candidate.identity().name()
             && other.release().identity() != candidate.identity()
     }) {
@@ -437,25 +440,69 @@ fn difference_for_candidate(
             assigned_to: other.release().identity().clone(),
         });
     }
+    if let Some(requirement) = difference.request.requirements.iter().find(|requirement| {
+        dependency_key(&requirement.name, &requirement.source)
+            .as_ref()
+            .is_some_and(|key| key == difference.subject)
+            && !requirement.constraint.satisfies(candidate.version())
+    }) {
+        return Some(AssignmentDifference::RootRequirementMismatch {
+            requirement: requirement.constraint.clone(),
+        });
+    }
     if let Some(dependency) = candidate.dependencies().iter().find(|dependency| {
-        dependency.name.as_str() == "R" && !dependency.constraint.satisfies(&r_version)
+        matches!(
+            dependency.kind,
+            DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
+        ) && dependency.name.as_str() == "R"
+            && !dependency.constraint.satisfies(&difference.r_version)
     }) {
         return Some(AssignmentDifference::ConstraintViolatedByAssignment {
             against: DecisionSubject::R,
             requirement: dependency.constraint.clone(),
-            assigned: DecisionCandidate::R(r_version),
+            assigned: DecisionCandidate::R(difference.r_version.clone()),
         });
     }
-    if context
+    if let Some((dependency, assigned)) = candidate
+        .dependencies()
+        .iter()
+        .filter(|dependency| {
+            matches!(
+                dependency.kind,
+                DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
+            ) && dependency.name.as_str() != "R"
+        })
+        .filter_map(|dependency| {
+            let key = dependency_key(&dependency.name, &dependency.source)?;
+            let assigned = difference
+                .selected_packages
+                .iter()
+                .find(|package| package.subject() == &key)?;
+            (!dependency
+                .constraint
+                .satisfies(assigned.release().version()))
+            .then_some((dependency, assigned))
+        })
+        .next()
+    {
+        return Some(AssignmentDifference::ConstraintViolatedByAssignment {
+            against: subject_to_decision_subject(assigned.subject()),
+            requirement: dependency.constraint.clone(),
+            assigned: release_candidate(assigned.release()),
+        });
+    }
+    if difference
+        .preference
         .locked
         .is_some_and(|locked| candidate.identity() != locked)
-        || context
+        || difference
+            .preference
             .repository_current
             .is_some_and(|current| candidate.identity() != current)
-        || candidate.version() < selected.version()
+        || candidate.version() < difference.selected.version()
     {
         return Some(AssignmentDifference::LowerPreference {
-            assigned: candidate_for_subject(subject, selected),
+            assigned: candidate_for_subject(difference.subject, difference.selected),
         });
     }
     None
