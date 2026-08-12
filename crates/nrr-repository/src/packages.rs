@@ -78,16 +78,17 @@ fn write_record(artifact: &MaterializationArtifact) -> Result<String, PackagesEr
     }
     let mut reserved: HashSet<String> = fields
         .iter()
-        .map(|(name, _)| name.to_ascii_lowercase())
+        .map(|(name, _)| canonical_field_name(name).to_ascii_lowercase())
         .collect();
     for (name, value) in artifact.metadata.fields() {
         validate_field_name(name)?;
-        if !reserved.insert(name.to_ascii_lowercase()) {
+        let canonical = canonical_field_name(name);
+        if !reserved.insert(canonical.to_ascii_lowercase()) {
             return Err(PackagesError::DuplicateField {
                 field: name.to_owned(),
             });
         }
-        fields.push((canonical_field_name(name), value.to_owned()));
+        fields.push((canonical, value.to_owned()));
     }
     fields.sort_by(|left, right| {
         field_rank(&left.0)
@@ -197,7 +198,7 @@ fn validate_field_name(name: &str) -> Result<(), PackagesError> {
     if name.is_empty()
         || !name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
         || !name.as_bytes()[0].is_ascii_alphabetic()
     {
         return Err(PackagesError::InvalidFieldName {

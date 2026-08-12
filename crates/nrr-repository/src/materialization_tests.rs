@@ -89,6 +89,82 @@ fn packages_are_deterministic_and_preserve_folded_metadata_and_dependencies() {
 }
 
 #[test]
+fn packages_accept_supported_slash_and_hyphen_metadata_names() {
+    let cache = CachedArtifact {
+        object_path: PathBuf::from("/tmp/object"),
+        metadata_path: PathBuf::from("/tmp/metadata"),
+        sha256: nrr_core::Sha256Digest::new("a".repeat(64)).unwrap(),
+        size: 1,
+        verification: VerificationStrength::None,
+    };
+    let selected = MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            PackageName::new("fixture").unwrap(),
+            Provenance::ImmutableSource {
+                scheme: nrr_core::SourceScheme::new("fixture").unwrap(),
+                digest: cache.sha256.clone(),
+            },
+        ),
+        RPackageVersion::parse("1.0.0").unwrap(),
+        cache,
+    )
+    .with_metadata(
+        ReleaseMetadata::from_pairs([
+            ("Config/Needs/website", "https://example.invalid"),
+            ("X-CRAN-Comment", "fixture metadata"),
+        ])
+        .unwrap(),
+        vec![],
+    );
+    let output = String::from_utf8(packages::write_packages(&[selected]).unwrap()).unwrap();
+    assert!(output.contains("Config/Needs/website: https://example.invalid\n"));
+    assert!(output.contains("X-CRAN-Comment: fixture metadata\n"));
+}
+
+#[test]
+fn packages_reject_invalid_field_names_and_canonical_duplicate_checksums() {
+    let cache = CachedArtifact {
+        object_path: PathBuf::from("/tmp/object"),
+        metadata_path: PathBuf::from("/tmp/metadata"),
+        sha256: nrr_core::Sha256Digest::new("a".repeat(64)).unwrap(),
+        size: 1,
+        verification: VerificationStrength::None,
+    };
+    let identity = ReleaseIdentity::new(
+        PackageName::new("fixture").unwrap(),
+        Provenance::ImmutableSource {
+            scheme: nrr_core::SourceScheme::new("fixture").unwrap(),
+            digest: cache.sha256.clone(),
+        },
+    );
+    for field in ["", "Bad:Name", " Bad", "Bad\nName", "_bad", "Bad?Name"] {
+        let selected = MaterializationArtifact::new(
+            identity.clone(),
+            RPackageVersion::parse("1.0.0").unwrap(),
+            cache.clone(),
+        )
+        .with_metadata(
+            ReleaseMetadata::from_pairs([(field, "value")]).unwrap(),
+            vec![],
+        );
+        assert!(matches!(
+            packages::write_packages(&[selected]),
+            Err(PackagesError::InvalidFieldName { .. })
+        ));
+    }
+    let duplicate =
+        MaterializationArtifact::new(identity, RPackageVersion::parse("1.0.0").unwrap(), cache)
+            .with_metadata(
+                ReleaseMetadata::from_pairs([("SHA256", "one"), ("SHA256SUM", "two")]).unwrap(),
+                vec![],
+            );
+    assert!(matches!(
+        packages::write_packages(&[duplicate]),
+        Err(PackagesError::DuplicateField { .. })
+    ));
+}
+
+#[test]
 fn rejects_legacy_materialization_schema() {
     let cache_root = temporary_root("materialize-schema-cache");
     let project_root = temporary_root("materialize-schema-project");
