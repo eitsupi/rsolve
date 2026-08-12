@@ -2,6 +2,7 @@
 name = "nrr-repository"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [lib]
@@ -9,3 +10,10 @@ path = "src/lib.rs"
 
 [dependencies]
 nrr-core = { path = "../nrr-core" }
+flate2 = { workspace = true }
+md-5 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
