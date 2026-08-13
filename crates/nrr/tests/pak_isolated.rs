@@ -14,20 +14,24 @@ const ISOLATION_MODE_ENV: &str = "NRR_PAK_ISOLATION_MODE";
 #[cfg(target_os = "linux")]
 const PARENT_NETNS_ENV: &str = "NRR_PAK_PARENT_NETNS";
 #[cfg(target_os = "linux")]
-const DECLARED_ISOLATION_MODE: &str = "linux-netns-v1";
+const PARENT_USERNS_ENV: &str = "NRR_PAK_PARENT_USERNS";
+#[cfg(target_os = "linux")]
+const PARENT_PIDNS_ENV: &str = "NRR_PAK_PARENT_PIDNS";
+#[cfg(target_os = "linux")]
+const DECLARED_ISOLATION_MODE: &str = "linux-user-pid-netns-v1";
 
 #[cfg(target_os = "linux")]
-fn namespace_identity(path: &Path) -> Result<String, String> {
+fn namespace_identity(path: &Path, kind: &str) -> Result<String, String> {
     let identity = fs::read_link(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?
         .to_string_lossy()
         .into_owned();
     let valid = identity
-        .strip_prefix("net:[")
+        .strip_prefix(&format!("{kind}:["))
         .and_then(|value| value.strip_suffix(']'))
         .is_some_and(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()));
     if !valid {
-        return Err(format!("invalid network namespace identity: {identity:?}"));
+        return Err(format!("invalid {kind} namespace identity: {identity:?}"));
     }
     Ok(identity)
 }
@@ -104,20 +108,21 @@ fn preflight() -> Result<(), String> {
             "{ISOLATION_MODE_ENV} must be {DECLARED_ISOLATION_MODE}"
         ));
     }
-    let parent = env::var(PARENT_NETNS_ENV)
-        .map_err(|_| format!("{PARENT_NETNS_ENV} must be supplied by the isolation wrapper"))?;
-    let parent_valid = parent
-        .strip_prefix("net:[")
-        .and_then(|value| value.strip_suffix(']'))
-        .is_some_and(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()));
-    if !parent_valid {
-        return Err(format!(
-            "{PARENT_NETNS_ENV} is not a valid net namespace identity"
-        ));
-    }
-    let current = namespace_identity(Path::new("/proc/self/ns/net"))?;
-    if parent == current {
-        return Err("isolated test is running in the wrapper parent network namespace".into());
+    for (env_name, kind, proc_path) in [
+        (PARENT_USERNS_ENV, "user", "/proc/self/ns/user"),
+        (PARENT_PIDNS_ENV, "pid", "/proc/self/ns/pid"),
+        (PARENT_NETNS_ENV, "net", "/proc/self/ns/net"),
+    ] {
+        let parent = env::var(env_name)
+            .map_err(|_| format!("{env_name} must be supplied by the isolation wrapper"))?;
+        let parent = parse_namespace_identity(&parent, kind)
+            .map_err(|error| format!("{env_name}: {error}"))?;
+        let current = namespace_identity(Path::new(proc_path), kind)?;
+        if parent == current {
+            return Err(format!(
+                "isolated test is running in the wrapper parent {kind} namespace"
+            ));
+        }
     }
     if has_ipv4_default_route(
         &fs::read_to_string("/proc/net/route").map_err(|error| error.to_string())?,
@@ -141,11 +146,25 @@ fn preflight() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn parse_namespace_identity(identity: &str, kind: &str) -> Result<String, String> {
+    let prefix = format!("{kind}:[");
+    if identity
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        Ok(identity.to_owned())
+    } else {
+        Err(format!("expected {kind}:[digits], got {identity:?}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn isolated_pak_contract_requires_wrapper_preflight_and_runs_shared_contract() {
     if let Err(error) = preflight() {
         panic!(
-            "pak_isolated requires wrapper-provided {ISOLATION_MODE_ENV}={DECLARED_ISOLATION_MODE}, distinct {PARENT_NETNS_ENV}, no default route, and only lo: {error}"
+            "pak_isolated requires wrapper-provided {ISOLATION_MODE_ENV}={DECLARED_ISOLATION_MODE}, distinct user/pid/net parent identities, no default route, and only lo: {error}"
         );
     }
     pak_harness::run_contract("pak-isolated");
@@ -160,7 +179,10 @@ fn isolated_pak_contract_requires_linux() {
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
-    use super::{has_ipv4_default_route, has_ipv6_default_route, namespace_identity};
+    use super::{
+        has_ipv4_default_route, has_ipv6_default_route, namespace_identity,
+        parse_namespace_identity,
+    };
     use std::fs;
 
     #[test]
@@ -204,8 +226,19 @@ mod tests {
         let _ = fs::remove_file(&path);
         #[cfg(unix)]
         std::os::unix::fs::symlink("not-a-netns", &path).expect("create test link");
-        assert!(namespace_identity(&path).is_err());
+        assert!(namespace_identity(&path, "net").is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn namespace_identity_accepts_only_the_requested_kind() {
+        assert_eq!(
+            parse_namespace_identity("user:[123]", "user").unwrap(),
+            "user:[123]"
+        );
+        assert!(parse_namespace_identity("net:[123]", "user").is_err());
+        assert!(parse_namespace_identity("pid:[x]", "pid").is_err());
+        assert!(parse_namespace_identity("pid:[123]", "net").is_err());
     }
 
     #[test]
