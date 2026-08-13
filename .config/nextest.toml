@@ -2,7 +2,7 @@
 # binaries are excluded from the default profile and selected only by their
 # dedicated profiles.
 [profile.default]
-default-filter = "not binary(r_interop) & not binary(repository_r_interop) & not binary(pak_portable)"
+default-filter = "not binary(r_interop) & not binary(repository_r_interop) & not binary(pak_portable) & not binary(pak_isolated)"
 slow-timeout = { period = "10s", terminate-after = 12 }
 fail-fast = false
 
@@ -25,7 +25,7 @@ default-filter = "binary(pak_portable)"
 
 [profile.pak-isolated]
 inherits = "ci"
-default-filter = "not all()"
+default-filter = "binary(pak_isolated)"
 
 [profile.live-network]
 inherits = "ci"
@@ -43,7 +43,7 @@ test-group = "r-process"
 slow-timeout = { period = "30s", terminate-after = 10 }
 
 [[profile.pak-isolated.overrides]]
-filter = "not all()"
+filter = "binary(pak_isolated)"
 test-group = "pak-isolated"
 slow-timeout = { period = "60s", terminate-after = 15 }
 

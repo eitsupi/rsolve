@@ -11,7 +11,11 @@ path = "src/main.rs"
 
 [[test]]
 name = "pak_portable"
-path = "tests/pak_portable.rs"
+path = "tests/pak_portable_entry.rs"
+
+[[test]]
+name = "pak_isolated"
+path = "tests/pak_isolated.rs"
 
 [dependencies]
 nrr-core = { path = "../nrr-core" }

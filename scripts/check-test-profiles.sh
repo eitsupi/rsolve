@@ -16,7 +16,7 @@ profile_list=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-opt-in.XXXXXX")
 trap 'rm -f "$metadata" "$default_list" "$profile_list"' EXIT
 
 # package name, target name, and the profile that must select the target.
-opt_in_targets='nrr-provider:r_interop:r-interop nrr-repository:repository_r_interop:r-interop nrr:pak_portable:pak-portable'
+opt_in_targets='nrr-provider:r_interop:r-interop nrr-repository:repository_r_interop:r-interop nrr:pak_portable:pak-portable nrr:pak_isolated:pak-isolated'
 
 cargo metadata --format-version 1 --all-features --no-deps --locked --offline \
     --manifest-path "$root/Cargo.toml" >"$metadata"

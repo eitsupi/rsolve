@@ -1,3 +1,6 @@
+//! Shared test-only pak contract harness. Thin target entrypoints invoke
+//! `run_contract` for portable and wrapper-isolated execution modes.
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -221,9 +224,8 @@ fn assert_installed(result: &nrr::PakInstallResult, project: &Path, expected: &[
     }
 }
 
-#[test]
-fn portable_pak_contract_uses_single_call_and_dependency_aware_success() {
-    assert_eq!(env::var("NRR_TEST_MODE").as_deref(), Ok("pak-portable"));
+pub fn run_contract(expected_mode: &str) {
+    assert_eq!(env::var("NRR_TEST_MODE").as_deref(), Ok(expected_mode));
     let root = fresh_root("contract");
     let repository = fixture_repository(&root);
     let artifact_list = artifacts(&root);
