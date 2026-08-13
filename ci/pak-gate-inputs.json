@@ -1,0 +1,450 @@
+{
+  "schema_version": 1,
+  "image": "ghcr.io/r-hub/containers/ubuntu-release@sha256:f61007cfe7f54e24c60150572357c01c70da79cfdeb85fd224c5416604afef7b",
+  "r": {
+    "version_string": "R version 4.6.1 (2026-06-24) -- \"Happy Hop\"",
+    "platform": "x86_64-pc-linux-gnu",
+    "architecture": "x86_64",
+    "r_home": "/opt/R/4.6.1/lib/R",
+    "executable": "/opt/R/4.6.1/bin/R",
+    "executable_sha256": "193fd61a2bf28989d64bcfb4be715173e5a5ac77220432b4f6ede313b8421713"
+  },
+  "digest_policy": {
+    "tree_manifest": "SHA-256 of sorted UTF-8 canonical JSON entries containing relative path, entry type, mode, file SHA-256 or symlink target; timestamps and ownership are excluded",
+    "closure_manifest": "SHA-256 of compact UTF-8 JSON for the sorted tool_library_closure array, with sorted keys and no trailing newline; the hash does not contain itself",
+    "installed_build_identity": "The installed tree digest identifies the measured package build; pak source archive bytes were unavailable in the extracted image"
+  },
+  "pak": {
+    "name": "pak",
+    "version": "0.11.1",
+    "package_path": "/opt/R/4.6.1/lib/R/library/pak",
+    "library_root": "/opt/R/4.6.1/lib/R/library",
+    "installed_tree_sha256": "d67b2c710ee75c7c19a6b5b63f13d7c7adddcbb2328e646f93c027af0456679a",
+    "containing_oci_layer_digest": "sha256:238c02bbfaef310934ec8f9f6269a58a0cedbb98f0b34b126c3c6357bac15a22",
+    "source_archive_sha256": null,
+    "source_archive_status": "unavailable_in_extracted_rootfs"
+  },
+  "tool_library_closure": [
+    {
+      "name": "R6",
+      "version": "2.5.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/R6",
+      "installed_tree_sha256": "e5c334fa44f6f34872ec2f2fac81e36472bbc4e9ef529f8f1751600ad09c6fe3"
+    },
+    {
+      "name": "callr",
+      "version": "3.7.6",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/callr",
+      "installed_tree_sha256": "4a1f62f0de00211cb914671e679d5061b6f90eee7f9c3bf384188db6fbd972a7"
+    },
+    {
+      "name": "cli",
+      "version": "3.6.6",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/cli",
+      "installed_tree_sha256": "fb0d01f259a0146c095d472fd5fe4a210fbebf6d7bee0f971d604f5a1971b45c"
+    },
+    {
+      "name": "curl",
+      "version": "7.1.0",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/curl",
+      "installed_tree_sha256": "db5f1c7c8ac6e42e96d43a07888ba6de1ce76418f7be001de419e1c0e0c9fa70"
+    },
+    {
+      "name": "desc",
+      "version": "1.4.3",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/desc",
+      "installed_tree_sha256": "b4dbf0401d873829e316a1f6750ea311ac0e92bac811053a870a96bc4536d4dc"
+    },
+    {
+      "name": "filelock",
+      "version": "1.0.3",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/filelock",
+      "installed_tree_sha256": "70dd55df48be7f4be06c5ec589c3168c649f8cb72d32155b1d286893b0743040"
+    },
+    {
+      "name": "jsonlite",
+      "version": "2.0.0",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/jsonlite",
+      "installed_tree_sha256": "dba62a5bb1514daecbb419cb8e672a2a43872d2040edbb1e2e97779fb04f4c35"
+    },
+    {
+      "name": "keyring",
+      "version": "1.4.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/keyring",
+      "installed_tree_sha256": "100ed6d74a1ae37b289890d83501474f18bdff1d33f40b1a4be4a0d59488ebac"
+    },
+    {
+      "name": "lpSolve",
+      "version": "5.6.23",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/lpSolve",
+      "installed_tree_sha256": "bae2452773647668a8cd999c51319ca246dcef2c292b93a0ce8275e14088b769"
+    },
+    {
+      "name": "pak",
+      "version": "0.11.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak",
+      "installed_tree_sha256": "d67b2c710ee75c7c19a6b5b63f13d7c7adddcbb2328e646f93c027af0456679a"
+    },
+    {
+      "name": "pkgbuild",
+      "version": "1.4.8",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/pkgbuild",
+      "installed_tree_sha256": "d1402c3266f547d3be8a4f43c7a44d77cf58b52d5bde40715fc477f80cb9b6e7"
+    },
+    {
+      "name": "pkgcache",
+      "version": "2.2.5.9000",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/pkgcache",
+      "installed_tree_sha256": "5b94720ede3205bb2227117a35fec5e467b491e744a04560246080a864f187d1"
+    },
+    {
+      "name": "pkgdepends",
+      "version": "0.9.1.9000",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/pkgdepends",
+      "installed_tree_sha256": "033c3604da72cf06d24c2f686a30eedc70e5ccaba821302cd5d63fa70cf5b380"
+    },
+    {
+      "name": "pkgsearch",
+      "version": "3.1.5",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/pkgsearch",
+      "installed_tree_sha256": "3d1c19bc34ece5b15ba1af29a44ca818a40ff51edd35a819c3bc4d0e66e1320a"
+    },
+    {
+      "name": "processx",
+      "version": "3.8.7",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/processx",
+      "installed_tree_sha256": "b79acf3b4a550d535c82b70c18228f0092b6b2ad9e5ad286280eb8152e9f21cb"
+    },
+    {
+      "name": "ps",
+      "version": "1.9.2",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/ps",
+      "installed_tree_sha256": "6006b98e889561b664f0044370a7176ee342e7025e8341609b47c90a1c1a7543"
+    },
+    {
+      "name": "tools",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/tools",
+      "installed_tree_sha256": "3ee794eda4ad75287890f6772f60385d3df0740aabd5f16c871e96768d59fb83"
+    },
+    {
+      "name": "tsitter",
+      "version": "0.0.0.9000",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/tsitter",
+      "installed_tree_sha256": "dc3836c7eff6cfe61919bc9aff376a0e69f80c64eeb0593e0047b7e104cd5b86"
+    },
+    {
+      "name": "tstoml",
+      "version": "0.0.0.9000",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/tstoml",
+      "installed_tree_sha256": "3adaa0784e4f27164622755fae53a873daad7397b0dc02072409479cc35989c9"
+    },
+    {
+      "name": "utils",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/utils",
+      "installed_tree_sha256": "c4c99163f76f50527d4fd56aa9db319d8a4e04db096ad9cde71a39d6dc2f3b67"
+    },
+    {
+      "name": "yaml",
+      "version": "2.3.12",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/yaml",
+      "installed_tree_sha256": "901b1924e813e722cd3be369dda5546c7f5ce5a60c19bd6d7fbc5688ec615ca7"
+    },
+    {
+      "name": "zip",
+      "version": "3.0.1.9000",
+      "package_path": "/opt/R/4.6.1/lib/R/library/pak/library/zip",
+      "installed_tree_sha256": "196739e1cd1f22da99bb4f3df2fe75c2047ff4ddceeaee25aaf03a2b2df43da9"
+    }
+  ],
+  "closure_manifest_sha256": "d744a126b103e1f1b8e69b8eeffcdc275e73c360841de4ba7999af20193ec9ce",
+  "r_home_library_allowlist": [
+    {
+      "name": "KernSmooth",
+      "version": "2.23-26",
+      "package_path": "/opt/R/4.6.1/lib/R/library/KernSmooth",
+      "installed_tree_sha256": "b46a97a84bd9d7969d2fc5e3023c892e5ba0ddec3bf5be4d681123c509f70489"
+    },
+    {
+      "name": "MASS",
+      "version": "7.3-65",
+      "package_path": "/opt/R/4.6.1/lib/R/library/MASS",
+      "installed_tree_sha256": "ddc9d39b39921bbaef4889aad9d542cbf8fb13beea1a18d0d7210b73d11b89bc"
+    },
+    {
+      "name": "Matrix",
+      "version": "1.7-5",
+      "package_path": "/opt/R/4.6.1/lib/R/library/Matrix",
+      "installed_tree_sha256": "e4eb1ac59bdee7979d39364ec71e3b351d4d31fd2fc2fecc4a7391ff0ed28ec5"
+    },
+    {
+      "name": "base",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/base",
+      "installed_tree_sha256": "722e51028cf57efd4c25834df7426a86eacd6286aef3e600c4bc8eb45b7fa30a"
+    },
+    {
+      "name": "boot",
+      "version": "1.3-32",
+      "package_path": "/opt/R/4.6.1/lib/R/library/boot",
+      "installed_tree_sha256": "6bfa62951953108995bbdcee2b104854b0c078abed172a1c1a50c072c0276528"
+    },
+    {
+      "name": "class",
+      "version": "7.3-23",
+      "package_path": "/opt/R/4.6.1/lib/R/library/class",
+      "installed_tree_sha256": "296b0ce40a737ff3f3eede301477c1ad8317569cf65d8994a8de9401c4ce8e65"
+    },
+    {
+      "name": "cluster",
+      "version": "2.1.8.2",
+      "package_path": "/opt/R/4.6.1/lib/R/library/cluster",
+      "installed_tree_sha256": "8fefb42d2103546247c5f2c2e420cfb2eb85f410a4cea3f022f1d3d3a91e0004"
+    },
+    {
+      "name": "codetools",
+      "version": "0.2-20",
+      "package_path": "/opt/R/4.6.1/lib/R/library/codetools",
+      "installed_tree_sha256": "ff157e81b005bd2bf0504d7100ac5c0faf7911fcbd49ec1085403b4f1efb1670"
+    },
+    {
+      "name": "compiler",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/compiler",
+      "installed_tree_sha256": "7b5b5ce264de103efcfd5df6686831635aafb0fbfe9d4d58b26da7839d711d70"
+    },
+    {
+      "name": "datasets",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/datasets",
+      "installed_tree_sha256": "5edf6442291ccb243199f13cf64597e3bd7e48fd9307b0c7844da982e670b27f"
+    },
+    {
+      "name": "foreign",
+      "version": "0.8-91",
+      "package_path": "/opt/R/4.6.1/lib/R/library/foreign",
+      "installed_tree_sha256": "03f1b2a90ebcef71026b2659857a27632a03dbfd6b13f7f3a7b4e923f0180a6d"
+    },
+    {
+      "name": "grDevices",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/grDevices",
+      "installed_tree_sha256": "f9c1781bed3680672f7b2574891163ce5cd21daf5287b005f2dca5f432c0e411"
+    },
+    {
+      "name": "graphics",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/graphics",
+      "installed_tree_sha256": "7f766e0add971c4f8b4c542cd62a62bfa1291e26d0007fea441403b30ed38f86"
+    },
+    {
+      "name": "grid",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/grid",
+      "installed_tree_sha256": "3e94de5aad99ac38829eabde90760a369e7f94eec03d41e8806eff514dcd296b"
+    },
+    {
+      "name": "lattice",
+      "version": "0.22-9",
+      "package_path": "/opt/R/4.6.1/lib/R/library/lattice",
+      "installed_tree_sha256": "900a054d73d1f9df448982d23de68683c747808bfad702270501446d3c183335"
+    },
+    {
+      "name": "methods",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/methods",
+      "installed_tree_sha256": "3c8dfd2cc7b13e5937dbb3e2e626ece48b192b034eea380f74f124d3ba08a4f2"
+    },
+    {
+      "name": "mgcv",
+      "version": "1.9-4",
+      "package_path": "/opt/R/4.6.1/lib/R/library/mgcv",
+      "installed_tree_sha256": "6c52380f7748c6a3bfdd54cacaef5ec1a7237e8e6c262d5da101206d29a7012a"
+    },
+    {
+      "name": "nlme",
+      "version": "3.1-169",
+      "package_path": "/opt/R/4.6.1/lib/R/library/nlme",
+      "installed_tree_sha256": "6f7b48ccd98e352edb49dcd55b1bde8018b2a1390adfa22139c09971ddb81401"
+    },
+    {
+      "name": "nnet",
+      "version": "7.3-20",
+      "package_path": "/opt/R/4.6.1/lib/R/library/nnet",
+      "installed_tree_sha256": "536d37e0ed2ef5cc00b5090f3a175a23e4125fd8848f54e60edd6a100c4946b4"
+    },
+    {
+      "name": "parallel",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/parallel",
+      "installed_tree_sha256": "90cf2212371cc6ccc4d754eff4b17b6584586f33b5f02b268657c86f0203baff"
+    },
+    {
+      "name": "rpart",
+      "version": "4.1.27",
+      "package_path": "/opt/R/4.6.1/lib/R/library/rpart",
+      "installed_tree_sha256": "949fd549d9cf9a7d1c2e303402271c9991ecac9c2fde0944368298bf4d7d725d"
+    },
+    {
+      "name": "spatial",
+      "version": "7.3-18",
+      "package_path": "/opt/R/4.6.1/lib/R/library/spatial",
+      "installed_tree_sha256": "467da65e79027db8a341821f7a276a1965e87cfa1bf0dede7f48b2f5cf259141"
+    },
+    {
+      "name": "splines",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/splines",
+      "installed_tree_sha256": "066cc1aaf4da2b24aa6a4b5e2cd0491ffcd62ba266de0ea5b959925017464f22"
+    },
+    {
+      "name": "stats",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/stats",
+      "installed_tree_sha256": "786a7e0c634b00786dbb2d48b9c3b424f18a505235e99ab5d9b9a705c839ca33"
+    },
+    {
+      "name": "stats4",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/stats4",
+      "installed_tree_sha256": "53b80f3f23d8de0dcdbbde9549a1f68d438aae5c8a6eeda08ef11afb2598598e"
+    },
+    {
+      "name": "survival",
+      "version": "3.8-6",
+      "package_path": "/opt/R/4.6.1/lib/R/library/survival",
+      "installed_tree_sha256": "55e868ebd46e6709dc61f5077250bd58c339b98c6bd1d74e26dc6c2071f509d0"
+    },
+    {
+      "name": "tcltk",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/tcltk",
+      "installed_tree_sha256": "230ecf5ce181e05822413f292ef83ff9df17ecce1b30fce0fed187b5720864b9"
+    },
+    {
+      "name": "translations",
+      "version": "4.6.1",
+      "package_path": "/opt/R/4.6.1/lib/R/library/translations",
+      "installed_tree_sha256": "92ed22c9037fede91b7f32cc4a0e266407f50b9c4cee5c82d632d5f81629f402"
+    }
+  ],
+  "native_toolchain": {
+    "executables": [
+      {
+        "path": "/usr/bin/ar",
+        "resolved_path": "/usr/bin/x86_64-linux-gnu-ar",
+        "symlink_target": "x86_64-linux-gnu-ar",
+        "version": "GNU ar (GNU Binutils for Ubuntu) 2.42",
+        "sha256": "6452af2eea333b8c65e1adb92964fc8f97863ab003fa13f9d12bff5345cd7dbe",
+        "os_package": "binutils-x86-64-linux-gnu"
+      },
+      {
+        "path": "/usr/bin/g++",
+        "resolved_path": "/usr/bin/g++-13",
+        "symlink_target": "g++-13",
+        "version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+        "sha256": "1353e9bdd29a7295c7226bf6c63abccce056d8cac31f112e5cdbecc3f28c2769",
+        "os_package": "g++-13"
+      },
+      {
+        "path": "/usr/bin/gcc",
+        "resolved_path": "/usr/bin/gcc-13",
+        "symlink_target": "gcc-13",
+        "version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+        "sha256": "1b99826121ae6682a634e5efe09bd3e3df58ce58e0b28f849114ab5b89139c26",
+        "os_package": "gcc-13"
+      },
+      {
+        "path": "/usr/bin/gfortran",
+        "resolved_path": "/usr/bin/gfortran-13",
+        "symlink_target": "gfortran-13",
+        "version": "GNU Fortran (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+        "sha256": "142861efc95f49e33705852027dae8c2e5382fd1155fcec6116ef973f25d8f84",
+        "os_package": "gfortran-13"
+      },
+      {
+        "path": "/usr/bin/ld",
+        "resolved_path": "/usr/bin/x86_64-linux-gnu-ld",
+        "symlink_target": "x86_64-linux-gnu-ld",
+        "version": "GNU ld (GNU Binutils for Ubuntu) 2.42",
+        "sha256": "e9ceb054c12207970f2726dfc07e9a66b411602748628baf27399f02a9bbb31b",
+        "os_package": "binutils-x86-64-linux-gnu"
+      },
+      {
+        "path": "/usr/bin/make",
+        "resolved_path": "/usr/bin/make",
+        "symlink_target": "",
+        "version": "GNU Make 4.3",
+        "sha256": "d78b8f1d099fbcfb6f2f49ab87223b9b68fb3956642f92d6ec6de812e8afa965",
+        "os_package": "make"
+      }
+    ],
+    "headers": [
+      {
+        "path": "/opt/R/4.6.1/lib/R/include",
+        "scope": "R headers required by source builds",
+        "tree_sha256": "e7c99f4546aae61b6a3ae1fec286fef30a9ecde1ba4129fdf5aa9ab1b02d1659",
+        "os_package": "r-4.6.1"
+      },
+      {
+        "path": "/usr/include",
+        "scope": "system headers required by source builds",
+        "tree_sha256": "6c3768da16621358af70de96e44402d2822ac33b5f44d002fee03dd50cc8e785",
+        "os_package": "libc6-dev"
+      }
+    ],
+    "os_packages": [
+      {
+        "name": "binutils-x86-64-linux-gnu",
+        "version": "2.42-4ubuntu2.10"
+      },
+      {
+        "name": "g++-13",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      {
+        "name": "gcc-13",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      {
+        "name": "gfortran-13",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      {
+        "name": "libc6-dev",
+        "version": "2.39-0ubuntu8.8"
+      },
+      {
+        "name": "make",
+        "version": "4.3-4.1build2"
+      },
+      {
+        "name": "r-4.6.1",
+        "version": "1"
+      }
+    ]
+  },
+  "fixture_manifest": [
+    {
+      "path": "crates/nrr-repository/tests/fixtures/closure/PACKAGES",
+      "sha256": "39523bc9b4135d065c39411d726699927ad391cb45c6864faa5091267c7b48e3",
+      "kind": "packages"
+    },
+    {
+      "path": "crates/nrr-repository/tests/fixtures/closure/artifacts/leaf_0.1.0.tar.gz",
+      "sha256": "ae6ada2ee46ed01edf049b97b4025bebf46936c615be5748c4c000e36a15fb0c",
+      "kind": "tarball"
+    },
+    {
+      "path": "crates/nrr-repository/tests/fixtures/closure/artifacts/middle_0.1.0.tar.gz",
+      "sha256": "fab5ca0fc982a0c42de7fa3abdb8139f6fef84be3e7e87d0ea73ad6c9f6d83c9",
+      "kind": "tarball"
+    },
+    {
+      "path": "crates/nrr-repository/tests/fixtures/closure/artifacts/root_0.1.0.tar.gz",
+      "sha256": "c4c0e11116c8b6fca6c4d6d84f31d2145c7e7189e52d3bcf9fa6e703e0ab53bf",
+      "kind": "tarball"
+    }
+  ]
+}

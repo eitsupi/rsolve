@@ -172,6 +172,10 @@ fn repository_round_trips_through_real_r() {
     assert_eq!(state.schema_version, 2);
     let contrib = root.join(".nrr/repository/src/contrib");
     assert!(contrib.join("PACKAGES").is_file());
+    assert_eq!(
+        fs::read(contrib.join("PACKAGES")).expect("read generated PACKAGES"),
+        fs::read(fixture.join("PACKAGES")).expect("read checked PACKAGES fixture")
+    );
     assert!(!contrib.join("PACKAGES.rds").exists());
     assert!(!contrib.join("PACKAGES.gz").exists());
     let r_script = r#"
