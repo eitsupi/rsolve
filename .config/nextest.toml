@@ -2,7 +2,7 @@
 # binaries are excluded from the default profile and selected only by their
 # dedicated profiles.
 [profile.default]
-default-filter = "not binary(r_interop) & not binary(repository_r_interop)"
+default-filter = "not binary(r_interop) & not binary(repository_r_interop) & not binary(pak_portable)"
 slow-timeout = { period = "10s", terminate-after = 12 }
 fail-fast = false
 
@@ -19,6 +19,10 @@ path = "junit.xml"
 inherits = "ci"
 default-filter = "binary(r_interop) | binary(repository_r_interop)"
 
+[profile.pak-portable]
+inherits = "ci"
+default-filter = "binary(pak_portable)"
+
 [profile.pak-isolated]
 inherits = "ci"
 default-filter = "not all()"
@@ -30,6 +34,7 @@ default-filter = "not all()"
 [test-groups]
 r-process = { max-threads = 1 }
 pak-isolated = { max-threads = 1 }
+pak-portable = { max-threads = 1 }
 live-network = { max-threads = 1 }
 
 [[profile.r-interop.overrides]]
@@ -41,6 +46,11 @@ slow-timeout = { period = "30s", terminate-after = 10 }
 filter = "not all()"
 test-group = "pak-isolated"
 slow-timeout = { period = "60s", terminate-after = 15 }
+
+[[profile.pak-portable.overrides]]
+filter = "binary(pak_portable)"
+test-group = "pak-portable"
+slow-timeout = { period = "120s", terminate-after = 15 }
 
 [[profile.live-network.overrides]]
 filter = "not all()"

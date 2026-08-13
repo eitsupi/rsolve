@@ -9,6 +9,10 @@ publish.workspace = true
 name = "nrr"
 path = "src/main.rs"
 
+[[test]]
+name = "pak_portable"
+path = "tests/pak_portable.rs"
+
 [dependencies]
 nrr-core = { path = "../nrr-core" }
 nrr-provider = { path = "../nrr-provider" }
@@ -16,4 +20,6 @@ nrr-resolver = { path = "../nrr-resolver" }
 nrr-repository = { path = "../nrr-repository" }
 percent-encoding.workspace = true
 serde.workspace = true
+sha2.workspace = true
 toml.workspace = true
+url.workspace = true

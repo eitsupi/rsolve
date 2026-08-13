@@ -15,6 +15,14 @@
       "package-id": "path+file:///workspace/crates/nrr-repository#0.1.0",
       "kind": "test",
       "status": "listed"
+    },
+    "nrr::pak_portable": {
+      "package-name": "nrr",
+      "binary-id": "nrr::pak_portable",
+      "binary-name": "pak_portable",
+      "package-id": "path+file:///workspace/crates/nrr#0.1.0",
+      "kind": "test",
+      "status": "listed"
     }
   }
 }

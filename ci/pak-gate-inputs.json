@@ -428,7 +428,7 @@
   "fixture_manifest": [
     {
       "path": "crates/nrr-repository/tests/fixtures/closure/PACKAGES",
-      "sha256": "39523bc9b4135d065c39411d726699927ad391cb45c6864faa5091267c7b48e3",
+      "sha256": "06d5d89730d43dc4ef5cc12c2da95dfd411bd21f546381cfe8acbbb5fb842805",
       "kind": "packages"
     },
     {

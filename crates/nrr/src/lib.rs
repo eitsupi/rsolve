@@ -6,6 +6,7 @@
 pub mod lock;
 pub mod manifest;
 pub mod orchestration;
+pub mod pak;
 pub mod wire;
 
 pub use lock::{
@@ -19,5 +20,9 @@ pub use manifest::{
 pub use orchestration::{
     CranResolutionError, CranResolutionOutcome, ResolutionMode, resolve_from_cran,
     resolve_with_loader, resolve_with_lock,
+};
+pub use pak::{
+    PakArtifact, PakInstallRequest, PakInstallResult, PakInstalledPackage, PakProcessConfig,
+    PakProcessError, run_pak,
 };
 pub use wire::{LockWireError, from_toml, to_toml};

@@ -16,7 +16,7 @@ profile_list=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-opt-in.XXXXXX")
 trap 'rm -f "$metadata" "$default_list" "$profile_list"' EXIT
 
 # package name, target name, and the profile that must select the target.
-opt_in_targets='nrr-provider:r_interop:r-interop nrr-repository:repository_r_interop:r-interop'
+opt_in_targets='nrr-provider:r_interop:r-interop nrr-repository:repository_r_interop:r-interop nrr:pak_portable:pak-portable'
 
 cargo metadata --format-version 1 --all-features --no-deps --locked --offline \
     --manifest-path "$root/Cargo.toml" >"$metadata"
@@ -59,7 +59,7 @@ for spec in $opt_in_targets; do
 
     cargo nextest list --workspace --all-targets --profile "$profile" --locked --offline \
         --message-format json >"$profile_list"
-    expected_count=$(printf '%s\n' "$opt_in_targets" | wc -w | tr -d ' ')
+    expected_count=$(printf '%s\n' "$opt_in_targets" | tr ' ' '\n' | awk -F: -v profile="$profile" '$3 == profile { count++ } END { print count + 0 }')
     selected_count=$(jq '[."rust-suites"[]? | select(.status == "listed")] | length' "$profile_list")
     if [ "$selected_count" -ne "$expected_count" ]; then
         echo "nextest profiles: $profile selected $selected_count suites, expected exactly $expected_count opt-in suites" >&2

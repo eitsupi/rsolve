@@ -118,6 +118,17 @@ fn render_dependency(
             field: field.to_owned(),
         });
     }
+    if dependency.constraint.clauses.len() > 1
+        || dependency
+            .constraint
+            .clauses
+            .iter()
+            .any(|clause| clause.op == RelationOp::Ne)
+    {
+        return Err(PackagesError::UnsupportedConstraint {
+            field: field.to_owned(),
+        });
+    }
     let mut rendered = dependency.name.to_string();
     if !dependency.constraint.clauses.is_empty() {
         rendered.push_str(" (");

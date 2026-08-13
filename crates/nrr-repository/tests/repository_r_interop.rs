@@ -12,7 +12,7 @@ use std::process::Command;
 use nrr_core::{
     ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
     PackageName, Provenance, RPackageVersion, RelationOp, ReleaseIdentity, ReleaseMetadata,
-    SourceArtifact, SourceScheme, VersionClause, VersionConstraint,
+    SourceArtifact, SourceScheme, VersionConstraint,
 };
 use nrr_repository::{
     MaterializationArtifact, MaterializationRequest, commit_source_artifact, materialize,
@@ -153,10 +153,10 @@ fn repository_round_trips_through_real_r() {
             vec![dependency_with_constraint(
                 DependencyKind::Imports,
                 "leaf",
-                VersionConstraint::new(vec![
-                    VersionClause::new(RelationOp::Ge, RPackageVersion::parse("0.1.0").unwrap()),
-                    VersionClause::new(RelationOp::Lt, RPackageVersion::parse("0.2.0").unwrap()),
-                ]),
+                VersionConstraint::from_clause(
+                    RelationOp::Ge,
+                    RPackageVersion::parse("0.1.0").unwrap(),
+                ),
             )],
         ),
         artifact(
@@ -186,7 +186,7 @@ dir.create(lib, recursive=TRUE, showWarnings=FALSE)
 ap <- available.packages(repos=repo, type="source", fields=c("Depends", "Imports", "LinkingTo", "Description"))
 stopifnot(all(c("leaf", "middle", "root") %in% rownames(ap)))
 stopifnot(all(ap[c("leaf", "middle", "root"), "Version"] == "0.1.0"))
-stopifnot(grepl("leaf (>= 0.1.0, < 0.2.0)", ap["middle", "Imports"], fixed=TRUE))
+stopifnot(grepl("leaf (>= 0.1.0)", ap["middle", "Imports"], fixed=TRUE))
 stopifnot(grepl("middle", ap["root", "LinkingTo"], fixed=TRUE))
 stopifnot(grepl("café", ap["middle", "Description"], fixed=TRUE))
 stopifnot(grepl("folded metadata line", ap["middle", "Description"], fixed=TRUE))

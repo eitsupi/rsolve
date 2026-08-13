@@ -89,6 +89,75 @@ fn packages_are_deterministic_and_preserve_folded_metadata_and_dependencies() {
 }
 
 #[test]
+fn packages_reject_multiple_version_clauses_for_one_dependency() {
+    let cache = CachedArtifact {
+        object_path: PathBuf::from("/tmp/object"),
+        metadata_path: PathBuf::from("/tmp/metadata"),
+        sha256: nrr_core::Sha256Digest::new("a".repeat(64)).unwrap(),
+        size: 1,
+        verification: VerificationStrength::None,
+    };
+    let identity = ReleaseIdentity::new(
+        PackageName::new("middle").unwrap(),
+        Provenance::ImmutableSource {
+            scheme: nrr_core::SourceScheme::new("fixture").unwrap(),
+            digest: cache.sha256.clone(),
+        },
+    );
+    let dependency = DependencyRequirement::new(
+        DependencyKind::Imports,
+        PackageName::new("leaf").unwrap(),
+        DependencySourceConstraint::Any,
+        VersionConstraint::new(vec![
+            nrr_core::VersionClause::new(RelationOp::Ge, RPackageVersion::parse("0.1.0").unwrap()),
+            nrr_core::VersionClause::new(RelationOp::Lt, RPackageVersion::parse("0.2.0").unwrap()),
+        ]),
+    );
+    let middle =
+        MaterializationArtifact::new(identity, RPackageVersion::parse("0.1.0").unwrap(), cache)
+            .with_metadata(
+                ReleaseMetadata::from_pairs([("License", "MIT")]).unwrap(),
+                vec![dependency],
+            );
+    assert!(matches!(
+        packages::write_packages(&[middle]),
+        Err(PackagesError::UnsupportedConstraint { .. })
+    ));
+
+    let not_equal = DependencyRequirement::new(
+        DependencyKind::Imports,
+        PackageName::new("leaf").unwrap(),
+        DependencySourceConstraint::Any,
+        VersionConstraint::from_clause(RelationOp::Ne, RPackageVersion::parse("0.1.0").unwrap()),
+    );
+    let middle = MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            PackageName::new("middle").unwrap(),
+            Provenance::ImmutableSource {
+                scheme: nrr_core::SourceScheme::new("fixture").unwrap(),
+                digest: nrr_core::Sha256Digest::new("b".repeat(64)).unwrap(),
+            },
+        ),
+        RPackageVersion::parse("0.1.0").unwrap(),
+        CachedArtifact {
+            object_path: PathBuf::from("/tmp/object-2"),
+            metadata_path: PathBuf::from("/tmp/metadata-2"),
+            sha256: nrr_core::Sha256Digest::new("b".repeat(64)).unwrap(),
+            size: 1,
+            verification: VerificationStrength::None,
+        },
+    )
+    .with_metadata(
+        ReleaseMetadata::from_pairs([("License", "MIT")]).unwrap(),
+        vec![not_equal],
+    );
+    assert!(matches!(
+        packages::write_packages(&[middle]),
+        Err(PackagesError::UnsupportedConstraint { .. })
+    ));
+}
+
+#[test]
 fn packages_accept_supported_slash_and_hyphen_metadata_names() {
     let cache = CachedArtifact {
         object_path: PathBuf::from("/tmp/object"),

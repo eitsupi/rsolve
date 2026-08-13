@@ -4,7 +4,7 @@ License: MIT
 
 Package: middle
 Version: 0.1.0
-Imports: leaf (>= 0.1.0, < 0.2.0)
+Imports: leaf (>= 0.1.0)
 License: MIT
 Description: UTF-8 middle package – café.
   folded metadata line.
