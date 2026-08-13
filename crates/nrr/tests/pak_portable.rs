@@ -32,9 +32,7 @@ fn fresh_root(label: &str) -> PathBuf {
     root
 }
 
-fn fixture_repository(root: &Path) -> PathBuf {
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../nrr-repository/tests/fixtures/closure");
+fn fixture_repository(root: &Path, source: &Path) -> PathBuf {
     let repository = root.join("repository");
     let contrib = repository.join("src/contrib");
     fs::create_dir_all(&contrib).expect("create fixture repository");
@@ -52,10 +50,8 @@ fn fixture_repository(root: &Path) -> PathBuf {
     repository
 }
 
-fn artifacts(root: &Path) -> Vec<PakArtifact> {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../nrr-repository/tests/fixtures/closure/SHA256SUMS");
-    let fixture = source.parent().expect("fixture directory");
+fn artifacts(root: &Path, fixture: &Path) -> Vec<PakArtifact> {
+    let source = fixture.join("SHA256SUMS");
     let cache = root.join("artifact-cache");
     fs::create_dir_all(&cache).expect("create artifact cache");
     let manifest: BTreeMap<_, _> = fs::read_to_string(&source)
@@ -224,11 +220,11 @@ fn assert_installed(result: &nrr::PakInstallResult, project: &Path, expected: &[
     }
 }
 
-pub fn run_contract(expected_mode: &str) {
+pub fn run_contract(expected_mode: &str, fixture: &Path) {
     assert_eq!(env::var("NRR_TEST_MODE").as_deref(), Ok(expected_mode));
     let root = fresh_root("contract");
-    let repository = fixture_repository(&root);
-    let artifact_list = artifacts(&root);
+    let repository = fixture_repository(&root, fixture);
+    let artifact_list = artifacts(&root, fixture);
     fs::write(
         repository.join("src/contrib/root_0.1.0.tar.gz"),
         b"repository archive replaced after artifact selection",

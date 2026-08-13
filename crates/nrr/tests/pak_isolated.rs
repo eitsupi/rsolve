@@ -38,6 +38,9 @@ fn namespace_identity(path: &Path, kind: &str) -> Result<String, String> {
 
 #[cfg(target_os = "linux")]
 fn has_ipv4_default_route(contents: &str) -> Result<bool, String> {
+    if contents.trim().is_empty() {
+        return Ok(false);
+    }
     let mut lines = contents.lines();
     let header: Vec<_> = lines
         .next()
@@ -72,7 +75,7 @@ fn has_ipv4_default_route(contents: &str) -> Result<bool, String> {
         {
             return Err("malformed IPv4 route record".into());
         }
-        Ok(found || (fields[1] == "00000000" && fields[7] == "00000000"))
+        Ok(found || (fields[0] != "lo" && fields[1] == "00000000" && fields[7] == "00000000"))
     })
 }
 
@@ -94,8 +97,72 @@ fn has_ipv6_default_route(contents: &str) -> Result<bool, String> {
                 return Err("malformed IPv6 route record".into());
             }
         }
-        Ok(found || (fields[0] == "00000000000000000000000000000000" && fields[1] == "00"))
+        Ok(found
+            || (fields[9] != "lo"
+                && fields[0] == "00000000000000000000000000000000"
+                && fields[1] == "00"))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_interfaces(contents: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut lines = contents.lines();
+    let first: Vec<_> = lines
+        .next()
+        .ok_or_else(|| "missing /proc/net/dev header".to_owned())?
+        .split_whitespace()
+        .collect();
+    let second: Vec<_> = lines
+        .next()
+        .ok_or_else(|| "missing /proc/net/dev header".to_owned())?
+        .split_whitespace()
+        .collect();
+    if first != ["Inter-|", "Receive", "|", "Transmit"]
+        || second
+            != [
+                "face",
+                "|bytes",
+                "packets",
+                "errs",
+                "drop",
+                "fifo",
+                "frame",
+                "compressed",
+                "multicast|bytes",
+                "packets",
+                "errs",
+                "drop",
+                "fifo",
+                "colls",
+                "carrier",
+                "compressed",
+            ]
+    {
+        return Err("malformed /proc/net/dev header".into());
+    }
+    let mut interfaces = std::collections::BTreeSet::new();
+    for line in lines {
+        let (name, counters) = line
+            .split_once(':')
+            .ok_or_else(|| "malformed /proc/net/dev interface record".to_owned())?;
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            || !interfaces.insert(name.to_owned())
+        {
+            return Err("malformed or duplicate /proc/net/dev interface".into());
+        }
+        let counters: Vec<_> = counters.split_whitespace().collect();
+        if counters.len() != 16 || counters.iter().any(|value| value.parse::<u64>().is_err()) {
+            return Err("malformed /proc/net/dev counters".into());
+        }
+    }
+    if interfaces.is_empty() {
+        return Err("/proc/net/dev has no interfaces".into());
+    }
+    Ok(interfaces)
 }
 
 #[cfg(target_os = "linux")]
@@ -131,15 +198,11 @@ fn preflight() -> Result<(), String> {
     )? {
         return Err("isolated network namespace has a default route".into());
     }
-    let interfaces = fs::read_dir("/sys/class/net")
-        .map_err(|error| error.to_string())?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name())
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if interfaces.iter().any(|name| name != "lo") || interfaces.is_empty() {
+    let interfaces = parse_interfaces(
+        &fs::read_to_string("/proc/net/dev")
+            .map_err(|error| format!("cannot read /proc/net/dev: {error}"))?,
+    )?;
+    if interfaces != std::iter::once("lo".to_owned()).collect() {
         return Err("isolated network namespace interfaces must contain only lo".into());
     }
     Ok(())
@@ -167,7 +230,10 @@ fn isolated_pak_contract_requires_wrapper_preflight_and_runs_shared_contract() {
             "pak_isolated requires wrapper-provided {ISOLATION_MODE_ENV}={DECLARED_ISOLATION_MODE}, distinct user/pid/net parent identities, no default route, and only lo: {error}"
         );
     }
-    pak_harness::run_contract("pak-isolated");
+    let fixture = std::env::var_os("NRR_PAK_FIXTURE_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("NRR_PAK_FIXTURE_ROOT must be supplied by the isolation wrapper");
+    pak_harness::run_contract("pak-isolated", &fixture);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -180,13 +246,17 @@ fn isolated_pak_contract_requires_linux() {
 #[cfg(target_os = "linux")]
 mod tests {
     use super::{
-        has_ipv4_default_route, has_ipv6_default_route, namespace_identity,
+        has_ipv4_default_route, has_ipv6_default_route, namespace_identity, parse_interfaces,
         parse_namespace_identity,
     };
     use std::fs;
 
     #[test]
     fn route_parsers_only_match_default_routes() {
+        assert!(!has_ipv4_default_route("").unwrap());
+        assert!(!has_ipv4_default_route(" \n\t").unwrap());
+        assert!(!has_ipv6_default_route("").unwrap());
+        assert!(has_ipv4_default_route("not a route header").is_err());
         let header =
             "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT  ";
         assert!(
@@ -207,8 +277,15 @@ mod tests {
             ))
             .unwrap()
         );
+        assert!(
+            !has_ipv4_default_route(&format!(
+                "{header}\nlo 00000000 00000000 0003 0 0 0 00000000 0 0 0"
+            ))
+            .unwrap()
+        );
         let ipv6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo";
-        assert!(has_ipv6_default_route(ipv6).unwrap());
+        assert!(!has_ipv6_default_route(ipv6).unwrap());
+        assert!(has_ipv6_default_route(&ipv6.replacen(" lo", " eth0", 1)).unwrap());
         assert!(!has_ipv6_default_route(&ipv6.replacen(" 00 ", " 80 ", 1)).unwrap());
         assert!(
             !has_ipv6_default_route(&ipv6.replacen(
@@ -218,6 +295,31 @@ mod tests {
             ))
             .unwrap()
         );
+    }
+
+    #[test]
+    fn proc_net_dev_parser_requires_only_lo_and_strict_records() {
+        let header = "Inter-|  Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed";
+        let counters = "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        let only_lo = format!("{header}\nlo: {counters}");
+        assert_eq!(
+            parse_interfaces(&only_lo)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["lo"]
+        );
+        let with_eth0 = format!("{only_lo}\neth0: {counters}");
+        assert!(parse_interfaces(&with_eth0).unwrap().contains("eth0"));
+        assert!(parse_interfaces(&format!("{header}\nlo: {counters}\nlo: {counters}")).is_err());
+        assert!(parse_interfaces("malformed").is_err());
+        assert!(parse_interfaces(&format!("{header}\nlo: 1 2")).is_err());
+    }
+
+    #[test]
+    fn current_proc_net_dev_is_parseable() {
+        let contents = fs::read_to_string("/proc/net/dev").expect("read /proc/net/dev");
+        assert!(!super::parse_interfaces(&contents).unwrap().is_empty());
     }
 
     #[test]

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "image": "ghcr.io/r-hub/containers/ubuntu-release@sha256:f61007cfe7f54e24c60150572357c01c70da79cfdeb85fd224c5416604afef7b",
   "r": {
-    "version_string": "R version 4.6.1 (2026-06-24) -- \"Happy Hop\"",
+    "version_string": "R version 4.6.1 (2026-06-24)",
     "platform": "x86_64-pc-linux-gnu",
     "architecture": "x86_64",
     "r_home": "/opt/R/4.6.1/lib/R",
@@ -341,31 +341,31 @@
       },
       {
         "path": "/usr/bin/g++",
-        "resolved_path": "/usr/bin/g++-13",
+        "resolved_path": "/usr/bin/x86_64-linux-gnu-g++-13",
         "symlink_target": "g++-13",
         "version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
         "sha256": "1353e9bdd29a7295c7226bf6c63abccce056d8cac31f112e5cdbecc3f28c2769",
-        "os_package": "g++-13"
+        "os_package": "g++-13-x86-64-linux-gnu"
       },
       {
         "path": "/usr/bin/gcc",
-        "resolved_path": "/usr/bin/gcc-13",
+        "resolved_path": "/usr/bin/x86_64-linux-gnu-gcc-13",
         "symlink_target": "gcc-13",
         "version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
         "sha256": "1b99826121ae6682a634e5efe09bd3e3df58ce58e0b28f849114ab5b89139c26",
-        "os_package": "gcc-13"
+        "os_package": "gcc-13-x86-64-linux-gnu"
       },
       {
         "path": "/usr/bin/gfortran",
-        "resolved_path": "/usr/bin/gfortran-13",
+        "resolved_path": "/usr/bin/x86_64-linux-gnu-gfortran-13",
         "symlink_target": "gfortran-13",
         "version": "GNU Fortran (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
         "sha256": "142861efc95f49e33705852027dae8c2e5382fd1155fcec6116ef973f25d8f84",
-        "os_package": "gfortran-13"
+        "os_package": "gfortran-13-x86-64-linux-gnu"
       },
       {
         "path": "/usr/bin/ld",
-        "resolved_path": "/usr/bin/x86_64-linux-gnu-ld",
+        "resolved_path": "/usr/bin/x86_64-linux-gnu-ld.bfd",
         "symlink_target": "x86_64-linux-gnu-ld",
         "version": "GNU ld (GNU Binutils for Ubuntu) 2.42",
         "sha256": "e9ceb054c12207970f2726dfc07e9a66b411602748628baf27399f02a9bbb31b",
@@ -404,11 +404,23 @@
         "version": "13.3.0-6ubuntu2~24.04.1"
       },
       {
+        "name": "g++-13-x86-64-linux-gnu",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      {
         "name": "gcc-13",
         "version": "13.3.0-6ubuntu2~24.04.1"
       },
       {
+        "name": "gcc-13-x86-64-linux-gnu",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      {
         "name": "gfortran-13",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      {
+        "name": "gfortran-13-x86-64-linux-gnu",
         "version": "13.3.0-6ubuntu2~24.04.1"
       },
       {

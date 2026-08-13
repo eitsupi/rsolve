@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import subprocess
 import sys
@@ -215,9 +216,66 @@ def internal_path(rootfs: Path, path: Path) -> str:
     return "/" + path.resolve().relative_to(rootfs.resolve()).as_posix().lstrip("/")
 
 
-def tree_digest(root: Path) -> str:
+def _resolve_symlink(rootfs: Path, link: Path, measured_root: Path) -> Path:
+    try:
+        link_relative = tuple(link.relative_to(rootfs).parts)
+        measured_relative = tuple(measured_root.relative_to(rootfs).parts)
+    except ValueError:
+        fail(f"tree {link}: path is outside rootfs")
+    resolved: list[str] = []
+    pending = list(link_relative)
+    seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    for _ in range(256):
+        if not pending:
+            current = tuple(resolved)
+            if current[: len(measured_relative)] != measured_relative:
+                fail(f"tree {link}: final symlink target escapes measured tree")
+            return rootfs.joinpath(*current)
+        state = (tuple(resolved), tuple(pending))
+        if state in seen:
+            fail(f"tree {link}: symlink chain loops")
+        seen.add(state)
+        component = pending.pop(0)
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if not resolved:
+                fail(f"tree {link}: symlink target escapes rootfs")
+            resolved.pop()
+            continue
+        candidate = rootfs.joinpath(*resolved, component)
+        try:
+            info = candidate.lstat()
+        except OSError as error:
+            fail(f"tree {link}: symlink target is dangling: {error}")
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                target = os.readlink(candidate)
+                target.encode("utf-8")
+            except (OSError, UnicodeError) as error:
+                fail(f"tree {link}: invalid symlink target: {error}")
+            target_parts = target.split("/")
+            if target.startswith("/"):
+                resolved.clear()
+                pending = target_parts[1:] + pending
+            else:
+                pending = target_parts + pending
+            continue
+        if pending and not stat.S_ISDIR(info.st_mode):
+            fail(f"tree {link}: symlink target has a non-directory ancestor")
+        resolved.append(component)
+    fail(f"tree {link}: symlink chain is too deep")
+
+
+def tree_digest(root: Path, rootfs: Path) -> str:
     if not root.is_dir() or root.is_symlink():
         fail(f"tree {root}: expected physical directory")
+    if not rootfs.is_dir() or rootfs.is_symlink():
+        fail(f"rootfs {rootfs}: expected physical directory")
+    try:
+        root.relative_to(rootfs)
+    except ValueError:
+        fail(f"tree {root}: outside rootfs")
     entries: list[dict[str, Any]] = []
     for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
@@ -254,13 +312,7 @@ def tree_digest(root: Path) -> str:
                     target.encode("utf-8")
                 except UnicodeEncodeError:
                     fail(f"tree {path}: symlink target is not UTF-8")
-                if os.path.isabs(target):
-                    fail(f"tree {path}: absolute symlink target is not allowed")
-                try:
-                    resolved = path.resolve(strict=True)
-                    resolved.relative_to(root.resolve())
-                except (OSError, RuntimeError, ValueError):
-                    fail(f"tree {path}: symlink target is dangling, looping, or escapes tree")
+                _resolve_symlink(rootfs, path, root)
                 entry["target"] = target
                 entry["type"] = "symlink"
             else:
@@ -283,6 +335,25 @@ def file_sha256(path: Path, label: str) -> str:
     except OSError as error:
         fail(f"{label}: cannot read: {error}")
     return digest.hexdigest()
+
+
+def parse_dpkg_owners(output: str) -> set[str]:
+    owners: set[str] = set()
+    for line in output.splitlines():
+        if not line or ": /" not in line:
+            fail("dpkg-query -S: malformed owner line")
+        owner_text, path = line.rsplit(": /", 1)
+        if not owner_text or not path:
+            fail("dpkg-query -S: malformed owner line")
+        for owner in owner_text.split(","):
+            owner = owner.strip()
+            match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9+.-]*)(?::([A-Za-z0-9][A-Za-z0-9+.-]*))?", owner)
+            if match is None:
+                fail("dpkg-query -S: malformed package owner")
+            owners.add(match.group(1))
+    if not owners:
+        fail("dpkg-query -S: no package owners")
+    return owners
 
 
 def parse_description(path: Path) -> dict[str, str]:
@@ -323,7 +394,7 @@ def verify_package_inventory(rootfs: Path, record: dict[str, Any]) -> None:
         fields = parse_description(description)
         if fields.get("Package") != item["name"] or fields.get("Version") != item["version"]:
             fail(f"package {item['name']}: DESCRIPTION identity mismatch")
-        actual = tree_digest(package_path)
+        actual = tree_digest(package_path, rootfs)
         if actual != item["installed_tree_sha256"]:
             fail(f"package {item['name']}: tree digest mismatch")
         by_library.setdefault(package_path.parent, set()).add(package_path.name)
@@ -410,7 +481,6 @@ def verify_r(rootfs: Path, record: dict[str, Any]) -> None:
         'cat(paste0("NRR_R_VERSION_STRING=", R.version.string, "\\n"));'
         'cat(paste0("NRR_R_PLATFORM=", R.version$platform, "\\n"));'
         'cat(paste0("NRR_R_HOME=", R.home(), "\\n"));'
-        'cat(paste0("NRR_R_EXECUTABLE=", normalizePath(file.path(R.home("bin"), "R"), mustWork=TRUE), "\\n"));'
         "library(pak, lib.loc=dirname(pak_path));"
         'cat(paste0("NRR_PAK_VERSION=", as.character(packageVersion("pak")), "\\n"));'
         'cat(paste0("NRR_PAK_PATH=", normalizePath(find.package("pak", lib.loc=dirname(pak_path)), mustWork=TRUE), "\\n"));'
@@ -425,7 +495,6 @@ def verify_r(rootfs: Path, record: dict[str, Any]) -> None:
         "NRR_R_VERSION_STRING": r["version_string"],
         "NRR_R_PLATFORM": r["platform"],
         "NRR_R_HOME": r["r_home"],
-        "NRR_R_EXECUTABLE": r["executable"],
         "NRR_PAK_VERSION": record["pak"]["version"],
         "NRR_PAK_PATH": record["pak"]["package_path"],
     }
@@ -454,7 +523,7 @@ def verify_native(rootfs: Path, record: dict[str, Any]) -> None:
         if item["os_package"] not in os_packages:
             fail(f"native executable {item['path']}: owner package is not declared")
         owner = run_isolated(rootfs, ["/usr/bin/dpkg-query", "-S", item["resolved_path"]])
-        owners = {line.split(":", 1)[0] for line in owner.splitlines() if ":" in line}
+        owners = parse_dpkg_owners(owner)
         if item["os_package"] not in owners:
             fail(f"native executable {item['path']}: dpkg owner mismatch")
         output = run_isolated(rootfs, [item["path"], "--version"])
@@ -484,12 +553,12 @@ def verify_native(rootfs: Path, record: dict[str, Any]) -> None:
         path = rootfs_path(rootfs, item["path"], f"header {item['path']}")
         if not path.is_dir() or path.is_symlink():
             fail(f"header {item['path']}: expected physical directory")
-        if tree_digest(path) != item["tree_sha256"]:
+        if tree_digest(path, rootfs) != item["tree_sha256"]:
             fail(f"header {item['path']}: tree digest mismatch")
         if item["os_package"] not in os_packages:
             fail(f"header {item['path']}: owner package is not declared")
         owner = run_isolated(rootfs, ["/usr/bin/dpkg-query", "-S", item["path"]])
-        owners = {line.split(":", 1)[0] for line in owner.splitlines() if ":" in line}
+        owners = parse_dpkg_owners(owner)
         if item["os_package"] not in owners:
             fail(f"header {item['path']}: dpkg owner mismatch")
 
