@@ -49,10 +49,13 @@ fn fixture_repository(root: &Path) -> PathBuf {
     repository
 }
 
-fn artifacts(repository: &Path) -> Vec<PakArtifact> {
+fn artifacts(root: &Path) -> Vec<PakArtifact> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../nrr-repository/tests/fixtures/closure/SHA256SUMS");
-    let manifest: BTreeMap<_, _> = fs::read_to_string(source)
+    let fixture = source.parent().expect("fixture directory");
+    let cache = root.join("artifact-cache");
+    fs::create_dir_all(&cache).expect("create artifact cache");
+    let manifest: BTreeMap<_, _> = fs::read_to_string(&source)
         .expect("read fixture manifest")
         .lines()
         .map(|line| {
@@ -68,12 +71,14 @@ fn artifacts(repository: &Path) -> Vec<PakArtifact> {
         .into_iter()
         .map(|package| {
             let name = format!("{package}_0.1.0.tar.gz");
+            let path = cache.join(&name);
+            fs::copy(fixture.join("artifacts").join(&name), &path)
+                .expect("copy artifact into cache");
             PakArtifact {
                 package: package.to_owned(),
-                path: repository.join("src/contrib").join(&name),
+                path: path.clone(),
                 sha256: {
-                    let bytes = fs::read(repository.join("src/contrib").join(&name))
-                        .expect("read fixture archive");
+                    let bytes = fs::read(&path).expect("read fixture archive");
                     let digest = format!("{:x}", Sha256::digest(bytes));
                     assert_eq!(digest, manifest[&name]);
                     digest
@@ -220,7 +225,12 @@ fn portable_pak_contract_uses_single_call_and_dependency_aware_success() {
     assert_eq!(env::var("NRR_TEST_MODE").as_deref(), Ok("pak-portable"));
     let root = fresh_root("contract");
     let repository = fixture_repository(&root);
-    let artifact_list = artifacts(&repository);
+    let artifact_list = artifacts(&root);
+    fs::write(
+        repository.join("src/contrib/root_0.1.0.tar.gz"),
+        b"repository archive replaced after artifact selection",
+    )
+    .expect("replace repository archive");
 
     let wrong_root = root.join("wrong");
     prepare_root(&wrong_root);
@@ -269,6 +279,16 @@ fn portable_pak_contract_uses_single_call_and_dependency_aware_success() {
             .unwrap_or("")
             .contains("middle")
     );
+    let leaked_staging = fs::read_dir(correct_root.join("tmp"))
+        .expect("read temporary directory")
+        .any(|entry| {
+            entry
+                .expect("read temporary directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".nrr-pak-staging-")
+        });
+    assert!(!leaked_staging, "staging directory should be cleaned up");
     assert!(
         installed["middle"]
             .description

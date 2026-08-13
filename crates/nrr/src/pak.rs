@@ -13,10 +13,13 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use nrr_core::PackageName;
+use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use sha2::{Digest, Sha256};
 
 /// Paths and environment required by one isolated child R process.
@@ -131,24 +134,25 @@ fn validate_request(request: &PakInstallRequest) -> Result<(), PakProcessError> 
     }
     let mut packages = BTreeMap::new();
     for package in &request.packages {
-        if package.is_empty() || package.contains('\n') || package.contains('\r') {
-            return Err(PakProcessError::InvalidPackageName(package.clone()));
-        }
-        if packages.insert(package, ()).is_some() {
+        let canonical = PackageName::new(package)
+            .map_err(|_| PakProcessError::InvalidPackageName(package.clone()))?;
+        if packages.insert(canonical, ()).is_some() {
             return Err(PakProcessError::DuplicatePackageName(package.clone()));
         }
     }
     let mut artifacts = BTreeMap::new();
     for artifact in &request.artifacts {
+        let canonical = PackageName::new(&artifact.package)
+            .map_err(|_| PakProcessError::InvalidPackageName(artifact.package.clone()))?;
         if !valid_sha256(&artifact.sha256) {
             return Err(PakProcessError::InvalidArtifactDigest(
                 artifact.package.clone(),
             ));
         }
-        if artifacts.insert(&artifact.package, ()).is_some() {
+        if artifacts.insert(canonical.clone(), ()).is_some() {
             return Err(PakProcessError::DuplicateArtifact(artifact.package.clone()));
         }
-        if !packages.contains_key(&artifact.package) {
+        if !packages.contains_key(&canonical) {
             return Err(PakProcessError::UnexpectedArtifact(
                 artifact.package.clone(),
             ));
@@ -156,28 +160,97 @@ fn validate_request(request: &PakInstallRequest) -> Result<(), PakProcessError> 
     }
     for package in packages.keys() {
         if !artifacts.contains_key(package) {
-            return Err(PakProcessError::MissingArtifact((*package).clone()));
+            return Err(PakProcessError::MissingArtifact(package.to_string()));
         }
     }
+    Ok(())
+}
+
+struct ArtifactStaging {
+    directory: PathBuf,
+    archive_file: PathBuf,
+}
+
+impl Drop for ArtifactStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Copy each artifact into an nrr-owned directory while hashing the bytes that
+/// will subsequently be handed to pak. The staging directory is deliberately
+/// created without replacement so a stale or concurrent directory cannot be
+/// reused accidentally.
+fn stage_artifacts(
+    config: &PakProcessConfig,
+    request: &PakInstallRequest,
+) -> Result<ArtifactStaging, PakProcessError> {
+    fs::create_dir_all(&config.tmp).map_err(PakProcessError::Io)?;
+    static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+    let directory = loop {
+        let id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = config
+            .tmp
+            .join(format!(".nrr-pak-staging-{}-{id}", std::process::id()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(PakProcessError::Io(error)),
+        }
+    };
+    let archive_file = directory.join("archive-paths");
+    let staging = ArtifactStaging {
+        directory,
+        archive_file,
+    };
+    let mut archive_paths = Vec::with_capacity(request.artifacts.len());
+
     for artifact in &request.artifacts {
-        let mut file = fs::File::open(&artifact.path).map_err(PakProcessError::Io)?;
+        let filename = artifact.path.file_name().ok_or_else(|| {
+            PakProcessError::Io(std::io::Error::other("artifact path has no file name"))
+        })?;
+        let package_directory = staging.directory.join(&artifact.package);
+        fs::create_dir(&package_directory).map_err(PakProcessError::Io)?;
+        let archive = package_directory.join(filename);
+        let mut source = fs::File::open(&artifact.path).map_err(PakProcessError::Io)?;
+        let mut target = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&archive)
+            .map_err(PakProcessError::Io)?;
         let mut digest = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let count = file.read(&mut buffer).map_err(PakProcessError::Io)?;
+            let count = source.read(&mut buffer).map_err(PakProcessError::Io)?;
             if count == 0 {
                 break;
             }
+            target
+                .write_all(&buffer[..count])
+                .map_err(PakProcessError::Io)?;
             digest.update(&buffer[..count]);
         }
+        target.flush().map_err(PakProcessError::Io)?;
         let actual = format!("{:x}", digest.finalize());
         if actual != artifact.sha256.to_ascii_lowercase() {
             return Err(PakProcessError::InvalidArtifactDigest(
                 artifact.package.clone(),
             ));
         }
+        let archive_path = archive
+            .to_str()
+            .ok_or_else(|| PakProcessError::Protocol("staged archive path is not UTF-8".into()))?;
+        archive_paths.push(percent_encode(archive_path.as_bytes(), NON_ALPHANUMERIC).to_string());
     }
-    Ok(())
+    let mut archive_manifest = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging.archive_file)
+        .map_err(PakProcessError::Io)?;
+    archive_manifest
+        .write_all((archive_paths.join("\n") + "\n").as_bytes())
+        .map_err(PakProcessError::Io)?;
+    Ok(staging)
 }
 
 const PAK_PROGRAM: &str = r#"
@@ -186,14 +259,16 @@ pak_library <- normalizePath(Sys.getenv("NRR_PAK_LIBRARY"), mustWork = FALSE)
 private_library <- normalizePath(Sys.getenv("NRR_PAK_PRIVATE_LIBRARY"), mustWork = FALSE)
 repository_url <- Sys.getenv("NRR_PAK_REPOSITORY_URL")
 package_file <- Sys.getenv("NRR_PAK_PACKAGE_FILE")
+archive_file <- Sys.getenv("NRR_PAK_ARCHIVE_FILE")
 result_file <- Sys.getenv("NRR_PAK_RESULT_FILE")
 dir.create(project, recursive = TRUE, showWarnings = FALSE)
 .libPaths(c(project, pak_library, private_library, .Library))
 options(repos = c(nrr = repository_url))
 library(pak, lib.loc = pak_library)
 packages <- readLines(package_file, warn = FALSE, encoding = "UTF-8")
+archives <- utils::URLdecode(readLines(archive_file, warn = FALSE, encoding = "UTF-8"))
 calls <- packages
-invisible(capture.output(pak::pkg_install(packages, lib = project, ask = FALSE, dependencies = NA)))
+invisible(capture.output(pak::pkg_install(archives, lib = project, ask = FALSE, dependencies = NA)))
 installed <- lapply(calls, function(package) {
   description <- packageDescription(package, lib.loc = project)
   value <- function(name) {
@@ -216,7 +291,11 @@ records <- data.frame(Package = character(), Version = character(), Imports = ch
 for (item in installed) {
   row <- if (!is.null(status_table)) status_table[status_table$package == item$name, , drop = FALSE] else data.frame()
   value <- function(name) if (nrow(row) == 0L || is.null(row[[name]]) || is.na(row[[name]][1])) "" else as.character(row[[name]][1])
-  records <- rbind(records, data.frame(Package = item$name, Version = item$version, Imports = item$imports, LinkingTo = item$linking_to, Description = item$description, Path = item$path, RemoteRepos = value("remoterepos"), RemotePkgRef = value("remotepkgref"), RemoteSha = value("remotesha"), Status = value("status"), Repository = "", PakStatus = "", PakCalls = "", stringsAsFactors = FALSE))
+  remote_repository <- value("remoterepos")
+  if (remote_repository == "") remote_repository <- repository_url
+  remote_ref <- value("remotepkgref")
+  if (remote_ref == "" || startsWith(remote_ref, "local::")) remote_ref <- item$name
+  records <- rbind(records, data.frame(Package = item$name, Version = item$version, Imports = item$imports, LinkingTo = item$linking_to, Description = item$description, Path = item$path, RemoteRepos = remote_repository, RemotePkgRef = remote_ref, RemoteSha = value("remotesha"), Status = value("status"), Repository = "", PakStatus = "", PakCalls = "", stringsAsFactors = FALSE))
 }
 write.dcf(rbind(metadata, records), result_file)
 "#;
@@ -268,16 +347,10 @@ pub fn run_pak(
     request: &PakInstallRequest,
 ) -> Result<PakInstallResult, PakProcessError> {
     validate_request(request)?;
+    let staging = stage_artifacts(config, request)?;
     let repository_url = url::Url::from_directory_path(&config.repository)
         .map_err(|_| PakProcessError::RepositoryUrl)?
         .to_string();
-    if let Some(package) = request
-        .packages
-        .iter()
-        .find(|package| package.is_empty() || package.contains('\n') || package.contains('\r'))
-    {
-        return Err(PakProcessError::InvalidPackageName(package.clone()));
-    }
     let package_input = request.packages.join("\n") + "\n";
     fs::write(&config.package_file, package_input).map_err(PakProcessError::Io)?;
     let _ = fs::remove_file(&config.result_file);
@@ -305,6 +378,7 @@ pub fn run_pak(
         .env("NRR_PAK_PRIVATE_LIBRARY", &config.pak_private_library)
         .env("NRR_PAK_REPOSITORY_URL", &repository_url)
         .env("NRR_PAK_PACKAGE_FILE", &config.package_file)
+        .env("NRR_PAK_ARCHIVE_FILE", &staging.archive_file)
         .env("NRR_PAK_RESULT_FILE", &config.result_file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -385,6 +459,17 @@ pub fn run_pak(
             })
         })
         .collect::<Result<Vec<_>, PakProcessError>>()?;
+    let expected_names: std::collections::BTreeSet<_> =
+        request.packages.iter().map(String::as_str).collect();
+    let actual_names: std::collections::BTreeSet<_> = installed
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
+    if installed.len() != expected_names.len() || actual_names != expected_names {
+        return Err(PakProcessError::Protocol(
+            "installed package names do not match request".into(),
+        ));
+    }
     Ok(PakInstallResult {
         calls: request.packages.clone(),
         pak_calls: protocol
@@ -402,7 +487,7 @@ pub fn run_pak(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{PakArtifact, PakInstallRequest, PakProcessError, validate_request};
+    use super::{PakArtifact, PakInstallRequest, PakProcessError, parse_dcf, validate_request};
 
     fn artifact(package: &str) -> PakArtifact {
         PakArtifact {
@@ -454,5 +539,42 @@ mod tests {
             validate_request(&request),
             Err(PakProcessError::InvalidArtifactDigest(_))
         ));
+    }
+
+    #[test]
+    fn request_rejects_non_canonical_package_coordinates() {
+        for value in ["user/repo", "foo@1.0.0", "./local-package"] {
+            let request = PakInstallRequest {
+                packages: vec![value.into()],
+                artifacts: vec![artifact(value)],
+            };
+            assert!(matches!(
+                validate_request(&request),
+                Err(PakProcessError::InvalidPackageName(name)) if name == value
+            ));
+        }
+
+        for value in ["user/repo", "foo@1.0.0", "./local-package"] {
+            let request = PakInstallRequest {
+                packages: vec!["valid".into()],
+                artifacts: vec![artifact(value)],
+            };
+            assert!(matches!(
+                validate_request(&request),
+                Err(PakProcessError::InvalidPackageName(name)) if name == value
+            ));
+        }
+    }
+
+    #[test]
+    fn dcf_parser_accepts_crlf_records_and_continuations() {
+        let records = parse_dcf("Package: demo\r\nDescription: first\r\n second\r\n\r\n")
+            .expect("CRLF DCF should parse");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].get("Package").map(String::as_str), Some("demo"));
+        assert_eq!(
+            records[0].get("Description").map(String::as_str),
+            Some("first\nsecond")
+        );
     }
 }
