@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).with_name("verify-pak-gate-rootfs.py")
+SPEC = importlib.util.spec_from_file_location("verify_pak_gate_rootfs", SCRIPT)
+assert SPEC and SPEC.loader
+verifier = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(verifier)
+
+
+class RootfsVerifierTests(unittest.TestCase):
+    def test_tree_digest_covers_types_modes_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "dir").mkdir()
+            (root / "dir" / "café").write_text("payload", encoding="utf-8")
+            (root / "file").write_bytes(b"file")
+            (root / "link").symlink_to("/outside")
+            os.chmod(root / "dir", stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            os.chmod(root / "dir" / "café", stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+            os.chmod(root / "file", stat.S_IRUSR | stat.S_IWUSR)
+            first = verifier.tree_digest(root)
+            self.assertEqual(first, "14ad0d24a710e6e7c2cbadf928d21a2c74946fd71ec615bb5d2dd9d8aefec03f")
+            os.chmod(root / "file", stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            self.assertNotEqual(first, verifier.tree_digest(root))
+            (root / "file").write_bytes(b"changed")
+            self.assertNotEqual(first, verifier.tree_digest(root))
+
+    def test_rootfs_path_rejects_parent_and_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "inside").mkdir()
+            (root / "escape").symlink_to("/tmp")
+            with self.assertRaises(verifier.VerificationError):
+                verifier.rootfs_path(root, "/inside/../outside", "path")
+            with self.assertRaises(verifier.VerificationError):
+                verifier.rootfs_path(root, "/escape/file", "path")
+
+    def test_duplicate_json_keys_are_rejected(self) -> None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as stream:
+            stream.write('{"schema_version":1,"schema_version":2}')
+            stream.flush()
+            with self.assertRaises(verifier.VerificationError):
+                verifier.load_record(Path(stream.name))
+
+    def test_package_inventory_rejects_extra_top_level_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "lib"
+            for name in ("pak", "foo", "extra"):
+                package = library / name
+                package.mkdir(parents=True)
+                (package / "DESCRIPTION").write_text(
+                    f"Package: {name}\nVersion: 1.0.0\n", encoding="utf-8"
+                )
+            package_items = []
+            for name in ("pak", "foo"):
+                package_path = library / name
+                package_items.append(
+                    {
+                        "name": name,
+                        "version": "1.0.0",
+                        "package_path": f"/lib/{name}",
+                        "installed_tree_sha256": verifier.tree_digest(package_path),
+                    }
+                )
+            record = {
+                "tool_library_closure": package_items,
+                "r_home_library_allowlist": [],
+                "pak": package_items[0],
+            }
+            with self.assertRaises(verifier.VerificationError):
+                verifier.verify_package_inventory(root, record)
+            shutil.rmtree(library / "extra")
+            shutil.rmtree(library / "foo")
+            with self.assertRaises(verifier.VerificationError):
+                verifier.verify_package_inventory(root, record)
+
+    def test_isolated_command_has_rootfs_boundary(self) -> None:
+        command = verifier.build_isolated_command(Path("/tmp/rootfs"), ["/bin/true"])
+        self.assertEqual(command[:4], ["unshare", "--user", "--map-root-user", "bwrap"])
+        self.assertIn("--ro-bind", command)
+        self.assertEqual(command[command.index("--ro-bind") + 2], "/")
+        self.assertIn("--clearenv", command)
+        self.assertEqual(command[command.index("--setenv") + 1], "PATH")
+        self.assertEqual(command[command.index("--setenv") + 2], "/usr/bin:/bin")
+        self.assertEqual(command[-1], "/bin/true")
+
+    def test_record_path_is_cwd_resolved_and_symlinks_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = root / "record.json"
+            record.write_text("{}", encoding="utf-8")
+            original = Path.cwd()
+            try:
+                os.chdir(root)
+                self.assertEqual(verifier.resolve_record_path(Path("record.json")), record)
+                symlink = root / "record-link.json"
+                symlink.symlink_to(record)
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.resolve_record_path(Path("record-link.json"))
+            finally:
+                os.chdir(original)
+
+
+if __name__ == "__main__":
+    unittest.main()
