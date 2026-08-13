@@ -24,12 +24,12 @@ class RootfsVerifierTests(unittest.TestCase):
             (root / "dir").mkdir()
             (root / "dir" / "café").write_text("payload", encoding="utf-8")
             (root / "file").write_bytes(b"file")
-            (root / "link").symlink_to("/outside")
+            (root / "link").symlink_to("dir/café")
             os.chmod(root / "dir", stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
             os.chmod(root / "dir" / "café", stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
             os.chmod(root / "file", stat.S_IRUSR | stat.S_IWUSR)
             first = verifier.tree_digest(root)
-            self.assertEqual(first, "14ad0d24a710e6e7c2cbadf928d21a2c74946fd71ec615bb5d2dd9d8aefec03f")
+            self.assertEqual(first, "848bbfd30fb1f7e88acfaf1d41ffb95013feac7134693b89bfc63f347af94722")
             os.chmod(root / "file", stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
             self.assertNotEqual(first, verifier.tree_digest(root))
             (root / "file").write_bytes(b"changed")
@@ -44,6 +44,20 @@ class RootfsVerifierTests(unittest.TestCase):
                 verifier.rootfs_path(root, "/inside/../outside", "path")
             with self.assertRaises(verifier.VerificationError):
                 verifier.rootfs_path(root, "/escape/file", "path")
+
+    def test_tree_digest_rejects_bad_symlink_targets(self) -> None:
+        cases = ("/absolute", "../escape", "missing", "loop")
+        for target in cases:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "dir").mkdir()
+                if target == "loop":
+                    (root / "link").symlink_to("loop2")
+                    (root / "loop2").symlink_to("link")
+                else:
+                    (root / "link").symlink_to(target)
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.tree_digest(root)
 
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as stream:
@@ -87,8 +101,10 @@ class RootfsVerifierTests(unittest.TestCase):
 
     def test_isolated_command_has_rootfs_boundary(self) -> None:
         command = verifier.build_isolated_command(Path("/tmp/rootfs"), ["/bin/true"])
-        self.assertEqual(command[:4], ["unshare", "--user", "--map-root-user", "bwrap"])
+        self.assertEqual(command[:5], ["unshare", "--user", "--map-root-user", "--net", "bwrap"])
+        self.assertIn("--net", command)
         self.assertIn("--ro-bind", command)
+        self.assertIn("--unshare-pid", command)
         self.assertEqual(command[command.index("--ro-bind") + 2], "/")
         self.assertIn("--clearenv", command)
         self.assertEqual(command[command.index("--setenv") + 1], "PATH")

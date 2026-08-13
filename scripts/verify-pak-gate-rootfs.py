@@ -254,6 +254,13 @@ def tree_digest(root: Path) -> str:
                     target.encode("utf-8")
                 except UnicodeEncodeError:
                     fail(f"tree {path}: symlink target is not UTF-8")
+                if os.path.isabs(target):
+                    fail(f"tree {path}: absolute symlink target is not allowed")
+                try:
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root.resolve())
+                except (OSError, RuntimeError, ValueError):
+                    fail(f"tree {path}: symlink target is dangling, looping, or escapes tree")
                 entry["target"] = target
                 entry["type"] = "symlink"
             else:
@@ -344,6 +351,7 @@ def build_isolated_command(rootfs: Path, argv: list[str]) -> list[str]:
         "unshare",
         "--user",
         "--map-root-user",
+        "--net",
         "bwrap",
         "--die-with-parent",
         "--ro-bind",
@@ -355,6 +363,7 @@ def build_isolated_command(rootfs: Path, argv: list[str]) -> list[str]:
         "/dev",
         "--tmpfs",
         "/tmp",
+        "--unshare-pid",
         "--clearenv",
         "--setenv",
         "PATH",
