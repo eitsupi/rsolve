@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nrr_core::PackageName;
+use nrr_core::{PackageName, RPackageVersion};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use sha2::{Digest, Sha256};
 
@@ -45,6 +45,7 @@ pub struct PakProcessConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PakArtifact {
     pub package: String,
+    pub version: String,
     pub path: PathBuf,
     pub sha256: String,
 }
@@ -88,6 +89,7 @@ pub enum PakProcessError {
     MissingArtifact(String),
     UnexpectedArtifact(String),
     InvalidArtifactDigest(String),
+    InvalidArtifactVersion(String),
     Io(std::io::Error),
     Spawn(std::io::Error),
     Failed { status: String, stderr: String },
@@ -109,6 +111,9 @@ impl fmt::Display for PakProcessError {
             Self::UnexpectedArtifact(name) => write!(formatter, "artifact is not selected: {name}"),
             Self::InvalidArtifactDigest(name) => {
                 write!(formatter, "invalid artifact digest: {name}")
+            }
+            Self::InvalidArtifactVersion(name) => {
+                write!(formatter, "invalid artifact version: {name}")
             }
             Self::Io(error) => write!(formatter, "pak protocol file failed: {error}"),
             Self::Spawn(error) => write!(formatter, "could not start Rscript: {error}"),
@@ -144,6 +149,8 @@ fn validate_request(request: &PakInstallRequest) -> Result<(), PakProcessError> 
     for artifact in &request.artifacts {
         let canonical = PackageName::new(&artifact.package)
             .map_err(|_| PakProcessError::InvalidPackageName(artifact.package.clone()))?;
+        RPackageVersion::parse(&artifact.version)
+            .map_err(|_| PakProcessError::InvalidArtifactVersion(artifact.package.clone()))?;
         if !valid_sha256(&artifact.sha256) {
             return Err(PakProcessError::InvalidArtifactDigest(
                 artifact.package.clone(),
@@ -206,12 +213,10 @@ fn stage_artifacts(
     let mut archive_paths = Vec::with_capacity(request.artifacts.len());
 
     for artifact in &request.artifacts {
-        let filename = artifact.path.file_name().ok_or_else(|| {
-            PakProcessError::Io(std::io::Error::other("artifact path has no file name"))
-        })?;
         let package_directory = staging.directory.join(&artifact.package);
         fs::create_dir(&package_directory).map_err(PakProcessError::Io)?;
-        let archive = package_directory.join(filename);
+        let archive =
+            package_directory.join(format!("{}_{}.tar.gz", artifact.package, artifact.version));
         let mut source = fs::File::open(&artifact.path).map_err(PakProcessError::Io)?;
         let mut target = fs::OpenOptions::new()
             .write(true)
@@ -492,6 +497,7 @@ mod tests {
     fn artifact(package: &str) -> PakArtifact {
         PakArtifact {
             package: package.into(),
+            version: "0.1.0".into(),
             path: PathBuf::from(format!("/tmp/{package}.tar.gz")),
             sha256: "a".repeat(64),
         }
@@ -564,6 +570,20 @@ mod tests {
                 Err(PakProcessError::InvalidPackageName(name)) if name == value
             ));
         }
+    }
+
+    #[test]
+    fn request_rejects_invalid_artifact_versions() {
+        let mut invalid = artifact("leaf");
+        invalid.version = "not-a-version".into();
+        let request = PakInstallRequest {
+            packages: vec!["leaf".into()],
+            artifacts: vec![invalid],
+        };
+        assert!(matches!(
+            validate_request(&request),
+            Err(PakProcessError::InvalidArtifactVersion(name)) if name == "leaf"
+        ));
     }
 
     #[test]

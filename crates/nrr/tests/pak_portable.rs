@@ -71,15 +71,16 @@ fn artifacts(root: &Path) -> Vec<PakArtifact> {
         .into_iter()
         .map(|package| {
             let name = format!("{package}_0.1.0.tar.gz");
-            let path = cache.join(&name);
-            fs::copy(fixture.join("artifacts").join(&name), &path)
-                .expect("copy artifact into cache");
+            let source_archive = fixture.join("artifacts").join(&name);
+            let bytes = fs::read(&source_archive).expect("read fixture archive");
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let path = cache.join(&digest);
+            fs::write(&path, bytes).expect("copy artifact into extensionless cache");
             PakArtifact {
                 package: package.to_owned(),
+                version: "0.1.0".into(),
                 path: path.clone(),
                 sha256: {
-                    let bytes = fs::read(&path).expect("read fixture archive");
-                    let digest = format!("{:x}", Sha256::digest(bytes));
                     assert_eq!(digest, manifest[&name]);
                     digest
                 },
