@@ -3,8 +3,8 @@ mod matrix_scenario;
 
 use matrix_scenario::MatrixCatalog;
 use matrix_scenario::regression_support::{
-    AlternativeCatalog, GitDependencyCatalog, SameVersionCatalog, StrongDependencyCatalog,
-    matrix_identity, require_locked_matrix_resolver, with_locked_matrix,
+    AlternativeCatalog, GitDependencyCatalog, MultiSourceCatalog, SameVersionCatalog,
+    StrongDependencyCatalog, matrix_identity, require_locked_matrix_resolver, with_locked_matrix,
 };
 use rsolve_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl,
@@ -28,6 +28,41 @@ fn matrix_selects_the_last_compatible_release_for_each_r_version() {
         .resolve(catalog.request("4.4.0"))
         .unwrap();
     assert_eq!(r_44.selected(&matrix).unwrap().version().as_str(), "1.7-0");
+}
+
+#[test]
+fn source_qualified_and_installed_name_identities_fail_closed() {
+    let catalog = MultiSourceCatalog::conflicting();
+    let failure = catalog.resolver().resolve(catalog.request()).unwrap_err();
+
+    match failure {
+        rsolve_resolver::ResolutionFailure::InstalledNameConflict {
+            name,
+            first_identity,
+            second_identity,
+        } => {
+            assert_eq!(name, PackageName::new("Foo").unwrap());
+            assert_eq!(*first_identity, catalog.source_qualified_identity());
+            assert_eq!(*second_identity, catalog.installed_name_identity());
+        }
+        other => panic!("expected installed-name conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_identity_from_multiple_subjects_uses_installed_name_canonical_subject() {
+    let catalog = MultiSourceCatalog::same_identity();
+    let resolution = catalog.resolver().resolve(catalog.request()).unwrap();
+
+    assert_eq!(resolution.packages().len(), 1);
+    assert_eq!(
+        resolution.packages()[0].subject(),
+        &SolverKey::InstalledName(PackageName::new("Foo").unwrap())
+    );
+    assert_eq!(
+        resolution.packages()[0].identity(),
+        &catalog.source_qualified_identity()
+    );
 }
 
 #[test]

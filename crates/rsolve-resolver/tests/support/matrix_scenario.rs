@@ -185,6 +185,88 @@ pub mod regression_support {
     use rsolve_resolver::RequireLocked;
     use std::collections::HashMap;
 
+    pub struct MultiSourceCatalog {
+        source_qualified: PackageRelease,
+        installed_name: PackageRelease,
+    }
+
+    impl MultiSourceCatalog {
+        pub fn conflicting() -> Self {
+            Self {
+                source_qualified: registry_candidate("Foo", "1.0.0", "cran", vec![]),
+                installed_name: registry_candidate("Foo", "1.0.0", "private", vec![]),
+            }
+        }
+
+        pub fn same_identity() -> Self {
+            let release = registry_candidate("Foo", "1.0.0", "cran", vec![]);
+            Self {
+                source_qualified: release.clone(),
+                installed_name: release,
+            }
+        }
+
+        pub fn resolver(&self) -> Resolver<'_> {
+            static PREFERENCE: DefaultCandidatePreference = DefaultCandidatePreference;
+            static LOCK_POLICY: PreferLocked = PreferLocked;
+            Resolver::new(self, &PREFERENCE, &LOCK_POLICY)
+        }
+
+        pub fn request(&self) -> ResolutionRequest {
+            let foo = PackageName::new("Foo").unwrap();
+            ResolutionRequest::without_lock(
+                vec![
+                    DependencyRequirement::new(
+                        DependencyKind::Depends,
+                        foo.clone(),
+                        DependencySourceConstraint::Registry {
+                            namespace: PackageNamespace::new("cran").unwrap(),
+                        },
+                        VersionConstraint::unconstrained(),
+                    ),
+                    DependencyRequirement::new(
+                        DependencyKind::Depends,
+                        foo,
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    ),
+                ],
+                ResolutionTarget::new(
+                    RPackageVersion::parse("4.4.0").unwrap(),
+                    Target::new("linux", "x86_64"),
+                ),
+                VersionConstraint::unconstrained(),
+            )
+        }
+
+        pub fn source_qualified_identity(&self) -> ReleaseIdentity {
+            self.source_qualified.identity().clone()
+        }
+
+        pub fn installed_name_identity(&self) -> ReleaseIdentity {
+            self.installed_name.identity().clone()
+        }
+    }
+
+    impl CandidateLoader for MultiSourceCatalog {
+        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+            match package {
+                SolverKey::Registry { namespace, name }
+                    if namespace.as_str() == "cran" && name.as_str() == "Foo" =>
+                {
+                    Ok(vec![self.source_qualified.clone()])
+                }
+                SolverKey::InstalledName(name) if name.as_str() == "Foo" => {
+                    Ok(vec![self.installed_name.clone()])
+                }
+                _ => Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("multi-source fixture has no candidates for {package:?}"),
+                )),
+            }
+        }
+    }
+
     pub struct SameVersionCatalog {
         foo: Vec<PackageRelease>,
     }

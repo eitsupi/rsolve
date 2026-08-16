@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -121,12 +121,6 @@ impl<'a> Provider<'a> {
             .fold(Ranges::full(), |range, clause| range.intersection(&clause))
     }
 
-    // TODO: Source-qualified SolverKey::Registry, SolverKey::Bioconductor, and SolverKey::Exact
-    // subjects and installed-name subjects are independent solver packages, so requirements for
-    // one name can be satisfied by different releases at once. Modelling installed-name
-    // occupancy as a shared solver constraint is deferred pending the repository-priority and
-    // duplicate-package policy decision. The first slice exercises only one registry, so this
-    // problem is not currently reachable.
     fn subject_for_dependency(
         &self,
         dependency: &DependencyRequirement,
@@ -226,10 +220,12 @@ impl<'a> Provider<'a> {
         candidates.sort_by(|left, right| self.compare_candidates(subject, left, right, context));
     }
 
-    // TODO: Identity is canonicalized per (subject, version), so a same-version alternative from
-    // a different provenance is not independently selectable. Making candidate identity a
-    // first-class part of the solver package/version domain is deferred pending the
-    // repository/provider-priority design decision.
+    // Candidate identity is currently canonicalized per (subject, version), so a same-version
+    // alternative from a different provenance is not independently selectable within one subject.
+    // A source-qualified subject and an installed-name subject can still select different
+    // identities; solve() enforces installed-name occupancy after PubGrub returns and fails
+    // closed without trying an alternative. Making candidate identity a first-class part of the
+    // solver package/version domain remains a future solver design question.
     fn candidate_for_version(
         &self,
         subject: &SolverKey,
@@ -372,6 +368,11 @@ pub enum ResolutionFailure {
     NoSolution {
         diagnostic: ResolutionDiagnostic,
     },
+    InstalledNameConflict {
+        name: rsolve_core::PackageName,
+        first_identity: Box<rsolve_core::ReleaseIdentity>,
+        second_identity: Box<rsolve_core::ReleaseIdentity>,
+    },
     Solver {
         diagnostic: ResolutionDiagnostic,
     },
@@ -397,6 +398,16 @@ impl fmt::Display for ResolutionFailure {
                 write!(f, "candidate load for {package:?} failed: {source}")
             }
             Self::NoSolution { diagnostic } => write!(f, "no resolution: {}", diagnostic.summary),
+            Self::InstalledNameConflict {
+                name,
+                first_identity,
+                second_identity,
+            } => write!(
+                f,
+                "installed package name {name} maps to distinct identities {} and {}",
+                identity_sort_key(first_identity),
+                identity_sort_key(second_identity),
+            ),
             Self::Solver { diagnostic } => write!(f, "resolver failure: {}", diagnostic.summary),
         }
     }
@@ -420,7 +431,7 @@ pub(crate) fn solve(
     let root_version = RPackageVersion::parse("0.0").expect("root version");
     let selected = resolve(&provider, PackageId::Root, root_version).map_err(map_error)?;
 
-    let mut packages = Vec::new();
+    let mut packages = BTreeMap::<rsolve_core::PackageName, (SolverKey, PackageRelease)>::new();
     for (package, version) in selected {
         if let PackageId::Subject(subject) = package {
             if subject == SolverKey::R {
@@ -435,11 +446,67 @@ pub(crate) fn solve(
             if release.is_r_base_package() {
                 continue;
             }
-            packages.push(rsolve_core::ResolvedPackage::new(subject, release));
+            let name = release.identity().name().clone();
+            match packages.entry(name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((subject, release));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (existing_subject, existing_release) = entry.get();
+                    if existing_release.identity() != release.identity() {
+                        let (first_identity, second_identity) =
+                            if identity_sort_key(existing_release.identity())
+                                <= identity_sort_key(release.identity())
+                            {
+                                (
+                                    existing_release.identity().clone(),
+                                    release.identity().clone(),
+                                )
+                            } else {
+                                (
+                                    release.identity().clone(),
+                                    existing_release.identity().clone(),
+                                )
+                            };
+                        return Err(ResolutionFailure::InstalledNameConflict {
+                            name,
+                            first_identity: Box::new(first_identity),
+                            second_identity: Box::new(second_identity),
+                        });
+                    }
+                    if canonical_subject_cmp(&subject, existing_subject) == Ordering::Less {
+                        entry.insert((subject, release));
+                    }
+                }
+            }
         }
     }
+    let mut packages = packages
+        .into_values()
+        .map(|(subject, release)| rsolve_core::ResolvedPackage::new(subject, release))
+        .collect::<Vec<_>>();
     packages.sort_by(|left, right| left.name().cmp(right.name()));
     Ok(Resolution::new(request.target.clone(), packages))
+}
+
+fn identity_sort_key(identity: &rsolve_core::ReleaseIdentity) -> String {
+    format!("{}:{:?}", identity.name(), identity.provenance())
+}
+
+fn canonical_subject_cmp(left: &SolverKey, right: &SolverKey) -> Ordering {
+    subject_rank(left)
+        .cmp(&subject_rank(right))
+        .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
+}
+
+fn subject_rank(subject: &SolverKey) -> u8 {
+    match subject {
+        SolverKey::InstalledName(_) => 0,
+        SolverKey::Registry { .. } => 1,
+        SolverKey::Bioconductor { .. } => 2,
+        SolverKey::Exact(_) => 3,
+        SolverKey::R => 4,
+    }
 }
 
 fn map_error(error: PubGrubError<Provider<'_>>) -> ResolutionFailure {
