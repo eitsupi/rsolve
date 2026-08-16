@@ -4,7 +4,7 @@ use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
     DependencyRequirement, DependencySourceConstraint, PackageName, PackageNamespace,
     PackageRelease, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, Target, VersionConstraint,
+    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{
     DefaultCandidatePreference, LockUpdatePolicy, PreferLocked, RBasePackageOverlay, RequireLocked,
@@ -41,10 +41,7 @@ impl CandidateLoader for FixtureLoader {
 }
 
 fn target(version: &str) -> ResolutionTarget {
-    ResolutionTarget::new(
-        RPackageVersion::parse(version).unwrap(),
-        Target::new("linux", "x86_64"),
-    )
+    ResolutionTarget::new(RPackageVersion::parse(version).unwrap())
 }
 
 fn package(name: &str) -> PackageName {

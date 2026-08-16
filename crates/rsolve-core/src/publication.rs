@@ -1,11 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use time::Date;
-use time::format_description::FormatItem;
-
-const ISO_DATE_FORMAT: &[FormatItem<'static>] =
-    time::macros::format_description!("[year]-[month]-[day]");
+use jiff::civil::Date;
 
 /// A validated, canonical calendar date with day precision.
 ///
@@ -48,7 +44,7 @@ impl PublicationDate {
     pub fn parse(input: impl AsRef<str>) -> Result<Self, PublicationDateError> {
         let input = input.as_ref();
         let date =
-            Date::parse(input, ISO_DATE_FORMAT).map_err(|error| PublicationDateError::Invalid {
+            Date::strptime("%Y-%m-%d", input).map_err(|error| PublicationDateError::Invalid {
                 input: input.into(),
                 diagnostic: error.to_string().into(),
             })?;
@@ -63,9 +59,7 @@ impl PublicationDate {
 
     /// Returns the canonical `YYYY-MM-DD` spelling.
     pub fn as_str(&self) -> String {
-        self.0
-            .format(ISO_DATE_FORMAT)
-            .expect("the static publication date format is valid")
+        self.0.strftime("%Y-%m-%d").to_string()
     }
 }
 

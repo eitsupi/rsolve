@@ -1,7 +1,9 @@
 use super::*;
 use rsolve_core::{
-    Artifact, ArtifactLocator, DistributionMetadata, PackageNamespace, RelationOp, ReleaseMetadata,
-    ReleaseObservation, SourceArtifact, UpstreamChecksum,
+    Artifact, ArtifactLocator, DependencyRequirement, DependencySourceConstraint, Distribution,
+    DistributionChannel, DistributionMetadata, PackageNamespace, RegistryId, RelationOp,
+    ReleaseMetadata, ReleaseObservation, SnapshotId, SourceArtifact, UpstreamChecksum,
+    VersionConstraint,
 };
 use std::collections::BTreeMap;
 
@@ -35,14 +37,15 @@ fn release(name: &str, spelling: &str) -> PackageRelease {
 }
 
 fn target() -> ResolutionTarget {
-    ResolutionTarget::new(
-        version("4.4.0"),
-        rsolve_core::Target::new("linux", "x86_64"),
-    )
+    ResolutionTarget::new(version("4.4.0"))
 }
 
 fn environment() -> EnvironmentId {
     EnvironmentId::new("default").unwrap()
+}
+
+fn digest() -> Sha256Digest {
+    Sha256Digest::new("0".repeat(64)).unwrap()
 }
 
 #[test]
@@ -76,9 +79,8 @@ fn reader_rejects_registry_record_version_mismatch() {
         identity,
         version: version("2.0.0"),
         published_version_spelling: None,
-        distributions: Vec::new(),
         dependencies: Vec::new(),
-        metadata_sha256: None,
+        metadata_sha256: digest(),
     };
     assert!(matches!(
         Lockfile::new(vec![LockedResolution {
@@ -95,17 +97,6 @@ fn reader_rejects_registry_record_version_mismatch() {
 fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
     let alpha = package("alpha");
     let beta = package("beta");
-    let dependency = |name: &PackageName, kind| LockedDependencyEdge {
-        kind,
-        name: name.clone(),
-        source: DependencySourceConstraint::Any,
-        constraint: VersionConstraint::unconstrained(),
-    };
-    let distribution = |channel: &str| LockedDistributionRef {
-        registry: RegistryId::new("cran").unwrap(),
-        channel: DistributionChannel::new(channel).unwrap(),
-        snapshot: None,
-    };
     let make = |name: PackageName| LockedPackage {
         identity: ReleaseIdentity::new(
             name,
@@ -116,15 +107,10 @@ fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
         ),
         version: version("1.0.0"),
         published_version_spelling: None,
-        distributions: vec![distribution("source"), distribution("archive")],
-        dependencies: vec![
-            dependency(&beta, DependencyKind::Suggests),
-            dependency(&alpha, DependencyKind::Depends),
-        ],
-        metadata_sha256: None,
+        dependencies: vec![beta.clone(), alpha.clone()],
+        metadata_sha256: digest(),
     };
     let mut reversed = make(alpha.clone());
-    reversed.distributions.reverse();
     reversed.dependencies.reverse();
     let ordered = make(alpha.clone());
     let first = Lockfile::new(vec![LockedResolution {
@@ -173,8 +159,7 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
             observed_metadata: DistributionMetadata::default(),
         }],
     })
-    .unwrap()
-    .with_metadata_digest(Sha256Digest::new("a".repeat(64)).unwrap());
+    .unwrap();
     let resolution = Resolution::new(
         target(),
         vec![
@@ -195,15 +180,7 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
     let zeta = &packages[1];
     assert_eq!(zeta.published_version_spelling.as_deref(), Some("1.6-5"));
     assert_eq!(zeta.dependencies.len(), 1);
-    assert_eq!(zeta.distributions.len(), 1);
-    assert_eq!(
-        zeta.metadata_sha256.as_ref().unwrap().as_str(),
-        &"a".repeat(64)
-    );
-    assert_eq!(zeta.distributions[0].registry.as_str(), "cran");
-    // These fields exist only on `Distribution`, never on the lock ref.
-    assert!(!format!("{:?}", zeta.distributions[0]).contains("machine/private"));
-    assert!(!format!("{:?}", zeta.distributions[0]).contains("deadbeef"));
+    assert!(!zeta.metadata_sha256.as_str().is_empty());
 }
 
 #[test]
@@ -236,7 +213,7 @@ fn downstream_projection_revalidates_mutated_public_lock_state() {
         lock.resolution_request(
             Manifest::new(
                 VersionConstraint::unconstrained(),
-                crate::manifest::ManifestTarget::new(version("4.4.0"), "linux", "x86_64",).unwrap(),
+                crate::manifest::ManifestTarget::new(version("4.4.0")),
                 vec![crate::manifest::ManifestDependency::new(
                     name,
                     VersionConstraint::unconstrained(),
@@ -263,7 +240,7 @@ fn publication_cutoff_is_reconstructed_from_lock() {
         .resolution_request(
             Manifest::new(
                 VersionConstraint::unconstrained(),
-                crate::manifest::ManifestTarget::new(version("4.4.0"), "linux", "x86_64").unwrap(),
+                crate::manifest::ManifestTarget::new(version("4.4.0")),
                 Vec::new(),
             )
             .unwrap(),
@@ -280,23 +257,18 @@ fn publication_cutoff_is_reconstructed_from_lock() {
 fn conflicting_repeated_identity_is_rejected_before_lock_state() {
     let identity_release = release("same", "1.0.0");
     let identity = identity_release.identity().clone();
-    let other = identity_release
-        .clone()
-        .with_metadata_digest(Sha256Digest::new("b".repeat(64)).unwrap());
-    let resolution = Resolution::new(
-        target(),
-        vec![
-            rsolve_core::ResolvedPackage::new(
-                SolverKey::InstalledName(package("same")),
-                identity_release,
-            ),
-            rsolve_core::ResolvedPackage::new(SolverKey::InstalledName(package("same")), other),
-        ],
+    let first = LockedPackage::from_release(&identity_release);
+    let mut second = first.clone();
+    second.metadata_sha256 = Sha256Digest::new("f".repeat(64)).unwrap();
+    assert!(
+        Lockfile::new(vec![LockedResolution {
+            target: target(),
+            environment: environment(),
+            publication_cutoff: None,
+            packages: vec![first, second],
+        }])
+        .is_err()
     );
-    assert!(matches!(
-        Lockfile::from_resolution(&resolution, environment()),
-        Err(LockError::ConflictingMetadata { identity: value }) if value.contains("same")
-    ));
     assert_eq!(identity.name().as_str(), "same");
 }
 
@@ -354,17 +326,15 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         identity: first.identity().clone(),
         version: first.version().clone(),
         published_version_spelling: None,
-        distributions: Vec::new(),
         dependencies: Vec::new(),
-        metadata_sha256: None,
+        metadata_sha256: digest(),
     };
     let second_lock = LockedPackage {
         identity: second.identity().clone(),
         version: second.version().clone(),
         published_version_spelling: None,
-        distributions: Vec::new(),
         dependencies: Vec::new(),
-        metadata_sha256: None,
+        metadata_sha256: digest(),
     };
     assert!(matches!(
         Lockfile::new(vec![LockedResolution {
@@ -403,17 +373,15 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
                 identity: registry.clone(),
                 version: version("1.0.0"),
                 published_version_spelling: None,
-                distributions: Vec::new(),
                 dependencies: Vec::new(),
-                metadata_sha256: None,
+                metadata_sha256: digest(),
             },
             LockedPackage {
                 identity: bioconductor.clone(),
                 version: version("2.0.0"),
                 published_version_spelling: None,
-                distributions: Vec::new(),
                 dependencies: Vec::new(),
-                metadata_sha256: None,
+                metadata_sha256: digest(),
             },
         ],
     }])

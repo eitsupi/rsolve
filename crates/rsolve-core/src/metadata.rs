@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::constraints::{DependencyRequirement, DependencySourceConstraint};
+use sha2::{Digest, Sha256};
+
+use crate::constraints::{
+    DependencyKind, DependencyRequirement, DependencySourceConstraint, RelationOp,
+};
 use crate::identity::{Distribution, Provenance, ReleaseIdentity};
 use crate::names::{PackageName, Sha256Digest};
 use crate::publication::ReleasePublication;
@@ -104,7 +108,7 @@ pub struct PackageRelease {
     publication: Option<ReleasePublication>,
     dependencies: Vec<DependencyRequirement>,
     distributions: Vec<Distribution>,
-    metadata_digest: Option<Sha256Digest>,
+    metadata_digest: Sha256Digest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +182,12 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
             }
         }
 
+        let metadata_digest = canonical_metadata_digest(
+            &observation.identity,
+            &observation.observed_version,
+            observation.publication,
+            &observation.dependencies,
+        );
         Ok(Self {
             identity: observation.identity,
             version: observation.observed_version,
@@ -185,21 +195,189 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
             publication: observation.publication,
             dependencies: observation.dependencies,
             distributions: unique_distributions,
-            metadata_digest: None,
+            metadata_digest,
         })
     }
 }
 
-impl PackageRelease {
-    /// Attach a provider-neutral digest of the release metadata.
-    ///
-    /// Artifact bytes and their checksums are deliberately not part of this
-    /// value.  The digest is optional because not every provider supplies one.
-    pub fn with_metadata_digest(mut self, digest: Sha256Digest) -> Self {
-        self.metadata_digest = Some(digest);
-        self
+// This is a fingerprint of validated logical/solver metadata, not an
+// arbitrary DESCRIPTION passthrough and not distribution or artifact bytes.
+const METADATA_DIGEST_DOMAIN: &[u8] = b"rsolve.logical-release-metadata\0v1";
+
+fn canonical_metadata_digest(
+    identity: &ReleaseIdentity,
+    observed_version: &RPackageVersion,
+    publication: Option<ReleasePublication>,
+    dependencies: &[DependencyRequirement],
+) -> Sha256Digest {
+    let mut encoded = Vec::new();
+    append_bytes(&mut encoded, METADATA_DIGEST_DOMAIN);
+    append_identity(&mut encoded, identity);
+    append_version(&mut encoded, observed_version);
+    match publication {
+        Some(publication) => {
+            encoded.push(1);
+            append_string(&mut encoded, &publication.date().to_string());
+        }
+        None => encoded.push(0),
     }
 
+    let mut dependency_records = dependencies
+        .iter()
+        .map(encode_dependency)
+        .collect::<Vec<_>>();
+    dependency_records.sort();
+    dependency_records.dedup();
+    append_u64(&mut encoded, dependency_records.len() as u64);
+    for dependency in dependency_records {
+        append_bytes(&mut encoded, &dependency);
+    }
+
+    let digest = Sha256::digest(encoded);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Sha256Digest::new(hex).expect("SHA-256 output is always a valid digest")
+}
+
+fn encode_dependency(dependency: &DependencyRequirement) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.push(match dependency.kind {
+        DependencyKind::Depends => 0,
+        DependencyKind::Imports => 1,
+        DependencyKind::LinkingTo => 2,
+        DependencyKind::Suggests => 3,
+        DependencyKind::Enhances => 4,
+    });
+    append_string(&mut encoded, dependency.name.as_str());
+    append_source_constraint(&mut encoded, &dependency.source);
+    let mut clauses = dependency
+        .constraint
+        .clauses
+        .iter()
+        .map(|clause| {
+            let mut encoded = Vec::new();
+            encoded.push(match clause.op {
+                RelationOp::Lt => 0,
+                RelationOp::Le => 1,
+                RelationOp::Eq => 2,
+                RelationOp::Ne => 3,
+                RelationOp::Ge => 4,
+                RelationOp::Gt => 5,
+            });
+            append_version(&mut encoded, &clause.version);
+            encoded
+        })
+        .collect::<Vec<_>>();
+    clauses.sort();
+    clauses.dedup();
+    append_u64(&mut encoded, clauses.len() as u64);
+    for clause in clauses {
+        append_bytes(&mut encoded, &clause);
+    }
+    encoded
+}
+
+fn append_source_constraint(encoded: &mut Vec<u8>, source: &DependencySourceConstraint) {
+    match source {
+        DependencySourceConstraint::Any => encoded.push(0),
+        DependencySourceConstraint::Registry { namespace } => {
+            encoded.push(1);
+            append_string(encoded, namespace.as_str());
+        }
+        DependencySourceConstraint::Bioconductor { namespace, release } => {
+            encoded.push(2);
+            append_string(encoded, namespace.as_str());
+            append_string(encoded, release.as_str());
+        }
+        DependencySourceConstraint::Git { repository } => {
+            encoded.push(3);
+            append_string(encoded, repository.as_str());
+        }
+        DependencySourceConstraint::Exact(identity) => {
+            encoded.push(4);
+            append_identity(encoded, identity);
+        }
+    }
+}
+
+fn append_identity(encoded: &mut Vec<u8>, identity: &ReleaseIdentity) {
+    append_string(encoded, identity.name().as_str());
+    match identity.provenance() {
+        Provenance::RBasePackage { r_version } => {
+            encoded.push(0);
+            append_version(encoded, r_version);
+        }
+        Provenance::RegistryRelease { namespace, version } => {
+            encoded.push(1);
+            append_string(encoded, namespace.as_str());
+            append_version(encoded, version);
+        }
+        Provenance::GitCommit {
+            repository,
+            commit,
+            subdirectory,
+        } => {
+            encoded.push(2);
+            append_string(encoded, repository.as_str());
+            append_string(encoded, commit.as_str());
+            append_optional_string(encoded, subdirectory.as_ref().map(|value| value.as_str()));
+        }
+        Provenance::BioconductorRelease {
+            namespace,
+            release,
+            version,
+        } => {
+            encoded.push(3);
+            append_string(encoded, namespace.as_str());
+            append_string(encoded, release.as_str());
+            append_version(encoded, version);
+        }
+        Provenance::ImmutableSource { scheme, digest } => {
+            encoded.push(4);
+            append_string(encoded, scheme.as_str());
+            append_string(encoded, digest.as_str());
+        }
+    }
+}
+
+fn append_optional_string(encoded: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            append_string(encoded, value);
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn append_string(encoded: &mut Vec<u8>, value: &str) {
+    append_bytes(encoded, value.as_bytes());
+}
+
+/// Encode R versions by their semantic numeric components, never by their
+/// retained display spelling.  This keeps equivalent separators, leading
+/// zeroes, and trailing zero components at the same digest coordinate.
+fn append_version(encoded: &mut Vec<u8>, value: &RPackageVersion) {
+    let component_count = value.canonical_component_count();
+    append_u64(encoded, component_count as u64);
+    for component in value.components().take(component_count) {
+        append_u64(encoded, u64::from(component));
+    }
+}
+
+fn append_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
+    append_u64(encoded, value.len() as u64);
+    encoded.extend_from_slice(value);
+}
+
+fn append_u64(encoded: &mut Vec<u8>, value: u64) {
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+impl PackageRelease {
     pub fn identity(&self) -> &ReleaseIdentity {
         &self.identity
     }
@@ -228,8 +406,11 @@ impl PackageRelease {
         &self.distributions
     }
 
-    pub fn metadata_digest(&self) -> Option<&Sha256Digest> {
-        self.metadata_digest.as_ref()
+    /// Returns the canonical fingerprint of validated logical/solver
+    /// metadata.  Arbitrary DESCRIPTION passthrough fields and distribution
+    /// or artifact facts are intentionally excluded.
+    pub fn metadata_digest(&self) -> &Sha256Digest {
+        &self.metadata_digest
     }
 
     fn merge_distributions(&mut self, incoming: &[Distribution]) {
@@ -238,6 +419,15 @@ impl PackageRelease {
                 self.distributions.push(distribution.clone());
             }
         }
+    }
+
+    fn refresh_metadata_digest(&mut self) {
+        self.metadata_digest = canonical_metadata_digest(
+            &self.identity,
+            &self.version,
+            self.publication,
+            &self.dependencies,
+        );
     }
 }
 
@@ -283,6 +473,9 @@ impl ReleaseAggregation {
                 });
             }
             existing.merge_distributions(&release.distributions);
+            // A previously unknown publication becomes part of the validated
+            // logical metadata fingerprint when a later observation supplies it.
+            existing.refresh_metadata_digest();
         } else {
             self.releases.insert(release.identity.clone(), release);
         }
@@ -362,6 +555,262 @@ mod tests {
         }
     }
 
+    fn digest_dependency(name: &str, kind: DependencyKind) -> DependencyRequirement {
+        DependencyRequirement::new(
+            kind,
+            package(name),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(RelationOp::Ge, version("1.0")),
+        )
+    }
+
+    #[test]
+    fn metadata_digest_is_canonical_and_excludes_distribution_facts() {
+        let provenance = Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("1.0"),
+        };
+        let mut first = observation(
+            identity(provenance.clone()),
+            "1.0",
+            source_distribution("a"),
+        );
+        first.dependencies = vec![
+            digest_dependency("lattice", DependencyKind::Imports),
+            digest_dependency("R", DependencyKind::Depends),
+        ];
+        let mut reversed = first.clone();
+        reversed.dependencies.reverse();
+        reversed.distributions = vec![source_distribution("different-artifact")];
+        let first_release = PackageRelease::try_from(first).unwrap();
+        let reversed_release = PackageRelease::try_from(reversed).unwrap();
+        assert_eq!(
+            first_release.metadata_digest(),
+            reversed_release.metadata_digest()
+        );
+
+        let mut changed = observation(identity(provenance), "1.0", source_distribution("a"));
+        changed.dependencies = vec![digest_dependency("lattice", DependencyKind::Suggests)];
+        assert_ne!(
+            first_release.metadata_digest(),
+            PackageRelease::try_from(changed).unwrap().metadata_digest()
+        );
+    }
+
+    #[test]
+    fn metadata_digest_uses_semantic_versions_and_logical_sources() {
+        let dependency = DependencyRequirement::new(
+            DependencyKind::Imports,
+            package("lattice"),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(RelationOp::Ge, version("1.0-0")),
+        );
+        let equivalent_identity = identity(Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("1.6.5"),
+        });
+        let mut equivalent = observation(
+            equivalent_identity,
+            "1.6.5",
+            source_distribution("equivalent"),
+        );
+        equivalent.dependencies = vec![dependency.clone()];
+
+        let raw_spelling_identity = identity(Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("01.6-5.0"),
+        });
+        let mut raw_spelling = observation(
+            raw_spelling_identity,
+            "01.6-5.0",
+            source_distribution("different-artifact"),
+        );
+        raw_spelling.dependencies = vec![DependencyRequirement::new(
+            DependencyKind::Imports,
+            package("lattice"),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(RelationOp::Ge, version("1.0.0")),
+        )];
+        let equivalent_release = PackageRelease::try_from(equivalent).unwrap();
+        let raw_spelling_release = PackageRelease::try_from(raw_spelling).unwrap();
+        assert_eq!(
+            equivalent_release.metadata_digest(),
+            raw_spelling_release.metadata_digest()
+        );
+
+        let mut duplicate = observation(
+            identity(Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.6.5"),
+            }),
+            "1.6.5",
+            source_distribution("duplicate"),
+        );
+        duplicate.dependencies = vec![dependency.clone(), dependency];
+        assert_eq!(
+            equivalent_release.metadata_digest(),
+            PackageRelease::try_from(duplicate)
+                .unwrap()
+                .metadata_digest()
+        );
+
+        let namespace_changed = PackageRelease::try_from(observation(
+            identity(Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("other").unwrap(),
+                version: version("1.6.5"),
+            }),
+            "1.6.5",
+            source_distribution("namespace"),
+        ))
+        .unwrap();
+        assert_ne!(
+            equivalent_release.metadata_digest(),
+            namespace_changed.metadata_digest()
+        );
+
+        let git_identity = |commit: &str| {
+            identity(Provenance::GitCommit {
+                repository: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
+                commit: GitCommitId::new(commit).unwrap(),
+                subdirectory: None,
+            })
+        };
+        let git_release = PackageRelease::try_from(observation(
+            git_identity("abcdef0123456789abcdef0123456789abcdef01"),
+            "1.0.0",
+            source_distribution("git-a"),
+        ))
+        .unwrap();
+        let changed_git_release = PackageRelease::try_from(observation(
+            git_identity("1234567890abcdef1234567890abcdef12345678"),
+            "1.0.0",
+            source_distribution("git-b"),
+        ))
+        .unwrap();
+        assert_ne!(
+            git_release.metadata_digest(),
+            changed_git_release.metadata_digest()
+        );
+
+        let source_changed = PackageRelease::try_from(observation(
+            identity(Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.6.5"),
+            }),
+            "1.6.5",
+            source_distribution("source-change"),
+        ))
+        .unwrap();
+        let mut source_observation = observation(
+            identity(Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.6.5"),
+            }),
+            "1.6.5",
+            source_distribution("source-change"),
+        );
+        source_observation.dependencies = vec![DependencyRequirement::new(
+            DependencyKind::Imports,
+            package("lattice"),
+            DependencySourceConstraint::Registry {
+                namespace: PackageNamespace::new("cran").unwrap(),
+            },
+            VersionConstraint::from_clause(RelationOp::Gt, version("1.0.0")),
+        )];
+        let changed_dependency = PackageRelease::try_from(source_observation).unwrap();
+        assert_ne!(
+            source_changed.metadata_digest(),
+            changed_dependency.metadata_digest()
+        );
+
+        let dependency_variant = |source, op, dependency_version| {
+            let mut observation = observation(
+                identity(Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                    version: version("1.6.5"),
+                }),
+                "1.6.5",
+                source_distribution("dependency-variant"),
+            );
+            observation.dependencies = vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                package("lattice"),
+                source,
+                VersionConstraint::from_clause(op, version(dependency_version)),
+            )];
+            PackageRelease::try_from(observation).unwrap()
+        };
+        assert_ne!(
+            equivalent_release.metadata_digest(),
+            dependency_variant(
+                DependencySourceConstraint::Registry {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                },
+                RelationOp::Ge,
+                "1.0.0",
+            )
+            .metadata_digest()
+        );
+        assert_ne!(
+            equivalent_release.metadata_digest(),
+            dependency_variant(DependencySourceConstraint::Any, RelationOp::Gt, "1.0.0")
+                .metadata_digest()
+        );
+        assert_ne!(
+            equivalent_release.metadata_digest(),
+            dependency_variant(DependencySourceConstraint::Any, RelationOp::Ge, "1.1.0")
+                .metadata_digest()
+        );
+    }
+
+    #[test]
+    fn metadata_digest_changes_for_coordinate_version_and_publication() {
+        let base_identity = identity(Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("1.0"),
+        });
+        let base = PackageRelease::try_from(observation(
+            base_identity.clone(),
+            "1.0",
+            source_distribution("base"),
+        ))
+        .unwrap();
+
+        let mut published = observation(base_identity, "1.0", source_distribution("base"));
+        published.publication = Some(ReleasePublication::new(
+            PublicationDate::parse("2026-01-01").unwrap(),
+        ));
+        assert_ne!(
+            base.metadata_digest(),
+            PackageRelease::try_from(published)
+                .unwrap()
+                .metadata_digest()
+        );
+
+        let changed_version = PackageRelease::try_from(observation(
+            identity(Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.1"),
+            }),
+            "1.1",
+            source_distribution("base"),
+        ))
+        .unwrap();
+        assert_ne!(base.metadata_digest(), changed_version.metadata_digest());
+
+        let other_name = ReleaseIdentity::new(
+            package("Other"),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.0"),
+            },
+        );
+        let other =
+            PackageRelease::try_from(observation(other_name, "1.0", source_distribution("base")))
+                .unwrap();
+        assert_ne!(base.metadata_digest(), other.metadata_digest());
+    }
+
     #[test]
     fn metadata_rejects_dependency_and_identity_fields() {
         let mut fields = BTreeMap::new();
@@ -385,13 +834,26 @@ mod tests {
         known.publication = Some(ReleasePublication::new(known_date));
         let mut aggregation = ReleaseAggregation::new();
         aggregation.observe(unknown.clone()).unwrap();
-        aggregation.observe(known).unwrap();
+        aggregation.observe(known.clone()).unwrap();
+        let mut reverse_aggregation = ReleaseAggregation::new();
+        reverse_aggregation.observe(known).unwrap();
+        reverse_aggregation.observe(unknown.clone()).unwrap();
         assert_eq!(
             aggregation
                 .get(&identity)
                 .and_then(PackageRelease::publication)
                 .map(|publication| publication.date()),
             Some(known_date)
+        );
+        assert_eq!(
+            aggregation
+                .get(&identity)
+                .expect("forward aggregation release")
+                .metadata_digest(),
+            reverse_aggregation
+                .get(&identity)
+                .expect("reverse aggregation release")
+                .metadata_digest()
         );
 
         unknown.publication = Some(ReleasePublication::new(

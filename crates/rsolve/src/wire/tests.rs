@@ -1,5 +1,11 @@
 use super::*;
-use crate::lock::LockedDistributionRef;
+use rsolve_core::{
+    ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
+    Distribution, DistributionChannel, DistributionMetadata, EnvironmentId, PackageNamespace,
+    Provenance, RPackageVersion, RegistryId, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+    RepositorySubdir, Sha256Digest, SourceArtifact, SourceScheme, UpstreamChecksum,
+    VersionConstraint,
+};
 
 fn version(value: &str) -> RPackageVersion {
     RPackageVersion::parse(value).unwrap()
@@ -13,104 +19,38 @@ fn identity(name: &str, provenance: Provenance) -> ReleaseIdentity {
     ReleaseIdentity::new(package(name), provenance)
 }
 
-fn distribution(channel: &str, snapshot: Option<&str>) -> LockedDistributionRef {
-    LockedDistributionRef {
-        registry: RegistryId::new("cran").unwrap(),
-        channel: DistributionChannel::new(channel).unwrap(),
-        snapshot: snapshot.map(|value| SnapshotId::new(value).unwrap()),
-    }
-}
-
-fn dependency(
-    kind: DependencyKind,
-    name: &str,
-    source: DependencySourceConstraint,
-    op: RelationOp,
-) -> LockedDependencyEdge {
-    LockedDependencyEdge {
-        kind,
-        name: package(name),
-        source,
-        constraint: VersionConstraint::new(vec![VersionClause::new(op, version("1.0"))]),
-    }
-}
-
 fn package_record(name: &str, provenance: Provenance) -> LockedPackage {
     LockedPackage {
         identity: identity(name, provenance),
         version: version("1.0"),
         published_version_spelling: None,
-        distributions: vec![distribution("source", Some("snapshot-1"))],
         dependencies: vec![
-            dependency(
-                DependencyKind::Depends,
-                "dep.any",
-                DependencySourceConstraint::Any,
-                RelationOp::Ge,
-            ),
-            dependency(
-                DependencyKind::Imports,
-                "dep.registry",
-                DependencySourceConstraint::Registry {
-                    namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
-                },
-                RelationOp::Eq,
-            ),
-            dependency(
-                DependencyKind::LinkingTo,
-                "dep.bioc",
-                DependencySourceConstraint::Bioconductor {
-                    namespace: rsolve_core::PackageNamespace::new("bioc").unwrap(),
-                    release: rsolve_core::BioconductorRelease::new("3.20").unwrap(),
-                },
-                RelationOp::Le,
-            ),
-            dependency(
-                DependencyKind::Suggests,
-                "dep.git",
-                DependencySourceConstraint::Git {
-                    repository: rsolve_core::NormalizedGitUrl::new("https://example.test/repo")
-                        .unwrap(),
-                },
-                RelationOp::Ne,
-            ),
-            dependency(
-                DependencyKind::Enhances,
-                "dep.exact",
-                DependencySourceConstraint::Exact(identity(
-                    "dep.exact",
-                    Provenance::ImmutableSource {
-                        scheme: SourceScheme::new("sha256").unwrap(),
-                        digest: Sha256Digest::new("b".repeat(64)).unwrap(),
-                    },
-                )),
-                RelationOp::Lt,
-            ),
+            package("registry"),
+            package("bioc"),
+            package("git"),
+            package("immutable"),
         ],
-        metadata_sha256: Some(Sha256Digest::new("a".repeat(64)).unwrap()),
+        metadata_sha256: Sha256Digest::new("a".repeat(64)).unwrap(),
     }
 }
 
 fn logical_lock() -> Lockfile {
     Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(
-            version("4.4.0"),
-            rsolve_core::Target::new("linux", "x86_64"),
-        ),
+        target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
         environment: EnvironmentId::new("default").unwrap(),
         publication_cutoff: None,
         packages: vec![
             package_record(
                 "registry",
                 Provenance::RegistryRelease {
-                    namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                    namespace: PackageNamespace::new("cran").unwrap(),
                     version: version("1.0"),
                 },
             ),
             package_record(
                 "bioc",
                 Provenance::BioconductorRelease {
-                    namespace: rsolve_core::PackageNamespace::new("bioc").unwrap(),
+                    namespace: PackageNamespace::new("bioc").unwrap(),
                     release: rsolve_core::BioconductorRelease::new("3.20").unwrap(),
                     version: version("1.0"),
                 },
@@ -139,116 +79,51 @@ fn logical_lock() -> Lockfile {
     .unwrap()
 }
 
+fn empty_wire() -> &'static str {
+    "version = 1\nr-version = \"4.4\"\npackages = []\n"
+}
+
 #[test]
-fn all_logical_provenance_and_source_constraints_round_trip() {
+fn logical_sources_and_flat_projection_round_trip_deterministically() {
+    let lock = logical_lock();
+    let first = to_toml(&lock).unwrap();
+    let decoded = from_toml(&first).unwrap();
+    assert_eq!(decoded, lock);
+    let second = to_toml(&decoded).unwrap();
+    assert_eq!(first, second);
+    assert!(first.starts_with(
+        "# This file is automatically @generated by rsolve.\n# It is not intended for manual editing.\n\n"
+    ));
+    assert!(first.contains("version = 1"));
+    assert!(!first.contains("schema-version"));
+    assert!(!first.contains("schema-revision"));
+    assert!(first.contains("kind = \"registry\""));
+    assert!(first.contains("kind = \"bioconductor\""));
+    assert!(first.contains("kind = \"git\""));
+    assert!(first.contains("kind = \"immutable\""));
+    assert!(first.contains("source = { kind = \"registry\", namespace = \"cran\" }"));
+    assert!(!first.contains("identity"));
+    assert!(!first.contains("distributions"));
+}
+
+#[test]
+fn package_published_spelling_is_preserved_but_r_version_is_canonical() {
     let lock = logical_lock();
     let text = to_toml(&lock).unwrap();
-    let decoded = from_toml(&text).unwrap();
-    assert_eq!(decoded, lock);
-    assert!(text.contains("schema-version = 1"));
-    assert!(text.contains("linking-to"));
-}
+    let alternate = text.replace("version = \"1.0\"", "version = \"1.0.0\"");
+    let reparsed = from_toml(&alternate).unwrap();
+    assert_eq!(to_toml(&reparsed).unwrap(), alternate);
 
-#[test]
-fn identity_encoding_is_canonical_and_lossless() {
-    for package in &logical_lock().resolutions[0].packages {
-        let encoded = encode_identity(&package.identity).unwrap();
-        assert_eq!(decode_identity(&encoded).unwrap(), package.identity);
-    }
-    for (value, expected) in [
-        ("registry:cran::registry@1.0.0", "noncanonical version"),
-        ("registry:cran::registry%2E@1.0", "over-escaped unreserved"),
-        ("registry:cran::registry%2e@1.0", "lowercase percent hex"),
-        (
-            "git:https%3A%2F%2FEXAMPLE.test%2Frepo@0123456789abcdef0123456789abcdef01234567::git",
-            "non-normalized URL",
-        ),
-        (
-            "git:https%3A%2F%2Fexample.test%2Frepo@0123::git",
-            "abbreviated commit",
-        ),
-    ] {
-        assert!(
-            matches!(
-                decode_identity(value),
-                Err(LockWireError::NonCanonicalIdentity(_))
-                    | Err(LockWireError::InvalidIdentity(_))
-            ),
-            "{expected}"
-        );
-    }
-}
-
-#[test]
-fn canonical_version_fields_have_one_wire_spelling() {
-    let make_lock = |package_version: &str, clause_version: &str, r_version: &str| {
-        Lockfile::new(vec![LockedResolution {
-            target: rsolve_core::ResolutionTarget::new(
-                version(r_version),
-                rsolve_core::Target::new("linux", "x86_64"),
-            ),
-            environment: EnvironmentId::new("default").unwrap(),
-            publication_cutoff: None,
-            packages: vec![LockedPackage {
-                identity: identity(
-                    "spellings",
-                    Provenance::RegistryRelease {
-                        namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
-                        version: version(package_version),
-                    },
-                ),
-                version: version(package_version),
-                published_version_spelling: None,
-                distributions: Vec::new(),
-                dependencies: vec![LockedDependencyEdge {
-                    kind: DependencyKind::Depends,
-                    name: package("dep"),
-                    source: DependencySourceConstraint::Any,
-                    constraint: VersionConstraint::new(vec![VersionClause::new(
-                        RelationOp::Ge,
-                        version(clause_version),
-                    )]),
-                }],
-                metadata_sha256: None,
-            }],
-        }])
-        .unwrap()
-    };
-    let canonical = make_lock("1.6.5", "1.0", "4.4");
-    let alternate = make_lock("1.6-5", "1.0.0", "4.4.0");
-    let leading_zero = make_lock("01.6.5", "01.0", "04.4");
-    assert_eq!(to_toml(&canonical).unwrap(), to_toml(&alternate).unwrap());
-    assert_eq!(
-        to_toml(&canonical).unwrap(),
-        to_toml(&leading_zero).unwrap()
-    );
-    let text = to_toml(&canonical).unwrap();
     assert!(matches!(
         from_toml(&text.replace("r-version = \"4.4\"", "r-version = \"4.4.0\"")),
         Err(LockWireError::NonCanonicalVersion { field, .. }) if field == "r-version"
-    ));
-    assert!(matches!(
-        from_toml(&text.replace("version = \"1.6.5\"", "version = \"1.6.5.0\"")),
-        Err(LockWireError::NonCanonicalVersion { field, .. }) if field == "version"
-    ));
-    assert!(matches!(
-        from_toml(&text.replace("version = \"1.6.5\"", "version = \"01.6.5\"")),
-        Err(LockWireError::NonCanonicalVersion { field, .. }) if field == "version"
-    ));
-    assert!(matches!(
-        from_toml(&text.replace("op = \"ge\"\nversion = \"1.0\"", "op = \"ge\"\nversion = \"1.0.0\"")),
-        Err(LockWireError::NonCanonicalVersion { field, .. })
-            if field == "dependency.clauses.version"
     ));
 }
 
 #[test]
 fn one_component_target_r_version_round_trips() {
     let lock = Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(
-            RPackageVersion::parse_bare("4").unwrap(),
-            rsolve_core::Target::new("linux", "x86_64"),
-        ),
+        target: rsolve_core::ResolutionTarget::new(RPackageVersion::parse_bare("4").unwrap()),
         environment: EnvironmentId::new("default").unwrap(),
         publication_cutoff: None,
         packages: Vec::new(),
@@ -263,10 +138,7 @@ fn one_component_target_r_version_round_trips() {
 fn publication_cutoff_round_trips_and_is_canonical() {
     let cutoff = PublicationDate::parse("2026-06-24").unwrap();
     let lock = Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(
-            version("4.4.0"),
-            rsolve_core::Target::new("linux", "x86_64"),
-        ),
+        target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
         environment: EnvironmentId::new("default").unwrap(),
         publication_cutoff: Some(cutoff),
         packages: Vec::new(),
@@ -282,40 +154,56 @@ fn publication_cutoff_round_trips_and_is_canonical() {
 }
 
 #[test]
-fn resolution_projection_wire_output_excludes_artifact_facts() {
+fn resolution_projection_excludes_artifacts_and_unselected_dependencies() {
     let name = package("artifactless");
     let release_version = version("1.0");
-    let release = rsolve_core::PackageRelease::try_from(rsolve_core::ReleaseObservation {
+    let release = rsolve_core::PackageRelease::try_from(ReleaseObservation {
         identity: identity(
             "artifactless",
             Provenance::RegistryRelease {
-                namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                namespace: PackageNamespace::new("cran").unwrap(),
                 version: release_version.clone(),
             },
         ),
         observed_package: name,
         observed_version: release_version,
-        metadata: rsolve_core::ReleaseMetadata::default(),
+        metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: Vec::new(),
-        distributions: vec![rsolve_core::Distribution {
+        dependencies: vec![
+            DependencyRequirement::new(
+                DependencyKind::Depends,
+                package("R"),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            ),
+            DependencyRequirement::new(
+                DependencyKind::Imports,
+                package("kept"),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            ),
+            DependencyRequirement::new(
+                DependencyKind::Suggests,
+                package("suggested"),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            ),
+        ],
+        distributions: vec![Distribution {
             registry: RegistryId::new("cran").unwrap(),
             channel: DistributionChannel::new("source").unwrap(),
             snapshot: None,
-            artifacts: vec![rsolve_core::Artifact::Source(rsolve_core::SourceArtifact {
-                locator: rsolve_core::ArtifactLocator::new("/machine/secret.tar.gz").unwrap(),
-                upstream_checksums: vec![rsolve_core::UpstreamChecksum::Md5("deadbeef".into())],
+            artifacts: vec![rsolve_core::Artifact::Source(SourceArtifact {
+                locator: ArtifactLocator::new("/machine/secret.tar.gz").unwrap(),
+                upstream_checksums: vec![UpstreamChecksum::Md5("deadbeef".into())],
                 size: Some(4242),
             })],
-            observed_metadata: rsolve_core::DistributionMetadata::default(),
+            observed_metadata: DistributionMetadata::default(),
         }],
     })
     .unwrap();
     let resolution = rsolve_core::Resolution::new(
-        rsolve_core::ResolutionTarget::new(
-            version("4.4"),
-            rsolve_core::Target::new("linux", "x86_64"),
-        ),
+        rsolve_core::ResolutionTarget::new(version("4.4")),
         vec![rsolve_core::ResolvedPackage::new(
             rsolve_core::SolverKey::InstalledName(package("artifactless")),
             release,
@@ -324,47 +212,65 @@ fn resolution_projection_wire_output_excludes_artifact_facts() {
     let lock =
         Lockfile::from_resolution(&resolution, EnvironmentId::new("default").unwrap()).unwrap();
     let text = to_toml(&lock).unwrap();
-    for forbidden in ["/machine/secret.tar.gz", "deadbeef", "4242"] {
+    for forbidden in [
+        "/machine/secret.tar.gz",
+        "deadbeef",
+        "4242",
+        "suggested",
+        "kept",
+    ] {
         assert!(!text.contains(forbidden));
     }
+    assert!(!text.contains("\"R\""));
 }
 
 #[test]
-fn reader_enforces_schema_and_exactly_one_resolution() {
-    let empty = "schema-version = 1\nschema-revision = 1\nresolutions = []\n";
-    assert!(matches!(
-        from_toml(empty),
-        Err(LockWireError::Domain(
-            LockError::UnsupportedResolutionCount { found: 0 }
-        ))
-    ));
-    let two = "schema-version = 1\nschema-revision = 1\n\n[[resolutions]]\nenvironment = \"default\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n\n[[resolutions]]\nenvironment = \"other\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n";
-    assert!(matches!(
-        from_toml(two),
-        Err(LockWireError::Domain(
-            LockError::UnsupportedResolutionCount { found: 2 }
-        ))
-    ));
-    assert!(matches!(
-        from_toml("schema-version = 2\nschema-revision = 1\nresolutions = []\n"),
-        Err(LockWireError::UnsupportedSchema { .. })
-    ));
-    for revision in [0, 2] {
-        let input = format!("schema-version = 1\nschema-revision = {revision}\nresolutions = []\n");
+fn reader_requires_version_one_and_rejects_removed_headers_and_wrappers() {
+    assert!(from_toml(empty_wire()).is_ok());
+    for input in [
+        "schema-version = 1\nversion = 1\nr-version = \"4.4\"\npackages = []\n",
+        "schema-revision = 1\nversion = 1\nr-version = \"4.4\"\npackages = []\n",
+        "version = 1\nr-version = \"4.4\"\npackages = []\nresolutions = []\n",
+    ] {
+        assert!(matches!(from_toml(input), Err(LockWireError::Parse(_))));
+    }
+    for version in [0, 2, 3] {
+        let input = format!("version = {version}\nr-version = \"4.4\"\npackages = []\n");
         assert!(matches!(
             from_toml(&input),
-            Err(LockWireError::UnsupportedSchema { .. })
+            Err(LockWireError::UnsupportedSchema { version: found, .. }) if found == version
         ));
     }
 }
 
 #[test]
+fn dangling_dependency_is_rejected_at_the_lock_boundary() {
+    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [\"missing\"]\n";
+    assert!(matches!(
+        from_toml(input),
+        Err(LockWireError::Domain(LockError::DanglingDependency { package, dependency }))
+            if package == "foo" && dependency == "missing"
+    ));
+}
+
+#[test]
+fn metadata_digest_is_required_on_wire_packages() {
+    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\ndependencies = []\n";
+    assert!(matches!(from_toml(input), Err(LockWireError::Parse(_))));
+}
+
+#[test]
 fn unknown_and_machine_local_fields_are_rejected_and_not_emitted() {
-    let unknown =
-        "schema-version = 1\nschema-revision = 1\nartifact-url = \"/tmp/a\"\nresolutions = []\n";
+    let unknown = "version = 1\nr-version = \"4.4\"\npackages = []\nartifact-url = \"/tmp/a\"\n";
     assert!(matches!(from_toml(unknown), Err(LockWireError::Parse(_))));
-    let forbidden = "schema-version = 1\nschema-revision = 1\n\n[[resolutions]]\nenvironment = \"default\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\n\n[[resolutions.packages]]\nidentity = \"registry:cran::foo@1.0\"\nversion = \"1.0\"\ndistributions = []\ndependencies = []\nartifact-url = \"/tmp/a\"\n";
-    assert!(matches!(from_toml(forbidden), Err(LockWireError::Parse(_))));
+    let platform =
+        "version = 1\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n";
+    assert!(matches!(from_toml(platform), Err(LockWireError::Parse(_))));
+    let package_machine_local = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\ndependencies = []\nartifact-url = \"/tmp/a\"\n";
+    assert!(matches!(
+        from_toml(package_machine_local),
+        Err(LockWireError::Parse(_))
+    ));
     let text = to_toml(&logical_lock()).unwrap();
     for forbidden in [
         "artifact-url",
@@ -372,9 +278,31 @@ fn unknown_and_machine_local_fields_are_rejected_and_not_emitted() {
         "link-method",
         "artifact-sha256",
         "size",
+        "identity",
+        "published-version-spelling",
+        "distributions",
+        "resolutions",
+        "environment",
     ] {
-        assert!(!text.contains(forbidden));
+        assert!(!text.contains(forbidden), "unexpected field {forbidden}");
     }
+    assert!(!text.contains("\nos = "));
+    assert!(!text.contains("\narch = "));
+}
+
+#[test]
+fn non_default_environment_cannot_be_silently_dropped() {
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: rsolve_core::ResolutionTarget::new(version("4.4")),
+        environment: EnvironmentId::new("other").unwrap(),
+        publication_cutoff: None,
+        packages: Vec::new(),
+    }])
+    .unwrap();
+    assert!(matches!(
+        to_toml(&lock),
+        Err(LockWireError::InvalidField { field, .. }) if field == "environment"
+    ));
 }
 
 #[test]
@@ -384,7 +312,6 @@ fn reversed_logical_input_has_identical_wire_bytes() {
     resolution.packages.reverse();
     for package in &mut resolution.packages {
         package.dependencies.reverse();
-        package.distributions.reverse();
     }
     let second = Lockfile::new(vec![resolution]).unwrap();
     assert_eq!(to_toml(&first).unwrap(), to_toml(&second).unwrap());

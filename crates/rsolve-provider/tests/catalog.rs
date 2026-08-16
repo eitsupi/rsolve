@@ -30,8 +30,12 @@ Unknown-Field: retained\n\n",
             if namespace.as_str() == "cran" && version.as_str() == "1.0.0"
     ));
     assert_eq!(
-        release.metadata().fields().get("Unknown-Field"),
-        Some(&"retained".to_owned())
+        release
+            .metadata()
+            .fields()
+            .get("Unknown-Field")
+            .map(String::as_str),
+        Some("retained")
     );
     assert_eq!(
         release.publication().map(|publication| publication.date()),
@@ -86,26 +90,195 @@ Unknown-Field: retained\n\n",
 }
 
 #[test]
+fn dependency_splitter_matches_r_terminal_empty_segment_rules() {
+    let cases = [
+        ("", Ok(vec![])),
+        ("rsolvefixture.one,", Ok(vec!["rsolvefixture.one"])),
+        ("rsolvefixture.one,,rsolvefixture.two", Err(())),
+        ("rsolvefixture.one,,", Err(())),
+        ("rsolvefixture.one,  ", Err(())),
+    ];
+    for (value, expected) in cases {
+        let input = format!("Package: dependency.case\nVersion: 1.0.0\nImports: {value}\n\n");
+        let result = CranCatalog::from_packages(input.as_bytes());
+        match expected {
+            Ok(names) => {
+                let catalog = result.expect("R-compatible dependency field");
+                let release = &catalog.candidates_named("dependency.case").unwrap()[0];
+                assert_eq!(
+                    release
+                        .dependencies()
+                        .iter()
+                        .map(|dependency| dependency.name.as_str())
+                        .collect::<Vec<_>>(),
+                    names
+                );
+            }
+            Err(()) => {
+                let error = result.expect_err("malformed empty dependency token");
+                assert!(matches!(
+                    error.diagnostics()[0].error(),
+                    CranRecordError::Dependency {
+                        field: "Imports",
+                        source: DependencyParseError::EmptyEntry,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn current_root_row_suppresses_matching_recommended_overlay() {
+    let catalog = CranCatalog::from_packages(
+        b"Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
+    )
+    .unwrap();
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(catalog.candidate_count(), 1);
+    assert_eq!(release.version().as_str(), "1.7-6");
+    assert!(!release.metadata().fields().contains_key("Path"));
+    assert_eq!(release.dependencies().len(), 2);
+    assert_eq!(
+        release
+            .dependencies()
+            .iter()
+            .find(|dependency| dependency.name.as_str() == "R")
+            .expect("R dependency")
+            .constraint
+            .clauses[0]
+            .version
+            .as_str(),
+        "4.4"
+    );
+}
+
+#[test]
+fn recommended_overlay_is_retained_without_a_prior_root() {
+    let catalog = CranCatalog::from_packages(
+        b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
+    )
+    .unwrap();
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(
+        release.metadata().fields().get("Path").map(String::as_str),
+        Some("4.7.0/Recommended")
+    );
+    assert_eq!(
+        release.dependencies()[0].constraint.clauses[0]
+            .version
+            .as_str(),
+        "4.7.0"
+    );
+}
+
+#[test]
+fn overlay_before_root_remains_a_conflicting_duplicate() {
+    let error = CranCatalog::from_packages(
+        b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\nMD5sum: same\n\n",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.diagnostics()[0].error(),
+        CranRecordError::Domain(_)
+    ));
+}
+
+#[test]
+fn mismatched_recommended_overlays_are_not_suppressed() {
+    for (path, md5) in [
+        ("4.7.0/Other", "same"),
+        ("4.7.0/Recommended", "different"),
+        ("4.7.0/Recommended", ""),
+        ("not-a-version/Recommended", "same"),
+    ] {
+        let input = format!(
+            "Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: {path}\nMD5sum: {md5}\n\n"
+        );
+        let error = CranCatalog::from_packages(input.as_bytes()).unwrap_err();
+        assert!(
+            matches!(error.diagnostics()[0].error(), CranRecordError::Domain(_)),
+            "{path} / {md5:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_recommended_overlays_and_missing_root_md5_are_not_suppressed() {
+    let cases = [
+        (
+            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7),, methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
+            "semantic dependency diagnostic",
+        ),
+        (
+            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\n\n",
+            "overlay MD5 missing",
+        ),
+        (
+            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
+            "root MD5 missing",
+        ),
+        (
+            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: \n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
+            "root MD5 empty",
+        ),
+        (
+            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended/extra\nMD5sum: same\n\n",
+            "overlay path has an extra slash",
+        ),
+    ];
+    for (input, description) in cases {
+        let error = CranCatalog::from_packages(input.as_bytes()).unwrap_err();
+        assert!(!error.diagnostics().is_empty(), "{description}");
+        if description == "semantic dependency diagnostic" {
+            assert!(matches!(
+                error.diagnostics()[0].error(),
+                CranRecordError::Dependency { .. }
+            ));
+        } else {
+            assert!(
+                matches!(error.diagnostics()[0].error(), CranRecordError::Domain(_)),
+                "{description}"
+            );
+        }
+    }
+}
+
+#[test]
 fn published_date_forms_are_first_class_and_missing_is_unknown() {
     let catalog = CranCatalog::from_packages(
         b"Package: dateonly\nVersion: 1.0.0\nPublished: 2026-06-24\n\n\
-Package: datetime\nVersion: 1.0.0\nPublished: 2026-06-25 19:14:59 UTC\n\n\
+Package: bare.datetime\nVersion: 1.0.0\nPublished: 2026-06-24 19:14:59\n\n\
+Package: datetime\nVersion: 1.0.0\nPublished: 2026-06-24 19:14:59 UTC\n\n\
 Package: missing\nVersion: 1.0.0\n\n\
 ",
     )
     .unwrap();
-    assert_eq!(
-        catalog.candidates_named("dateonly").unwrap()[0]
-            .publication()
-            .map(|publication| publication.date()),
-        Some(PublicationDate::parse("2026-06-24").unwrap())
-    );
-    assert_eq!(
-        catalog.candidates_named("datetime").unwrap()[0]
-            .publication()
-            .map(|publication| publication.date()),
-        Some(PublicationDate::parse("2026-06-25").unwrap())
-    );
+    let expected = PublicationDate::parse("2026-06-24").unwrap();
+    let date_only = catalog.candidates_named("dateonly").unwrap()[0]
+        .publication()
+        .map(|publication| publication.date())
+        .unwrap();
+    let timezone_free = catalog.candidates_named("bare.datetime").unwrap()[0]
+        .publication()
+        .map(|publication| publication.date())
+        .unwrap();
+    let utc = catalog.candidates_named("datetime").unwrap()[0]
+        .publication()
+        .map(|publication| publication.date())
+        .unwrap();
+    assert_eq!(date_only, expected);
+    assert_eq!(timezone_free, expected);
+    assert_eq!(utc, expected);
     assert!(
         catalog.candidates_named("missing").unwrap()[0]
             .publication()
@@ -127,6 +300,33 @@ fn invalid_published_date_is_a_semantic_diagnostic() {
             CranRecordError::InvalidPublicationDate { .. }
         )
     }));
+}
+
+#[test]
+fn invalid_published_datetime_spellings_are_semantic_diagnostics() {
+    for (index, value) in [
+        "2026-06-24T19:14:59",
+        "2026-06-24 19:14:59.1",
+        "2026-06-24 19:14:59+00:00",
+        "2026-06-24 19:14:59Z",
+        "2026-06-24 19:14:59 utc",
+        "2026-06-24 19:14:59 UTC extra",
+        "2026-02-29 19:14:59",
+        "2026-06-24 24:00:00",
+        "2026-06-24 19:60:00",
+        "2026-06-24 19:14:60",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let package = format!("invalid.datetime{index}");
+        let input = format!("Package: {package}\nVersion: 1.0.0\nPublished: {value}\n\n");
+        let error = CranCatalog::from_packages(input.as_bytes()).unwrap_err();
+        assert!(matches!(
+            error.diagnostics()[0].error(),
+            CranRecordError::InvalidPublicationDate { .. }
+        ));
+    }
 }
 
 #[test]

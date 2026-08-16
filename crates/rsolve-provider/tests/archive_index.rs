@@ -3,6 +3,11 @@ use rsolve_provider::cran::{CranArchiveIndexError, CranCatalog, CranRecordError}
 const ARCHIVE: &[u8] = include_bytes!("fixtures/cran-2026-08-08/synthetic-archive-PACKAGES.rds");
 const VALID_ARCHIVE: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-valid-archive-PACKAGES.rds");
+const OVERLAY_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-PACKAGES.rds");
+const OVERLAY_MISMATCH_ARCHIVE: &[u8] = include_bytes!(
+    "fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds"
+);
 
 // R 4.6.1, format 3, uncompressed RDS containing a character vector rather
 // than a matrix. It is deliberately small so this structural test has no
@@ -33,12 +38,20 @@ fn archive_rows_are_not_assumed_to_be_version_ordered() {
         vec!["0.3.0", "1.10.0"]
     );
     assert_eq!(
-        history[0].metadata().fields().get("License"),
-        Some(&"RSOLVE Fictional Terms Older".to_owned())
+        history[0]
+            .metadata()
+            .fields()
+            .get("License")
+            .map(String::as_str),
+        Some("RSOLVE Fictional Terms Older")
     );
     assert_eq!(
-        history[1].metadata().fields().get("License"),
-        Some(&"RSOLVE Fictional Terms – Archive".to_owned())
+        history[1]
+            .metadata()
+            .fields()
+            .get("License")
+            .map(String::as_str),
+        Some("RSOLVE Fictional Terms – Archive")
     );
 }
 
@@ -88,8 +101,9 @@ fn archive_reader_looks_up_columns_and_preserves_dependencies_and_utf8() {
         catalog.candidates_named("rsolvefixture.utf8").unwrap()[0]
             .metadata()
             .fields()
-            .get("License"),
-        Some(&"RSOLVE Fictional Terms 日本語".to_owned())
+            .get("License")
+            .map(String::as_str),
+        Some("RSOLVE Fictional Terms 日本語")
     );
 }
 
@@ -114,6 +128,50 @@ fn archive_semantic_invalid_rows_fail_without_partial_catalog() {
     assert!(matches!(
         diagnostic.error(),
         CranRecordError::InvalidVersion(_)
+    ));
+}
+
+#[test]
+fn archive_root_row_suppresses_matching_recommended_overlay() {
+    let object = rd_rds::file::from_bytes(OVERLAY_ARCHIVE).expect("archive RDS");
+    let matrix = rd_rds::package::PackagesMatrix::from_object(&object).expect("archive matrix");
+    assert_eq!(matrix.row(0).unwrap().get("Path"), Some(None));
+    assert_eq!(
+        matrix.row(1).unwrap().get("Path"),
+        Some(Some("4.7.0/Recommended"))
+    );
+
+    let catalog = CranCatalog::from_archive_index_rds(OVERLAY_ARCHIVE).expect("archive fixture");
+    assert_eq!(catalog.package_count(), 1);
+    assert_eq!(catalog.candidate_count(), 1);
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(
+        release
+            .dependencies()
+            .iter()
+            .find(|dependency| dependency.name.as_str() == "R")
+            .and_then(|dependency| dependency.constraint.clauses.first())
+            .map(|clause| clause.version.as_str()),
+        Some("4.4")
+    );
+    assert!(
+        release
+            .dependencies()
+            .iter()
+            .any(|dependency| dependency.name.as_str() == "methods")
+    );
+    assert!(!release.metadata().fields().contains_key("Path"));
+}
+
+#[test]
+fn archive_mismatched_recommended_overlay_remains_a_conflicting_duplicate() {
+    let error = CranCatalog::from_archive_index_rds(OVERLAY_MISMATCH_ARCHIVE).unwrap_err();
+    assert!(matches!(
+        error
+            .diagnostics()
+            .first()
+            .map(|diagnostic| diagnostic.error()),
+        Some(CranRecordError::Domain(_))
     ));
 }
 

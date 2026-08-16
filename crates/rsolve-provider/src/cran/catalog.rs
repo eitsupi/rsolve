@@ -1,6 +1,6 @@
 //! Conversion of a current CRAN `PACKAGES` DCF index into domain candidates.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -260,11 +260,21 @@ where
     >,
 {
     let mut aggregation = ReleaseAggregation::new();
+    let mut root_md5_by_identity = HashMap::<ReleaseIdentity, String>::new();
     let mut diagnostics = Vec::new();
 
     for (record_index, package, observation) in observations {
         match observation {
             Ok(observation) => {
+                if let Some(root_md5) = root_md5_by_identity.get(&observation.identity)
+                    && is_recommended_overlay(&observation)
+                    && overlay_matches_root(&observation, root_md5)
+                {
+                    continue;
+                }
+                if let Some(md5) = valid_root_md5(&observation) {
+                    root_md5_by_identity.insert(observation.identity.clone(), md5.to_owned());
+                }
                 if let Err(error) = aggregation.observe(observation) {
                     diagnostics.push(CranDiagnostic {
                         record_index,
@@ -297,6 +307,43 @@ where
     Ok(CranCatalog { candidates })
 }
 
+fn metadata_field<'a>(observation: &'a ReleaseObservation, name: &str) -> Option<&'a str> {
+    observation
+        .metadata
+        .fields()
+        .iter()
+        .find(|(field, _)| field.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn valid_root_md5(observation: &ReleaseObservation) -> Option<&str> {
+    if metadata_field(observation, "Path").is_some() {
+        return None;
+    }
+    let md5 = metadata_field(observation, "MD5sum")?;
+    (!md5.trim().is_empty()).then_some(md5)
+}
+
+fn is_recommended_overlay(observation: &ReleaseObservation) -> bool {
+    let Some(path) = metadata_field(observation, "Path") else {
+        return false;
+    };
+    let Some((version, suffix)) = path.rsplit_once('/') else {
+        return false;
+    };
+    suffix == "Recommended"
+        && !version.is_empty()
+        && RPackageVersion::parse(version).is_ok()
+        && path.matches('/').count() == 1
+}
+
+fn overlay_matches_root(observation: &ReleaseObservation, root_md5: &str) -> bool {
+    let Some(overlay_md5) = metadata_field(observation, "MD5sum") else {
+        return false;
+    };
+    !overlay_md5.trim().is_empty() && overlay_md5 == root_md5
+}
+
 pub(super) fn observation_from_fields(
     fields: &[(&str, &str)],
 ) -> Result<ReleaseObservation, CranRecordError> {
@@ -320,7 +367,12 @@ pub(super) fn observation_from_fields(
         ("Enhances", DependencyKind::Enhances),
     ] {
         if let Some(value) = field(fields, field_name) {
-            for entry in value.split(',') {
+            // `split_terminator` drops only the terminal empty segment from
+            // a literal trailing comma, while preserving internal empties
+            // and whitespace-only entries for semantic validation, matching
+            // R's dependency splitter without allocating an intermediate
+            // collection.
+            for entry in value.split_terminator(',') {
                 let dependency = parse_dependency_entry(entry).map_err(|source| {
                     CranRecordError::Dependency {
                         field: field_name,
@@ -414,28 +466,37 @@ fn is_reserved_field(name: &str) -> bool {
 fn parse_publication_date(value: &str) -> Result<rsolve_core::ReleasePublication, CranRecordError> {
     let value = value.trim();
     let date = if value.len() == 10 {
-        PublicationDate::parse(value)
+        PublicationDate::parse(value).map_err(|error| error.to_string())
     } else {
-        let date_part = value
-            .get(..10)
-            .ok_or_else(|| rsolve_core::PublicationDateError::Invalid {
-                input: value.into(),
-                diagnostic: "publication datetime is too short".into(),
-            });
-        let format =
-            time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
-        time::PrimitiveDateTime::parse(value, format)
-            .map_err(|error| rsolve_core::PublicationDateError::Invalid {
-                input: value.into(),
-                diagnostic: error.to_string().into(),
-            })
-            .and_then(|_| date_part.and_then(PublicationDate::parse))
+        parse_publication_datetime(value)
     };
     date.map(rsolve_core::ReleasePublication::new)
-        .map_err(|error| CranRecordError::InvalidPublicationDate {
+        .map_err(|diagnostic| CranRecordError::InvalidPublicationDate {
             value: value.to_owned(),
-            diagnostic: error.to_string(),
+            diagnostic,
         })
+}
+
+fn parse_publication_datetime(value: &str) -> Result<PublicationDate, String> {
+    let (format, has_utc_suffix) = match value.len() {
+        19 => ("%Y-%m-%d %H:%M:%S", false),
+        23 => ("%Y-%m-%d %H:%M:%S UTC", true),
+        _ => return Err("Published datetime must use an accepted full-string spelling".into()),
+    };
+    if has_utc_suffix && !value.ends_with(" UTC") {
+        return Err("Published datetime must end with uppercase UTC".into());
+    }
+    let datetime =
+        jiff::civil::DateTime::strptime(format, value).map_err(|error| error.to_string())?;
+    let canonical = datetime.strftime(format).to_string();
+    if canonical != value {
+        return Err(
+            "Published datetime is not canonical (leap seconds and normalized values are rejected)"
+                .into(),
+        );
+    }
+    let date = datetime.date().strftime("%Y-%m-%d").to_string();
+    PublicationDate::parse(date).map_err(|error| error.to_string())
 }
 
 struct ParsedDependency {

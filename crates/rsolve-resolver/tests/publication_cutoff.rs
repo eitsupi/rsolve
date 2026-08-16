@@ -4,7 +4,7 @@ use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
     DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl, PackageName,
     PackageRelease, Provenance, PublicationCutoff, PublicationDate, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, Target,
+    ReleaseMetadata, ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey,
     VersionConstraint,
 };
 use rsolve_resolver::{
@@ -42,10 +42,7 @@ fn date(value: &str) -> PublicationDate {
 }
 
 fn target() -> ResolutionTarget {
-    ResolutionTarget::new(
-        rsolve_core::RPackageVersion::parse("4.4.0").unwrap(),
-        Target::new("linux", "x86_64"),
-    )
+    ResolutionTarget::new(rsolve_core::RPackageVersion::parse("4.4.0").unwrap())
 }
 
 fn release(name: &str, version: &str, publication: Option<&str>) -> PackageRelease {

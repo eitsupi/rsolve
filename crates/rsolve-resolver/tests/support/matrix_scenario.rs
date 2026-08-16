@@ -6,7 +6,7 @@ use rsolve_core::{
     DependencyRequirement, DependencySourceConstraint, Distribution, DistributionChannel,
     DistributionMetadata, PackageName, PackageNamespace, PackageRelease, Provenance,
     RPackageVersion, RelationOp, ReleaseAggregation, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, Target, VersionConstraint,
+    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{DefaultCandidatePreference, PreferLocked, Resolver};
 
@@ -80,10 +80,7 @@ impl MatrixCatalog {
                 DependencySourceConstraint::Any,
                 constraint,
             )],
-            ResolutionTarget::new(
-                RPackageVersion::parse(r_version).unwrap(),
-                Target::new("linux", "x86_64"),
-            ),
+            ResolutionTarget::new(RPackageVersion::parse(r_version).unwrap()),
             VersionConstraint::unconstrained(),
         )
     }
@@ -233,10 +230,7 @@ pub mod regression_support {
                         VersionConstraint::unconstrained(),
                     ),
                 ],
-                ResolutionTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    Target::new("linux", "x86_64"),
-                ),
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
         }
@@ -334,10 +328,7 @@ pub mod regression_support {
         pub fn request(&self) -> ResolutionRequest {
             ResolutionRequest::without_lock(
                 vec![foo_requirement()],
-                ResolutionTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    Target::new("linux", "x86_64"),
-                ),
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
         }
@@ -350,10 +341,7 @@ pub mod regression_support {
             );
             ResolutionRequest::new(
                 vec![foo_requirement()],
-                ResolutionTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    Target::new("linux", "x86_64"),
-                ),
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
                 locked,
             )
@@ -457,10 +445,7 @@ pub mod regression_support {
                     DependencySourceConstraint::Any,
                     VersionConstraint::unconstrained(),
                 )],
-                ResolutionTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    Target::new("linux", "x86_64"),
-                ),
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
         }
@@ -515,10 +500,7 @@ pub mod regression_support {
                     DependencySourceConstraint::Any,
                     VersionConstraint::unconstrained(),
                 )],
-                ResolutionTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    Target::new("linux", "x86_64"),
-                ),
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
         }
@@ -601,10 +583,7 @@ pub mod regression_support {
                     DependencySourceConstraint::Any,
                     VersionConstraint::unconstrained(),
                 )],
-                ResolutionTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    Target::new("linux", "x86_64"),
-                ),
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
         }

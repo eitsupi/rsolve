@@ -380,12 +380,7 @@ mod tests {
                 rsolve_core::RelationOp::Ge,
                 RPackageVersion::parse("4.0").unwrap(),
             ),
-            crate::manifest::ManifestTarget::new(
-                RPackageVersion::parse("4.4.0").unwrap(),
-                "linux",
-                "x86_64",
-            )
-            .unwrap(),
+            crate::manifest::ManifestTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
             vec![crate::manifest::ManifestDependency::new(
                 name,
                 VersionConstraint::unconstrained(),
@@ -400,10 +395,7 @@ mod tests {
         let old = release_at_version(&name, "1.0.0");
         let newer = release_at_version(&name, "2.0.0");
         let old_resolution = Resolution::new(
-            ResolutionTarget::new(
-                RPackageVersion::parse("4.4.0").unwrap(),
-                rsolve_core::Target::new("linux", "x86_64"),
-            ),
+            ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
             vec![rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(name.clone()),
                 old,
@@ -460,12 +452,7 @@ mod tests {
                 rsolve_core::RelationOp::Ge,
                 RPackageVersion::parse("4.0").unwrap(),
             ),
-            crate::manifest::ManifestTarget::new(
-                RPackageVersion::parse("4.4.0").unwrap(),
-                "linux",
-                "x86_64",
-            )
-            .unwrap(),
+            crate::manifest::ManifestTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
             vec![crate::manifest::ManifestDependency::new(
                 root.clone(),
                 VersionConstraint::unconstrained(),
@@ -520,12 +507,7 @@ mod tests {
                     rsolve_core::RelationOp::Ge,
                     RPackageVersion::parse("4.0").unwrap(),
                 ),
-                crate::manifest::ManifestTarget::new(
-                    RPackageVersion::parse("4.4.0").unwrap(),
-                    "linux",
-                    "x86_64",
-                )
-                .unwrap(),
+                crate::manifest::ManifestTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 vec![crate::manifest::ManifestDependency::new(
                     root,
                     VersionConstraint::unconstrained(),
@@ -746,12 +728,7 @@ mod tests {
                 rsolve_core::RelationOp::Ge,
                 RPackageVersion::parse("4.0").unwrap(),
             ),
-            crate::manifest::ManifestTarget::new(
-                RPackageVersion::parse("4.4.0").unwrap(),
-                "linux",
-                "x86_64",
-            )
-            .unwrap(),
+            crate::manifest::ManifestTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
             vec![crate::manifest::ManifestDependency::new(
                 PackageName::new("fixture").unwrap(),
                 VersionConstraint::unconstrained(),

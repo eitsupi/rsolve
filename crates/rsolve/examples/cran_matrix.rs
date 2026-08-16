@@ -148,7 +148,7 @@ fn format_resolution(mirror: &str, resolution: &Resolution) -> String {
 fn matrix_manifest(r_version: RPackageVersion) -> Result<Manifest, Box<dyn Error>> {
     Ok(Manifest::new(
         VersionConstraint::unconstrained(),
-        ManifestTarget::new(r_version, "linux", "x86_64")?,
+        ManifestTarget::new(r_version),
         vec![ManifestDependency::new(
             PackageName::new("Matrix")?,
             VersionConstraint::unconstrained(),
@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use rsolve_core::{
         Provenance, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ResolutionTarget,
-        ResolvedPackage, SolverKey, Target,
+        ResolvedPackage, SolverKey,
     };
 
     fn version(value: &str) -> RPackageVersion {
@@ -238,7 +238,7 @@ mod tests {
         let matrix = PackageName::new("Matrix").unwrap();
         let methods = PackageName::new("methods").unwrap();
         let matrix_version = version("1.7-0");
-        let target = ResolutionTarget::new(version("4.4.0"), Target::new("linux", "x86_64"));
+        let target = ResolutionTarget::new(version("4.4.0"));
         let metadata = ReleaseMetadata::new(std::collections::BTreeMap::new()).unwrap();
         let matrix_release = PackageRelease::try_from(ReleaseObservation {
             identity: ReleaseIdentity::new(

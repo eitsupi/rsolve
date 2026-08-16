@@ -3,6 +3,7 @@
 //! This crate must not move domain, provider, resolver, or repository
 //! implementation into the binary beyond composition responsibilities.
 
+pub mod cli;
 pub mod lock;
 pub mod manifest;
 pub mod orchestration;
@@ -10,8 +11,7 @@ pub mod pak;
 pub mod wire;
 
 pub use lock::{
-    EnvironmentId, EnvironmentIdError, LockError, LockedDependencyEdge, LockedDistributionRef,
-    LockedPackage, LockedResolution, Lockfile,
+    EnvironmentId, EnvironmentIdError, LockError, LockedPackage, LockedResolution, Lockfile,
 };
 pub use manifest::{
     Manifest, ManifestDependency, ManifestError, ManifestTarget, compose_resolution_request,

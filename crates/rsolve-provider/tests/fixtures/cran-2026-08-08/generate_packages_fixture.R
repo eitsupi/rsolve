@@ -231,6 +231,47 @@ set_matrix_archive_row(2L, c(
     NeedsCompilation = "yes"
 ))
 write_binary_fixture("synthetic-matrix-archive-PACKAGES.rds", matrix_archive)
+
+# A current-index-shaped duplicate pair: the root row precedes a Recommended
+# path overlay for the same release identity. The catalog reader must keep
+# the root metadata and suppress only the matching overlay.
+matrix_overlay_columns <- c(archive_columns, "Path")
+matrix_overlay_archive <- matrix(
+    NA_character_,
+    nrow = 2L,
+    ncol = length(matrix_overlay_columns),
+    dimnames = list(NULL, matrix_overlay_columns)
+)
+set_matrix_overlay_row <- function(row, values) {
+    matrix_overlay_archive[row, names(values)] <<- unname(values)
+}
+set_matrix_overlay_row(1L, c(
+    Package = "Matrix",
+    Version = "1.7-6",
+    Depends = "R (>= 4.4), methods",
+    License = "RSOLVE Fictional Terms Matrix",
+    MD5sum = "00000000000000000000000000000031",
+    NeedsCompilation = "yes"
+))
+set_matrix_overlay_row(2L, c(
+    Package = "Matrix",
+    Version = "1.7-6",
+    Depends = "R (>= 4.7), methods",
+    License = "RSOLVE Fictional Terms Matrix",
+    MD5sum = "00000000000000000000000000000031",
+    NeedsCompilation = "yes",
+    Path = "4.7.0/Recommended"
+))
+write_binary_fixture(
+    "synthetic-matrix-archive-overlay-PACKAGES.rds",
+    matrix_overlay_archive
+)
+matrix_overlay_mismatch <- matrix_overlay_archive
+matrix_overlay_mismatch[2L, "MD5sum"] <- "00000000000000000000000000000032"
+write_binary_fixture(
+    "synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds",
+    matrix_overlay_mismatch
+)
 write_binary_fixture("synthetic-matrix-archive-wrong-root.rds", "wrong root")
 write_binary_fixture(
     "synthetic-matrix-archive-missing-version.rds",

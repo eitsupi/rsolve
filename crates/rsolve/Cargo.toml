@@ -18,6 +18,7 @@ name = "pak_isolated"
 path = "tests/pak_isolated.rs"
 
 [dependencies]
+clap.workspace = true
 rsolve-core = { path = "../rsolve-core" }
 rsolve-provider = { path = "../rsolve-provider" }
 rsolve-resolver = { path = "../rsolve-resolver" }
@@ -25,5 +26,9 @@ rsolve-repository = { path = "../rsolve-repository" }
 percent-encoding.workspace = true
 serde.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 toml.workspace = true
 url.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

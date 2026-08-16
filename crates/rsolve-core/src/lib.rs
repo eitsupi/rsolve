@@ -41,4 +41,4 @@ pub use request::{LockedIdentities, ResolutionRequest, SolverKey};
 pub use resolution::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, Resolution, ResolvedPackage,
 };
-pub use target::{ResolutionTarget, Target};
+pub use target::ResolutionTarget;

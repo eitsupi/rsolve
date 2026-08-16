@@ -5,61 +5,19 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, Distribution,
-    DistributionChannel, LockedIdentities, PackageName, PackageRelease, Provenance,
-    PublicationCutoff, PublicationDate, RPackageVersion, RegistryId, ReleaseIdentity, Resolution,
-    ResolutionRequest, ResolutionTarget, Sha256Digest, SnapshotId, SolverKey, VersionClause,
-    VersionConstraint,
+    DependencyKind, LockedIdentities, PackageName, PackageRelease, Provenance, PublicationCutoff,
+    PublicationDate, RPackageVersion, ReleaseIdentity, Resolution, ResolutionRequest,
+    ResolutionTarget, Sha256Digest, SolverKey,
 };
 
 pub use rsolve_core::{EnvironmentId, EnvironmentIdError};
 
 use crate::manifest::{Manifest, ManifestError};
-
-/// A distribution coordinate that is meaningful across machines.
-///
-/// In particular, this type has no artifact list. Artifact locators,
-/// checksums, sizes, and selected source/binary forms belong to local state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LockedDistributionRef {
-    pub registry: RegistryId,
-    pub channel: DistributionChannel,
-    pub snapshot: Option<SnapshotId>,
-}
-
-impl LockedDistributionRef {
-    fn from_distribution(distribution: &Distribution) -> Self {
-        Self {
-            registry: distribution.registry.clone(),
-            channel: distribution.channel.clone(),
-            snapshot: distribution.snapshot.clone(),
-        }
-    }
-}
-
-/// A dependency edge retained in the shared logical result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LockedDependencyEdge {
-    pub kind: DependencyKind,
-    pub name: PackageName,
-    pub source: DependencySourceConstraint,
-    pub constraint: VersionConstraint,
-}
-
-impl From<&DependencyRequirement> for LockedDependencyEdge {
-    fn from(dependency: &DependencyRequirement) -> Self {
-        Self {
-            kind: dependency.kind,
-            name: dependency.name.clone(),
-            source: dependency.source.clone(),
-            constraint: dependency.constraint.clone(),
-        }
-    }
-}
 
 /// One validated logical release in a lockfile.
 ///
@@ -70,9 +28,8 @@ pub struct LockedPackage {
     pub identity: ReleaseIdentity,
     pub version: RPackageVersion,
     pub published_version_spelling: Option<Box<str>>,
-    pub distributions: Vec<LockedDistributionRef>,
-    pub dependencies: Vec<LockedDependencyEdge>,
-    pub metadata_sha256: Option<Sha256Digest>,
+    pub dependencies: Vec<PackageName>,
+    pub metadata_sha256: Sha256Digest,
 }
 
 impl LockedPackage {
@@ -84,34 +41,37 @@ impl LockedPackage {
             _ => release.version().as_str(),
         };
         let published_version_spelling = (published != canonical).then(|| published.into());
-        let mut distributions = release
-            .distributions()
-            .iter()
-            .map(LockedDistributionRef::from_distribution)
-            .collect::<Vec<_>>();
-        distributions.sort_by(distribution_sort_cmp);
-        distributions.dedup();
         let mut dependencies = release
             .dependencies()
             .iter()
-            .map(LockedDependencyEdge::from)
+            .filter(|dependency| {
+                matches!(
+                    dependency.kind,
+                    DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
+                ) && dependency.name.as_str() != "R"
+            })
+            .map(|dependency| dependency.name.clone())
             .collect::<Vec<_>>();
-        for dependency in &mut dependencies {
-            dependency
-                .constraint
-                .clauses
-                .sort_by(compare_version_clauses);
-        }
-        dependencies.sort_by(dependency_sort_cmp);
+        dependencies.sort();
         dependencies.dedup();
         Self {
             identity: release.identity().clone(),
             version: release.version().clone(),
             published_version_spelling,
-            distributions,
             dependencies,
-            metadata_sha256: release.metadata_digest().cloned(),
+            metadata_sha256: release.metadata_digest().clone(),
         }
+    }
+
+    fn from_release_for_lock(
+        release: &PackageRelease,
+        selected_names: &BTreeSet<PackageName>,
+    ) -> Self {
+        let mut package = Self::from_release(release);
+        package
+            .dependencies
+            .retain(|dependency| selected_names.contains(dependency));
+        package
     }
 
     fn validate(&self) -> Result<(), LockError> {
@@ -134,16 +94,6 @@ impl LockedPackage {
             | Provenance::RBasePackage { .. }
             | Provenance::RegistryRelease { .. }
             | Provenance::BioconductorRelease { .. } => {}
-        }
-        for (index, dependency) in self.dependencies.iter().enumerate() {
-            if let DependencySourceConstraint::Exact(identity) = &dependency.source
-                && identity.name() != &dependency.name
-            {
-                return Err(LockError::InvalidDependency {
-                    package: identity_key(&self.identity),
-                    index,
-                });
-            }
         }
         if let Some(spelling) = &self.published_version_spelling {
             let parsed = RPackageVersion::parse(spelling).map_err(|_| {
@@ -170,7 +120,9 @@ pub struct LockedResolution {
     pub packages: Vec<LockedPackage>,
 }
 
-/// Shared lock state. v1 accepts exactly one element in `resolutions`.
+/// Shared lock state. The current command boundary accepts exactly one
+/// logical resolution; the TOML projection flattens that resolution at the
+/// wire root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lockfile {
     pub resolutions: Vec<LockedResolution>,
@@ -190,10 +142,17 @@ impl Lockfile {
         environment: EnvironmentId,
         publication_cutoff: Option<PublicationDate>,
     ) -> Result<Self, LockError> {
+        let selected_names = resolution
+            .packages()
+            .iter()
+            .map(|selected| selected.name().clone())
+            .collect::<BTreeSet<_>>();
         let mut packages = resolution
             .packages()
             .iter()
-            .map(|selected| LockedPackage::from_release(selected.release()))
+            .map(|selected| {
+                LockedPackage::from_release_for_lock(selected.release(), &selected_names)
+            })
             .collect::<Vec<_>>();
         for package in &packages {
             package.validate()?;
@@ -300,15 +259,7 @@ impl Lockfile {
         for resolution in &mut self.resolutions {
             for package in &mut resolution.packages {
                 package.validate()?;
-                package.distributions.sort_by(distribution_sort_cmp);
-                package.distributions.dedup();
-                for dependency in &mut package.dependencies {
-                    dependency
-                        .constraint
-                        .clauses
-                        .sort_by(compare_version_clauses);
-                }
-                package.dependencies.sort_by(dependency_sort_cmp);
+                package.dependencies.sort();
                 package.dependencies.dedup();
             }
             resolution
@@ -330,6 +281,7 @@ impl Lockfile {
             }
             resolution.packages = unique;
             ensure_installed_names(&resolution.packages)?;
+            ensure_dependencies_exist(&resolution.packages)?;
         }
         Ok(())
     }
@@ -349,6 +301,7 @@ impl Lockfile {
                 }
             }
             ensure_installed_names(&packages)?;
+            ensure_dependencies_exist(&packages)?;
         }
         Ok(())
     }
@@ -376,9 +329,9 @@ pub enum LockError {
     RBasePackage {
         identity: String,
     },
-    InvalidDependency {
+    DanglingDependency {
         package: String,
-        index: usize,
+        dependency: String,
     },
     InstalledNameConflict {
         name: String,
@@ -408,9 +361,13 @@ impl fmt::Display for LockError {
             Self::RBasePackage { identity } => {
                 write!(f, "R base package is not lockable: {identity}")
             }
-            Self::InvalidDependency { package, index } => {
-                write!(f, "invalid dependency {index} in locked package {package}")
-            }
+            Self::DanglingDependency {
+                package,
+                dependency,
+            } => write!(
+                f,
+                "locked package {package} refers to unselected dependency {dependency}"
+            ),
             Self::InstalledNameConflict {
                 name,
                 first_identity,
@@ -441,6 +398,24 @@ fn ensure_installed_names(packages: &[LockedPackage]) -> Result<(), LockError> {
                 first_identity: identity_key(previous),
                 second_identity: identity_key(&package.identity),
             });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_dependencies_exist(packages: &[LockedPackage]) -> Result<(), LockError> {
+    let selected = packages
+        .iter()
+        .map(|package| package.identity.name())
+        .collect::<BTreeSet<_>>();
+    for package in packages {
+        for dependency in &package.dependencies {
+            if !selected.contains(dependency) {
+                return Err(LockError::DanglingDependency {
+                    package: package.identity.name().to_string(),
+                    dependency: dependency.to_string(),
+                });
+            }
         }
     }
     Ok(())
@@ -495,33 +470,6 @@ fn identity_solver_keys(identity: &ReleaseIdentity) -> Vec<SolverKey> {
     keys
 }
 
-fn distribution_sort_cmp(left: &LockedDistributionRef, right: &LockedDistributionRef) -> Ordering {
-    left.registry
-        .cmp(&right.registry)
-        .then_with(|| left.channel.cmp(&right.channel))
-        .then_with(|| cmp_optional_snapshot(&left.snapshot, &right.snapshot))
-}
-
-fn dependency_sort_cmp(left: &LockedDependencyEdge, right: &LockedDependencyEdge) -> Ordering {
-    dependency_kind_rank(left.kind)
-        .cmp(&dependency_kind_rank(right.kind))
-        .then_with(|| left.name.cmp(&right.name))
-        .then_with(|| cmp_source(&left.source, &right.source))
-        .then_with(|| cmp_constraint(&left.constraint, &right.constraint))
-}
-
-fn compare_version_clauses(left: &VersionClause, right: &VersionClause) -> Ordering {
-    relation_rank(left.op)
-        .cmp(&relation_rank(right.op))
-        .then_with(|| left.version.cmp(&right.version))
-}
-
-fn cmp_optional_snapshot(left: &Option<SnapshotId>, right: &Option<SnapshotId>) -> Ordering {
-    left.as_ref()
-        .map(SnapshotId::as_str)
-        .cmp(&right.as_ref().map(SnapshotId::as_str))
-}
-
 fn cmp_optional_subdirectory(
     left: &Option<rsolve_core::RepositorySubdir>,
     right: &Option<rsolve_core::RepositorySubdir>,
@@ -529,82 +477,6 @@ fn cmp_optional_subdirectory(
     left.as_ref()
         .map(rsolve_core::RepositorySubdir::as_str)
         .cmp(&right.as_ref().map(rsolve_core::RepositorySubdir::as_str))
-}
-
-fn dependency_kind_rank(kind: DependencyKind) -> u8 {
-    match kind {
-        DependencyKind::Depends => 0,
-        DependencyKind::Imports => 1,
-        DependencyKind::LinkingTo => 2,
-        DependencyKind::Suggests => 3,
-        DependencyKind::Enhances => 4,
-    }
-}
-
-fn relation_rank(op: rsolve_core::RelationOp) -> u8 {
-    match op {
-        rsolve_core::RelationOp::Lt => 0,
-        rsolve_core::RelationOp::Le => 1,
-        rsolve_core::RelationOp::Eq => 2,
-        rsolve_core::RelationOp::Ne => 3,
-        rsolve_core::RelationOp::Ge => 4,
-        rsolve_core::RelationOp::Gt => 5,
-    }
-}
-
-fn cmp_constraint(left: &VersionConstraint, right: &VersionConstraint) -> Ordering {
-    left.clauses
-        .iter()
-        .zip(&right.clauses)
-        .map(|(left, right)| {
-            relation_rank(left.op)
-                .cmp(&relation_rank(right.op))
-                .then_with(|| left.version.cmp(&right.version))
-        })
-        .find(|ordering| *ordering != Ordering::Equal)
-        .unwrap_or_else(|| left.clauses.len().cmp(&right.clauses.len()))
-}
-
-fn cmp_source(left: &DependencySourceConstraint, right: &DependencySourceConstraint) -> Ordering {
-    source_rank(left)
-        .cmp(&source_rank(right))
-        .then_with(|| match (left, right) {
-            (DependencySourceConstraint::Any, DependencySourceConstraint::Any) => Ordering::Equal,
-            (
-                DependencySourceConstraint::Registry { namespace: left },
-                DependencySourceConstraint::Registry { namespace: right },
-            ) => left.cmp(right),
-            (
-                DependencySourceConstraint::Bioconductor {
-                    namespace: left_namespace,
-                    release: left_release,
-                },
-                DependencySourceConstraint::Bioconductor {
-                    namespace: right_namespace,
-                    release: right_release,
-                },
-            ) => left_namespace
-                .cmp(right_namespace)
-                .then_with(|| left_release.cmp(right_release)),
-            (
-                DependencySourceConstraint::Git { repository: left },
-                DependencySourceConstraint::Git { repository: right },
-            ) => left.cmp(right),
-            (DependencySourceConstraint::Exact(left), DependencySourceConstraint::Exact(right)) => {
-                cmp_identity(left, right)
-            }
-            _ => Ordering::Equal,
-        })
-}
-
-fn source_rank(source: &DependencySourceConstraint) -> u8 {
-    match source {
-        DependencySourceConstraint::Any => 0,
-        DependencySourceConstraint::Registry { .. } => 1,
-        DependencySourceConstraint::Bioconductor { .. } => 2,
-        DependencySourceConstraint::Git { .. } => 3,
-        DependencySourceConstraint::Exact(_) => 4,
-    }
 }
 
 fn cmp_identity(left: &ReleaseIdentity, right: &ReleaseIdentity) -> Ordering {

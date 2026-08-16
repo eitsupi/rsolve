@@ -4,7 +4,7 @@ use std::fmt;
 
 use rsolve_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, LockedIdentities,
-    RPackageVersion, ResolutionRequest, ResolutionTarget, Target, VersionConstraint,
+    RPackageVersion, ResolutionRequest, ResolutionTarget, VersionConstraint,
 };
 
 /// The deliberately small, typed manifest subset used by the first slice.
@@ -50,7 +50,7 @@ impl Manifest {
                 });
             }
         }
-        self.target.validate()
+        Ok(())
     }
 }
 
@@ -71,48 +71,27 @@ impl ManifestDependency {
     }
 }
 
-/// The one target supported by the first slice.
+/// The one logical target supported by the first slice: an exact R version.
+/// Host operating system and architecture are deliberately not part of the
+/// shared resolution input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestTarget {
     pub r_version: RPackageVersion,
-    pub os: Box<str>,
-    pub arch: Box<str>,
 }
 
 impl ManifestTarget {
-    pub fn new(
-        r_version: RPackageVersion,
-        os: impl Into<Box<str>>,
-        arch: impl Into<Box<str>>,
-    ) -> Result<Self, ManifestError> {
-        let target = Self {
-            r_version,
-            os: os.into(),
-            arch: arch.into(),
-        };
-        target.validate()?;
-        Ok(target)
-    }
-
-    fn validate(&self) -> Result<(), ManifestError> {
-        if self.os.is_empty() {
-            return Err(ManifestError::EmptyTargetField { field: "os" });
-        }
-        if self.arch.is_empty() {
-            return Err(ManifestError::EmptyTargetField { field: "arch" });
-        }
-        Ok(())
+    pub fn new(r_version: RPackageVersion) -> Self {
+        Self { r_version }
     }
 
     fn into_resolution_target(self) -> ResolutionTarget {
-        ResolutionTarget::new(self.r_version, Target::new(self.os, self.arch))
+        ResolutionTarget::new(self.r_version)
     }
 }
 
 /// Errors from validating or composing the first-slice manifest subset.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestError {
-    EmptyTargetField { field: &'static str },
     RIsNotAPackageRequirement,
     DuplicateRequirement { name: rsolve_core::PackageName },
 }
@@ -120,7 +99,6 @@ pub enum ManifestError {
 impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyTargetField { field } => write!(f, "manifest target {field} is empty"),
             Self::RIsNotAPackageRequirement => f.write_str(
                 "R is expressed by the manifest R constraint, not a package requirement",
             ),
@@ -190,7 +168,7 @@ mod tests {
     fn minimal_manifest() -> Manifest {
         Manifest::new(
             VersionConstraint::from_clause(RelationOp::Ge, version("4.3")),
-            ManifestTarget::new(version("4.4.0"), "linux", "x86_64").unwrap(),
+            ManifestTarget::new(version("4.4.0")),
             vec![ManifestDependency::new(
                 package("example"),
                 VersionConstraint::new(vec![VersionClause::new(RelationOp::Ge, version("1.2.0"))]),
@@ -211,7 +189,6 @@ mod tests {
             VersionConstraint::from_clause(RelationOp::Ge, version("1.2.0"))
         );
         assert_eq!(request.target.r_version, version("4.4.0"));
-        assert_eq!(request.target.platform, Target::new("linux", "x86_64"));
         assert_eq!(
             request.r_requirement,
             VersionConstraint::from_clause(RelationOp::Ge, version("4.3"))
@@ -245,7 +222,7 @@ mod tests {
     fn manifest_rejects_r_as_a_regular_requirement() {
         let result = Manifest::new(
             VersionConstraint::unconstrained(),
-            ManifestTarget::new(version("4.4.0"), "linux", "x86_64").unwrap(),
+            ManifestTarget::new(version("4.4.0")),
             vec![ManifestDependency::new(
                 package("R"),
                 VersionConstraint::unconstrained(),
@@ -258,7 +235,7 @@ mod tests {
     fn manifest_rejects_duplicate_requirements() {
         let result = Manifest::new(
             VersionConstraint::unconstrained(),
-            ManifestTarget::new(version("4.4.0"), "linux", "x86_64").unwrap(),
+            ManifestTarget::new(version("4.4.0")),
             vec![
                 ManifestDependency::new(package("example"), VersionConstraint::unconstrained()),
                 ManifestDependency::new(package("example"), VersionConstraint::unconstrained()),
@@ -269,18 +246,6 @@ mod tests {
             Err(ManifestError::DuplicateRequirement {
                 name: package("example")
             })
-        );
-    }
-
-    #[test]
-    fn manifest_rejects_empty_target_coordinates() {
-        assert_eq!(
-            ManifestTarget::new(version("4.4.0"), "", "x86_64"),
-            Err(ManifestError::EmptyTargetField { field: "os" })
-        );
-        assert_eq!(
-            ManifestTarget::new(version("4.4.0"), "linux", ""),
-            Err(ManifestError::EmptyTargetField { field: "arch" })
         );
     }
 }

@@ -85,7 +85,7 @@ impl ResolvedPackage {
         self.release.distributions()
     }
 
-    pub fn metadata_digest(&self) -> Option<&crate::Sha256Digest> {
+    pub fn metadata_digest(&self) -> &crate::Sha256Digest {
         self.release.metadata_digest()
     }
 

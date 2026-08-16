@@ -85,13 +85,15 @@ check_forbidden_path "2 (repository -> resolver)" rsolve-repository rsolve-resol
 check_forbidden_path "3 (resolver -> provider)" rsolve-resolver rsolve-provider
 
 # Invariant 4 is an allowlist, not a finite denylist: rsolve-core currently has
-# no dependencies at all. This catches every HTTP client, runtime, and other
+# only opaque implementation dependencies. This catches every HTTP client,
+# runtime, and other
 # future external crate, including optional dependencies resolved by
 # --all-features. An allowlist is complete; a denylist would only improve
 # wording while inevitably missing a new crate name.
-# `time` is used only behind rsolve-core's opaque PublicationDate API; its
-# date-library type is not exposed in the public domain surface.
-ALLOWED_CORE_CRATES=(time)
+# `jiff` and `sha2` are used only behind opaque core APIs; neither the date
+# library type nor the hashing implementation is exposed in the public domain
+# surface.
+ALLOWED_CORE_CRATES=(jiff sha2)
 while IFS=$'\t' read -r source target; do
     if [[ "$source" == rsolve-core ]]; then
         allowed=false
