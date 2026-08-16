@@ -1,46 +1,17 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
-    Provenance, ReleaseMetadata, ReleaseObservation, Resolution, SolverKey,
-};
+use rsolve_core::{CandidateLoadError, CandidateLoader, PackageRelease, Resolution, SolverKey};
 use rsolve_provider::cran::{
     CranCandidateSnapshot, CranRefreshDiagnostic, CranSnapshotRefresher, CranSnapshotRefresherError,
 };
 use rsolve_resolver::{
-    DefaultCandidatePreference, PreferLocked, RequireLocked, ResolutionFailure, Resolver,
+    DefaultCandidatePreference, PreferLocked, RBasePackageOverlay, RequireLocked,
+    ResolutionFailure, Resolver, is_r_base_package_name,
 };
 
 use crate::lock::{EnvironmentId, LockError, Lockfile};
 use crate::manifest::{Manifest, ManifestError, compose_resolution_request};
-
-// These are R base packages only. Recommended packages such as Matrix are
-// intentionally absent; without runtime inventory, rsolve must not infer that a
-// recommended package is environment-provided.
-const R_BASE_PACKAGE_NAMES: [&str; 14] = [
-    "base",
-    "compiler",
-    "datasets",
-    "graphics",
-    "grDevices",
-    "grid",
-    "methods",
-    "parallel",
-    "splines",
-    "stats",
-    "stats4",
-    "tcltk",
-    "tools",
-    "utils",
-];
-
-fn is_r_base_package_name(name: &PackageName) -> bool {
-    R_BASE_PACKAGE_NAMES
-        .iter()
-        .any(|candidate| *candidate == name.as_str())
-}
 
 struct CandidateLoaderRef<'a>(&'a dyn CandidateLoader);
 
@@ -50,82 +21,13 @@ impl CandidateLoader for CandidateLoaderRef<'_> {
     }
 }
 
-struct BasePackageOverlay<L> {
-    loader: L,
-    base: HashMap<PackageName, Vec<PackageRelease>>,
-    r_version: rsolve_core::RPackageVersion,
-}
+type RuntimeSnapshot = RBasePackageOverlay<CranCandidateSnapshot>;
 
-impl<L> BasePackageOverlay<L> {
-    fn new(loader: L, r_version: rsolve_core::RPackageVersion) -> Result<Self, CandidateLoadError> {
-        let mut base = HashMap::new();
-        for name in R_BASE_PACKAGE_NAMES {
-            let package = PackageName::new(name).map_err(|error| {
-                CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("invalid R base package name {name}: {error}"),
-                )
-            })?;
-            let release = PackageRelease::try_from(ReleaseObservation {
-                identity: rsolve_core::ReleaseIdentity::new(
-                    package.clone(),
-                    Provenance::RBasePackage {
-                        r_version: r_version.clone(),
-                    },
-                ),
-                observed_package: package.clone(),
-                observed_version: r_version.clone(),
-                metadata: ReleaseMetadata::new(std::collections::BTreeMap::new()).map_err(
-                    |error| {
-                        CandidateLoadError::new(
-                            CandidateLoadErrorCategory::MetadataInvalid,
-                            format!("invalid R base package metadata: {error}"),
-                        )
-                    },
-                )?,
-                dependencies: Vec::new(),
-                distributions: Vec::new(),
-            })
-            .map_err(|error| {
-                CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("invalid R base package release {name}: {error}"),
-                )
-            })?;
-            base.insert(package, vec![release]);
-        }
-        Ok(Self {
-            loader,
-            base,
-            r_version,
-        })
-    }
-
-    fn r_version(&self) -> &rsolve_core::RPackageVersion {
-        &self.r_version
-    }
-}
-
-impl<L: CandidateLoader> CandidateLoader for BasePackageOverlay<L> {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
-        if let SolverKey::InstalledName(name) = package
-            && let Some(releases) = self.base.get(name)
-        {
-            return Ok(releases.clone());
-        }
-        self.loader.releases(package)
-    }
-}
-
-type RuntimeSnapshot = BasePackageOverlay<CranCandidateSnapshot>;
-
-impl BasePackageOverlay<CranCandidateSnapshot> {
-    fn needs_refresh(&self, package: &SolverKey) -> bool {
-        match package {
-            SolverKey::InstalledName(name) if is_r_base_package_name(name) => false,
-            SolverKey::InstalledName(_) => self.loader.needs_refresh(package),
-            _ => false,
-        }
+fn runtime_snapshot_needs_refresh(snapshot: &RuntimeSnapshot, package: &SolverKey) -> bool {
+    match package {
+        SolverKey::InstalledName(name) if is_r_base_package_name(name) => false,
+        SolverKey::InstalledName(_) => snapshot.inner().needs_refresh(package),
+        _ => false,
     }
 }
 
@@ -199,7 +101,7 @@ pub fn resolve_with_loader(
 ) -> Result<Resolution, CranResolutionError> {
     let request = compose_resolution_request(manifest).map_err(CranResolutionError::Composition)?;
     let overlay =
-        BasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
+        RBasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
             .map_err(CranResolutionError::Refresh)?;
     resolve_request(request, &overlay)
 }
@@ -220,7 +122,7 @@ pub fn resolve_with_lock(
         .resolution_request(manifest, environment)
         .map_err(CranResolutionError::Lock)?;
     let overlay =
-        BasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
+        RBasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
             .map_err(CranResolutionError::Refresh)?;
     resolve_request_with_mode(request, &overlay, mode)
 }
@@ -264,7 +166,10 @@ where
                 package: rsolve_core::SolverKey::InstalledName(name),
                 source,
             })) if source.category() == rsolve_core::CandidateLoadErrorCategory::NotFound
-                && snapshot.needs_refresh(&rsolve_core::SolverKey::InstalledName(name.clone())) =>
+                && runtime_snapshot_needs_refresh(
+                    &snapshot,
+                    &rsolve_core::SolverKey::InstalledName(name.clone()),
+                ) =>
             {
                 let next_snapshot = refresh(std::slice::from_ref(&name))
                     .map_err(CranResolutionError::Refresh)
@@ -272,7 +177,10 @@ where
                         RuntimeSnapshot::new(next, snapshot.r_version().clone())
                             .map_err(CranResolutionError::Refresh)
                     })?;
-                if next_snapshot.needs_refresh(&SolverKey::InstalledName(name.clone())) {
+                if runtime_snapshot_needs_refresh(
+                    &next_snapshot,
+                    &SolverKey::InstalledName(name.clone()),
+                ) {
                     return Err(CranResolutionError::Refresh(CandidateLoadError::new(
                         rsolve_core::CandidateLoadErrorCategory::SnapshotInvalid,
                         format!("refresh did not produce a result for package {name}"),
@@ -328,6 +236,7 @@ mod tests {
         SolverKey, VersionConstraint,
     };
     use rsolve_provider::cran::CranCandidateSnapshot;
+    use rsolve_resolver::R_BASE_PACKAGE_NAMES;
     use std::collections::BTreeMap;
 
     struct FixtureLoader {
@@ -722,15 +631,19 @@ mod tests {
         assert_eq!(base_release.len(), 1);
         assert!(base_release[0].is_r_base_package());
         assert_eq!(base_release[0].version(), &target);
-        assert!(!overlay.needs_refresh(&SolverKey::InstalledName(methods)));
+        assert!(!runtime_snapshot_needs_refresh(
+            &overlay,
+            &SolverKey::InstalledName(methods),
+        ));
         assert!(
             !overlay.releases(&SolverKey::InstalledName(matrix)).unwrap()[0].is_r_base_package()
         );
         let empty_overlay =
             RuntimeSnapshot::new(CranCandidateSnapshot::from_candidates([]), target).unwrap();
-        assert!(empty_overlay.needs_refresh(&SolverKey::InstalledName(
-            PackageName::new("Matrix").unwrap(),
-        )));
+        assert!(runtime_snapshot_needs_refresh(
+            &empty_overlay,
+            &SolverKey::InstalledName(PackageName::new("Matrix").unwrap()),
+        ));
     }
 
     #[test]

@@ -6,14 +6,134 @@
 mod adapter;
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use rsolve_core::{
-    CandidateLoader, DependencyKind, DependencySourceConstraint, PackageName, PackageRelease,
-    RPackageVersion, ReleaseIdentity, Resolution, ResolutionRequest, SolverKey, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
+    DependencySourceConstraint, PackageName, PackageRelease, Provenance, RPackageVersion,
+    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, Resolution, ResolutionRequest, SolverKey,
+    VersionConstraint,
 };
 
 pub use adapter::{ResolutionDiagnostic, ResolutionFailure};
+
+// These are R base packages only. Recommended packages such as Matrix are
+// intentionally absent; without runtime inventory, the resolver must not
+// infer that a recommended package is environment-provided.
+/// The official R base package names projected by [`RBasePackageOverlay`].
+pub const R_BASE_PACKAGE_NAMES: [&str; 14] = [
+    "base",
+    "compiler",
+    "datasets",
+    "graphics",
+    "grDevices",
+    "grid",
+    "methods",
+    "parallel",
+    "splines",
+    "stats",
+    "stats4",
+    "tcltk",
+    "tools",
+    "utils",
+];
+
+/// Reports whether a package is supplied by the selected R runtime.
+///
+/// This is a fixed R-base projection, not runtime discovery or selection. It
+/// intentionally excludes recommended packages and any actual runtime
+/// inventory.
+pub fn is_r_base_package_name(name: &PackageName) -> bool {
+    R_BASE_PACKAGE_NAMES
+        .iter()
+        .any(|candidate| *candidate == name.as_str())
+}
+
+/// Shadows candidate loading for the base packages supplied by one selected R
+/// runtime.
+///
+/// The overlay projects the already-selected target R version into exactly one
+/// canonical candidate for each of the fourteen official base packages. It is
+/// not a runtime discovery or selection API, and it does not model recommended
+/// packages or the runtime's actual installed inventory. Installed-name keys
+/// for those packages are shadowed; source-qualified keys and all other names
+/// delegate to the wrapped loader.
+pub struct RBasePackageOverlay<L> {
+    loader: L,
+    base: BTreeMap<PackageName, PackageRelease>,
+    r_version: RPackageVersion,
+}
+
+impl<L> RBasePackageOverlay<L> {
+    /// Constructs a base-package projection for an already-selected R version.
+    ///
+    /// The projected releases pass through the same fallible canonical domain
+    /// constructors as provider candidates. No unchecked or panic-based
+    /// release construction is used.
+    pub fn new(loader: L, r_version: RPackageVersion) -> Result<Self, CandidateLoadError> {
+        let mut base = BTreeMap::new();
+        for name in R_BASE_PACKAGE_NAMES {
+            let package = PackageName::new(name).map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("invalid R base package name {name}: {error}"),
+                )
+            })?;
+            let release = PackageRelease::try_from(ReleaseObservation {
+                identity: ReleaseIdentity::new(
+                    package.clone(),
+                    Provenance::RBasePackage {
+                        r_version: r_version.clone(),
+                    },
+                ),
+                observed_package: package.clone(),
+                observed_version: r_version.clone(),
+                metadata: ReleaseMetadata::new(BTreeMap::new()).map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        format!("invalid R base package metadata: {error}"),
+                    )
+                })?,
+                dependencies: Vec::new(),
+                distributions: Vec::new(),
+            })
+            .map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("invalid R base package release {name}: {error}"),
+                )
+            })?;
+            base.insert(package, release);
+        }
+        Ok(Self {
+            loader,
+            base,
+            r_version,
+        })
+    }
+
+    /// Returns the wrapped loader for consumer-owned refresh policy.
+    pub fn inner(&self) -> &L {
+        &self.loader
+    }
+
+    /// Returns the selected R version projected by this overlay.
+    pub fn r_version(&self) -> &RPackageVersion {
+        &self.r_version
+    }
+}
+
+impl<L: CandidateLoader> CandidateLoader for RBasePackageOverlay<L> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        if let SolverKey::InstalledName(name) = package
+            && let Some(release) = self.base.get(name)
+        {
+            return Ok(vec![release.clone()]);
+        }
+        self.loader.releases(package)
+    }
+}
 
 /// Information available to a candidate ordering policy for one solve.
 pub struct PreferenceContext<'a> {
