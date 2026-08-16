@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, PackageName, PackageRelease, Provenance,
-    PublicationCutoff, PublicationDate, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
-    ResolutionRequest, ResolutionTarget, SolverKey, Target, VersionConstraint,
+    DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl, PackageName,
+    PackageRelease, Provenance, PublicationCutoff, PublicationDate, ReleaseIdentity,
+    ReleaseMetadata, ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, Target,
+    VersionConstraint,
 };
 use rsolve_resolver::{
     AssignmentDifference, DefaultCandidatePreference, LockUpdatePolicy, PreferLocked,
@@ -231,9 +232,14 @@ fn transitive_publication_proof_reports_all_stable_reasons() {
         .collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
-    let ResolutionFailure::PublicationIneligible { rejections, .. } = error else {
-        panic!("expected publication policy failure from final proof");
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure from final proof");
     };
+    let policy = diagnostic
+        .publication_policy()
+        .expect("publication leaf evidence");
+    assert_eq!(policy.cutoff, PublicationCutoff::new(date("2026-06-01")));
+    let rejections = &policy.rejections;
     assert!(matches!(
         rejections.as_ref(),
         [
@@ -274,7 +280,63 @@ fn mixed_publication_and_missing_proof_remains_generic_no_solution() {
         .collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
-    assert!(matches!(error, ResolutionFailure::NoSolution { .. }));
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
+    };
+    assert!(diagnostic.publication_policy().is_some());
+}
+
+#[test]
+fn publication_and_custom_proof_both_remain_no_solution_with_evidence() {
+    let git_dependency = DependencyRequirement::new(
+        DependencyKind::Depends,
+        package("gitdep"),
+        DependencySourceConstraint::Git {
+            repository: NormalizedGitUrl::new("https://example.test/gitdep.git").unwrap(),
+        },
+        VersionConstraint::unconstrained(),
+    );
+    let loader = FixtureLoader {
+        candidates: [
+            (
+                package("parent"),
+                vec![
+                    release_with_dependencies(
+                        "parent",
+                        "2.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("childnew")],
+                    ),
+                    release_with_dependencies(
+                        "parent",
+                        "1.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("childgit")],
+                    ),
+                ],
+            ),
+            (
+                package("childnew"),
+                vec![release("childnew", "1.0.0", Some("2026-07-01"))],
+            ),
+            (
+                package("childgit"),
+                vec![release_with_dependencies(
+                    "childgit",
+                    "1.0.0",
+                    Some("2026-01-01"),
+                    vec![git_dependency],
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
+    };
+    assert!(diagnostic.publication_policy().is_some());
 }
 
 #[test]
@@ -319,11 +381,26 @@ fn disjoint_ranges_for_same_package_do_not_hide_unrelated_no_versions() {
         .collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
-    assert!(matches!(error, ResolutionFailure::NoSolution { .. }));
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
+    };
+    assert!(diagnostic.publication_policy().is_some());
 }
 
 #[test]
-fn unknown_or_cooldown_only_candidates_report_typed_failures() {
+fn ordinary_no_solution_has_no_publication_evidence() {
+    let loader = FixtureLoader {
+        candidates: [(package("missing"), Vec::new())].into_iter().collect(),
+    };
+    let error = resolve(&loader, &PreferLocked, request("missing", HashMap::new())).unwrap_err();
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
+    };
+    assert!(diagnostic.publication_policy().is_none());
+}
+
+#[test]
+fn unknown_or_cooldown_only_candidates_report_typed_evidence() {
     for publication in [Some("2026-07-01"), None] {
         let loader = FixtureLoader {
             candidates: [(package("demo"), vec![release("demo", "1.0.0", publication)])]
@@ -331,11 +408,10 @@ fn unknown_or_cooldown_only_candidates_report_typed_failures() {
                 .collect(),
         };
         let error = resolve(&loader, &PreferLocked, request("demo", HashMap::new())).unwrap_err();
-        assert!(matches!(
-            error,
-            ResolutionFailure::PublicationIneligible { rejections, .. }
-                if rejections.len() == 1
-        ));
+        let ResolutionFailure::NoSolution { diagnostic } = error else {
+            panic!("expected no-solution failure");
+        };
+        assert_eq!(diagnostic.publication_policy().unwrap().rejections.len(), 1);
     }
 }
 
@@ -358,10 +434,12 @@ fn publication_policy_is_range_aware() {
         request_with_constraint("demo", only_newer, HashMap::new()),
     )
     .unwrap_err();
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
+    };
     assert!(matches!(
-        error,
-        ResolutionFailure::PublicationIneligible { rejections, .. }
-            if matches!(rejections.as_ref(), [PublicationRejection::PublicationCooldown { .. }])
+        diagnostic.publication_policy().unwrap().rejections.as_ref(),
+        [PublicationRejection::PublicationCooldown { .. }]
     ));
 
     let unknown = release("demo", "2.0.0", None);
@@ -380,10 +458,12 @@ fn publication_policy_is_range_aware() {
         request_with_constraint("demo", exact_newer, HashMap::new()),
     )
     .unwrap_err();
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
+    };
     assert!(matches!(
-        error,
-        ResolutionFailure::PublicationIneligible { rejections, .. }
-            if matches!(rejections.as_ref(), [PublicationRejection::PublicationUnknown { .. }])
+        diagnostic.publication_policy().unwrap().rejections.as_ref(),
+        [PublicationRejection::PublicationUnknown { .. }]
     ));
 }
 
@@ -405,9 +485,10 @@ fn mixed_publication_rejections_are_lossless_and_stable() {
         .collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("demo", HashMap::new())).unwrap_err();
-    let ResolutionFailure::PublicationIneligible { rejections, .. } = error else {
-        panic!("expected publication policy failure");
+    let ResolutionFailure::NoSolution { diagnostic } = error else {
+        panic!("expected no-solution failure");
     };
+    let rejections = &diagnostic.publication_policy().unwrap().rejections;
     assert!(matches!(
         rejections.as_ref(),
         [

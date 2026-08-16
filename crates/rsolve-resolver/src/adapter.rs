@@ -12,9 +12,9 @@ use pubgrub::{
 };
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, PackageRelease, PublicationDate,
-    RPackageVersion, RelationOp, ReleaseIdentity, Resolution, ResolutionRequest, SolverKey,
-    VersionConstraint,
+    DependencyRequirement, DependencySourceConstraint, PackageRelease, PublicationCutoff,
+    PublicationDate, RPackageVersion, RelationOp, ReleaseIdentity, Resolution, ResolutionRequest,
+    SolverKey, VersionConstraint,
 };
 
 use crate::{CandidatePreference, LockDecision, LockUpdatePolicy, PreferenceContext};
@@ -29,7 +29,6 @@ enum PackageId {
 enum ProviderMessage {
     Text(String),
     Publication {
-        cutoff: PublicationDate,
         rejections: Vec<PublicationRejection>,
     },
 }
@@ -462,13 +461,7 @@ impl DependencyProvider for Provider<'_> {
             PackageId::Subject(subject) => {
                 let rejections = self.publication_rejections_for_version(subject, version)?;
                 if !rejections.is_empty() {
-                    let cutoff = self
-                        .request
-                        .publication_cutoff
-                        .expect("publication rejections require a cutoff")
-                        .date();
                     return Ok(Dependencies::Unavailable(ProviderMessage::Publication {
-                        cutoff,
                         rejections,
                     }));
                 }
@@ -519,6 +512,36 @@ fn publication_rejection_sort_key(rejection: &PublicationRejection) -> String {
     }
 }
 
+fn publication_rejection_cmp(
+    left: &PublicationRejection,
+    right: &PublicationRejection,
+) -> Ordering {
+    publication_rejection_sort_key(left)
+        .cmp(&publication_rejection_sort_key(right))
+        .then_with(|| match (left, right) {
+            (
+                PublicationRejection::PublicationCooldown {
+                    published: left, ..
+                },
+                PublicationRejection::PublicationCooldown {
+                    published: right, ..
+                },
+            ) => left.cmp(right),
+            (
+                PublicationRejection::PublicationCooldown { .. },
+                PublicationRejection::PublicationUnknown { .. },
+            ) => Ordering::Less,
+            (
+                PublicationRejection::PublicationUnknown { .. },
+                PublicationRejection::PublicationCooldown { .. },
+            ) => Ordering::Greater,
+            (
+                PublicationRejection::PublicationUnknown { .. },
+                PublicationRejection::PublicationUnknown { .. },
+            ) => Ordering::Equal,
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolutionFailure {
     CandidateLoad {
@@ -533,25 +556,42 @@ pub enum ResolutionFailure {
         first_identity: Box<rsolve_core::ReleaseIdentity>,
         second_identity: Box<rsolve_core::ReleaseIdentity>,
     },
-    PublicationIneligible {
-        cutoff: PublicationDate,
-        rejections: Box<[PublicationRejection]>,
-    },
     Solver {
         diagnostic: ResolutionDiagnostic,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Evidence that publication-policy rejections occurred in the final solver
+/// derivation. This is diagnostic evidence only; it does not classify the
+/// complete cause of the unsatisfiable request.
 pub struct ResolutionDiagnostic {
     pub summary: Box<str>,
+    publication_policy: Option<PublicationPolicyDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Publication-policy leaves observed in a no-solution derivation.
+pub struct PublicationPolicyDiagnostic {
+    pub cutoff: PublicationCutoff,
+    pub rejections: Box<[PublicationRejection]>,
 }
 
 impl ResolutionDiagnostic {
     fn new(summary: impl Into<Box<str>>) -> Self {
         Self {
             summary: summary.into(),
+            publication_policy: None,
         }
+    }
+
+    fn with_publication_policy(mut self, policy: Option<PublicationPolicyDiagnostic>) -> Self {
+        self.publication_policy = policy;
+        self
+    }
+
+    pub fn publication_policy(&self) -> Option<&PublicationPolicyDiagnostic> {
+        self.publication_policy.as_ref()
     }
 }
 
@@ -571,11 +611,6 @@ impl fmt::Display for ResolutionFailure {
                 "installed package name {name} maps to distinct identities {} and {}",
                 identity_sort_key(first_identity),
                 identity_sort_key(second_identity),
-            ),
-            Self::PublicationIneligible { cutoff, rejections } => write!(
-                f,
-                "publication cutoff {cutoff} rejected {} candidate(s)",
-                rejections.len()
             ),
             Self::Solver { diagnostic } => write!(f, "resolver failure: {}", diagnostic.summary),
         }
@@ -598,7 +633,8 @@ pub(crate) fn solve(
         cache: RefCell::new(HashMap::new()),
     };
     let root_version = RPackageVersion::parse("0.0").expect("root version");
-    let selected = resolve(&provider, PackageId::Root, root_version).map_err(map_error)?;
+    let selected = resolve(&provider, PackageId::Root, root_version)
+        .map_err(|error| map_error(error, request.publication_cutoff))?;
 
     let mut packages = BTreeMap::<rsolve_core::PackageName, (SolverKey, PackageRelease)>::new();
     for (package, version) in selected {
@@ -682,210 +718,176 @@ fn map_adapter_error(error: AdapterError) -> ResolutionFailure {
     }
 }
 
-fn map_error(error: PubGrubError<Provider<'_>>) -> ResolutionFailure {
+fn map_error(
+    error: PubGrubError<Provider<'_>>,
+    publication_cutoff: Option<PublicationCutoff>,
+) -> ResolutionFailure {
     match error {
         PubGrubError::ErrorRetrievingDependencies { source, .. }
         | PubGrubError::ErrorChoosingVersion { source, .. }
         | PubGrubError::ErrorInShouldCancel(source) => map_adapter_error(*source),
-        PubGrubError::NoSolution(tree) => {
-            publication_failure_from_tree(&tree).unwrap_or_else(|| ResolutionFailure::NoSolution {
-                diagnostic: ResolutionDiagnostic::new(format!("{tree:?}")),
-            })
-        }
+        PubGrubError::NoSolution(tree) => ResolutionFailure::NoSolution {
+            diagnostic: ResolutionDiagnostic::new(format!("{tree:?}"))
+                .with_publication_policy(publication_policy_diagnostic(&tree, publication_cutoff)),
+        },
     }
 }
 
-fn publication_failure_from_tree(
+fn publication_policy_diagnostic(
     tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
-) -> Option<ResolutionFailure> {
-    let mut reasons = Vec::new();
-    let mut policy_causes = Vec::new();
-    let mut no_versions_causes = Vec::new();
-    let mut dependency_edges = Vec::new();
-    let mut unrelated_custom = false;
-    collect_proof_causes(
-        tree,
-        &mut reasons,
-        &mut policy_causes,
-        &mut no_versions_causes,
-        &mut dependency_edges,
-        &mut unrelated_custom,
-    );
-    let unrelated_no_versions = no_versions_causes
-        .iter()
-        .any(|cause| !reaches_policy_cause(cause, &policy_causes, &dependency_edges));
-    if reasons.is_empty() || unrelated_custom || unrelated_no_versions {
+    cutoff: Option<PublicationCutoff>,
+) -> Option<PublicationPolicyDiagnostic> {
+    let cutoff = cutoff?;
+    let mut rejections = Vec::new();
+    collect_publication_leaves(tree, &mut rejections);
+    if rejections.is_empty() {
         return None;
     }
-    reasons.sort_by(|left, right| {
-        left.0.cmp(&right.0).then_with(|| {
-            publication_rejection_sort_key(&left.1).cmp(&publication_rejection_sort_key(&right.1))
-        })
-    });
-    reasons.dedup();
-    let cutoff = reasons[0].0;
-    let rejections = reasons
-        .into_iter()
-        .map(|(_, rejection)| rejection)
-        .collect();
-    Some(ResolutionFailure::PublicationIneligible { cutoff, rejections })
+    rejections.sort_by(publication_rejection_cmp);
+    rejections.dedup();
+    Some(PublicationPolicyDiagnostic {
+        cutoff,
+        rejections: rejections.into_boxed_slice(),
+    })
 }
 
-fn collect_proof_causes(
+fn collect_publication_leaves(
     tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
-    reasons: &mut Vec<(PublicationDate, PublicationRejection)>,
-    policy_causes: &mut Vec<ProofCause>,
-    no_versions_causes: &mut Vec<ProofCause>,
-    dependency_edges: &mut Vec<DependencyEdge>,
-    unrelated_custom: &mut bool,
+    rejections: &mut Vec<PublicationRejection>,
 ) {
     match tree {
         DerivationTree::External(External::Custom(
-            package,
-            versions,
-            ProviderMessage::Publication { cutoff, rejections },
+            _,
+            _,
+            ProviderMessage::Publication {
+                rejections: leaf, ..
+            },
         )) => {
-            policy_causes.push(ProofCause {
-                package: package.clone(),
-                versions: versions.clone(),
-            });
-            reasons.extend(
-                rejections
-                    .iter()
-                    .cloned()
-                    .map(|rejection| (*cutoff, rejection)),
-            );
+            rejections.extend(leaf.iter().cloned());
         }
-        DerivationTree::External(External::Custom(_, _, ProviderMessage::Text(_))) => {
-            *unrelated_custom = true
-        }
-        DerivationTree::External(External::NoVersions(package, versions)) => no_versions_causes
-            .push(ProofCause {
-                package: package.clone(),
-                versions: versions.clone(),
-            }),
-        DerivationTree::External(External::NotRoot(_, _)) => {}
-        DerivationTree::External(External::FromDependencyOf(
-            parent,
-            parent_versions,
-            child,
-            child_versions,
-        )) => {
-            dependency_edges.push(DependencyEdge {
-                parent: parent.clone(),
-                parent_versions: parent_versions.clone(),
-                child: child.clone(),
-                child_versions: child_versions.clone(),
-            });
-        }
+        DerivationTree::External(_) => {}
         DerivationTree::Derived(derived) => {
-            collect_proof_causes(
-                &derived.cause1,
-                reasons,
-                policy_causes,
-                no_versions_causes,
-                dependency_edges,
-                unrelated_custom,
-            );
-            collect_proof_causes(
-                &derived.cause2,
-                reasons,
-                policy_causes,
-                no_versions_causes,
-                dependency_edges,
-                unrelated_custom,
-            );
+            collect_publication_leaves(&derived.cause1, rejections);
+            collect_publication_leaves(&derived.cause2, rejections);
         }
     }
 }
 
-#[derive(Clone)]
-struct ProofCause {
-    package: PackageId,
-    versions: Ranges<RPackageVersion>,
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-#[derive(Clone)]
-struct DependencyEdge {
-    parent: PackageId,
-    parent_versions: Ranges<RPackageVersion>,
-    child: PackageId,
-    child_versions: Ranges<RPackageVersion>,
-}
+    use pubgrub::{Derived, External};
 
-fn reaches_policy_cause(
-    cause: &ProofCause,
-    policy_causes: &[ProofCause],
-    dependency_edges: &[DependencyEdge],
-) -> bool {
-    // The same package may occur in separate proof branches at disjoint
-    // ranges. Match same-package causes through their incoming dependency
-    // context instead of package name alone.
-    if policy_causes.iter().any(|policy| {
-        policy.package == cause.package
-            && incoming_edges(dependency_edges, cause)
-                .iter()
-                .any(|cause_edge| {
-                    incoming_edges(dependency_edges, policy)
-                        .iter()
-                        .any(|policy_edge| {
-                            cause_edge.parent == policy_edge.parent
-                                && !cause_edge
-                                    .parent_versions
-                                    .is_disjoint(&policy_edge.parent_versions)
-                        })
-                })
-    }) {
-        return true;
+    use super::*;
+
+    #[test]
+    fn publication_policy_evidence_deduplicates_repeated_leaves() {
+        let package = rsolve_core::PackageName::new("policy").unwrap();
+        let version = RPackageVersion::parse("1.0.0").unwrap();
+        let identity = ReleaseIdentity::new(
+            package.clone(),
+            rsolve_core::Provenance::RegistryRelease {
+                namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                version: version.clone(),
+            },
+        );
+        let rejection = PublicationRejection::PublicationUnknown { identity };
+        let leaf = DerivationTree::External(External::Custom(
+            PackageId::Subject(SolverKey::InstalledName(package)),
+            Ranges::singleton(version),
+            ProviderMessage::Publication {
+                rejections: vec![rejection.clone()],
+            },
+        ));
+        let tree = DerivationTree::Derived(Derived {
+            terms: Default::default(),
+            shared_id: None,
+            cause1: Arc::new(leaf.clone()),
+            cause2: Arc::new(leaf),
+        });
+
+        let diagnostic = publication_policy_diagnostic(
+            &tree,
+            Some(PublicationCutoff::new(
+                PublicationDate::parse("2026-06-01").unwrap(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(diagnostic.rejections.as_ref(), [rejection]);
     }
 
-    // Carry the range imposed on the current package while walking
-    // dependency edges. This prevents sibling branches with non-overlapping
-    // parent ranges from being merged into one policy explanation.
-    let mut pending = incoming_edges(dependency_edges, cause)
-        .into_iter()
-        .map(|edge| (cause.package.clone(), edge.child_versions.clone()))
-        .collect::<Vec<_>>();
-    let mut visited: Vec<(PackageId, Ranges<RPackageVersion>)> = Vec::new();
-    while let Some((current, current_versions)) = pending.pop() {
-        if visited
-            .iter()
-            .any(|(package, versions)| package == &current && versions == &current_versions)
-        {
-            continue;
-        }
-        visited.push((current.clone(), current_versions.clone()));
-        for edge in dependency_edges.iter().filter(|edge| {
-            edge.parent == current && !edge.parent_versions.is_disjoint(&current_versions)
-        }) {
-            if policy_causes.iter().any(|policy| {
-                policy.package == edge.child
-                    && !edge.child_versions.is_disjoint(&policy.versions)
-                    && incoming_edges(dependency_edges, policy)
-                        .iter()
-                        .any(|policy_edge| {
-                            policy_edge.parent == edge.parent
-                                && !policy_edge
-                                    .parent_versions
-                                    .is_disjoint(&edge.parent_versions)
-                        })
-            }) {
-                return true;
-            }
-            pending.push((edge.child.clone(), edge.child_versions.clone()));
-        }
+    #[test]
+    fn cross_branch_edges_do_not_promote_publication_to_a_failure_variant() {
+        let shared_name = rsolve_core::PackageName::new("shared").unwrap();
+        let policy_name = rsolve_core::PackageName::new("policychild").unwrap();
+        let parent_name = rsolve_core::PackageName::new("parent").unwrap();
+        let version = RPackageVersion::parse("1.0.0").unwrap();
+        let shared = PackageId::Subject(SolverKey::InstalledName(shared_name));
+        let policy = PackageId::Subject(SolverKey::InstalledName(policy_name.clone()));
+        let parent = PackageId::Subject(SolverKey::InstalledName(parent_name));
+        let rejection = PublicationRejection::PublicationUnknown {
+            identity: ReleaseIdentity::new(
+                policy_name,
+                rsolve_core::Provenance::RegistryRelease {
+                    namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+        };
+        let all_versions = Ranges::full();
+        let unrelated_branch = DerivationTree::Derived(Derived {
+            terms: Default::default(),
+            shared_id: None,
+            cause1: Arc::new(DerivationTree::External(External::NoVersions(
+                shared.clone(),
+                all_versions.clone(),
+            ))),
+            cause2: Arc::new(DerivationTree::External(External::FromDependencyOf(
+                parent,
+                all_versions.clone(),
+                shared.clone(),
+                all_versions.clone(),
+            ))),
+        });
+        let publication_branch = DerivationTree::Derived(Derived {
+            terms: Default::default(),
+            shared_id: None,
+            cause1: Arc::new(DerivationTree::External(External::FromDependencyOf(
+                shared,
+                all_versions.clone(),
+                policy.clone(),
+                all_versions.clone(),
+            ))),
+            cause2: Arc::new(DerivationTree::External(External::Custom(
+                policy,
+                all_versions,
+                ProviderMessage::Publication {
+                    rejections: vec![rejection.clone()],
+                },
+            ))),
+        });
+        // These branches deliberately use overlapping ranges. A flattened
+        // package/edge graph would connect the NoVersions leaf to the policy
+        // leaf through the sibling `shared -> policychild` edge.
+        let tree = DerivationTree::Derived(Derived {
+            terms: Default::default(),
+            shared_id: None,
+            cause1: Arc::new(unrelated_branch),
+            cause2: Arc::new(publication_branch),
+        });
+        let cutoff = PublicationCutoff::new(PublicationDate::parse("2026-06-01").unwrap());
+        let result = map_error(
+            PubGrubError::<Provider<'static>>::NoSolution(tree),
+            Some(cutoff),
+        );
+        let ResolutionFailure::NoSolution { diagnostic } = result else {
+            panic!("publication evidence must not become a failure variant");
+        };
+        let evidence = diagnostic
+            .publication_policy()
+            .expect("publication leaf evidence");
+        assert_eq!(evidence.cutoff, cutoff);
+        assert_eq!(evidence.rejections.as_ref(), [rejection]);
     }
-    false
-}
-
-fn incoming_edges<'a>(
-    dependency_edges: &'a [DependencyEdge],
-    target: &ProofCause,
-) -> Vec<&'a DependencyEdge> {
-    dependency_edges
-        .iter()
-        .filter(|edge| {
-            edge.child == target.package && !edge.child_versions.is_disjoint(&target.versions)
-        })
-        .collect()
 }

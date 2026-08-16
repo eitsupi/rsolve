@@ -16,7 +16,9 @@ use rsolve_core::{
     ResolutionRequest, SolverKey, VersionConstraint,
 };
 
-pub use adapter::{PublicationRejection, ResolutionDiagnostic, ResolutionFailure};
+pub use adapter::{
+    PublicationPolicyDiagnostic, PublicationRejection, ResolutionDiagnostic, ResolutionFailure,
+};
 
 // These are R base packages only. Recommended packages such as Matrix are
 // intentionally absent; without runtime inventory, the resolver must not
