@@ -251,6 +251,7 @@ mod tests {
             observed_package: matrix.clone(),
             observed_version: matrix_version,
             metadata: metadata.clone(),
+            publication: None,
             dependencies: Vec::new(),
             distributions: Vec::new(),
         })
@@ -265,6 +266,7 @@ mod tests {
             observed_package: methods,
             observed_version: version("4.4.0"),
             metadata,
+            publication: None,
             dependencies: Vec::new(),
             distributions: Vec::new(),
         })

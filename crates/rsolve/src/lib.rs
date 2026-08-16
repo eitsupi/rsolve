@@ -19,7 +19,8 @@ pub use manifest::{
 };
 pub use orchestration::{
     CranResolutionError, CranResolutionOutcome, ResolutionMode, resolve_from_cran,
-    resolve_with_loader, resolve_with_lock,
+    resolve_from_cran_with_publication_cutoff, resolve_with_loader,
+    resolve_with_loader_with_publication_cutoff, resolve_with_lock,
 };
 pub use pak::{
     PakArtifact, PakInstallRequest, PakInstallResult, PakInstalledPackage, PakProcessConfig,

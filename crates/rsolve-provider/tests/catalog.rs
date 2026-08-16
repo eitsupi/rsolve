@@ -1,4 +1,6 @@
-use rsolve_core::{DependencyKind, DependencySourceConstraint, Provenance, RelationOp};
+use rsolve_core::{
+    DependencyKind, DependencySourceConstraint, Provenance, PublicationDate, RelationOp,
+};
 use rsolve_provider::cran::{CranCatalog, CranRecordError, DependencyParseError};
 
 const SYNTHETIC_PACKAGES: &[u8] = include_bytes!("fixtures/cran-2026-08-08/synthetic-PACKAGES");
@@ -12,7 +14,7 @@ Imports: Matrix (>= 1.6-5), stats\n\
 LinkingTo: cpp11 (>= 0.1.0), Rcpp\n\
 Suggests: testthat (== 3.2.0), knitr\n\
 Enhances: foo (> 1.0), bar\n\
-Published: fictional\n\
+Published: 2026-06-24 19:14:59 UTC\n\
 Unknown-Field: retained\n\n",
     )
     .unwrap();
@@ -31,6 +33,10 @@ Unknown-Field: retained\n\n",
     assert_eq!(
         release.metadata().fields().get("Unknown-Field"),
         Some(&"retained".to_owned())
+    );
+    assert_eq!(
+        release.publication().map(|publication| publication.date()),
+        Some(PublicationDate::parse("2026-06-24").unwrap())
     );
     assert_eq!(release.dependencies().len(), 10);
 
@@ -78,6 +84,32 @@ Unknown-Field: retained\n\n",
             None => assert!(dependency.constraint.is_unconstrained()),
         }
     }
+}
+
+#[test]
+fn published_date_forms_are_first_class_and_invalid_values_are_diagnostic() {
+    let catalog = CranCatalog::from_packages(
+        b"Package: dateonly\nVersion: 1.0.0\nPublished: 2026-06-24\n\n\
+Package: datetime\nVersion: 1.0.0\nPublished: 2026-06-25 19:14:59 UTC\n\n\
+Package: missing\nVersion: 1.0.0\n\n\
+Package: invalid\nVersion: 1.0.0\nPublished: 2026-02-29\n\n",
+    )
+    .unwrap();
+    assert_eq!(catalog.candidates_named("dateonly").unwrap().len(), 1);
+    assert_eq!(catalog.candidates_named("datetime").unwrap().len(), 1);
+    assert_eq!(catalog.candidates_named("missing").unwrap().len(), 1);
+    assert!(
+        catalog.candidates_named("missing").unwrap()[0]
+            .publication()
+            .is_none()
+    );
+    assert!(catalog.candidates_named("invalid").unwrap().is_empty());
+    assert!(catalog.diagnostics().iter().any(|diagnostic| {
+        matches!(
+            diagnostic.error(),
+            CranRecordError::InvalidPublicationDate { .. }
+        )
+    }));
 }
 
 #[test]

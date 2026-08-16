@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use rsolve_core::{
     DependencyKind, DependencySourceConstraint, DistributionChannel, EnvironmentId, PackageName,
-    Provenance, RPackageVersion, RegistryId, RelationOp, ReleaseIdentity, RepositorySubdir,
-    Sha256Digest, SnapshotId, SourceScheme, VersionClause, VersionConstraint,
+    Provenance, PublicationDate, RPackageVersion, RegistryId, RelationOp, ReleaseIdentity,
+    RepositorySubdir, Sha256Digest, SnapshotId, SourceScheme, VersionClause, VersionConstraint,
 };
 
 use crate::lock::{
@@ -22,7 +22,7 @@ use crate::lock::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
-const SCHEMA_REVISION: u32 = 0;
+const SCHEMA_REVISION: u32 = 1;
 
 // RFC 3986 unreserved bytes are left literal. Everything else is percent
 // encoded, including Unicode UTF-8 bytes and all identity delimiters.
@@ -121,6 +121,8 @@ struct WireResolution {
     r_version: String,
     os: String,
     arch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publication_cutoff: Option<String>,
     packages: Vec<WirePackage>,
 }
 
@@ -234,9 +236,17 @@ fn decode_resolution(wire: WireResolution) -> Result<LockedResolution, LockWireE
         .into_iter()
         .map(decode_package)
         .collect::<Result<Vec<_>, _>>()?;
+    let publication_cutoff = wire
+        .publication_cutoff
+        .map(|value| {
+            PublicationDate::parse(&value)
+                .map_err(|error| invalid_field("publication-cutoff", error.to_string()))
+        })
+        .transpose()?;
     Ok(LockedResolution {
         target: rsolve_core::ResolutionTarget::new(r_version, rsolve_core::Target::new(os, arch)),
         environment,
+        publication_cutoff,
         packages,
     })
 }
@@ -247,6 +257,7 @@ fn encode_resolution(resolution: &LockedResolution) -> Result<WireResolution, Lo
         r_version: canonical_version(&resolution.target.r_version),
         os: resolution.target.platform.os.to_string(),
         arch: resolution.target.platform.arch.to_string(),
+        publication_cutoff: resolution.publication_cutoff.map(|date| date.to_string()),
         packages: resolution
             .packages
             .iter()

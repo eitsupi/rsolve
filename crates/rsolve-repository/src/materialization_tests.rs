@@ -4,7 +4,7 @@ use flate2::{Compression, write::GzEncoder};
 use rsolve_core::{
     BioconductorRelease, DependencyKind, DependencyRequirement, DependencySourceConstraint,
     PackageName, PackageNamespace, Provenance, RPackageVersion, RelationOp, ReleaseIdentity,
-    ReleaseMetadata, UpstreamChecksum, VersionConstraint,
+    ReleaseMetadata, ReleasePublication, UpstreamChecksum, VersionConstraint,
 };
 use sha2::Digest;
 use std::fs::OpenOptions;
@@ -86,6 +86,48 @@ fn packages_are_deterministic_and_preserve_folded_metadata_and_dependencies() {
         std::str::from_utf8(&bytes).unwrap(),
         "Package: middle\nVersion: 0.1.0\nPriority: recommended\nImports: leaf (>= 0.1.0)\nLicense_is_FOSS: yes\nDescription: UTF-8 summary\n with a continuation\nEncoding: UTF-8\n"
     );
+}
+
+#[test]
+fn packages_project_first_class_publication_deterministically() {
+    let cache = CachedArtifact {
+        object_path: PathBuf::from("/tmp/object"),
+        metadata_path: PathBuf::from("/tmp/metadata"),
+        sha256: rsolve_core::Sha256Digest::new("a".repeat(64)).unwrap(),
+        size: 1,
+        verification: VerificationStrength::None,
+    };
+    let alpha = MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            PackageName::new("alpha").unwrap(),
+            Provenance::ImmutableSource {
+                scheme: rsolve_core::SourceScheme::new("fixture").unwrap(),
+                digest: cache.sha256.clone(),
+            },
+        ),
+        RPackageVersion::parse("1.0.0").unwrap(),
+        cache.clone(),
+    )
+    .with_publication(ReleasePublication::new(
+        rsolve_core::PublicationDate::parse("2026-06-24").unwrap(),
+    ));
+    let beta = MaterializationArtifact::new(
+        ReleaseIdentity::new(
+            PackageName::new("beta").unwrap(),
+            Provenance::ImmutableSource {
+                scheme: rsolve_core::SourceScheme::new("fixture").unwrap(),
+                digest: cache.sha256.clone(),
+            },
+        ),
+        RPackageVersion::parse("1.0.0").unwrap(),
+        cache,
+    );
+    let output = String::from_utf8(packages::write_packages(&[beta, alpha]).unwrap()).unwrap();
+    assert_eq!(
+        output,
+        "Package: alpha\nVersion: 1.0.0\nPublished: 2026-06-24\n\nPackage: beta\nVersion: 1.0.0\n"
+    );
+    assert!(ReleaseMetadata::from_pairs([("Published", "2026-06-24")]).is_err());
 }
 
 #[test]

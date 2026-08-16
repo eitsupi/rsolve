@@ -89,6 +89,10 @@ impl ResolvedPackage {
         self.release.metadata_digest()
     }
 
+    pub fn publication(&self) -> Option<&crate::ReleasePublication> {
+        self.release.publication()
+    }
+
     pub fn name(&self) -> &PackageName {
         self.release.identity().name()
     }

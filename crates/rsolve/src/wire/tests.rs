@@ -98,6 +98,7 @@ fn logical_lock() -> Lockfile {
             rsolve_core::Target::new("linux", "x86_64"),
         ),
         environment: EnvironmentId::new("default").unwrap(),
+        publication_cutoff: None,
         packages: vec![
             package_record(
                 "registry",
@@ -187,6 +188,7 @@ fn canonical_version_fields_have_one_wire_spelling() {
                 rsolve_core::Target::new("linux", "x86_64"),
             ),
             environment: EnvironmentId::new("default").unwrap(),
+            publication_cutoff: None,
             packages: vec![LockedPackage {
                 identity: identity(
                     "spellings",
@@ -248,12 +250,35 @@ fn one_component_target_r_version_round_trips() {
             rsolve_core::Target::new("linux", "x86_64"),
         ),
         environment: EnvironmentId::new("default").unwrap(),
+        publication_cutoff: None,
         packages: Vec::new(),
     }])
     .unwrap();
     let text = to_toml(&lock).unwrap();
     assert!(text.contains("r-version = \"4\""));
     assert_eq!(from_toml(&text).unwrap(), lock);
+}
+
+#[test]
+fn publication_cutoff_round_trips_and_is_canonical() {
+    let cutoff = PublicationDate::parse("2026-06-24").unwrap();
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: rsolve_core::ResolutionTarget::new(
+            version("4.4.0"),
+            rsolve_core::Target::new("linux", "x86_64"),
+        ),
+        environment: EnvironmentId::new("default").unwrap(),
+        publication_cutoff: Some(cutoff),
+        packages: Vec::new(),
+    }])
+    .unwrap();
+    let text = to_toml(&lock).unwrap();
+    assert!(text.contains("publication-cutoff = \"2026-06-24\""));
+    assert_eq!(from_toml(&text).unwrap(), lock);
+    assert!(matches!(
+        from_toml(&text.replace("2026-06-24", "2026-6-24")),
+        Err(LockWireError::InvalidField { field, .. }) if field == "publication-cutoff"
+    ));
 }
 
 #[test]
@@ -271,6 +296,7 @@ fn resolution_projection_wire_output_excludes_artifact_facts() {
         observed_package: name,
         observed_version: release_version,
         metadata: rsolve_core::ReleaseMetadata::default(),
+        publication: None,
         dependencies: Vec::new(),
         distributions: vec![rsolve_core::Distribution {
             registry: RegistryId::new("cran").unwrap(),
@@ -305,14 +331,14 @@ fn resolution_projection_wire_output_excludes_artifact_facts() {
 
 #[test]
 fn reader_enforces_schema_and_exactly_one_resolution() {
-    let empty = "schema-version = 1\nschema-revision = 0\nresolutions = []\n";
+    let empty = "schema-version = 1\nschema-revision = 1\nresolutions = []\n";
     assert!(matches!(
         from_toml(empty),
         Err(LockWireError::Domain(
             LockError::UnsupportedResolutionCount { found: 0 }
         ))
     ));
-    let two = "schema-version = 1\nschema-revision = 0\n\n[[resolutions]]\nenvironment = \"default\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n\n[[resolutions]]\nenvironment = \"other\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n";
+    let two = "schema-version = 1\nschema-revision = 1\n\n[[resolutions]]\nenvironment = \"default\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n\n[[resolutions]]\nenvironment = \"other\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n";
     assert!(matches!(
         from_toml(two),
         Err(LockWireError::Domain(
@@ -320,17 +346,24 @@ fn reader_enforces_schema_and_exactly_one_resolution() {
         ))
     ));
     assert!(matches!(
-        from_toml("schema-version = 2\nschema-revision = 0\nresolutions = []\n"),
+        from_toml("schema-version = 2\nschema-revision = 1\nresolutions = []\n"),
         Err(LockWireError::UnsupportedSchema { .. })
     ));
+    for revision in [0, 2] {
+        let input = format!("schema-version = 1\nschema-revision = {revision}\nresolutions = []\n");
+        assert!(matches!(
+            from_toml(&input),
+            Err(LockWireError::UnsupportedSchema { .. })
+        ));
+    }
 }
 
 #[test]
 fn unknown_and_machine_local_fields_are_rejected_and_not_emitted() {
     let unknown =
-        "schema-version = 1\nschema-revision = 0\nartifact-url = \"/tmp/a\"\nresolutions = []\n";
+        "schema-version = 1\nschema-revision = 1\nartifact-url = \"/tmp/a\"\nresolutions = []\n";
     assert!(matches!(from_toml(unknown), Err(LockWireError::Parse(_))));
-    let forbidden = "schema-version = 1\nschema-revision = 0\n\n[[resolutions]]\nenvironment = \"default\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\n\n[[resolutions.packages]]\nidentity = \"registry:cran::foo@1.0\"\nversion = \"1.0\"\ndistributions = []\ndependencies = []\nartifact-url = \"/tmp/a\"\n";
+    let forbidden = "schema-version = 1\nschema-revision = 1\n\n[[resolutions]]\nenvironment = \"default\"\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\n\n[[resolutions.packages]]\nidentity = \"registry:cran::foo@1.0\"\nversion = \"1.0\"\ndistributions = []\ndependencies = []\nartifact-url = \"/tmp/a\"\n";
     assert!(matches!(from_toml(forbidden), Err(LockWireError::Parse(_))));
     let text = to_toml(&logical_lock()).unwrap();
     for forbidden in [

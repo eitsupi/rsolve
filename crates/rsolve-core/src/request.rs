@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::constraints::{DependencyRequirement, VersionConstraint};
 use crate::identity::ReleaseIdentity;
 use crate::names::{BioconductorRelease, PackageName, PackageNamespace};
+use crate::publication::PublicationCutoff;
 use crate::target::ResolutionTarget;
 
 /// The solver-facing key for a logical package subject.
@@ -44,6 +45,7 @@ pub struct ResolutionRequest {
     pub target: ResolutionTarget,
     pub r_requirement: VersionConstraint,
     pub locked: LockedIdentities,
+    pub publication_cutoff: Option<PublicationCutoff>,
 }
 
 impl ResolutionRequest {
@@ -58,6 +60,7 @@ impl ResolutionRequest {
             target,
             r_requirement,
             locked,
+            publication_cutoff: None,
         }
     }
 
@@ -67,5 +70,15 @@ impl ResolutionRequest {
         r_requirement: VersionConstraint,
     ) -> Self {
         Self::new(requirements, target, r_requirement, LockedIdentities::new())
+    }
+
+    pub fn with_publication_cutoff(mut self, cutoff: PublicationCutoff) -> Self {
+        self.publication_cutoff = Some(cutoff);
+        self
+    }
+
+    pub fn with_optional_publication_cutoff(mut self, cutoff: Option<PublicationCutoff>) -> Self {
+        self.publication_cutoff = cutoff;
+        self
     }
 }

@@ -54,6 +54,9 @@ fn write_record(artifact: &MaterializationArtifact) -> Result<String, PackagesEr
         ("Package".to_owned(), artifact.package().to_string()),
         ("Version".to_owned(), artifact.version.to_string()),
     ];
+    if let Some(publication) = artifact.publication() {
+        fields.push(("Published".to_owned(), publication.date().to_string()));
+    }
     let mut grouped: BTreeMap<DependencyKind, Vec<&DependencyRequirement>> = BTreeMap::new();
     for dependency in &artifact.dependencies {
         grouped.entry(dependency.kind).or_default().push(dependency);

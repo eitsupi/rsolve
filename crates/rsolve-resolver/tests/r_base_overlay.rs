@@ -69,6 +69,7 @@ fn registry_release(
         observed_package: name,
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        publication: None,
         dependencies,
         distributions: Vec::new(),
     })

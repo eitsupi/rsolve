@@ -11,8 +11,9 @@ use std::fmt;
 use rsolve_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, Distribution,
     DistributionChannel, LockedIdentities, PackageName, PackageRelease, Provenance,
-    RPackageVersion, RegistryId, ReleaseIdentity, Resolution, ResolutionRequest, ResolutionTarget,
-    Sha256Digest, SnapshotId, SolverKey, VersionClause, VersionConstraint,
+    PublicationCutoff, PublicationDate, RPackageVersion, RegistryId, ReleaseIdentity, Resolution,
+    ResolutionRequest, ResolutionTarget, Sha256Digest, SnapshotId, SolverKey, VersionClause,
+    VersionConstraint,
 };
 
 pub use rsolve_core::{EnvironmentId, EnvironmentIdError};
@@ -165,6 +166,7 @@ impl LockedPackage {
 pub struct LockedResolution {
     pub target: ResolutionTarget,
     pub environment: EnvironmentId,
+    pub publication_cutoff: Option<PublicationDate>,
     pub packages: Vec<LockedPackage>,
 }
 
@@ -179,6 +181,14 @@ impl Lockfile {
     pub fn from_resolution(
         resolution: &Resolution,
         environment: EnvironmentId,
+    ) -> Result<Self, LockError> {
+        Self::from_resolution_with_publication_cutoff(resolution, environment, None)
+    }
+
+    pub fn from_resolution_with_publication_cutoff(
+        resolution: &Resolution,
+        environment: EnvironmentId,
+        publication_cutoff: Option<PublicationDate>,
     ) -> Result<Self, LockError> {
         let mut packages = resolution
             .packages()
@@ -206,6 +216,7 @@ impl Lockfile {
         Self::new(vec![LockedResolution {
             target: resolution.target().clone(),
             environment,
+            publication_cutoff,
             packages: unique,
         }])
     }
@@ -274,6 +285,9 @@ impl Lockfile {
             request.target,
             request.r_requirement,
             self.locked_identities()?,
+        )
+        .with_optional_publication_cutoff(
+            resolution.publication_cutoff.map(PublicationCutoff::new),
         ))
     }
 

@@ -27,6 +27,7 @@ fn release(name: &str, spelling: &str) -> PackageRelease {
         observed_package: name,
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        publication: None,
         dependencies: Vec::new(),
         distributions: Vec::new(),
     })
@@ -53,6 +54,7 @@ fn v1_requires_exactly_one_resolution() {
     let empty = LockedResolution {
         target: target(),
         environment: environment(),
+        publication_cutoff: None,
         packages: Vec::new(),
     };
     assert_eq!(
@@ -82,6 +84,7 @@ fn reader_rejects_registry_record_version_mismatch() {
         Lockfile::new(vec![LockedResolution {
             target: target(),
             environment: environment(),
+            publication_cutoff: None,
             packages: vec![package],
         }]),
         Err(LockError::ConflictingMetadata { identity }) if identity.contains("mismatch")
@@ -127,12 +130,14 @@ fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
     let first = Lockfile::new(vec![LockedResolution {
         target: target(),
         environment: environment(),
+        publication_cutoff: None,
         packages: vec![ordered, make(beta.clone())],
     }])
     .unwrap();
     let second = Lockfile::new(vec![LockedResolution {
         target: target(),
         environment: environment(),
+        publication_cutoff: None,
         packages: vec![make(beta.clone()), reversed],
     }])
     .unwrap();
@@ -154,6 +159,7 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
         observed_package: first.identity().name().clone(),
         observed_version: first.version().clone(),
         metadata: first.metadata().clone(),
+        publication: first.publication().copied(),
         dependencies: vec![dependency],
         distributions: vec![Distribution {
             registry: RegistryId::new("cran").unwrap(),
@@ -244,6 +250,33 @@ fn downstream_projection_revalidates_mutated_public_lock_state() {
 }
 
 #[test]
+fn publication_cutoff_is_reconstructed_from_lock() {
+    let cutoff = rsolve_core::PublicationDate::parse("2026-06-24").unwrap();
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: Some(cutoff),
+        packages: Vec::new(),
+    }])
+    .unwrap();
+    let request = lock
+        .resolution_request(
+            Manifest::new(
+                VersionConstraint::unconstrained(),
+                crate::manifest::ManifestTarget::new(version("4.4.0"), "linux", "x86_64").unwrap(),
+                Vec::new(),
+            )
+            .unwrap(),
+            &environment(),
+        )
+        .unwrap();
+    assert_eq!(
+        request.publication_cutoff.map(|cutoff| cutoff.date()),
+        Some(rsolve_core::PublicationCutoff::new(cutoff).date())
+    );
+}
+
+#[test]
 fn conflicting_repeated_identity_is_rejected_before_lock_state() {
     let identity_release = release("same", "1.0.0");
     let identity = identity_release.identity().clone();
@@ -282,6 +315,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         observed_package: name.clone(),
         observed_version: version.clone(),
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        publication: None,
         dependencies: Vec::new(),
         distributions: Vec::new(),
     })
@@ -297,6 +331,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         observed_package: name.clone(),
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        publication: None,
         dependencies: Vec::new(),
         distributions: Vec::new(),
     })
@@ -335,6 +370,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         Lockfile::new(vec![LockedResolution {
             target: target(),
             environment: environment(),
+            publication_cutoff: None,
             packages: vec![first_lock, second_lock],
         }]),
         Err(LockError::InstalledNameConflict { .. })
@@ -361,6 +397,7 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
     let lock = Lockfile::new(vec![LockedResolution {
         target: target(),
         environment: environment(),
+        publication_cutoff: None,
         packages: vec![
             LockedPackage {
                 identity: registry.clone(),

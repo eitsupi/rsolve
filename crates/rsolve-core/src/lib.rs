@@ -8,6 +8,7 @@ mod environment;
 mod identity;
 mod metadata;
 mod names;
+mod publication;
 mod r_versions;
 mod request;
 mod resolution;
@@ -31,6 +32,9 @@ pub use names::{
     GitCommitIdError, GitHashAlgorithm, IdentifierError, NormalizedGitUrl, NormalizedGitUrlError,
     PackageName, PackageNameError, PackageNamespace, RegistryId, RepositorySubdir, Sha256Digest,
     SnapshotId, SourceScheme,
+};
+pub use publication::{
+    PublicationCutoff, PublicationDate, PublicationDateError, ReleasePublication,
 };
 pub use r_versions::{RPackageVersion, RPackageVersionError};
 pub use request::{LockedIdentities, ResolutionRequest, SolverKey};

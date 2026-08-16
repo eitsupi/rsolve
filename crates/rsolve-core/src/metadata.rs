@@ -5,6 +5,7 @@ use std::fmt;
 use crate::constraints::{DependencyRequirement, DependencySourceConstraint};
 use crate::identity::{Distribution, Provenance, ReleaseIdentity};
 use crate::names::{PackageName, Sha256Digest};
+use crate::publication::ReleasePublication;
 use crate::r_versions::RPackageVersion;
 
 /// Normalized metadata excluding `Package`, `Version`, and every dependency
@@ -47,6 +48,7 @@ impl ReleaseMetadata {
                     | "linkingto"
                     | "suggests"
                     | "enhances"
+                    | "published"
             ) {
                 return Err(ReleaseMetadataError::ReservedField {
                     field: field.clone(),
@@ -81,6 +83,7 @@ pub struct ReleaseObservation {
     pub observed_package: PackageName,
     pub observed_version: RPackageVersion,
     pub metadata: ReleaseMetadata,
+    pub publication: Option<ReleasePublication>,
     pub dependencies: Vec<DependencyRequirement>,
     pub distributions: Vec<Distribution>,
 }
@@ -98,6 +101,7 @@ pub struct PackageRelease {
     identity: ReleaseIdentity,
     version: RPackageVersion,
     metadata: ReleaseMetadata,
+    publication: Option<ReleasePublication>,
     dependencies: Vec<DependencyRequirement>,
     distributions: Vec<Distribution>,
     metadata_digest: Option<Sha256Digest>,
@@ -178,6 +182,7 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
             identity: observation.identity,
             version: observation.observed_version,
             metadata: observation.metadata,
+            publication: observation.publication,
             dependencies: observation.dependencies,
             distributions: unique_distributions,
             metadata_digest: None,
@@ -209,6 +214,10 @@ impl PackageRelease {
 
     pub fn metadata(&self) -> &ReleaseMetadata {
         &self.metadata
+    }
+
+    pub fn publication(&self) -> Option<&ReleasePublication> {
+        self.publication.as_ref()
     }
 
     pub fn dependencies(&self) -> &[DependencyRequirement] {
@@ -259,6 +268,15 @@ impl ReleaseAggregation {
             if existing.metadata != release.metadata {
                 return Err(PackageReleaseError::ConflictingMetadata { field: "metadata" });
             }
+            match (existing.publication, release.publication) {
+                (Some(left), Some(right)) if left != right => {
+                    return Err(PackageReleaseError::ConflictingMetadata {
+                        field: "publication",
+                    });
+                }
+                (None, Some(publication)) => existing.publication = Some(publication),
+                _ => {}
+            }
             if existing.dependencies != release.dependencies {
                 return Err(PackageReleaseError::ConflictingMetadata {
                     field: "dependencies",
@@ -299,6 +317,7 @@ mod tests {
         ArtifactLocator, BioconductorRelease, DistributionChannel, GitCommitId, NormalizedGitUrl,
         PackageNamespace, RegistryId, Sha256Digest, SnapshotId, SourceScheme,
     };
+    use crate::publication::PublicationDate;
     use std::collections::{BTreeMap, HashSet};
 
     fn version(value: &str) -> RPackageVersion {
@@ -337,6 +356,7 @@ mod tests {
             identity,
             observed_version: version(release_version),
             metadata: ReleaseMetadata::default(),
+            publication: None,
             dependencies: vec![],
             distributions: vec![distribution],
         }
@@ -349,6 +369,43 @@ mod tests {
         assert!(matches!(
             ReleaseMetadata::new(fields),
             Err(ReleaseMetadataError::ReservedField { .. })
+        ));
+    }
+
+    #[test]
+    fn publication_facts_merge_unknown_and_reject_conflicting_known_values() {
+        let identity = identity(Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("1.0.0"),
+        });
+        let distribution = source_distribution("publication");
+        let mut unknown = observation(identity.clone(), "1.0.0", distribution.clone());
+        let known_date = PublicationDate::parse("2026-06-24").unwrap();
+        let mut known = observation(identity.clone(), "1.0.0", distribution.clone());
+        known.publication = Some(ReleasePublication::new(known_date));
+        let mut aggregation = ReleaseAggregation::new();
+        aggregation.observe(unknown.clone()).unwrap();
+        aggregation.observe(known).unwrap();
+        assert_eq!(
+            aggregation
+                .get(&identity)
+                .and_then(PackageRelease::publication)
+                .map(|publication| publication.date()),
+            Some(known_date)
+        );
+
+        unknown.publication = Some(ReleasePublication::new(
+            PublicationDate::parse("2026-06-25").unwrap(),
+        ));
+        let mut conflicting = ReleaseAggregation::new();
+        conflicting.observe(unknown).unwrap();
+        let mut other = observation(identity, "1.0.0", distribution);
+        other.publication = Some(ReleasePublication::new(known_date));
+        assert!(matches!(
+            conflicting.observe(other),
+            Err(PackageReleaseError::ConflictingMetadata {
+                field: "publication"
+            })
         ));
     }
 
@@ -472,6 +529,7 @@ mod tests {
             observed_package: matrix,
             observed_version: version("1.6-5"),
             metadata: ReleaseMetadata::default(),
+            publication: None,
             dependencies: vec![dependency.clone()],
             distributions: vec![],
         })
@@ -499,6 +557,7 @@ mod tests {
             observed_package: package("Matrix"),
             observed_version: version("1.6-5"),
             metadata: ReleaseMetadata::default(),
+            publication: None,
             dependencies: vec![dependency],
             distributions: vec![],
         });
@@ -630,6 +689,7 @@ mod tests {
             observed_package: package.clone(),
             observed_version: target.clone(),
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
             dependencies: Vec::new(),
             distributions: Vec::new(),
         })
@@ -642,6 +702,7 @@ mod tests {
             observed_package: package,
             observed_version: version("4.3.0"),
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
             dependencies: Vec::new(),
             distributions: Vec::new(),
         });

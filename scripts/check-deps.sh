@@ -89,7 +89,9 @@ check_forbidden_path "3 (resolver -> provider)" rsolve-resolver rsolve-provider
 # future external crate, including optional dependencies resolved by
 # --all-features. An allowlist is complete; a denylist would only improve
 # wording while inevitably missing a new crate name.
-ALLOWED_CORE_CRATES=()
+# `time` is used only behind rsolve-core's opaque PublicationDate API; its
+# date-library type is not exposed in the public domain surface.
+ALLOWED_CORE_CRATES=(time)
 while IFS=$'\t' read -r source target; do
     if [[ "$source" == rsolve-core ]]; then
         allowed=false

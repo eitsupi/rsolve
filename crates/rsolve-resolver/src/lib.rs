@@ -11,12 +11,12 @@ use std::fmt;
 
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencySourceConstraint, PackageName, PackageRelease, Provenance, RPackageVersion,
-    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, Resolution, ResolutionRequest, SolverKey,
-    VersionConstraint,
+    DependencySourceConstraint, PackageName, PackageRelease, Provenance, PublicationDate,
+    RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, Resolution,
+    ResolutionRequest, SolverKey, VersionConstraint,
 };
 
-pub use adapter::{ResolutionDiagnostic, ResolutionFailure};
+pub use adapter::{PublicationRejection, ResolutionDiagnostic, ResolutionFailure};
 
 // These are R base packages only. Recommended packages such as Matrix are
 // intentionally absent; without runtime inventory, the resolver must not
@@ -95,6 +95,7 @@ impl<L> RBasePackageOverlay<L> {
                         format!("invalid R base package metadata: {error}"),
                     )
                 })?,
+                publication: None,
                 dependencies: Vec::new(),
                 distributions: Vec::new(),
             })
@@ -289,6 +290,10 @@ pub enum AssignmentDifference {
     LowerPreference {
         assigned: DecisionCandidate,
     },
+    PublicationCooldown {
+        cutoff: PublicationDate,
+    },
+    PublicationUnknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -549,6 +554,26 @@ fn difference_for_candidate(
         return Some(AssignmentDifference::RequiredLockMismatch {
             required: required.clone(),
         });
+    }
+    let locked = match difference.decision {
+        LockDecision::Prefer(identity) | LockDecision::Require(identity) => {
+            candidate.identity() == identity
+        }
+        LockDecision::Unlocked => false,
+    };
+    if let Some(cutoff) = difference.request.publication_cutoff
+        && !candidate.is_r_base_package()
+        && !locked
+    {
+        match candidate.publication() {
+            Some(publication) if publication.date() > cutoff.date() => {
+                return Some(AssignmentDifference::PublicationCooldown {
+                    cutoff: cutoff.date(),
+                });
+            }
+            None => return Some(AssignmentDifference::PublicationUnknown),
+            Some(_) => {}
+        }
     }
     if let Some(other) = difference.selected_packages.iter().find(|other| {
         other.subject() != difference.subject

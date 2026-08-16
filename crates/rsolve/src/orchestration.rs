@@ -1,7 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-use rsolve_core::{CandidateLoadError, CandidateLoader, PackageRelease, Resolution, SolverKey};
+use rsolve_core::{
+    CandidateLoadError, CandidateLoader, PackageRelease, PublicationCutoff, PublicationDate,
+    Resolution, SolverKey,
+};
 use rsolve_provider::cran::{
     CranCandidateSnapshot, CranRefreshDiagnostic, CranSnapshotRefresher, CranSnapshotRefresherError,
 };
@@ -99,7 +102,17 @@ pub fn resolve_with_loader(
     manifest: Manifest,
     loader: &dyn CandidateLoader,
 ) -> Result<Resolution, CranResolutionError> {
+    resolve_with_loader_with_publication_cutoff(manifest, loader, None)
+}
+
+pub fn resolve_with_loader_with_publication_cutoff(
+    manifest: Manifest,
+    loader: &dyn CandidateLoader,
+    publication_cutoff: Option<PublicationDate>,
+) -> Result<Resolution, CranResolutionError> {
     let request = compose_resolution_request(manifest).map_err(CranResolutionError::Composition)?;
+    let request =
+        request.with_optional_publication_cutoff(publication_cutoff.map(PublicationCutoff::new));
     let overlay =
         RBasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
             .map_err(CranResolutionError::Refresh)?;
@@ -202,7 +215,17 @@ pub fn resolve_from_cran(
     manifest: Manifest,
     base_url: impl AsRef<str>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
+    resolve_from_cran_with_publication_cutoff(manifest, base_url, None)
+}
+
+pub fn resolve_from_cran_with_publication_cutoff(
+    manifest: Manifest,
+    base_url: impl AsRef<str>,
+    publication_cutoff: Option<PublicationDate>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
     let request = compose_resolution_request(manifest).map_err(CranResolutionError::Composition)?;
+    let request =
+        request.with_optional_publication_cutoff(publication_cutoff.map(PublicationCutoff::new));
     let refresher = CranSnapshotRefresher::new(base_url).map_err(CranResolutionError::Provider)?;
     let roots = request
         .requirements
@@ -298,6 +321,7 @@ mod tests {
             observed_package: package,
             observed_version: version,
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
             dependencies: Vec::new(),
             distributions: Vec::new(),
         };
@@ -323,6 +347,7 @@ mod tests {
             observed_package: name.clone(),
             observed_version: version,
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
             dependencies,
             distributions: Vec::new(),
         })
@@ -342,6 +367,7 @@ mod tests {
             observed_package: name.clone(),
             observed_version: version,
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
             dependencies: Vec::new(),
             distributions: Vec::new(),
         })

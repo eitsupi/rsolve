@@ -128,6 +128,7 @@ fn matrix_release(version: &str, r_constraint: VersionConstraint) -> ReleaseObse
         observed_package: package,
         observed_version: RPackageVersion::parse(version).unwrap(),
         metadata: ReleaseMetadata::default(),
+        publication: None,
         dependencies: vec![
             DependencyRequirement::new(
                 DependencyKind::Depends,
@@ -166,6 +167,7 @@ fn plain_release(name: &str, version: &str) -> ReleaseObservation {
         observed_package: package,
         observed_version: parsed_version,
         metadata: ReleaseMetadata::default(),
+        publication: None,
         dependencies: Vec::new(),
         distributions: vec![Distribution {
             registry: rsolve_core::RegistryId::new("cran").unwrap(),
@@ -659,6 +661,7 @@ pub mod regression_support {
             observed_package: package,
             observed_version: parsed_version,
             metadata: ReleaseMetadata::default(),
+            publication: None,
             dependencies,
             distributions: vec![Distribution {
                 registry: rsolve_core::RegistryId::new("cran").unwrap(),

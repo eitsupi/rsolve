@@ -16,3 +16,4 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 ureq = { workspace = true }
 url = { workspace = true }
+time = { workspace = true }

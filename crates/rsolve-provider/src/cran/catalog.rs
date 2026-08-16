@@ -7,9 +7,9 @@ use std::fmt;
 use rsolve_core::{
     DependencyKind, DependencyRequirement, DependencySourceConstraint, Distribution,
     DistributionChannel, DistributionMetadata, PackageName, PackageNameError, PackageRelease,
-    PackageReleaseError, Provenance, RPackageVersion, RPackageVersionError, RegistryId, RelationOp,
-    ReleaseAggregation, ReleaseIdentity, ReleaseMetadata, ReleaseMetadataError, ReleaseObservation,
-    VersionConstraint,
+    PackageReleaseError, Provenance, PublicationDate, RPackageVersion, RPackageVersionError,
+    RegistryId, RelationOp, ReleaseAggregation, ReleaseIdentity, ReleaseMetadata,
+    ReleaseMetadataError, ReleaseObservation, VersionConstraint,
 };
 
 use super::{DcfDocument, DcfError};
@@ -162,6 +162,10 @@ pub enum CranRecordError {
     DuplicateField(String),
     InvalidPackageName(PackageNameError),
     InvalidVersion(RPackageVersionError),
+    InvalidPublicationDate {
+        value: String,
+        diagnostic: String,
+    },
     InvalidMetadata(ReleaseMetadataError),
     Dependency {
         field: &'static str,
@@ -178,6 +182,9 @@ impl fmt::Display for CranRecordError {
             Self::DuplicateField(field) => write!(f, "duplicate field {field}"),
             Self::InvalidPackageName(error) => error.fmt(f),
             Self::InvalidVersion(error) => error.fmt(f),
+            Self::InvalidPublicationDate { value, diagnostic } => {
+                write!(f, "invalid Published value {value:?}: {diagnostic}")
+            }
             Self::InvalidMetadata(error) => error.fmt(f),
             Self::Dependency {
                 field,
@@ -273,6 +280,9 @@ pub(super) fn observation_from_fields(
         PackageName::new(package_value.trim()).map_err(CranRecordError::InvalidPackageName)?;
     let version =
         RPackageVersion::parse(version_value.trim()).map_err(CranRecordError::InvalidVersion)?;
+    let publication = field(fields, "Published")
+        .map(parse_publication_date)
+        .transpose()?;
 
     let mut dependencies = Vec::new();
     for (field_name, kind) in [
@@ -322,6 +332,7 @@ pub(super) fn observation_from_fields(
         observed_package: package,
         observed_version: version,
         metadata,
+        publication,
         dependencies,
         distributions: vec![Distribution {
             registry: RegistryId::new(CRAN_NAMESPACE).expect("the fixed CRAN registry is valid"),
@@ -362,8 +373,42 @@ fn reject_duplicate_fields(fields: &[(&str, &str)]) -> Result<(), CranRecordErro
 fn is_reserved_field(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "package" | "version" | "depends" | "imports" | "linkingto" | "suggests" | "enhances"
+        "package"
+            | "version"
+            | "depends"
+            | "imports"
+            | "linkingto"
+            | "suggests"
+            | "enhances"
+            | "published"
     )
+}
+
+fn parse_publication_date(value: &str) -> Result<rsolve_core::ReleasePublication, CranRecordError> {
+    let value = value.trim();
+    let date = if value.len() == 10 {
+        PublicationDate::parse(value)
+    } else {
+        let date_part = value
+            .get(..10)
+            .ok_or_else(|| rsolve_core::PublicationDateError::Invalid {
+                input: value.into(),
+                diagnostic: "publication datetime is too short".into(),
+            });
+        let format =
+            time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
+        time::PrimitiveDateTime::parse(value, format)
+            .map_err(|error| rsolve_core::PublicationDateError::Invalid {
+                input: value.into(),
+                diagnostic: error.to_string().into(),
+            })
+            .and_then(|_| date_part.and_then(PublicationDate::parse))
+    };
+    date.map(rsolve_core::ReleasePublication::new)
+        .map_err(|error| CranRecordError::InvalidPublicationDate {
+            value: value.to_owned(),
+            diagnostic: error.to_string(),
+        })
 }
 
 struct ParsedDependency {

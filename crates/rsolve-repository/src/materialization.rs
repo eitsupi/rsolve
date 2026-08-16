@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use rsolve_core::{
     DependencyRequirement, PackageName, Provenance, RPackageVersion, ReleaseIdentity,
-    ReleaseMetadata,
+    ReleaseMetadata, ReleasePublication,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,7 @@ pub struct MaterializationArtifact {
     pub version: RPackageVersion,
     pub artifact: CachedArtifact,
     pub metadata: ReleaseMetadata,
+    pub publication: Option<ReleasePublication>,
     pub dependencies: Vec<DependencyRequirement>,
 }
 
@@ -56,6 +57,7 @@ impl MaterializationArtifact {
             version,
             artifact,
             metadata: ReleaseMetadata::default(),
+            publication: None,
             dependencies: Vec::new(),
         }
     }
@@ -68,6 +70,16 @@ impl MaterializationArtifact {
         self.metadata = metadata;
         self.dependencies = dependencies;
         self
+    }
+
+    /// Attach the first-class publication fact projected into PACKAGES.
+    pub fn with_publication(mut self, publication: ReleasePublication) -> Self {
+        self.publication = Some(publication);
+        self
+    }
+
+    pub fn publication(&self) -> Option<&ReleasePublication> {
+        self.publication.as_ref()
     }
 
     pub fn package(&self) -> &PackageName {
