@@ -26,6 +26,7 @@ fictional phrase.
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `996457bb49b94effe5740b0d1ea135ad2988126097ee3e7b693c68228ecd66e3` |
 | `synthetic-matrix-archive-overlay-PACKAGES.rds` | 2 | Matrix 1.7-6 root release followed by a matching Recommended-path overlay; SHA-256 `3a0700effafc53513b91a326239ae5d6df82fec6b566499e6a802c71bdddeb46` |
 | `synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds` | 2 | Matrix root/Recommended-path pair with mismatched MD5sum, which must fail closed; SHA-256 `d9d8821bb57307b76718e3a2429b51c2e4143e79e7c53bc9dbfa2bf69768af04` |
+| `synthetic-matrix-archive-overlay-p3m-PACKAGES.rds` | 2 | P3M-shaped Matrix overlay-first pair without MD5sum; the root row must be retained; SHA-256 `873dd4279923c5c6b9938e8f049ec2bff4b6bca6fd2c0e6928d559c6d7fc3c5f` |
 | `synthetic-matrix-archive-wrong-root.rds` | 1 | Invalid fast-path wrong root type fixture; SHA-256 `715f0358ada164c6b70b892b14b21ba58b5b30cfb8aac581a4aa2cca84231a57` |
 | `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `fabb389fc6fc1cf4951a76121c644df269150184aa7e1860a547b2f064ec2a4c` |
 | `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration, including canonical prefixed source path; SHA-256 `86fb29d89f3718f8128818243c4880cb6fabd67a77470bfab5b8eb2d1be2a5d9` |

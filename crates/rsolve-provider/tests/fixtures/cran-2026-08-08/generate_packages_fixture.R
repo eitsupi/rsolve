@@ -272,6 +272,15 @@ write_binary_fixture(
     "synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds",
     matrix_overlay_mismatch
 )
+
+# P3M-shaped current-index duplicate: the Recommended overlay comes first and
+# neither row carries MD5sum. Catalog selection must still retain the root row.
+matrix_p3m_overlay <- matrix_overlay_archive[c(2L, 1L), , drop = FALSE]
+matrix_p3m_overlay[, "MD5sum"] <- NA_character_
+write_binary_fixture(
+    "synthetic-matrix-archive-overlay-p3m-PACKAGES.rds",
+    matrix_p3m_overlay
+)
 write_binary_fixture("synthetic-matrix-archive-wrong-root.rds", "wrong root")
 write_binary_fixture(
     "synthetic-matrix-archive-missing-version.rds",

@@ -185,7 +185,6 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
         let metadata_digest = canonical_metadata_digest(
             &observation.identity,
             &observation.observed_version,
-            observation.publication,
             &observation.dependencies,
         );
         Ok(Self {
@@ -201,26 +200,19 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
 }
 
 // This is a fingerprint of validated logical/solver metadata, not an
-// arbitrary DESCRIPTION passthrough and not distribution or artifact bytes.
+// arbitrary DESCRIPTION passthrough, repository observation, or distribution
+// and artifact bytes.
 const METADATA_DIGEST_DOMAIN: &[u8] = b"rsolve.logical-release-metadata\0v1";
 
 fn canonical_metadata_digest(
     identity: &ReleaseIdentity,
     observed_version: &RPackageVersion,
-    publication: Option<ReleasePublication>,
     dependencies: &[DependencyRequirement],
 ) -> Sha256Digest {
     let mut encoded = Vec::new();
     append_bytes(&mut encoded, METADATA_DIGEST_DOMAIN);
     append_identity(&mut encoded, identity);
     append_version(&mut encoded, observed_version);
-    match publication {
-        Some(publication) => {
-            encoded.push(1);
-            append_string(&mut encoded, &publication.date().to_string());
-        }
-        None => encoded.push(0),
-    }
 
     let mut dependency_records = dependencies
         .iter()
@@ -407,8 +399,9 @@ impl PackageRelease {
     }
 
     /// Returns the canonical fingerprint of validated logical/solver
-    /// metadata.  Arbitrary DESCRIPTION passthrough fields and distribution
-    /// or artifact facts are intentionally excluded.
+    /// metadata. Arbitrary DESCRIPTION passthrough fields, repository
+    /// observation facts such as publication dates, and distribution or
+    /// artifact facts are intentionally excluded.
     pub fn metadata_digest(&self) -> &Sha256Digest {
         &self.metadata_digest
     }
@@ -419,15 +412,6 @@ impl PackageRelease {
                 self.distributions.push(distribution.clone());
             }
         }
-    }
-
-    fn refresh_metadata_digest(&mut self) {
-        self.metadata_digest = canonical_metadata_digest(
-            &self.identity,
-            &self.version,
-            self.publication,
-            &self.dependencies,
-        );
     }
 }
 
@@ -473,9 +457,6 @@ impl ReleaseAggregation {
                 });
             }
             existing.merge_distributions(&release.distributions);
-            // A previously unknown publication becomes part of the validated
-            // logical metadata fingerprint when a later observation supplies it.
-            existing.refresh_metadata_digest();
         } else {
             self.releases.insert(release.identity.clone(), release);
         }
@@ -764,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_digest_changes_for_coordinate_version_and_publication() {
+    fn metadata_digest_changes_for_coordinate_version_but_not_publication() {
         let base_identity = identity(Provenance::RegistryRelease {
             namespace: PackageNamespace::new("cran").unwrap(),
             version: version("1.0"),
@@ -776,13 +757,20 @@ mod tests {
         ))
         .unwrap();
 
-        let mut published = observation(base_identity, "1.0", source_distribution("base"));
+        let mut published = observation(base_identity.clone(), "1.0", source_distribution("base"));
         published.publication = Some(ReleasePublication::new(
             PublicationDate::parse("2026-01-01").unwrap(),
         ));
-        assert_ne!(
-            base.metadata_digest(),
-            PackageRelease::try_from(published)
+        let published_release = PackageRelease::try_from(published).unwrap();
+        assert_eq!(base.metadata_digest(), published_release.metadata_digest());
+
+        let mut published_later = observation(base_identity, "1.0", source_distribution("base"));
+        published_later.publication = Some(ReleasePublication::new(
+            PublicationDate::parse("2026-02-01").unwrap(),
+        ));
+        assert_eq!(
+            published_release.metadata_digest(),
+            PackageRelease::try_from(published_later)
                 .unwrap()
                 .metadata_digest()
         );

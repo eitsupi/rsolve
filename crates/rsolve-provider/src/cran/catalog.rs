@@ -259,21 +259,28 @@ where
         ),
     >,
 {
+    let observations = observations.into_iter().collect::<Vec<_>>();
+    let mut root_md5_by_identity = HashMap::<ReleaseIdentity, Vec<Option<String>>>::new();
+    for (_, _, observation) in &observations {
+        let Ok(observation) = observation else {
+            continue;
+        };
+        if metadata_field(observation, "Path").is_none() {
+            root_md5_by_identity
+                .entry(observation.identity.clone())
+                .or_default()
+                .push(metadata_field(observation, "MD5sum").map(str::to_owned));
+        }
+    }
+
     let mut aggregation = ReleaseAggregation::new();
-    let mut root_md5_by_identity = HashMap::<ReleaseIdentity, String>::new();
     let mut diagnostics = Vec::new();
 
     for (record_index, package, observation) in observations {
         match observation {
             Ok(observation) => {
-                if let Some(root_md5) = root_md5_by_identity.get(&observation.identity)
-                    && is_recommended_overlay(&observation)
-                    && overlay_matches_root(&observation, root_md5)
-                {
+                if should_suppress_overlay(&observation, &root_md5_by_identity) {
                     continue;
-                }
-                if let Some(md5) = valid_root_md5(&observation) {
-                    root_md5_by_identity.insert(observation.identity.clone(), md5.to_owned());
                 }
                 if let Err(error) = aggregation.observe(observation) {
                     diagnostics.push(CranDiagnostic {
@@ -316,14 +323,6 @@ fn metadata_field<'a>(observation: &'a ReleaseObservation, name: &str) -> Option
         .map(|(_, value)| value.as_str())
 }
 
-fn valid_root_md5(observation: &ReleaseObservation) -> Option<&str> {
-    if metadata_field(observation, "Path").is_some() {
-        return None;
-    }
-    let md5 = metadata_field(observation, "MD5sum")?;
-    (!md5.trim().is_empty()).then_some(md5)
-}
-
 fn is_recommended_overlay(observation: &ReleaseObservation) -> bool {
     let Some(path) = metadata_field(observation, "Path") else {
         return false;
@@ -333,15 +332,37 @@ fn is_recommended_overlay(observation: &ReleaseObservation) -> bool {
     };
     suffix == "Recommended"
         && !version.is_empty()
-        && RPackageVersion::parse(version).is_ok()
+        && RPackageVersion::parse_bare(version).is_ok()
         && path.matches('/').count() == 1
 }
 
-fn overlay_matches_root(observation: &ReleaseObservation, root_md5: &str) -> bool {
-    let Some(overlay_md5) = metadata_field(observation, "MD5sum") else {
+fn should_suppress_overlay(
+    observation: &ReleaseObservation,
+    root_md5_by_identity: &HashMap<ReleaseIdentity, Vec<Option<String>>>,
+) -> bool {
+    if !is_recommended_overlay(observation) {
+        return false;
+    }
+    let Some(root_md5s) = root_md5_by_identity.get(&observation.identity) else {
         return false;
     };
-    !overlay_md5.trim().is_empty() && overlay_md5 == root_md5
+
+    // A missing MD5 on either row is common in alternate CRAN indexes and
+    // does not prevent selecting the root metadata. If both sides provide a
+    // value, retain the overlay on any mismatch so normal aggregation fails
+    // closed instead of silently discarding conflicting artifact facts.
+    let overlay_md5 = metadata_field(observation, "MD5sum")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim);
+    let has_mismatch = root_md5s
+        .iter()
+        .flatten()
+        .filter_map(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then_some(value)
+        })
+        .any(|root_md5| Some(root_md5) != overlay_md5 && overlay_md5.is_some());
+    !has_mismatch
 }
 
 pub(super) fn observation_from_fields(

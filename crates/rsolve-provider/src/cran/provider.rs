@@ -84,6 +84,7 @@ pub enum CranCurrentIndexRepresentation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CranRefreshSource {
     ArchiveFastPath,
+    ArchiveHistory,
     CurrentIndex(CranCurrentIndexRepresentation),
 }
 
@@ -470,9 +471,23 @@ struct CranRefreshSession<T> {
     base_url: Box<str>,
     transport: Rc<T>,
     current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
-    history: Option<Result<Rc<[ArchiveEntry]>, CandidateLoadError>>,
+    history: Option<Result<HistorySource, CandidateLoadError>>,
     packages: HashMap<PackageName, Vec<PackageRelease>>,
     diagnostics: Vec<CranRefreshDiagnostic>,
+}
+
+#[derive(Clone)]
+enum HistorySource {
+    Available(Rc<[ArchiveEntry]>),
+    Absent,
+}
+
+enum FastPathFailure {
+    Absent,
+    Invalid {
+        category: CandidateLoadErrorCategory,
+        diagnostic: Box<str>,
+    },
 }
 
 impl<T: Transport> CranRefreshSession<T> {
@@ -595,38 +610,83 @@ impl<T: Transport> CranRefreshSession<T> {
         });
     }
 
-    fn ensure_history(&mut self) -> Result<Rc<[ArchiveEntry]>, CandidateLoadError> {
+    fn ensure_history(&mut self) -> Result<HistorySource, CandidateLoadError> {
         if let Some(result) = &self.history {
             return result.clone();
         }
         let endpoint = format!("{}/Meta/archive.rds", self.base_url);
-        let result = self
-            .transport
-            .get(&endpoint)
-            .map_err(|error| {
-                CandidateLoadError::new(
+        let result = match self.transport.get(&endpoint) {
+            Err(error) => {
+                self.push_history_diagnostic(
+                    endpoint.clone(),
+                    None,
+                    format!("transport failure: {error}"),
+                );
+                Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
                     format!("failed to refresh {endpoint}: {error}"),
-                )
-            })
-            .and_then(|response| {
-                if response.status != 200 {
-                    return Err(CandidateLoadError::new(
-                        CandidateLoadErrorCategory::TransportFailure,
-                        format!("failed to refresh {endpoint}: HTTP {}", response.status),
-                    ));
+                ))
+            }
+            Ok(response) if matches!(response.status, 404 | 410) => {
+                self.diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: Some(response.status),
+                    status_detail: CranFastPathStatus::Absent {
+                        status: response.status,
+                    },
+                    source: CranRefreshSource::ArchiveHistory,
+                });
+                Ok(HistorySource::Absent)
+            }
+            Ok(response) if response.status != 200 => {
+                let diagnostic = format!("unexpected archive history status {}", response.status);
+                self.push_history_diagnostic(
+                    endpoint.clone(),
+                    Some(response.status),
+                    diagnostic.clone(),
+                );
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::TransportFailure,
+                    format!("failed to refresh {endpoint}: HTTP {}", response.status),
+                ))
+            }
+            Ok(response) => match enumerate_archive_rds(&response.body) {
+                Ok(entries) => Ok(HistorySource::Available(Rc::from(
+                    entries.into_boxed_slice(),
+                ))),
+                Err(error) => {
+                    let diagnostic = format!("invalid CRAN archive history: {error}");
+                    self.push_history_diagnostic(
+                        endpoint.clone(),
+                        Some(response.status),
+                        diagnostic.clone(),
+                    );
+                    Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        diagnostic,
+                    ))
                 }
-                enumerate_archive_rds(&response.body)
-                    .map(|entries| Rc::from(entries.into_boxed_slice()))
-                    .map_err(|error| {
-                        CandidateLoadError::new(
-                            CandidateLoadErrorCategory::MetadataInvalid,
-                            format!("invalid CRAN archive history: {error}"),
-                        )
-                    })
-            });
+            },
+        };
         self.history = Some(result.clone());
         result
+    }
+
+    fn push_history_diagnostic(
+        &mut self,
+        endpoint: String,
+        status: Option<u16>,
+        diagnostic: String,
+    ) {
+        self.diagnostics.push(CranRefreshDiagnostic {
+            endpoint: endpoint.into_boxed_str(),
+            status,
+            status_detail: CranFastPathStatus::Invalid {
+                status: status.unwrap_or_default(),
+                diagnostic: diagnostic.into_boxed_str(),
+            },
+            source: CranRefreshSource::ArchiveHistory,
+        });
     }
 
     fn refresh_package(
@@ -643,7 +703,7 @@ impl<T: Transport> CranRefreshSession<T> {
             package.as_str()
         );
         let mut package_diagnostics = Vec::new();
-        let source = match self.transport.get(&endpoint) {
+        let fast_result = match self.transport.get(&endpoint) {
             Err(error) => {
                 package_diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into_boxed_str(),
@@ -654,7 +714,10 @@ impl<T: Transport> CranRefreshSession<T> {
                     },
                     source: CranRefreshSource::ArchiveFastPath,
                 });
-                CandidateSource::Fallback(self.ensure_history()?)
+                Err(FastPathFailure::Invalid {
+                    category: CandidateLoadErrorCategory::TransportFailure,
+                    diagnostic: format!("archive fast path for {package} failed: {error}").into(),
+                })
             }
             Ok(response) if response.status == 200 => {
                 match CranCatalog::from_archive_index_rds(&response.body) {
@@ -665,19 +728,25 @@ impl<T: Transport> CranRefreshSession<T> {
                             status_detail: CranFastPathStatus::Available,
                             source: CranRefreshSource::ArchiveFastPath,
                         });
-                        CandidateSource::Fast(catalog)
+                        Ok(CandidateSource::Fast(catalog))
                     }
                     Err(error) => {
+                        let diagnostic = format!(
+                            "archive fast path for {package} has invalid metadata: {error}"
+                        );
                         package_diagnostics.push(CranRefreshDiagnostic {
                             endpoint: endpoint.clone().into_boxed_str(),
                             status: Some(response.status),
                             status_detail: CranFastPathStatus::Invalid {
                                 status: response.status,
-                                diagnostic: error.to_string().into_boxed_str(),
+                                diagnostic: diagnostic.clone().into_boxed_str(),
                             },
                             source: CranRefreshSource::ArchiveFastPath,
                         });
-                        CandidateSource::Fallback(self.ensure_history()?)
+                        Err(FastPathFailure::Invalid {
+                            category: CandidateLoadErrorCategory::MetadataInvalid,
+                            diagnostic: diagnostic.into_boxed_str(),
+                        })
                     }
                 }
             }
@@ -697,15 +766,41 @@ impl<T: Transport> CranRefreshSession<T> {
                     status_detail,
                     source: CranRefreshSource::ArchiveFastPath,
                 });
-                CandidateSource::Fallback(self.ensure_history()?)
+                if matches!(status, 404 | 410) {
+                    Err(FastPathFailure::Absent)
+                } else {
+                    Err(FastPathFailure::Invalid {
+                        category: CandidateLoadErrorCategory::TransportFailure,
+                        diagnostic: format!(
+                            "archive fast path for {package} returned unexpected HTTP {status}"
+                        )
+                        .into(),
+                    })
+                }
             }
+        };
+        let mut provider_diagnostics = Vec::new();
+        let source = match fast_result {
+            Ok(source) => {
+                provider_diagnostics = package_diagnostics;
+                source
+            }
+            Err(failure) => match self.resolve_fast_path_failure(
+                package,
+                &current,
+                package_diagnostics,
+                failure,
+            )? {
+                Some(source) => source,
+                None => return Ok(current),
+            },
         };
         let provider = CranProvider::from_source(
             Rc::clone(&self.transport),
             &self.base_url,
             package.clone(),
             source,
-            package_diagnostics,
+            provider_diagnostics,
         );
         self.diagnostics
             .extend(provider.diagnostics().iter().cloned());
@@ -723,6 +818,35 @@ impl<T: Transport> CranRefreshSession<T> {
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
         self.packages.insert(package.clone(), candidates.clone());
         Ok(candidates)
+    }
+
+    fn resolve_fast_path_failure(
+        &mut self,
+        package: &PackageName,
+        current: &[PackageRelease],
+        mut package_diagnostics: Vec<CranRefreshDiagnostic>,
+        failure: FastPathFailure,
+    ) -> Result<Option<CandidateSource>, CandidateLoadError> {
+        // Record the fast-path attempt before probing history so diagnostics
+        // follow the actual endpoint order. History itself is cached by the
+        // session and contributes at most one diagnostic.
+        self.diagnostics.append(&mut package_diagnostics);
+        match self.ensure_history()? {
+            HistorySource::Available(entries) => Ok(Some(CandidateSource::Fallback(entries))),
+            HistorySource::Absent => match failure {
+                FastPathFailure::Absent => {
+                    self.packages.insert(package.clone(), current.to_vec());
+                    Ok(None)
+                }
+                FastPathFailure::Invalid {
+                    category,
+                    diagnostic,
+                } => Err(CandidateLoadError::new(
+                    category,
+                    format!("{diagnostic}; archive history is absent"),
+                )),
+            },
+        }
     }
 
     fn refresh_packages(

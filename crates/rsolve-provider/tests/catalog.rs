@@ -175,16 +175,20 @@ fn recommended_overlay_is_retained_without_a_prior_root() {
 }
 
 #[test]
-fn overlay_before_root_remains_a_conflicting_duplicate() {
-    let error = CranCatalog::from_packages(
-        b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\nMD5sum: same\n\n\
-Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\nMD5sum: same\n\n",
+fn overlay_before_root_without_md5_is_suppressed() {
+    let catalog = CranCatalog::from_packages(
+        b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\n\n\
+Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\n\n",
     )
-    .unwrap_err();
-    assert!(matches!(
-        error.diagnostics()[0].error(),
-        CranRecordError::Domain(_)
-    ));
+    .unwrap();
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(catalog.candidate_count(), 1);
+    assert_eq!(
+        release.dependencies()[0].constraint.clauses[0]
+            .version
+            .as_str(),
+        "3.0.0"
+    );
 }
 
 #[test]
@@ -192,7 +196,6 @@ fn mismatched_recommended_overlays_are_not_suppressed() {
     for (path, md5) in [
         ("4.7.0/Other", "same"),
         ("4.7.0/Recommended", "different"),
-        ("4.7.0/Recommended", ""),
         ("not-a-version/Recommended", "same"),
     ] {
         let input = format!(
@@ -208,32 +211,17 @@ Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: {path}\nMD5sum: {m
 }
 
 #[test]
-fn invalid_recommended_overlays_and_missing_root_md5_are_not_suppressed() {
+fn invalid_recommended_overlays_remain_fail_closed() {
     let cases = [
-        (
-            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
-Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7),, methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
-            "semantic dependency diagnostic",
-        ),
-        (
-            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
-Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\n\n",
-            "overlay MD5 missing",
-        ),
-        (
-            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\n\n\
-Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
-            "root MD5 missing",
-        ),
-        (
-            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: \n\n\
-Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
-            "root MD5 empty",
-        ),
         (
             "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
 Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended/extra\nMD5sum: same\n\n",
             "overlay path has an extra slash",
+        ),
+        (
+            "Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7),, methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
+            "semantic dependency diagnostic",
         ),
     ];
     for (input, description) in cases {
@@ -250,6 +238,27 @@ Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recom
                 "{description}"
             );
         }
+    }
+}
+
+#[test]
+fn p3m_overlay_shape_is_order_independent_and_allows_missing_md5() {
+    for input in [
+        b"Package: boot\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\n\n\
+Package: boot\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\n\n" as &[u8],
+        b"Package: boot\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\n\n\
+Package: boot\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\n\n",
+    ] {
+        let catalog = CranCatalog::from_packages(input).expect("p3m overlay catalog");
+        let release = &catalog.candidates_named("boot").unwrap()[0];
+        assert_eq!(catalog.candidate_count(), 1);
+        assert_eq!(
+            release.dependencies()[0].constraint.clauses[0]
+                .version
+                .as_str(),
+            "3.0.0"
+        );
+        assert!(!release.metadata().fields().contains_key("Path"));
     }
 }
 

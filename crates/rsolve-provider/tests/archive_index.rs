@@ -8,6 +8,8 @@ const OVERLAY_ARCHIVE: &[u8] =
 const OVERLAY_MISMATCH_ARCHIVE: &[u8] = include_bytes!(
     "fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds"
 );
+const P3M_OVERLAY_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-p3m-PACKAGES.rds");
 
 // R 4.6.1, format 3, uncompressed RDS containing a character vector rather
 // than a matrix. It is deliberately small so this structural test has no
@@ -173,6 +175,33 @@ fn archive_mismatched_recommended_overlay_remains_a_conflicting_duplicate() {
             .map(|diagnostic| diagnostic.error()),
         Some(CranRecordError::Domain(_))
     ));
+}
+
+#[test]
+fn archive_p3m_overlay_first_without_md5_keeps_the_root_row() {
+    let object = rd_rds::file::from_bytes(P3M_OVERLAY_ARCHIVE).expect("archive RDS");
+    let matrix = rd_rds::package::PackagesMatrix::from_object(&object).expect("archive matrix");
+    assert_eq!(
+        matrix.row(0).unwrap().get("Path"),
+        Some(Some("4.7.0/Recommended"))
+    );
+    assert_eq!(matrix.row(0).unwrap().get("MD5sum"), Some(None));
+    assert_eq!(matrix.row(1).unwrap().get("Path"), Some(None));
+
+    let catalog = CranCatalog::from_archive_index_rds(P3M_OVERLAY_ARCHIVE)
+        .expect("p3m overlay archive catalog");
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(catalog.candidate_count(), 1);
+    assert_eq!(
+        release
+            .dependencies()
+            .iter()
+            .find(|dependency| dependency.name.as_str() == "R")
+            .and_then(|dependency| dependency.constraint.clauses.first())
+            .map(|clause| clause.version.as_str()),
+        Some("4.4")
+    );
+    assert!(!release.metadata().fields().contains_key("Path"));
 }
 
 #[test]

@@ -747,6 +747,304 @@ fn gone_fast_path_is_absent_and_shared_history_is_fetched_once() {
 }
 
 #[test]
+fn absent_fast_path_and_absent_history_use_current_candidates_only() {
+    let current = b"Package: Matrix\nVersion: 1.8-0\n";
+    for (fast_status, history_status) in [(404, 404), (404, 410), (410, 404), (410, 410)] {
+        let mut transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: current.to_vec(),
+            },
+        );
+        transport.responses.insert(
+            fast_url(),
+            TransportResponse {
+                status: fast_status,
+                body: Vec::new(),
+            },
+        );
+        transport.responses.insert(
+            history_url(),
+            TransportResponse {
+                status: history_status,
+                body: Vec::new(),
+            },
+        );
+        let requests = Rc::clone(&transport.requests);
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let snapshot = session
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+            .expect("current-only refresh");
+        assert_eq!(
+            snapshot
+                .releases(&SolverKey::InstalledName(
+                    PackageName::new("Matrix").unwrap()
+                ))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!requests.borrow().iter().any(|url| url == &old_url()));
+        assert!(session.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source() == CranRefreshSource::ArchiveHistory
+                && diagnostic.status_detail()
+                    == &CranFastPathStatus::Absent {
+                        status: history_status,
+                    }
+        }));
+        let fast_index = session
+            .diagnostics
+            .iter()
+            .position(|diagnostic| diagnostic.source() == CranRefreshSource::ArchiveFastPath)
+            .unwrap();
+        let history_index = session
+            .diagnostics
+            .iter()
+            .position(|diagnostic| diagnostic.source() == CranRefreshSource::ArchiveHistory)
+            .unwrap();
+        assert!(fast_index < history_index);
+    }
+}
+
+#[test]
+fn current_absence_with_absent_archive_sources_is_empty() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: other\nVersion: 1.0.0\n".to_vec(),
+        },
+    );
+    transport.responses.insert(
+        history_url(),
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let snapshot = session
+        .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+        .expect("empty current result");
+    assert!(
+        snapshot
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap()
+            ))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(requests.borrow().len(), 5);
+    assert!(requests.borrow().iter().any(|url| url == &fast_url()));
+    assert!(requests.borrow().iter().any(|url| url == &history_url()));
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::ArchiveHistory
+            && matches!(
+                diagnostic.status_detail(),
+                CranFastPathStatus::Absent { status: 404 }
+            )
+    }));
+}
+
+#[test]
+fn archive_candidates_are_retained_when_current_index_lacks_package() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: other\nVersion: 1.0.0\n".to_vec(),
+        },
+    );
+    transport.responses.insert(
+        fast_url(),
+        TransportResponse {
+            status: 200,
+            body: FAST.to_vec(),
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let snapshot = session
+        .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+        .expect("archive-only candidates");
+    assert_eq!(
+        snapshot
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap()
+            ))
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(requests.borrow().iter().any(|url| url == &fast_url()));
+    assert!(!requests.borrow().iter().any(|url| url == &history_url()));
+}
+
+#[test]
+fn fast_path_failure_is_not_hidden_by_absent_history() {
+    for fast_response in [
+        TransportResponse {
+            status: 500,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: WRONG_ROOT.to_vec(),
+        },
+    ] {
+        let mut transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            },
+        );
+        transport
+            .responses
+            .insert(fast_url(), fast_response.clone());
+        transport.responses.insert(
+            history_url(),
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+        );
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let error = session
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+            .unwrap_err();
+        assert_eq!(
+            error.category(),
+            if fast_response.status == 200 {
+                CandidateLoadErrorCategory::MetadataInvalid
+            } else {
+                CandidateLoadErrorCategory::TransportFailure
+            }
+        );
+        assert!(session.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source() == CranRefreshSource::ArchiveHistory
+                && matches!(
+                    diagnostic.status_detail(),
+                    CranFastPathStatus::Absent { status: 404 }
+                )
+        }));
+    }
+}
+
+#[test]
+fn history_transport_and_metadata_failures_remain_hard_failures() {
+    let cases = [
+        (
+            500,
+            Vec::new(),
+            CandidateLoadErrorCategory::TransportFailure,
+        ),
+        (
+            200,
+            b"invalid history".to_vec(),
+            CandidateLoadErrorCategory::MetadataInvalid,
+        ),
+    ];
+    for (history_status, history_body, expected_category) in cases {
+        let mut transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            },
+        );
+        transport.responses.insert(
+            history_url(),
+            TransportResponse {
+                status: history_status,
+                body: history_body,
+            },
+        );
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let error = session
+            .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+            .unwrap_err();
+        assert_eq!(error.category(), expected_category);
+        assert!(session.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source() == CranRefreshSource::ArchiveHistory
+                && diagnostic.status() == Some(history_status)
+        }));
+    }
+}
+
+#[test]
+fn history_transport_error_is_hard_failure_after_absent_fast_path() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+        },
+    );
+    transport.responses.remove(&history_url());
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let error = session
+        .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+        .unwrap_err();
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::TransportFailure
+    );
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::ArchiveHistory
+            && diagnostic.status().is_none()
+            && matches!(
+                diagnostic.status_detail(),
+                CranFastPathStatus::Invalid { status: 0, .. }
+            )
+    }));
+}
+
+#[test]
 fn fast_path_transport_error_is_diagnostic_and_falls_back() {
     let current = b"Package: Matrix\nVersion: 1.8-0\n";
     let mut transport = session_transport(
