@@ -173,6 +173,85 @@ class AttestationTests(unittest.TestCase):
             self.assertEqual((root / "dir/nested/child").read_bytes(), b"child")
             self.assertEqual((root / "introduced/file").read_bytes(), b"survives")
 
+    def test_bind_destinations_are_created_without_following_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "rootfs"
+            root.mkdir()
+            attestation.prepare_bind_destinations(root)
+            for path in (root / "proc", root / "dev", root / "tmp", root / "nrr", root / "nrr/fixtures"):
+                self.assertTrue(path.is_dir())
+            self.assertTrue((root / "nrr/pak_isolated").is_file())
+
+    def test_bind_destinations_accept_existing_physical_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "rootfs"
+            root.mkdir()
+            for mountpoint in ("proc", "dev", "tmp"):
+                (root / mountpoint).mkdir()
+            (root / "nrr" / "fixtures").mkdir(parents=True)
+            pak_isolated = root / "nrr" / "pak_isolated"
+            pak_isolated.write_bytes(b"preserve this content")
+
+            attestation.prepare_bind_destinations(root)
+
+            self.assertEqual(pak_isolated.read_bytes(), b"preserve this content")
+            for path in (root / "proc", root / "dev", root / "tmp", root / "nrr/fixtures"):
+                self.assertTrue(path.is_dir())
+            self.assertTrue(pak_isolated.is_file())
+
+    def test_bind_destinations_reject_rootfs_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            outside = base / "outside"
+            outside.mkdir()
+            marker = outside / "marker"
+            marker.write_text("keep", encoding="utf-8")
+            root = base / "rootfs"
+            root.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(attestation.AttestationError):
+                attestation.prepare_bind_destinations(root)
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_bind_destinations_reject_symlinks_and_type_collisions(self):
+        scenarios = (
+            ("proc", "symlink", False),
+            ("dev", "symlink", False),
+            ("tmp", "symlink", False),
+            ("nrr", "symlink", False),
+            ("nrr/fixtures", "symlink", True),
+            ("nrr/pak_isolated", "symlink", True),
+            ("proc", "file", False),
+            ("dev", "file", False),
+            ("tmp", "file", False),
+            ("nrr", "file", False),
+            ("nrr/fixtures", "file", True),
+            ("nrr/pak_isolated", "directory", True),
+        )
+        for relative, kind, nested in scenarios:
+            with self.subTest(relative=relative, kind=kind), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                root = base / "rootfs"
+                root.mkdir()
+                outside = base / "outside"
+                outside.mkdir()
+                marker = outside / "marker"
+                marker.write_text("keep", encoding="utf-8")
+                target = root / relative
+                if nested:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "symlink":
+                    target.symlink_to(outside if target.name != "pak_isolated" else marker)
+                elif kind == "file":
+                    target.write_text("collision", encoding="utf-8")
+                else:
+                    target.mkdir()
+                with self.assertRaises(attestation.AttestationError):
+                    attestation.prepare_bind_destinations(root)
+                self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
     def test_hardlink_success(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -46,6 +47,16 @@ SUPPORTED_LAYERS = {
     "application/vnd.docker.image.rootfs.diff.tar.gzip": "r:gz",
 }
 MAX_MEMBER_SIZE = 2 * 1024 * 1024 * 1024
+
+# The release attestation runs on Linux. O_PATH permits checking and walking
+# image-provided directories without requiring read permission, while
+# O_NOFOLLOW/O_DIRECTORY ensure that each fd names the directory we intended.
+_DIRECTORY_FD_FLAGS = (
+    getattr(os, "O_PATH", os.O_RDONLY)
+    | os.O_DIRECTORY
+    | os.O_NOFOLLOW
+    | os.O_CLOEXEC
+)
 
 
 class AttestationError(Exception):
@@ -400,6 +411,84 @@ def select_manifest(registry: Registry, manifest_bytes: bytes, digest: str) -> t
     return select_manifest(registry, child, child_digest)
 
 
+def _open_directory_at(parent_fd: int, name: str, display_path: str) -> int:
+    try:
+        fd = os.open(name, _DIRECTORY_FD_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise AttestationError(f"wrapper bind destination is not a directory: {display_path}") from error
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError as error:
+        os.close(fd)
+        raise AttestationError(f"could not validate wrapper bind destination: {display_path}") from error
+    if not stat.S_ISDIR(mode):
+        os.close(fd)
+        raise AttestationError(f"wrapper bind destination is not a directory: {display_path}")
+    return fd
+
+
+def _ensure_directory_at(parent_fd: int, name: str, display_path: str) -> int:
+    try:
+        os.mkdir(name, 0o755, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise AttestationError(f"could not create wrapper bind destination: {display_path}") from error
+    return _open_directory_at(parent_fd, name, display_path)
+
+
+def _ensure_regular_file_at(parent_fd: int, name: str, display_path: str) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
+        | os.O_NONBLOCK
+    )
+    try:
+        fd = os.open(name, flags, 0o666, dir_fd=parent_fd)
+    except OSError as error:
+        raise AttestationError(f"wrapper bind destination is not a regular file: {display_path}") from error
+    try:
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise AttestationError(f"wrapper bind destination is not a regular file: {display_path}")
+            # Preserve touch()'s existing behavior without reopening the path.
+            os.utime(fd, None)
+        except OSError as error:
+            raise AttestationError(f"could not validate wrapper bind destination: {display_path}") from error
+    finally:
+        os.close(fd)
+
+
+def prepare_bind_destinations(root: Path) -> None:
+    """Create bwrap destinations while rejecting image-controlled symlinks."""
+    try:
+        root_fd = os.open(root, _DIRECTORY_FD_FLAGS)
+    except OSError as error:
+        raise AttestationError("rootfs must be an existing physical directory") from error
+    try:
+        try:
+            if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+                raise AttestationError("rootfs must be an existing physical directory")
+        except OSError as error:
+            raise AttestationError("could not validate rootfs directory") from error
+
+        for mountpoint in ("proc", "dev", "tmp"):
+            mount_fd = _ensure_directory_at(root_fd, mountpoint, f"/{mountpoint}")
+            os.close(mount_fd)
+
+        nrr_fd = _ensure_directory_at(root_fd, "nrr", "/nrr")
+        try:
+            fixtures_fd = _ensure_directory_at(nrr_fd, "fixtures", "/nrr/fixtures")
+            os.close(fixtures_fd)
+            _ensure_regular_file_at(nrr_fd, "pak_isolated", "/nrr/pak_isolated")
+        finally:
+            os.close(nrr_fd)
+    finally:
+        os.close(root_fd)
+
+
 def rootfs_from_image(registry: Registry, image_digest: str, workspace: Path) -> tuple[Path, str]:
     manifest = fetch_verified(registry, "manifests/" + image_digest, image_digest, accept=MANIFEST_ACCEPT)
     document, selected_digest = select_manifest(registry, manifest, image_digest)
@@ -423,11 +512,8 @@ def rootfs_from_image(registry: Registry, image_digest: str, workspace: Path) ->
             raise AttestationError(f"OCI layer {index}: unsupported media type")
         payload = fetch_verified(registry, "blobs/" + layer_digest, layer_digest, layer_size)
         apply_layer(root, payload, media_type)
-    for mountpoint in ("proc", "dev", "tmp"):
-        (root / mountpoint).mkdir(exist_ok=True)
     # Bubblewrap requires bind destinations to exist in its read-only root.
-    (root / "nrr" / "fixtures").mkdir(parents=True, exist_ok=True)
-    (root / "nrr" / "pak_isolated").touch()
+    prepare_bind_destinations(root)
     return root, selected_digest
 
 
