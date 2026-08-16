@@ -552,7 +552,7 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
 }
 
 #[test]
-fn unsupported_rds_current_index_falls_back_to_gzip() {
+fn invalid_rds_current_index_falls_back_to_gzip() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
         .write_all(b"Package: rsolvefixture.plain\nVersion: 3.0.0\n")

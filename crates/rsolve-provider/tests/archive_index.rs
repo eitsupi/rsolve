@@ -216,40 +216,30 @@ fn structural_archive_failures_fail_the_whole_operation() {
     ));
 }
 
-/// An envelope this build cannot decompress must stay distinguishable from a
-/// corrupt or unrecognised stream, because the two demand different responses:
-/// an unsupported envelope is a capability limit of this build that a caller
-/// can answer by falling back to another index representation, while an
-/// unknown envelope means the bytes are not an RDS file at all.
+/// Recognised compression envelopes must stay distinguishable from a corrupt
+/// or unrecognised stream.  An unsupported envelope is a capability limit of
+/// a build that a caller can answer by falling back to another index
+/// representation, while an unknown envelope means the bytes are not an RDS
+/// file at all.
 ///
 /// The envelope is chosen by whoever writes the file, not by the directory it
 /// sits in.  CRAN's current `src/contrib` index is xz today while the
 /// per-package archive index is gzip, and R itself already accepts
 /// `saveRDS(compress = "zstd")` when built with libzstd.  This build enables
-/// gzip and zstd only, so xz and bzip2 must report a capability limit rather
-/// than masquerading as corruption.
+/// all four supported RDS compression formats, so each recognised envelope
+/// must be attempted rather than reported as a capability limit.
 #[test]
-fn an_envelope_this_build_cannot_decompress_is_reported_as_a_capability_limit() {
+fn all_supported_envelopes_are_attempted_and_unknown_is_rejected() {
     // Envelope detection is by magic bytes and happens before decompression,
     // so these need no valid compressed payload.
     const XZ_MAGIC: &[u8] = &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x00];
     const BZIP2_MAGIC: &[u8] = b"BZh9padding";
 
-    for (bytes, expected) in [
-        (XZ_MAGIC, rd_rds::file::Compression::Xz),
-        (BZIP2_MAGIC, rd_rds::file::Compression::Bzip2),
-    ] {
-        match CranCatalog::from_archive_index_rds(bytes) {
-            Err(CranArchiveIndexError::Decode(rd_rds::file::ReadError::CompressionDisabled {
-                format,
-            })) => assert_eq!(format, expected),
-            other => panic!("expected a disabled-compression report for {expected}, got {other:?}"),
-        }
-    }
-
-    // The enabled envelopes must not report a capability limit.  Truncated
-    // payloads fail later, in decompression or decoding.
+    // Truncated payloads fail later, in decompression or decoding, but no
+    // recognised envelope is rejected merely because its decoder is absent.
     for bytes in [
+        XZ_MAGIC,
+        BZIP2_MAGIC,
         &[0x1fu8, 0x8b, 0x08, 0x00][..],
         &[0x28, 0xb5, 0x2f, 0xfd][..],
     ] {
@@ -260,7 +250,7 @@ fn an_envelope_this_build_cannot_decompress_is_reported_as_a_capability_limit() 
                     rd_rds::file::ReadError::CompressionDisabled { .. }
                 ))
             ),
-            "gzip and zstd must be enabled in this build"
+            "all supported compression formats must be enabled in this build"
         );
     }
 
