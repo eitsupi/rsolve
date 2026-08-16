@@ -149,34 +149,41 @@ set_archive_row(4L, c(
     MD5sum = "00000000000000000000000000000014"
 ))
 
-archive_bytes <- function(value, compression = "gzip") {
+archive_bytes <- function(value, compression = "gzip", version = 3L) {
     path <- tempfile("rsolvefixture-archive-")
-    saveRDS(value, path, compress = compression, version = 3L)
+    saveRDS(value, path, compress = compression, version = version)
     bytes <- readBin(path, what = "raw", n = file.info(path)$size)
     unlink(path)
     # R's gzip writer records the current time in bytes 5:8 of the header.
     # The serialized payload and all other header fields are deterministic.
-    if (compression == "gzip") {
+    if (identical(compression, "gzip")) {
         bytes[5:8] <- as.raw(rep(0L, 4L))
     }
     bytes
 }
 
-write_binary_fixture <- function(name, value, compression = "gzip") {
-    bytes <- archive_bytes(value, compression)
-    decompressed <- memDecompress(bytes, type = compression)
-    magic <- switch(
-        compression,
-        gzip = as.raw(c(0x1f, 0x8b)),
-        xz = as.raw(c(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00)),
-        bzip2 = charToRaw("BZh"),
-        stop("unsupported fixture compression: ", compression)
-    )
-    stopifnot(
-        identical(bytes[seq_len(length(magic))], magic),
-        identical(decompressed[seq_len(2L)], charToRaw("X\n")),
-        identical(decompressed[3:6], as.raw(c(0, 0, 0, 3)))
-    )
+write_binary_fixture <- function(name, value, compression = "gzip", version = 3L) {
+    bytes <- archive_bytes(value, compression, version)
+    if (identical(compression, FALSE)) {
+        stopifnot(
+            identical(bytes[seq_len(2L)], charToRaw("X\n")),
+            identical(bytes[3:6], as.raw(c(0, 0, 0, version)))
+        )
+    } else {
+        decompressed <- memDecompress(bytes, type = compression)
+        magic <- switch(
+            compression,
+            gzip = as.raw(c(0x1f, 0x8b)),
+            xz = as.raw(c(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00)),
+            bzip2 = charToRaw("BZh"),
+            stop("unsupported fixture compression: ", compression)
+        )
+        stopifnot(
+            identical(bytes[seq_len(length(magic))], magic),
+            identical(decompressed[seq_len(2L)], charToRaw("X\n")),
+            identical(decompressed[3:6], as.raw(c(0, 0, 0, version)))
+        )
+    }
     target <- file.path(root, name)
     if (mode == "--update") {
         writeBin(bytes, target)
@@ -249,6 +256,39 @@ write_binary_fixture(
     "synthetic-matrix-archive-bzip2-PACKAGES.rds",
     matrix_archive,
     "bzip2"
+)
+
+# Format 2 has no native-encoding field in its header. These repository
+# records retain valid UTF-8 bytes while their character flags remain
+# Native/unknown, so the provider's explicit UTF-8 contract is required.
+native_license <- "RSOLVE UTF-8 fixture ™"
+Encoding(native_license) <- "unknown"
+native_archive <- matrix(
+    c("Matrix", "1.7-6", native_license),
+    nrow = 1L,
+    dimnames = list(NULL, c("Package", "Version", "License"))
+)
+write_binary_fixture(
+    "synthetic-native-utf8-archive-PACKAGES.rds",
+    native_archive,
+    compression = FALSE,
+    version = 2L
+)
+
+# Invalid native bytes must remain a hard decode failure even when the
+# provider opts into UTF-8 for CRAN-compatible repository data.
+invalid_license <- rawToChar(as.raw(c(0xc3, 0x28)), multiple = FALSE)
+Encoding(invalid_license) <- "unknown"
+invalid_archive <- matrix(
+    c("Matrix", "1.7-6", invalid_license),
+    nrow = 1L,
+    dimnames = list(NULL, c("Package", "Version", "License"))
+)
+write_binary_fixture(
+    "synthetic-invalid-utf8-archive-PACKAGES.rds",
+    invalid_archive,
+    compression = FALSE,
+    version = 2L
 )
 
 # A current-index-shaped duplicate pair: the root row precedes a Recommended

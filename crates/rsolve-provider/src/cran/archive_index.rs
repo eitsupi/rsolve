@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use rd_rds::{file::ReadOptions, package::PackagesMatrix};
+use rd_rds::{NativeEncodingPolicy, file::ReadOptions, package::PackagesMatrix};
 
 use super::catalog::{
     CranCatalog, CranDiagnostic, catalog_from_observations, observation_from_fields,
@@ -27,6 +27,16 @@ impl CranArchiveIndexError {
             Self::Decode(_) | Self::Matrix(_) | Self::MissingColumn(_) => &[],
         }
     }
+}
+
+/// Options used at the provider's CRAN-compatible repository boundary.
+///
+/// To match the existing DCF reader, rsolve treats this boundary as UTF-8,
+/// including format-2 RDS streams whose headers do not carry a native
+/// encoding marker. Public option-taking APIs remain caller-controlled; this
+/// helper is only for the provider's repository boundary.
+pub(crate) fn provider_rds_read_options() -> ReadOptions {
+    ReadOptions::default().native_encoding_policy(NativeEncodingPolicy::AssumeUtf8)
 }
 
 impl fmt::Display for CranArchiveIndexError {

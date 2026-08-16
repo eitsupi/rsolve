@@ -4,6 +4,8 @@ use std::error::Error;
 use std::fmt;
 
 use rd_rds::{RObject, RStr, RValue, file::ReadOptions};
+
+use super::archive_index::provider_rds_read_options;
 use rsolve_core::{PackageName, RPackageVersion};
 
 /// One historical source archive advertised by `Meta/archive.rds`.
@@ -97,9 +99,22 @@ impl Error for CranHistoryError {}
 
 /// Decode a `Meta/archive.rds` named list or a `file.info`-shaped data frame.
 pub fn enumerate_archive_rds(input: &[u8]) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
-    let object = rd_rds::file::from_bytes_with_options(input, &ReadOptions::default())
+    enumerate_archive_rds_with_options(input, &ReadOptions::default())
+}
+
+pub(crate) fn enumerate_archive_rds_with_options(
+    input: &[u8],
+    options: &ReadOptions,
+) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
+    let object = rd_rds::file::from_bytes_with_options(input, options)
         .map_err(|error| CranHistoryError::Decode(error.to_string()))?;
     enumerate_object(&object)
+}
+
+pub(crate) fn enumerate_archive_rds_for_provider(
+    input: &[u8],
+) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
+    enumerate_archive_rds_with_options(input, &provider_rds_read_options())
 }
 
 fn enumerate_object(object: &RObject) -> Result<Vec<ArchiveEntry>, CranHistoryError> {

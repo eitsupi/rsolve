@@ -27,3 +27,6 @@ tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 url = "2"
 windows-sys = "0.61"
+
+[patch.crates-io]
+rd-rds = { git = "https://github.com/eitsupi/r-documentation-rs", rev = "dcedec3efe3b9c3e8eee31aae4cb9080f09d6f6c" }

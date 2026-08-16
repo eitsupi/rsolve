@@ -8,10 +8,11 @@ use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
 
+use super::archive_index::provider_rds_read_options;
 use super::catalog::CranCatalog;
 #[cfg(test)]
 use super::history::CranHistoryError;
-use super::history::{ArchiveEntry, enumerate_archive_rds};
+use super::history::{ArchiveEntry, enumerate_archive_rds_for_provider};
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
     ReleaseAggregation, SolverKey,
@@ -152,7 +153,10 @@ impl<T: Transport> CranProvider<T> {
             })?;
         let mut diagnostics = Vec::new();
         let source = if response.status == 200 {
-            match CranCatalog::from_archive_index_rds(&response.body) {
+            match CranCatalog::from_archive_index_rds_with_options(
+                &response.body,
+                &provider_rds_read_options(),
+            ) {
                 Ok(catalog) => {
                     diagnostics.push(CranRefreshDiagnostic {
                         endpoint: endpoint.clone().into_boxed_str(),
@@ -246,7 +250,8 @@ impl<T: Transport> CranProvider<T> {
                 )),
             });
         }
-        let entries = enumerate_archive_rds(&response.body).map_err(CranProviderError::History)?;
+        let entries = enumerate_archive_rds_for_provider(&response.body)
+            .map_err(CranProviderError::History)?;
         Ok(CandidateSource::Fallback(Rc::from(
             entries.into_boxed_slice(),
         )))
@@ -541,8 +546,11 @@ impl<T: Transport> CranRefreshSession<T> {
             }
             let parsed = match representation {
                 CranCurrentIndexRepresentation::Rds => {
-                    CranCatalog::from_archive_index_rds(&response.body)
-                        .map_err(|error| error.to_string())
+                    CranCatalog::from_archive_index_rds_with_options(
+                        &response.body,
+                        &provider_rds_read_options(),
+                    )
+                    .map_err(|error| error.to_string())
                 }
                 CranCurrentIndexRepresentation::Gzip => {
                     decode_gzip(&response.body).and_then(|body| {
@@ -650,7 +658,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     format!("failed to refresh {endpoint}: HTTP {}", response.status),
                 ))
             }
-            Ok(response) => match enumerate_archive_rds(&response.body) {
+            Ok(response) => match enumerate_archive_rds_for_provider(&response.body) {
                 Ok(entries) => Ok(HistorySource::Available(Rc::from(
                     entries.into_boxed_slice(),
                 ))),
@@ -720,7 +728,10 @@ impl<T: Transport> CranRefreshSession<T> {
                 })
             }
             Ok(response) if response.status == 200 => {
-                match CranCatalog::from_archive_index_rds(&response.body) {
+                match CranCatalog::from_archive_index_rds_with_options(
+                    &response.body,
+                    &provider_rds_read_options(),
+                ) {
                     Ok(catalog) => {
                         package_diagnostics.push(CranRefreshDiagnostic {
                             endpoint: endpoint.clone().into_boxed_str(),

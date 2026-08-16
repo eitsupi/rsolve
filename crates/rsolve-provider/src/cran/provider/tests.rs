@@ -1,4 +1,5 @@
 use super::*;
+use crate::cran::enumerate_archive_rds;
 use rsolve_core::{CandidateLoadErrorCategory, PackageName, SolverKey};
 use std::collections::HashMap;
 use std::io::Write;
@@ -13,6 +14,12 @@ const WRONG_ROOT: &[u8] = include_bytes!(
 );
 const MISSING_VERSION: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-missing-version.rds"
+);
+const NATIVE_UTF8_CURRENT: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-native-utf8-archive-PACKAGES.rds"
+);
+const INVALID_UTF8_CURRENT: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-invalid-utf8-archive-PACKAGES.rds"
 );
 const HISTORY: &[u8] =
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-archive.rds");
@@ -191,6 +198,62 @@ fn session_transport(
         responses,
         requests: Rc::new(RefCell::new(Vec::new())),
     }
+}
+
+#[test]
+fn current_rds_provider_path_assumes_utf8_for_native_format_two_strings() {
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+    );
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let catalog = session
+        .ensure_current()
+        .expect("provider CRAN UTF-8 contract should accept native format-2 strings");
+    assert_eq!(
+        catalog.candidates_named("Matrix").unwrap()[0]
+            .metadata()
+            .fields()
+            .get("License")
+            .map(String::as_str),
+        Some("RSOLVE UTF-8 fixture ™")
+    );
+}
+
+#[test]
+fn current_rds_provider_path_rejects_invalid_native_utf8() {
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: INVALID_UTF8_CURRENT.to_vec(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+    );
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let error = session
+        .ensure_current()
+        .expect_err("invalid native UTF-8 must fail closed");
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::MetadataInvalid
+    );
 }
 
 #[test]

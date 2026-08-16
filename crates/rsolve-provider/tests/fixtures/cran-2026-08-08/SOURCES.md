@@ -26,6 +26,8 @@ fictional phrase.
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `996457bb49b94effe5740b0d1ea135ad2988126097ee3e7b693c68228ecd66e3` |
 | `synthetic-matrix-archive-xz-PACKAGES.rds` | 2 | XZ-compressed format-3 Matrix history matrix; SHA-256 `13b61110746dc807800bd0e2e19bdbec104c2e85f8b0f2d0e1d1ea49e5580707` |
 | `synthetic-matrix-archive-bzip2-PACKAGES.rds` | 2 | Bzip2-compressed format-3 Matrix history matrix; SHA-256 `1a6751edf254191282d42e76dfcca33ecaa74b83a44f0476ee314c91965a4d97` |
+| `synthetic-native-utf8-archive-PACKAGES.rds` | 1 | Uncompressed format-2 archive matrix with valid native/unknown UTF-8; SHA-256 `b84f460daf88744203ee0c83e1c25e003cc427ec568969ae4bee85d34dd9355c` |
+| `synthetic-invalid-utf8-archive-PACKAGES.rds` | 1 | Uncompressed format-2 archive matrix with invalid native/unknown UTF-8; SHA-256 `a06ffff79234e515c73780e666d691e8c77582d28aaa14e49004ade5f8ae7b8b` |
 | `synthetic-matrix-archive-overlay-PACKAGES.rds` | 2 | Matrix 1.7-6 root release followed by a matching Recommended-path overlay; SHA-256 `3a0700effafc53513b91a326239ae5d6df82fec6b566499e6a802c71bdddeb46` |
 | `synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds` | 2 | Matrix root/Recommended-path pair with mismatched MD5sum, which must fail closed; SHA-256 `d9d8821bb57307b76718e3a2429b51c2e4143e79e7c53bc9dbfa2bf69768af04` |
 | `synthetic-matrix-archive-overlay-p3m-PACKAGES.rds` | 2 | P3M-shaped Matrix overlay-first pair without MD5sum; the root row must be retained; SHA-256 `873dd4279923c5c6b9938e8f049ec2bff4b6bca6fd2c0e6928d559c6d7fc3c5f` |

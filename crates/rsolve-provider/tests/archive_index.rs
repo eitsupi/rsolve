@@ -1,3 +1,4 @@
+use rd_rds::{NativeEncodingPolicy, file::ReadOptions};
 use rsolve_provider::cran::{CranArchiveIndexError, CranCatalog, CranRecordError};
 
 const ARCHIVE: &[u8] = include_bytes!("fixtures/cran-2026-08-08/synthetic-archive-PACKAGES.rds");
@@ -14,6 +15,10 @@ const MATRIX_ARCHIVE_XZ: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-xz-PACKAGES.rds");
 const MATRIX_ARCHIVE_BZIP2: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-bzip2-PACKAGES.rds");
+const NATIVE_UTF8_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-native-utf8-archive-PACKAGES.rds");
+const INVALID_UTF8_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-invalid-utf8-archive-PACKAGES.rds");
 
 // R 4.6.1, format 3, uncompressed RDS containing a character vector rather
 // than a matrix. It is deliberately small so this structural test has no
@@ -244,6 +249,32 @@ fn valid_xz_and_bzip2_archive_indexes_decode_to_the_expected_catalog() {
                 && dependency.kind == rsolve_core::DependencyKind::Imports
         }));
     }
+}
+
+#[test]
+fn native_utf8_requires_provider_policy_and_invalid_bytes_still_fail_closed() {
+    assert!(matches!(
+        CranCatalog::from_archive_index_rds(NATIVE_UTF8_ARCHIVE),
+        Err(CranArchiveIndexError::Matrix(_))
+    ));
+
+    let provider_options =
+        ReadOptions::default().native_encoding_policy(NativeEncodingPolicy::AssumeUtf8);
+    let catalog =
+        CranCatalog::from_archive_index_rds_with_options(NATIVE_UTF8_ARCHIVE, &provider_options)
+            .expect("provider UTF-8 contract should decode valid native strings");
+    assert_eq!(
+        catalog.candidates_named("Matrix").unwrap()[0]
+            .metadata()
+            .fields()
+            .get("License")
+            .map(String::as_str),
+        Some("RSOLVE UTF-8 fixture ™")
+    );
+    assert!(matches!(
+        CranCatalog::from_archive_index_rds_with_options(INVALID_UTF8_ARCHIVE, &provider_options),
+        Err(CranArchiveIndexError::Matrix(_))
+    ));
 }
 
 /// Recognised compression envelopes must stay distinguishable from a corrupt
