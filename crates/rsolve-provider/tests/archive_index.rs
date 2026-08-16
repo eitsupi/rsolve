@@ -10,6 +10,10 @@ const OVERLAY_MISMATCH_ARCHIVE: &[u8] = include_bytes!(
 );
 const P3M_OVERLAY_ARCHIVE: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-p3m-PACKAGES.rds");
+const MATRIX_ARCHIVE_XZ: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-xz-PACKAGES.rds");
+const MATRIX_ARCHIVE_BZIP2: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-bzip2-PACKAGES.rds");
 
 // R 4.6.1, format 3, uncompressed RDS containing a character vector rather
 // than a matrix. It is deliberately small so this structural test has no
@@ -214,6 +218,32 @@ fn structural_archive_failures_fail_the_whole_operation() {
         CranCatalog::from_archive_index_rds(NON_MATRIX_RDS),
         Err(CranArchiveIndexError::Matrix(_))
     ));
+}
+
+#[test]
+fn valid_xz_and_bzip2_archive_indexes_decode_to_the_expected_catalog() {
+    for input in [MATRIX_ARCHIVE_XZ, MATRIX_ARCHIVE_BZIP2] {
+        let catalog = CranCatalog::from_archive_index_rds(input).expect("compressed archive");
+        assert_eq!(catalog.package_count(), 1);
+        assert_eq!(catalog.candidate_count(), 2);
+
+        let releases = catalog.candidates_named("Matrix").expect("Matrix history");
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.version().as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.6-5", "1.7-0"]
+        );
+        assert_eq!(
+            releases[1].metadata().fields().get("License"),
+            Some(&"RSOLVE Fictional Terms Matrix".to_owned())
+        );
+        assert!(releases[1].dependencies().iter().any(|dependency| {
+            dependency.name.as_str() == "methods"
+                && dependency.kind == rsolve_core::DependencyKind::Imports
+        }));
+    }
 }
 
 /// Recognised compression envelopes must stay distinguishable from a corrupt

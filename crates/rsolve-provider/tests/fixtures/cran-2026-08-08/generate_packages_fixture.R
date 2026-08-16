@@ -149,22 +149,31 @@ set_archive_row(4L, c(
     MD5sum = "00000000000000000000000000000014"
 ))
 
-archive_bytes <- function(value) {
+archive_bytes <- function(value, compression = "gzip") {
     path <- tempfile("rsolvefixture-archive-")
-    saveRDS(value, path, compress = "gzip", version = 3L)
+    saveRDS(value, path, compress = compression, version = 3L)
     bytes <- readBin(path, what = "raw", n = file.info(path)$size)
     unlink(path)
     # R's gzip writer records the current time in bytes 5:8 of the header.
     # The serialized payload and all other header fields are deterministic.
-    bytes[5:8] <- as.raw(rep(0L, 4L))
+    if (compression == "gzip") {
+        bytes[5:8] <- as.raw(rep(0L, 4L))
+    }
     bytes
 }
 
-write_binary_fixture <- function(name, value) {
-    bytes <- archive_bytes(value)
-    decompressed <- memDecompress(bytes, type = "gzip")
+write_binary_fixture <- function(name, value, compression = "gzip") {
+    bytes <- archive_bytes(value, compression)
+    decompressed <- memDecompress(bytes, type = compression)
+    magic <- switch(
+        compression,
+        gzip = as.raw(c(0x1f, 0x8b)),
+        xz = as.raw(c(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00)),
+        bzip2 = charToRaw("BZh"),
+        stop("unsupported fixture compression: ", compression)
+    )
     stopifnot(
-        identical(bytes[seq_len(2L)], as.raw(c(0x1f, 0x8b))),
+        identical(bytes[seq_len(length(magic))], magic),
         identical(decompressed[seq_len(2L)], charToRaw("X\n")),
         identical(decompressed[3:6], as.raw(c(0, 0, 0, 3)))
     )
@@ -231,6 +240,16 @@ set_matrix_archive_row(2L, c(
     NeedsCompilation = "yes"
 ))
 write_binary_fixture("synthetic-matrix-archive-PACKAGES.rds", matrix_archive)
+write_binary_fixture(
+    "synthetic-matrix-archive-xz-PACKAGES.rds",
+    matrix_archive,
+    "xz"
+)
+write_binary_fixture(
+    "synthetic-matrix-archive-bzip2-PACKAGES.rds",
+    matrix_archive,
+    "bzip2"
+)
 
 # A current-index-shaped duplicate pair: the root row precedes a Recommended
 # path overlay for the same release identity. The catalog reader must keep

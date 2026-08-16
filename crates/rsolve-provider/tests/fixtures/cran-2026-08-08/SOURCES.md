@@ -4,7 +4,7 @@ These files contain fictional records written by
 `generate_packages_fixture.R`. They are not extracts from a repository index,
 and the generator does not access the network or call `tools::write_PACKAGES()`.
 The generator requires R 4.6.1 and writes UTF-8 bytes with explicit LF line
-endings for DCF, gzip-compressed format-3 RDS values, and fictional gzip source
+endings for DCF, gzip/xz/bzip2-compressed format-3 RDS values, and fictional gzip source
 tarballs. It defaults
 to an in-memory byte-for-byte check; pass `--update` to write regenerated files:
 
@@ -24,6 +24,8 @@ fictional phrase.
 | `synthetic-archive-PACKAGES.rds` | 4 | Gzip, format-3 archive package matrix; SHA-256 `29666ee379d1f6db074abed4e25795dff251d9506bf1baf5bbd057fe8ce15c85` |
 | `synthetic-valid-archive-PACKAGES.rds` | 3 | Gzip, format-3 valid archive matrix in non-semantic source order; SHA-256 `031591d19106f0a6788a57a7725f6ae32a193b69475ecfcea9ea77a4b00228c0` |
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `996457bb49b94effe5740b0d1ea135ad2988126097ee3e7b693c68228ecd66e3` |
+| `synthetic-matrix-archive-xz-PACKAGES.rds` | 2 | XZ-compressed format-3 Matrix history matrix; SHA-256 `13b61110746dc807800bd0e2e19bdbec104c2e85f8b0f2d0e1d1ea49e5580707` |
+| `synthetic-matrix-archive-bzip2-PACKAGES.rds` | 2 | Bzip2-compressed format-3 Matrix history matrix; SHA-256 `1a6751edf254191282d42e76dfcca33ecaa74b83a44f0476ee314c91965a4d97` |
 | `synthetic-matrix-archive-overlay-PACKAGES.rds` | 2 | Matrix 1.7-6 root release followed by a matching Recommended-path overlay; SHA-256 `3a0700effafc53513b91a326239ae5d6df82fec6b566499e6a802c71bdddeb46` |
 | `synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds` | 2 | Matrix root/Recommended-path pair with mismatched MD5sum, which must fail closed; SHA-256 `d9d8821bb57307b76718e3a2429b51c2e4143e79e7c53bc9dbfa2bf69768af04` |
 | `synthetic-matrix-archive-overlay-p3m-PACKAGES.rds` | 2 | P3M-shaped Matrix overlay-first pair without MD5sum; the root row must be retained; SHA-256 `873dd4279923c5c6b9938e8f049ec2bff4b6bca6fd2c0e6928d559c6d7fc3c5f` |
@@ -67,15 +69,16 @@ made by this fixture or reader.
 The fixture's column order deliberately differs from the observed CRAN order so
 that a reader indexing by column position rather than by name fails against it.
 
-The gzip envelope in this fixture records what the per-package archive index was
-observed to use on 2026-08-11; it is not an assumption that the envelope is
-fixed. The envelope is chosen by whoever writes the file, and the same date's
-observations put the current `src/contrib` index at xz and R-universe's binary
-indexes at zstd. R 4.6.1 already accepts `saveRDS(compress = "zstd")` when the
-R build includes libzstd, and R's own NEWS signals zstd as a future default for
-package tooling. The reader therefore selects its envelope from the file's magic
-bytes and reports an envelope this build cannot decompress as a distinct,
-actionable capability limit rather than as corrupt input.
+The gzip envelope in `synthetic-archive-PACKAGES.rds` records what the
+per-package archive index was observed to use on 2026-08-11; the xz and bzip2
+files exercise the other supported CRAN/RDS envelope forms. The envelope is
+chosen by whoever writes the file, and the same date's observations put the
+current `src/contrib` index at xz and R-universe's binary indexes at zstd. R
+4.6.1 already accepts `saveRDS(compress = "zstd")` when the R build includes
+libzstd, and R's own NEWS signals zstd as a future default for package tooling.
+The reader therefore selects its envelope from the file's magic bytes and
+reports an envelope this build cannot decompress as a distinct, actionable
+capability limit rather than as corrupt input.
 
 ## CRAN measurements used for shape selection
 
