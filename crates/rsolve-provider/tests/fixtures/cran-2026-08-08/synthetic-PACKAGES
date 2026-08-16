@@ -1,0 +1,71 @@
+Package: rsolvefixture.core
+Version: 0.1.0
+Depends: R (>= 4.6.0), rsolvefixture.base
+Imports: rsolvefixture.import,
+ rsolvefixture.import.helper
+LinkingTo: rsolvefixture.link
+Suggests: rsolvefixture.suggest
+Enhances: rsolvefixture.enhance
+Priority: fixture-primary
+Path: synthetic/core
+OS_type: fixture-unix
+Archs: fixture-x86, fixture-arm
+License: RSOLVE Fictional Terms Core
+License_is_FOSS: yes
+License_restricts_use: no
+MD5sum: 00000000000000000000000000000001
+NeedsCompilation: yes
+Published: 2026-06-24 19:14:59 UTC
+
+Package: rsolvefixture.folded
+Version: 0.2.0
+Suggests: rsolvefixture.suggest.00,
+ rsolvefixture.suggest.01,
+ rsolvefixture.suggest.02,
+ rsolvefixture.suggest.03,
+ rsolvefixture.suggest.04,
+ rsolvefixture.suggest.05,
+ rsolvefixture.suggest.06,
+ rsolvefixture.suggest.07,
+ rsolvefixture.suggest.08,
+ rsolvefixture.suggest.09,
+ rsolvefixture.suggest.10,
+ rsolvefixture.suggest.11,
+ rsolvefixture.suggest.12,
+ rsolvefixture.suggest.13,
+ rsolvefixture.suggest.14,
+ rsolvefixture.suggest.15,
+ rsolvefixture.suggest.16,
+ rsolvefixture.suggest.17,
+ rsolvefixture.suggest.18,
+ rsolvefixture.suggest.19,
+ rsolvefixture.suggest.20,
+ rsolvefixture.suggest.21,
+ rsolvefixture.suggest.22,
+ rsolvefixture.suggest.23,
+ rsolvefixture.suggest.24
+Description: UTF-8 fixture value: 日本語の説明 – café
+License: RSOLVE Fictional Terms Folded
+MD5sum: 00000000000000000000000000000002
+NeedsCompilation: no
+Published: 2026-06-25 19:14:59 UTC
+
+Package: rsolvefixture.rare
+Version: 1.0.0
+Priority: fixture-secondary
+Path: synthetic/rare
+OS_type: fixture-windows
+Archs: fixture-riscv, fixture-wasm
+License: RSOLVE Fictional Terms Restricted
+License_is_FOSS: no
+License_restricts_use: yes
+MD5sum: 00000000000000000000000000000003
+NeedsCompilation: maybe
+Published: 2026-06-26 19:14:59 UTC
+
+Package: rsolvefixture.plain
+Version: 3.0.0
+License: RSOLVE Fictional Terms Plain
+MD5sum: 00000000000000000000000000000004
+NeedsCompilation: no
+Published: 2026-06-27 19:14:59 UTC

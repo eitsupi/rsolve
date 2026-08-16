@@ -5,8 +5,8 @@ set -euo pipefail
 # for every violation so a transitive edge is actionable.
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-metadata_file=$(mktemp "${TMPDIR:-/tmp}/nrr-cargo-metadata.XXXXXX")
-edges_file=$(mktemp "${TMPDIR:-/tmp}/nrr-cargo-edges.XXXXXX")
+metadata_file=$(mktemp "${TMPDIR:-/tmp}/rsolve-cargo-metadata.XXXXXX")
+edges_file=$(mktemp "${TMPDIR:-/tmp}/rsolve-cargo-edges.XXXXXX")
 trap 'rm -f "$metadata_file" "$edges_file"' EXIT
 
 cargo metadata --format-version 1 --all-features --locked --offline \
@@ -80,18 +80,18 @@ check_forbidden_path() {
     fi
 }
 
-check_forbidden_path "1 (resolver -> repository)" nrr-resolver nrr-repository
-check_forbidden_path "2 (repository -> resolver)" nrr-repository nrr-resolver
-check_forbidden_path "3 (resolver -> provider)" nrr-resolver nrr-provider
+check_forbidden_path "1 (resolver -> repository)" rsolve-resolver rsolve-repository
+check_forbidden_path "2 (repository -> resolver)" rsolve-repository rsolve-resolver
+check_forbidden_path "3 (resolver -> provider)" rsolve-resolver rsolve-provider
 
-# Invariant 4 is an allowlist, not a finite denylist: nrr-core currently has
+# Invariant 4 is an allowlist, not a finite denylist: rsolve-core currently has
 # no dependencies at all. This catches every HTTP client, runtime, and other
 # future external crate, including optional dependencies resolved by
 # --all-features. An allowlist is complete; a denylist would only improve
 # wording while inevitably missing a new crate name.
 ALLOWED_CORE_CRATES=()
 while IFS=$'\t' read -r source target; do
-    if [[ "$source" == nrr-core ]]; then
+    if [[ "$source" == rsolve-core ]]; then
         allowed=false
         for permitted in "${ALLOWED_CORE_CRATES[@]}"; do
             if [[ "$target" == "$permitted" ]]; then
@@ -100,25 +100,25 @@ while IFS=$'\t' read -r source target; do
             fi
         done
         if [[ "$allowed" != true ]]; then
-            printf 'nrr-core dependency allowlist violated: %s -> %s\n' "$source" "$target" >&2
+            printf 'rsolve-core dependency allowlist violated: %s -> %s\n' "$source" "$target" >&2
             exit 1
         fi
     fi
-done < <(awk -F '\t' '$1 == "nrr-core" { print }' "$edges_file")
+done < <(awk -F '\t' '$1 == "rsolve-core" { print }' "$edges_file")
 
 # Invariant 5's mechanical boundary check: core may not resolve another
 # workspace implementation. Public trait semantics still require mandatory
 # review, which is reported below.
-for forbidden in nrr-provider nrr-resolver nrr-repository; do
-    check_forbidden_path "5 mechanical type boundary (core -> provider/transport/runtime: $forbidden)" nrr-core "$forbidden"
+for forbidden in rsolve-provider rsolve-resolver rsolve-repository; do
+    check_forbidden_path "5 mechanical type boundary (core -> provider/transport/runtime: $forbidden)" rsolve-core "$forbidden"
 done
 
 # Enforce the complete workspace-local allowlist from the architecture. Use
-# metadata.workspace_members rather than a name prefix so the nrr binary and
+# metadata.workspace_members rather than a name prefix so the rsolve binary and
 # any future differently named member are covered too.
 while IFS=$'\t' read -r source target; do
     case "$source->$target" in
-        nrr-provider-\>nrr-core|nrr-resolver-\>nrr-core|nrr-repository-\>nrr-core|nrr-\>nrr-core|nrr-\>nrr-provider|nrr-\>nrr-resolver|nrr-\>nrr-repository)
+        rsolve-provider-\>rsolve-core|rsolve-resolver-\>rsolve-core|rsolve-repository-\>rsolve-core|rsolve-\>rsolve-core|rsolve-\>rsolve-provider|rsolve-\>rsolve-resolver|rsolve-\>rsolve-repository)
             ;;
         *)
             printf 'workspace dependency allowlist violated: %s -> %s\n' "$source" "$target" >&2

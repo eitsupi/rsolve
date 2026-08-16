@@ -478,12 +478,12 @@ def verify_r(rootfs: Path, record: dict[str, Any]) -> None:
     pak_path_literal = json.dumps(record["pak"]["package_path"], ensure_ascii=False)
     script = (
         f"pak_path <- {pak_path_literal}; .libPaths(c(dirname(pak_path), file.path(pak_path, 'library'), .libPaths()));"
-        'cat(paste0("NRR_R_VERSION_STRING=", R.version.string, "\\n"));'
-        'cat(paste0("NRR_R_PLATFORM=", R.version$platform, "\\n"));'
-        'cat(paste0("NRR_R_HOME=", R.home(), "\\n"));'
+        'cat(paste0("RSOLVE_R_VERSION_STRING=", R.version.string, "\\n"));'
+        'cat(paste0("RSOLVE_R_PLATFORM=", R.version$platform, "\\n"));'
+        'cat(paste0("RSOLVE_R_HOME=", R.home(), "\\n"));'
         "library(pak, lib.loc=dirname(pak_path));"
-        'cat(paste0("NRR_PAK_VERSION=", as.character(packageVersion("pak")), "\\n"));'
-        'cat(paste0("NRR_PAK_PATH=", normalizePath(find.package("pak", lib.loc=dirname(pak_path)), mustWork=TRUE), "\\n"));'
+        'cat(paste0("RSOLVE_PAK_VERSION=", as.character(packageVersion("pak")), "\\n"));'
+        'cat(paste0("RSOLVE_PAK_PATH=", normalizePath(find.package("pak", lib.loc=dirname(pak_path)), mustWork=TRUE), "\\n"));'
     )
     output = run_isolated(rootfs, [r["executable"], "--vanilla", "--slave", "-e", script])
     values: dict[str, str] = {}
@@ -492,11 +492,11 @@ def verify_r(rootfs: Path, record: dict[str, Any]) -> None:
             key, value = line.split("=", 1)
             values[key] = value
     expected = {
-        "NRR_R_VERSION_STRING": r["version_string"],
-        "NRR_R_PLATFORM": r["platform"],
-        "NRR_R_HOME": r["r_home"],
-        "NRR_PAK_VERSION": record["pak"]["version"],
-        "NRR_PAK_PATH": record["pak"]["package_path"],
+        "RSOLVE_R_VERSION_STRING": r["version_string"],
+        "RSOLVE_R_PLATFORM": r["platform"],
+        "RSOLVE_R_HOME": r["r_home"],
+        "RSOLVE_PAK_VERSION": record["pak"]["version"],
+        "RSOLVE_PAK_PATH": record["pak"]["package_path"],
     }
     for key, value in expected.items():
         if values.get(key) != value:

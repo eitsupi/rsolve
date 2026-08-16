@@ -179,9 +179,9 @@ class AttestationTests(unittest.TestCase):
             root = base / "rootfs"
             root.mkdir()
             attestation.prepare_bind_destinations(root)
-            for path in (root / "proc", root / "dev", root / "tmp", root / "nrr", root / "nrr/fixtures"):
+            for path in (root / "proc", root / "dev", root / "tmp", root / "rsolve", root / "rsolve/fixtures"):
                 self.assertTrue(path.is_dir())
-            self.assertTrue((root / "nrr/pak_isolated").is_file())
+            self.assertTrue((root / "rsolve/pak_isolated").is_file())
 
     def test_bind_destinations_accept_existing_physical_entries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -189,14 +189,14 @@ class AttestationTests(unittest.TestCase):
             root.mkdir()
             for mountpoint in ("proc", "dev", "tmp"):
                 (root / mountpoint).mkdir()
-            (root / "nrr" / "fixtures").mkdir(parents=True)
-            pak_isolated = root / "nrr" / "pak_isolated"
+            (root / "rsolve" / "fixtures").mkdir(parents=True)
+            pak_isolated = root / "rsolve" / "pak_isolated"
             pak_isolated.write_bytes(b"preserve this content")
 
             attestation.prepare_bind_destinations(root)
 
             self.assertEqual(pak_isolated.read_bytes(), b"preserve this content")
-            for path in (root / "proc", root / "dev", root / "tmp", root / "nrr/fixtures"):
+            for path in (root / "proc", root / "dev", root / "tmp", root / "rsolve/fixtures"):
                 self.assertTrue(path.is_dir())
             self.assertTrue(pak_isolated.is_file())
 
@@ -220,15 +220,15 @@ class AttestationTests(unittest.TestCase):
             ("proc", "symlink", False),
             ("dev", "symlink", False),
             ("tmp", "symlink", False),
-            ("nrr", "symlink", False),
-            ("nrr/fixtures", "symlink", True),
-            ("nrr/pak_isolated", "symlink", True),
+            ("rsolve", "symlink", False),
+            ("rsolve/fixtures", "symlink", True),
+            ("rsolve/pak_isolated", "symlink", True),
             ("proc", "file", False),
             ("dev", "file", False),
             ("tmp", "file", False),
-            ("nrr", "file", False),
-            ("nrr/fixtures", "file", True),
-            ("nrr/pak_isolated", "directory", True),
+            ("rsolve", "file", False),
+            ("rsolve/fixtures", "file", True),
+            ("rsolve/pak_isolated", "directory", True),
         )
         for relative, kind, nested in scenarios:
             with self.subTest(relative=relative, kind=kind), tempfile.TemporaryDirectory() as directory:
@@ -323,8 +323,8 @@ class AttestationTests(unittest.TestCase):
         self.assertIn("--net", command)
         self.assertIn("--unshare-pid", command)
         self.assertIn("--clearenv", command)
-        self.assertIn("/nrr/fixtures", command)
-        self.assertIn("NRR_PAK_PARENT_USERNS", command)
+        self.assertIn("/rsolve/fixtures", command)
+        self.assertIn("RSOLVE_PAK_PARENT_USERNS", command)
         self.assertIn("linux-user-pid-netns-v1", command)
         self.assertIn("LANG", command)
         self.assertIn("C.utf8", command)

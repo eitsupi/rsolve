@@ -201,18 +201,18 @@ class RootfsVerifierTests(unittest.TestCase):
             }
             output = "\n".join(
                 (
-                    "NRR_R_VERSION_STRING=R version 4.6.1 (2026-06-24)",
-                    "NRR_R_PLATFORM=x86_64-pc-linux-gnu",
-                    "NRR_R_HOME=/opt/R/4.6.1/lib/R",
-                    "NRR_PAK_VERSION=0.11.1",
-                    "NRR_PAK_PATH=/opt/R/4.6.1/lib/R/library/pak",
+                    "RSOLVE_R_VERSION_STRING=R version 4.6.1 (2026-06-24)",
+                    "RSOLVE_R_PLATFORM=x86_64-pc-linux-gnu",
+                    "RSOLVE_R_HOME=/opt/R/4.6.1/lib/R",
+                    "RSOLVE_PAK_VERSION=0.11.1",
+                    "RSOLVE_PAK_PATH=/opt/R/4.6.1/lib/R/library/pak",
                 )
             )
             with patch.object(verifier, "run_isolated", return_value=output) as run:
                 verifier.verify_r(root, record)
             argv = run.call_args.args[1]
             self.assertEqual(argv[:2], ["/opt/R/4.6.1/bin/R", "--vanilla"])
-            self.assertNotIn("NRR_R_EXECUTABLE", output)
+            self.assertNotIn("RSOLVE_R_EXECUTABLE", output)
 
     def test_record_path_is_cwd_resolved_and_symlinks_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

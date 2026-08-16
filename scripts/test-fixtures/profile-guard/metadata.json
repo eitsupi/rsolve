@@ -1,8 +1,8 @@
 {
   "packages": [
     {
-      "id": "path+file:///workspace/crates/nrr-provider#0.1.0",
-      "name": "nrr-provider",
+      "id": "path+file:///workspace/crates/rsolve-provider#0.1.0",
+      "name": "rsolve-provider",
       "targets": [
         {
           "name": "r_interop",
@@ -23,8 +23,8 @@
       ]
     },
     {
-      "id": "path+file:///workspace/crates/nrr-repository#0.1.0",
-      "name": "nrr-repository",
+      "id": "path+file:///workspace/crates/rsolve-repository#0.1.0",
+      "name": "rsolve-repository",
       "targets": [
         {
           "name": "repository_r_interop",

@@ -478,13 +478,13 @@ def prepare_bind_destinations(root: Path) -> None:
             mount_fd = _ensure_directory_at(root_fd, mountpoint, f"/{mountpoint}")
             os.close(mount_fd)
 
-        nrr_fd = _ensure_directory_at(root_fd, "nrr", "/nrr")
+        rsolve_fd = _ensure_directory_at(root_fd, "rsolve", "/rsolve")
         try:
-            fixtures_fd = _ensure_directory_at(nrr_fd, "fixtures", "/nrr/fixtures")
+            fixtures_fd = _ensure_directory_at(rsolve_fd, "fixtures", "/rsolve/fixtures")
             os.close(fixtures_fd)
-            _ensure_regular_file_at(nrr_fd, "pak_isolated", "/nrr/pak_isolated")
+            _ensure_regular_file_at(rsolve_fd, "pak_isolated", "/rsolve/pak_isolated")
         finally:
-            os.close(nrr_fd)
+            os.close(rsolve_fd)
     finally:
         os.close(root_fd)
 
@@ -533,35 +533,35 @@ def isolated_command(rootfs: Path, binary: Path, record: dict[str, Any], parent_
     try:
         rscript = Path(record["r"]["executable"]).with_name("Rscript")
         env = {
-            "NRR_TEST_MODE": "pak-isolated",
-            "NRR_PAK_ISOLATION_MODE": "linux-user-pid-netns-v1",
-            "NRR_PAK_PARENT_USERNS": parent_ids["user"],
-            "NRR_PAK_PARENT_PIDNS": parent_ids["pid"],
-            "NRR_PAK_PARENT_NETNS": parent_ids["net"],
-            "NRR_RSCRIPT": str(rscript),
-            "NRR_PAK_LIBRARY": record["pak"]["library_root"],
-            "NRR_PAK_PRIVATE_LIBRARY": record["pak"]["package_path"] + "/library",
+            "RSOLVE_TEST_MODE": "pak-isolated",
+            "RSOLVE_PAK_ISOLATION_MODE": "linux-user-pid-netns-v1",
+            "RSOLVE_PAK_PARENT_USERNS": parent_ids["user"],
+            "RSOLVE_PAK_PARENT_PIDNS": parent_ids["pid"],
+            "RSOLVE_PAK_PARENT_NETNS": parent_ids["net"],
+            "RSOLVE_RSCRIPT": str(rscript),
+            "RSOLVE_PAK_LIBRARY": record["pak"]["library_root"],
+            "RSOLVE_PAK_PRIVATE_LIBRARY": record["pak"]["package_path"] + "/library",
             "PATH": "/usr/bin:/bin",
             "LANG": "C.utf8",
             "LC_ALL": "C.utf8",
-            "NRR_PAK_FIXTURE_ROOT": "/nrr/fixtures",
+            "RSOLVE_PAK_FIXTURE_ROOT": "/rsolve/fixtures",
         }
     except (KeyError, TypeError) as error:
         raise AttestationError("record is missing pak isolation fields") from error
     command = [
         "unshare", "--user", "--map-root-user", "--net", "bwrap", "--die-with-parent",
-        "--ro-bind", str(rootfs), "/", "--ro-bind", str(fixture), "/nrr/fixtures",
-        "--ro-bind", str(binary), "/nrr/pak_isolated", "--proc", "/proc", "--dev", "/dev",
+        "--ro-bind", str(rootfs), "/", "--ro-bind", str(fixture), "/rsolve/fixtures",
+        "--ro-bind", str(binary), "/rsolve/pak_isolated", "--proc", "/proc", "--dev", "/dev",
         "--tmpfs", "/tmp", "--unshare-pid", "--clearenv",
     ]
     for key, value in env.items():
         command += ["--setenv", key, value]
-    command += ["--chdir", "/", "/nrr/pak_isolated", "isolated_pak_contract_requires_wrapper_preflight_and_runs_shared_contract", "--exact", "--nocapture"]
+    command += ["--chdir", "/", "/rsolve/pak_isolated", "isolated_pak_contract_requires_wrapper_preflight_and_runs_shared_contract", "--exact", "--nocapture"]
     return command
 
 
 def locate_test_binary() -> Path:
-    command = ["cargo", "test", "-p", "nrr", "--test", "pak_isolated", "--no-run", "--locked", "--offline", "--message-format", "json"]
+    command = ["cargo", "test", "-p", "rsolve", "--test", "pak_isolated", "--no-run", "--locked", "--offline", "--message-format", "json"]
     try:
         result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -592,13 +592,13 @@ def parent_namespace_ids() -> dict[str, str]:
 @contextmanager
 def workspace_context(debug_keep: bool) -> Iterator[Path]:
     if debug_keep:
-        path = Path(tempfile.mkdtemp(prefix="nrr-pak-attestation-"))
+        path = Path(tempfile.mkdtemp(prefix="rsolve-pak-attestation-"))
         try:
             yield path
         finally:
             print(f"debug workspace retained: {path}", file=sys.stderr)
     else:
-        with tempfile.TemporaryDirectory(prefix="nrr-pak-attestation-") as directory:
+        with tempfile.TemporaryDirectory(prefix="rsolve-pak-attestation-") as directory:
             yield Path(directory)
 
 
@@ -616,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
             raise AttestationError("record must be an object with a string image")
         host, repository = image_ref(record["image"])
         image_digest = record["image"].rsplit("@", 1)[1]
-        fixture = REPO_ROOT / "crates/nrr-repository/tests/fixtures/closure"
+        fixture = REPO_ROOT / "crates/rsolve-repository/tests/fixtures/closure"
         if not fixture.is_dir() or fixture.is_symlink():
             raise AttestationError("pak closure fixture directory is unavailable")
         with workspace_context(args.debug_keep) as workspace:

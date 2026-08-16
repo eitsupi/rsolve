@@ -1,0 +1,9 @@
+Package: rsolvefixture.description
+Version: 0.4.0
+Title: A fictional single-record fixture
+Description: UTF-8 single record: 日本語とcafé
+Maintainer: Fixture Author <fixture@example.invalid>
+License: RSOLVE Fictional Terms Description
+Encoding: UTF-8
+Published: 2026-06-28 19:14:59 UTC
+

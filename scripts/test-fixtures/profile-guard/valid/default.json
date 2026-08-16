@@ -1,26 +1,26 @@
 {
   "rust-suites": {
-    "nrr-provider::r_interop": {
-      "package-name": "nrr-provider",
-      "binary-id": "nrr-provider::r_interop",
+    "rsolve-provider::r_interop": {
+      "package-name": "rsolve-provider",
+      "binary-id": "rsolve-provider::r_interop",
       "binary-name": "r_interop",
-      "package-id": "path+file:///workspace/crates/nrr-provider#0.1.0",
+      "package-id": "path+file:///workspace/crates/rsolve-provider#0.1.0",
       "kind": "test",
       "status": "skipped-default-filter"
     },
-    "nrr-repository::repository_r_interop": {
-      "package-name": "nrr-repository",
-      "binary-id": "nrr-repository::repository_r_interop",
+    "rsolve-repository::repository_r_interop": {
+      "package-name": "rsolve-repository",
+      "binary-id": "rsolve-repository::repository_r_interop",
       "binary-name": "repository_r_interop",
-      "package-id": "path+file:///workspace/crates/nrr-repository#0.1.0",
+      "package-id": "path+file:///workspace/crates/rsolve-repository#0.1.0",
       "kind": "test",
       "status": "skipped-default-filter"
     },
-    "nrr::pak_portable": {
-      "package-name": "nrr",
-      "binary-id": "nrr::pak_portable",
+    "rsolve::pak_portable": {
+      "package-name": "rsolve",
+      "binary-id": "rsolve::pak_portable",
       "binary-name": "pak_portable",
-      "package-id": "path+file:///workspace/crates/nrr#0.1.0",
+      "package-id": "path+file:///workspace/crates/rsolve#0.1.0",
       "kind": "test",
       "status": "skipped-default-filter"
     }

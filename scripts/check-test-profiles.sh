@@ -10,13 +10,13 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-metadata=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-metadata.XXXXXX")
-default_list=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-default.XXXXXX")
-profile_list=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-opt-in.XXXXXX")
+metadata=$(mktemp "${TMPDIR:-/tmp}/rsolve-test-profile-metadata.XXXXXX")
+default_list=$(mktemp "${TMPDIR:-/tmp}/rsolve-test-profile-default.XXXXXX")
+profile_list=$(mktemp "${TMPDIR:-/tmp}/rsolve-test-profile-opt-in.XXXXXX")
 trap 'rm -f "$metadata" "$default_list" "$profile_list"' EXIT
 
 # package name, target name, and the profile that must select the target.
-opt_in_targets='nrr-provider:r_interop:r-interop nrr-repository:repository_r_interop:r-interop nrr:pak_portable:pak-portable nrr:pak_isolated:pak-isolated'
+opt_in_targets='rsolve-provider:r_interop:r-interop rsolve-repository:repository_r_interop:r-interop rsolve:pak_portable:pak-portable rsolve:pak_isolated:pak-isolated'
 
 cargo metadata --format-version 1 --all-features --no-deps --locked --offline \
     --manifest-path "$root/Cargo.toml" >"$metadata"
@@ -65,7 +65,7 @@ for spec in $opt_in_targets; do
         echo "nextest profiles: $profile selected $selected_count suites, expected exactly $expected_count opt-in suites" >&2
         exit 1
     fi
-    target_profile=$(mktemp "${TMPDIR:-/tmp}/nrr-test-profile-target.XXXXXX")
+    target_profile=$(mktemp "${TMPDIR:-/tmp}/rsolve-test-profile-target.XXXXXX")
     trap 'rm -f "$metadata" "$default_list" "$profile_list" "$target_profile"' EXIT
     jq --arg package "$package_name" --arg target "$target_name" \
         '."rust-suites" |= with_entries(select(.value["package-name"] == $package and .value["binary-name"] == $target))' \

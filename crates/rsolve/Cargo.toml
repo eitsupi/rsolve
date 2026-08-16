@@ -1,0 +1,29 @@
+[package]
+name = "rsolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rsolve"
+path = "src/main.rs"
+
+[[test]]
+name = "pak_portable"
+path = "tests/pak_portable_entry.rs"
+
+[[test]]
+name = "pak_isolated"
+path = "tests/pak_isolated.rs"
+
+[dependencies]
+rsolve-core = { path = "../rsolve-core" }
+rsolve-provider = { path = "../rsolve-provider" }
+rsolve-resolver = { path = "../rsolve-resolver" }
+rsolve-repository = { path = "../rsolve-repository" }
+percent-encoding.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+url.workspace = true
