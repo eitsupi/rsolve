@@ -699,8 +699,22 @@ fn publication_failure_from_tree(
     tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
 ) -> Option<ResolutionFailure> {
     let mut reasons = Vec::new();
-    collect_publication_rejections(tree, &mut reasons);
-    if reasons.is_empty() {
+    let mut policy_causes = Vec::new();
+    let mut no_versions_causes = Vec::new();
+    let mut dependency_edges = Vec::new();
+    let mut unrelated_custom = false;
+    collect_proof_causes(
+        tree,
+        &mut reasons,
+        &mut policy_causes,
+        &mut no_versions_causes,
+        &mut dependency_edges,
+        &mut unrelated_custom,
+    );
+    let unrelated_no_versions = no_versions_causes
+        .iter()
+        .any(|cause| !reaches_policy_cause(cause, &policy_causes, &dependency_edges));
+    if reasons.is_empty() || unrelated_custom || unrelated_no_versions {
         return None;
     }
     reasons.sort_by(|left, right| {
@@ -717,25 +731,161 @@ fn publication_failure_from_tree(
     Some(ResolutionFailure::PublicationIneligible { cutoff, rejections })
 }
 
-fn collect_publication_rejections(
+fn collect_proof_causes(
     tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
     reasons: &mut Vec<(PublicationDate, PublicationRejection)>,
+    policy_causes: &mut Vec<ProofCause>,
+    no_versions_causes: &mut Vec<ProofCause>,
+    dependency_edges: &mut Vec<DependencyEdge>,
+    unrelated_custom: &mut bool,
 ) {
     match tree {
         DerivationTree::External(External::Custom(
-            _,
-            _,
+            package,
+            versions,
             ProviderMessage::Publication { cutoff, rejections },
-        )) => reasons.extend(
-            rejections
-                .iter()
-                .cloned()
-                .map(|rejection| (*cutoff, rejection)),
-        ),
-        DerivationTree::External(_) => {}
+        )) => {
+            policy_causes.push(ProofCause {
+                package: package.clone(),
+                versions: versions.clone(),
+            });
+            reasons.extend(
+                rejections
+                    .iter()
+                    .cloned()
+                    .map(|rejection| (*cutoff, rejection)),
+            );
+        }
+        DerivationTree::External(External::Custom(_, _, ProviderMessage::Text(_))) => {
+            *unrelated_custom = true
+        }
+        DerivationTree::External(External::NoVersions(package, versions)) => no_versions_causes
+            .push(ProofCause {
+                package: package.clone(),
+                versions: versions.clone(),
+            }),
+        DerivationTree::External(External::NotRoot(_, _)) => {}
+        DerivationTree::External(External::FromDependencyOf(
+            parent,
+            parent_versions,
+            child,
+            child_versions,
+        )) => {
+            dependency_edges.push(DependencyEdge {
+                parent: parent.clone(),
+                parent_versions: parent_versions.clone(),
+                child: child.clone(),
+                child_versions: child_versions.clone(),
+            });
+        }
         DerivationTree::Derived(derived) => {
-            collect_publication_rejections(&derived.cause1, reasons);
-            collect_publication_rejections(&derived.cause2, reasons);
+            collect_proof_causes(
+                &derived.cause1,
+                reasons,
+                policy_causes,
+                no_versions_causes,
+                dependency_edges,
+                unrelated_custom,
+            );
+            collect_proof_causes(
+                &derived.cause2,
+                reasons,
+                policy_causes,
+                no_versions_causes,
+                dependency_edges,
+                unrelated_custom,
+            );
         }
     }
+}
+
+#[derive(Clone)]
+struct ProofCause {
+    package: PackageId,
+    versions: Ranges<RPackageVersion>,
+}
+
+#[derive(Clone)]
+struct DependencyEdge {
+    parent: PackageId,
+    parent_versions: Ranges<RPackageVersion>,
+    child: PackageId,
+    child_versions: Ranges<RPackageVersion>,
+}
+
+fn reaches_policy_cause(
+    cause: &ProofCause,
+    policy_causes: &[ProofCause],
+    dependency_edges: &[DependencyEdge],
+) -> bool {
+    // The same package may occur in separate proof branches at disjoint
+    // ranges. Match same-package causes through their incoming dependency
+    // context instead of package name alone.
+    if policy_causes.iter().any(|policy| {
+        policy.package == cause.package
+            && incoming_edges(dependency_edges, cause)
+                .iter()
+                .any(|cause_edge| {
+                    incoming_edges(dependency_edges, policy)
+                        .iter()
+                        .any(|policy_edge| {
+                            cause_edge.parent == policy_edge.parent
+                                && !cause_edge
+                                    .parent_versions
+                                    .is_disjoint(&policy_edge.parent_versions)
+                        })
+                })
+    }) {
+        return true;
+    }
+
+    // Carry the range imposed on the current package while walking
+    // dependency edges. This prevents sibling branches with non-overlapping
+    // parent ranges from being merged into one policy explanation.
+    let mut pending = incoming_edges(dependency_edges, cause)
+        .into_iter()
+        .map(|edge| (cause.package.clone(), edge.child_versions.clone()))
+        .collect::<Vec<_>>();
+    let mut visited: Vec<(PackageId, Ranges<RPackageVersion>)> = Vec::new();
+    while let Some((current, current_versions)) = pending.pop() {
+        if visited
+            .iter()
+            .any(|(package, versions)| package == &current && versions == &current_versions)
+        {
+            continue;
+        }
+        visited.push((current.clone(), current_versions.clone()));
+        for edge in dependency_edges.iter().filter(|edge| {
+            edge.parent == current && !edge.parent_versions.is_disjoint(&current_versions)
+        }) {
+            if policy_causes.iter().any(|policy| {
+                policy.package == edge.child
+                    && !edge.child_versions.is_disjoint(&policy.versions)
+                    && incoming_edges(dependency_edges, policy)
+                        .iter()
+                        .any(|policy_edge| {
+                            policy_edge.parent == edge.parent
+                                && !policy_edge
+                                    .parent_versions
+                                    .is_disjoint(&edge.parent_versions)
+                        })
+            }) {
+                return true;
+            }
+            pending.push((edge.child.clone(), edge.child_versions.clone()));
+        }
+    }
+    false
+}
+
+fn incoming_edges<'a>(
+    dependency_edges: &'a [DependencyEdge],
+    target: &ProofCause,
+) -> Vec<&'a DependencyEdge> {
+    dependency_edges
+        .iter()
+        .filter(|edge| {
+            edge.child == target.package && !edge.child_versions.is_disjoint(&target.versions)
+        })
+        .collect()
 }

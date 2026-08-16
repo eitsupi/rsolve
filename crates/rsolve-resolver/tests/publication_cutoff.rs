@@ -150,11 +150,18 @@ fn cooldown_excludes_newer_release_and_selects_mature_fallback() {
 }
 
 fn hard_dependency(name: &str) -> DependencyRequirement {
+    hard_dependency_with_constraint(name, VersionConstraint::unconstrained())
+}
+
+fn hard_dependency_with_constraint(
+    name: &str,
+    constraint: VersionConstraint,
+) -> DependencyRequirement {
     DependencyRequirement::new(
         DependencyKind::Depends,
         package(name),
         DependencySourceConstraint::Any,
-        VersionConstraint::unconstrained(),
+        constraint,
     )
 }
 
@@ -234,6 +241,85 @@ fn transitive_publication_proof_reports_all_stable_reasons() {
             PublicationRejection::PublicationUnknown { identity: second }
         ] if first.name().as_str() == "childnew" && second.name().as_str() == "childunknown"
     ));
+}
+
+#[test]
+fn mixed_publication_and_missing_proof_remains_generic_no_solution() {
+    let loader = FixtureLoader {
+        candidates: [
+            (
+                package("parent"),
+                vec![
+                    release_with_dependencies(
+                        "parent",
+                        "2.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("childnew")],
+                    ),
+                    release_with_dependencies(
+                        "parent",
+                        "1.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("missing")],
+                    ),
+                ],
+            ),
+            (
+                package("childnew"),
+                vec![release("childnew", "1.0.0", Some("2026-07-01"))],
+            ),
+            (package("missing"), Vec::new()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
+    assert!(matches!(error, ResolutionFailure::NoSolution { .. }));
+}
+
+#[test]
+fn disjoint_ranges_for_same_package_do_not_hide_unrelated_no_versions() {
+    let loader = FixtureLoader {
+        candidates: [
+            (
+                package("parent"),
+                vec![
+                    release_with_dependencies(
+                        "parent",
+                        "2.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency_with_constraint(
+                            "foo",
+                            VersionConstraint::from_clause(
+                                rsolve_core::RelationOp::Ge,
+                                rsolve_core::RPackageVersion::parse("2.0").unwrap(),
+                            ),
+                        )],
+                    ),
+                    release_with_dependencies(
+                        "parent",
+                        "1.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency_with_constraint(
+                            "foo",
+                            VersionConstraint::from_clause(
+                                rsolve_core::RelationOp::Lt,
+                                rsolve_core::RPackageVersion::parse("2.0").unwrap(),
+                            ),
+                        )],
+                    ),
+                ],
+            ),
+            (
+                package("foo"),
+                vec![release("foo", "2.0.0", Some("2026-07-01"))],
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
+    assert!(matches!(error, ResolutionFailure::NoSolution { .. }));
 }
 
 #[test]
