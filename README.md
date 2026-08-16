@@ -56,3 +56,29 @@ Run the repository validation suite:
 ```sh
 sh scripts/check.sh
 ```
+
+## Live CRAN example
+
+The opt-in `cran_matrix` example performs network access when it runs. It
+uses `https://cloud.r-project.org` by default and resolves Matrix for target R
+versions `4.3.3` and `4.4.0` when no positional versions are supplied:
+
+```sh
+cargo run -p rsolve --example cran_matrix
+```
+
+Pass one or more target R versions after `--`:
+
+```sh
+cargo run -p rsolve --example cran_matrix -- 4.3.3 4.4.0
+```
+
+Override the mirror with `RSOLVE_CRAN_MIRROR`:
+
+```sh
+RSOLVE_CRAN_MIRROR=https://cran.rstudio.com \
+  cargo run -p rsolve --example cran_matrix -- 4.4.0
+```
+
+The example is separate from the top-level binary, which is currently a
+no-op. Results can change as the live CRAN catalog changes.
