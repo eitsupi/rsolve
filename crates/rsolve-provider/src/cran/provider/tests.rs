@@ -6,6 +6,8 @@ use std::rc::Rc;
 
 const FAST: &[u8] =
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-PACKAGES.rds");
+const SEMANTIC_INVALID_FAST: &[u8] =
+    include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-archive-PACKAGES.rds");
 const WRONG_ROOT: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-wrong-root.rds"
 );
@@ -94,6 +96,20 @@ fn old_url() -> String {
 
 fn new_url() -> String {
     "https://cran.invalid/src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz".to_owned()
+}
+
+fn invalid_description_tar() -> Vec<u8> {
+    let description = b"Package: Matrix\nVersion: not-a-version\n";
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("Matrix/DESCRIPTION").unwrap();
+    header.set_size(description.len() as u64);
+    header.set_cksum();
+    archive.append(&header, description.as_slice()).unwrap();
+    let archive = archive.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&archive).unwrap();
+    encoder.finish().unwrap()
 }
 
 fn current_rds_url() -> String {
@@ -340,7 +356,12 @@ fn runtime_loader_invalid_fast_path_falls_back_to_history() {
 fn invalid_fast_path_shapes_match_fast_catalog() {
     let fast = provider(FixtureTransport::fallback(FAST.to_vec(), 200));
     let expected = logical_signature(&fast);
-    for invalid in [b"truncated RDS".as_slice(), WRONG_ROOT, MISSING_VERSION] {
+    for invalid in [
+        b"truncated RDS".as_slice(),
+        WRONG_ROOT,
+        MISSING_VERSION,
+        SEMANTIC_INVALID_FAST,
+    ] {
         let fallback = provider(FixtureTransport::fallback(invalid.to_vec(), 200));
         assert_eq!(logical_signature(&fallback), expected);
         assert!(matches!(
@@ -565,6 +586,42 @@ fn unsupported_rds_current_index_falls_back_to_gzip() {
 }
 
 #[test]
+fn semantic_invalid_current_index_falls_back_to_gzip() {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(b"Package: rsolvefixture.plain\nVersion: 3.0.0\n")
+        .unwrap();
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: SEMANTIC_INVALID_FAST.to_vec(),
+        },
+        TransportResponse {
+            status: 200,
+            body: encoder.finish().unwrap(),
+        },
+        TransportResponse {
+            status: 500,
+            body: Vec::new(),
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    session
+        .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
+        .unwrap();
+    assert_eq!(requests.borrow()[0], current_rds_url());
+    assert_eq!(requests.borrow()[1], current_gzip_url());
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Rds)
+            && matches!(
+                diagnostic.status_detail(),
+                CranFastPathStatus::Invalid { .. }
+            )
+    }));
+}
+
+#[test]
 fn current_index_transport_or_status_failures_remain_transport_failures() {
     for responses in [
         HashMap::new(),
@@ -767,6 +824,44 @@ fn size_mismatch_is_a_hard_acquisition_error() {
         CandidateLoadErrorCategory::TransportFailure
     );
     assert!(error.diagnostic().contains("size mismatch"));
+}
+
+#[test]
+fn semantically_invalid_description_is_metadata_invalid() {
+    let mut transport = FixtureTransport::fallback(Vec::new(), 404);
+    let mut invalid = invalid_description_tar();
+    invalid.resize(OLD_TAR.len(), 0);
+    transport.responses.insert(
+        old_url(),
+        TransportResponse {
+            status: 200,
+            body: invalid.clone(),
+        },
+    );
+    invalid.resize(NEW_TAR.len(), 0);
+    transport.responses.insert(
+        new_url(),
+        TransportResponse {
+            status: 200,
+            body: invalid,
+        },
+    );
+    let provider = provider(transport);
+    let error = provider
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::MetadataInvalid
+    );
+    assert!(error.diagnostic().contains("invalid DESCRIPTION"));
+    assert!(
+        error
+            .diagnostic()
+            .contains("R version component 0 is not numeric")
+    );
 }
 
 #[test]

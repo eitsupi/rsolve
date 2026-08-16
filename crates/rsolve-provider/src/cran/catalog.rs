@@ -21,16 +21,14 @@ const SOURCE_CHANNEL: &str = "source";
 #[derive(Clone, Debug, Default)]
 pub struct CranCatalog {
     candidates: BTreeMap<PackageName, Vec<PackageRelease>>,
-    diagnostics: Vec<CranDiagnostic>,
 }
 
 impl CranCatalog {
     /// Parses and converts a plain `src/contrib/PACKAGES` snapshot.
     ///
     /// DCF syntax errors fail the operation because record boundaries cannot
-    /// be trusted.  A semantically malformed record is instead skipped and
-    /// recorded in [`Self::diagnostics`], allowing the rest of a large index
-    /// to remain useful.
+    /// be trusted. A semantically malformed record rejects the catalog, with
+    /// all record diagnostics retained in source order.
     pub fn from_packages(input: &[u8]) -> Result<Self, CranCatalogError> {
         let document = DcfDocument::parse(input).map_err(CranCatalogError::Dcf)?;
         Self::from_document(document)
@@ -57,7 +55,7 @@ impl CranCatalog {
                     .collect::<Vec<_>>();
                 (record_index, package, observation_from_fields(&fields))
             });
-        Ok(catalog_from_observations(observations))
+        catalog_from_observations(observations).map_err(CranCatalogError::Semantic)
     }
 
     /// Returns all candidates for a canonical package name in version order.
@@ -91,23 +89,49 @@ impl CranCatalog {
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
     }
-
-    /// Records skipped semantic records, in source record order.
-    pub fn diagnostics(&self) -> &[CranDiagnostic] {
-        &self.diagnostics
-    }
 }
 
-/// A failure while parsing the index as DCF syntax.
+/// A failure while parsing the index as DCF syntax or converting parsed
+/// records into validated catalog entries.
 #[derive(Debug)]
 pub enum CranCatalogError {
     Dcf(DcfError),
+    Semantic(Box<[CranDiagnostic]>),
+}
+
+impl CranCatalogError {
+    /// Returns all semantic record diagnostics in source order.
+    pub fn diagnostics(&self) -> &[CranDiagnostic] {
+        match self {
+            Self::Semantic(diagnostics) => diagnostics,
+            Self::Dcf(_) => &[],
+        }
+    }
 }
 
 impl fmt::Display for CranCatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Dcf(error) => write!(f, "invalid CRAN PACKAGES DCF: {error}"),
+            Self::Semantic(diagnostics) => {
+                if diagnostics.is_empty() {
+                    return f.write_str("semantic CRAN PACKAGES records are invalid");
+                }
+                write!(
+                    f,
+                    "{} semantic CRAN PACKAGES record(s) are invalid: {}",
+                    diagnostics.len(),
+                    diagnostics[0]
+                )?;
+                if diagnostics.len() > 1 {
+                    write!(
+                        f,
+                        ", and {} additional diagnostic(s)",
+                        diagnostics.len() - 1
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -116,6 +140,7 @@ impl Error for CranCatalogError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Dcf(error) => Some(error),
+            Self::Semantic(_) => None,
         }
     }
 }
@@ -222,7 +247,9 @@ impl fmt::Display for DependencyParseError {
 
 impl Error for DependencyParseError {}
 
-pub(super) fn catalog_from_observations<I>(observations: I) -> CranCatalog
+pub(super) fn catalog_from_observations<I>(
+    observations: I,
+) -> Result<CranCatalog, Box<[CranDiagnostic]>>
 where
     I: IntoIterator<
         Item = (
@@ -264,10 +291,10 @@ where
     for releases in candidates.values_mut() {
         releases.sort_by(|left, right| left.version().cmp(right.version()));
     }
-    CranCatalog {
-        candidates,
-        diagnostics,
+    if !diagnostics.is_empty() {
+        return Err(diagnostics.into_boxed_slice());
     }
+    Ok(CranCatalog { candidates })
 }
 
 pub(super) fn observation_from_fields(

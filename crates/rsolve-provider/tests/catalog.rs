@@ -1,7 +1,7 @@
 use rsolve_core::{
     DependencyKind, DependencySourceConstraint, Provenance, PublicationDate, RelationOp,
 };
-use rsolve_provider::cran::{CranCatalog, CranRecordError, DependencyParseError};
+use rsolve_provider::cran::{CranCatalog, CranCatalogError, CranRecordError, DependencyParseError};
 
 const SYNTHETIC_PACKAGES: &[u8] = include_bytes!("fixtures/cran-2026-08-08/synthetic-PACKAGES");
 
@@ -22,7 +22,6 @@ Unknown-Field: retained\n\n",
     let candidates = catalog.candidates_named("demo").unwrap();
     assert_eq!(candidates.len(), 1);
     assert!(catalog.candidates_named("R").unwrap().is_empty());
-    assert!(catalog.diagnostics().is_empty());
 
     let release = &candidates[0];
     assert!(matches!(
@@ -87,24 +86,42 @@ Unknown-Field: retained\n\n",
 }
 
 #[test]
-fn published_date_forms_are_first_class_and_invalid_values_are_diagnostic() {
+fn published_date_forms_are_first_class_and_missing_is_unknown() {
     let catalog = CranCatalog::from_packages(
         b"Package: dateonly\nVersion: 1.0.0\nPublished: 2026-06-24\n\n\
 Package: datetime\nVersion: 1.0.0\nPublished: 2026-06-25 19:14:59 UTC\n\n\
 Package: missing\nVersion: 1.0.0\n\n\
-Package: invalid\nVersion: 1.0.0\nPublished: 2026-02-29\n\n",
+",
     )
     .unwrap();
-    assert_eq!(catalog.candidates_named("dateonly").unwrap().len(), 1);
-    assert_eq!(catalog.candidates_named("datetime").unwrap().len(), 1);
-    assert_eq!(catalog.candidates_named("missing").unwrap().len(), 1);
+    assert_eq!(
+        catalog.candidates_named("dateonly").unwrap()[0]
+            .publication()
+            .map(|publication| publication.date()),
+        Some(PublicationDate::parse("2026-06-24").unwrap())
+    );
+    assert_eq!(
+        catalog.candidates_named("datetime").unwrap()[0]
+            .publication()
+            .map(|publication| publication.date()),
+        Some(PublicationDate::parse("2026-06-25").unwrap())
+    );
     assert!(
         catalog.candidates_named("missing").unwrap()[0]
             .publication()
             .is_none()
     );
-    assert!(catalog.candidates_named("invalid").unwrap().is_empty());
-    assert!(catalog.diagnostics().iter().any(|diagnostic| {
+}
+
+#[test]
+fn invalid_published_date_is_a_semantic_diagnostic() {
+    let error =
+        CranCatalog::from_packages(b"Package: invalid\nVersion: 1.0.0\nPublished: 2026-02-29\n\n")
+            .unwrap_err();
+    let CranCatalogError::Semantic(diagnostics) = error else {
+        panic!("expected semantic diagnostics");
+    };
+    assert!(diagnostics.iter().any(|diagnostic| {
         matches!(
             diagnostic.error(),
             CranRecordError::InvalidPublicationDate { .. }
@@ -135,18 +152,21 @@ fn folded_dependencies_and_absent_optional_fields_are_handled() {
 }
 
 #[test]
-fn malformed_records_are_skipped_with_a_diagnostic() {
-    let catalog = CranCatalog::from_packages(
+fn malformed_records_fail_catalog_with_typed_diagnostic() {
+    let error = CranCatalog::from_packages(
         b"Package: good\nVersion: 1.0.0\nLicense: fictional\n\n\
 Package: malformed\nVersion: 1.0.0\nDepends: valid, broken (>=)\n\n\
 Package: later\nVersion: 2.0.0\n\n",
     )
-    .unwrap();
-
-    assert_eq!(catalog.candidate_count(), 2);
-    assert!(catalog.candidates_named("malformed").unwrap().is_empty());
-    assert_eq!(catalog.diagnostics().len(), 1);
-    let diagnostic = &catalog.diagnostics()[0];
+    .unwrap_err();
+    assert!(error.to_string().contains("record 1 (malformed)"));
+    assert!(
+        error
+            .to_string()
+            .contains("1 semantic CRAN PACKAGES record(s)")
+    );
+    assert_eq!(error.diagnostics().len(), 1);
+    let diagnostic = &error.diagnostics()[0];
     assert_eq!(diagnostic.record_index(), 1);
     assert_eq!(diagnostic.package(), Some("malformed"));
     assert!(matches!(
@@ -156,6 +176,50 @@ Package: later\nVersion: 2.0.0\n\n",
             source: DependencyParseError::MissingConstraintVersion,
             ..
         }
+    ));
+}
+
+#[test]
+fn multiple_semantic_diagnostics_are_lossless_and_source_ordered() {
+    let error = CranCatalog::from_packages(
+        b"Package: good\nVersion: 1.0.0\n\n\
+Package: firstbad\nVersion: not-a-version\n\n\
+Package: secondbad\nLicense: fictional\n\n",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("record 1 (firstbad)"));
+    assert!(
+        error
+            .to_string()
+            .contains("R version component 0 is not numeric")
+    );
+    assert!(error.to_string().contains("and 1 additional diagnostic(s)"));
+    assert_eq!(error.diagnostics().len(), 2);
+    assert_eq!(error.diagnostics()[0].record_index(), 1);
+    assert_eq!(error.diagnostics()[0].package(), Some("firstbad"));
+    assert_eq!(error.diagnostics()[1].record_index(), 2);
+    assert_eq!(error.diagnostics()[1].package(), Some("secondbad"));
+    assert!(matches!(
+        error.diagnostics()[0].error(),
+        CranRecordError::InvalidVersion(_)
+    ));
+    assert!(matches!(
+        error.diagnostics()[1].error(),
+        CranRecordError::MissingField("Version")
+    ));
+}
+
+#[test]
+fn conflicting_same_identity_metadata_fails_catalog_as_domain_diagnostic() {
+    let error = CranCatalog::from_packages(
+        b"Package: conflict\nVersion: 1.0.0\nLicense: first\n\n\
+Package: conflict\nVersion: 1.0.0\nLicense: second\n\n",
+    )
+    .unwrap_err();
+    assert_eq!(error.diagnostics().len(), 1);
+    assert!(matches!(
+        error.diagnostics()[0].error(),
+        CranRecordError::Domain(_)
     ));
 }
 
@@ -173,11 +237,9 @@ fn duplicate_fields_are_rejected_case_insensitively() {
     ] {
         let input =
             format!("Package: demo\nVersion: 1.0.0\n{first}: value-one\n{second}: value-two\n");
-        let catalog = CranCatalog::from_packages(input.as_bytes()).unwrap();
-
-        assert!(catalog.is_empty(), "duplicate {first} should be rejected");
+        let error = CranCatalog::from_packages(input.as_bytes()).unwrap_err();
         assert!(matches!(
-            catalog.diagnostics()[0].error(),
+            error.diagnostics()[0].error(),
             CranRecordError::DuplicateField(_)
         ));
     }
@@ -185,13 +247,11 @@ fn duplicate_fields_are_rejected_case_insensitively() {
 
 #[test]
 fn single_equals_dependency_constraint_is_rejected() {
-    let catalog =
+    let error =
         CranCatalog::from_packages(b"Package: demo\nVersion: 1.0.0\nDepends: foo (= 1.0)\n")
-            .unwrap();
-
-    assert!(catalog.is_empty());
+            .unwrap_err();
     assert!(matches!(
-        catalog.diagnostics()[0].error(),
+        error.diagnostics()[0].error(),
         CranRecordError::Dependency {
             field: "Depends",
             source: DependencyParseError::InvalidConstraintSyntax,
@@ -201,14 +261,13 @@ fn single_equals_dependency_constraint_is_rejected() {
 }
 
 #[test]
-fn missing_required_fields_are_skipped_but_dcf_errors_fail_the_index() {
-    let catalog = CranCatalog::from_packages(
+fn missing_required_fields_fail_but_dcf_errors_remain_distinct() {
+    let error = CranCatalog::from_packages(
         b"Package: missing-version\nLicense: fictional\n\nPackage: valid\nVersion: 1.0.0\n\n",
     )
-    .unwrap();
-    assert_eq!(catalog.candidate_count(), 1);
+    .unwrap_err();
     assert!(matches!(
-        catalog.diagnostics()[0].error(),
+        error.diagnostics()[0].error(),
         CranRecordError::MissingField("Version")
     ));
 

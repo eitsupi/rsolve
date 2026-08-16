@@ -198,6 +198,10 @@ write_raw_fixture <- function(name, bytes) {
 }
 
 write_binary_fixture("synthetic-archive-PACKAGES.rds", archive)
+write_binary_fixture(
+    "synthetic-valid-archive-PACKAGES.rds",
+    archive[c(1L, 2L, 3L), , drop = FALSE]
+)
 
 matrix_archive <- matrix(
     NA_character_,

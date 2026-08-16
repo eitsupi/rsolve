@@ -22,6 +22,7 @@ fictional phrase.
 | `synthetic-PACKAGES` | 4 | Multi-record PACKAGES-like input |
 | `synthetic-DESCRIPTION` | 1 | Single-record DESCRIPTION-like input |
 | `synthetic-archive-PACKAGES.rds` | 4 | Gzip, format-3 archive package matrix; SHA-256 `29666ee379d1f6db074abed4e25795dff251d9506bf1baf5bbd057fe8ce15c85` |
+| `synthetic-valid-archive-PACKAGES.rds` | 3 | Gzip, format-3 valid archive matrix in non-semantic source order; SHA-256 `031591d19106f0a6788a57a7725f6ae32a193b69475ecfcea9ea77a4b00228c0` |
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `996457bb49b94effe5740b0d1ea135ad2988126097ee3e7b693c68228ecd66e3` |
 | `synthetic-matrix-archive-wrong-root.rds` | 1 | Invalid fast-path wrong root type fixture; SHA-256 `715f0358ada164c6b70b892b14b21ba58b5b30cfb8aac581a4aa2cca84231a57` |
 | `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `fabb389fc6fc1cf4951a76121c644df269150184aa7e1860a547b2f064ec2a4c` |
@@ -46,12 +47,14 @@ fictional phrase.
 | `rsolvefixture.plain` | Provides an ordinary record with the common required index fields. |
 | `rsolvefixture.description` | Is a separate one-record input with UTF-8 values, including a non-ASCII `Description`. |
 
-The archive matrix has 15 columns in the CRAN archive profile, including all
-five dependency fields. `rsolvefixture.history` occurs at versions `1.10.0` and
-`0.3.0` in that non-version order; its `Imports` value is folded over long
-continuation-style lines. The matrix also contains UTF-8 license values and an
-R `NA` cell, while `rsolvefixture.broken` has an invalid version and must be
-skipped with a diagnostic at source row 3 (zero-based).
+The archive matrices have 15 columns in the CRAN archive profile, including all
+five dependency fields. The valid archive matrix contains the first three rows
+of the full archive in source order: `rsolvefixture.history` occurs at versions
+`1.10.0` and `0.3.0` in non-version order, with all five dependency kinds,
+folded `Imports`, and UTF-8 license coverage; `rsolvefixture.utf8` retains an
+R `NA` cell. The full archive additionally contains
+`rsolvefixture.broken` with an invalid version and is intentionally a semantic-
+invalid fixture at source row 3 (zero-based).
 
 CRAN observation (2026-08-11): per-package archive indexes were observed to
 exclude the current package version and to store rows in archival order rather

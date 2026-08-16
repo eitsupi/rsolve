@@ -1,6 +1,8 @@
 use rsolve_provider::cran::{CranArchiveIndexError, CranCatalog, CranRecordError};
 
 const ARCHIVE: &[u8] = include_bytes!("fixtures/cran-2026-08-08/synthetic-archive-PACKAGES.rds");
+const VALID_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-valid-archive-PACKAGES.rds");
 
 // R 4.6.1, format 3, uncompressed RDS containing a character vector rather
 // than a matrix. It is deliberately small so this structural test has no
@@ -12,16 +14,15 @@ const NON_MATRIX_RDS: &[u8] = &[
 
 #[test]
 fn archive_rows_are_not_assumed_to_be_version_ordered() {
-    let object = rd_rds::file::from_bytes(ARCHIVE).expect("archive RDS");
+    let object = rd_rds::file::from_bytes(VALID_ARCHIVE).expect("archive RDS");
     let matrix = rd_rds::package::PackagesMatrix::from_object(&object).expect("archive matrix");
     assert_eq!(matrix.row(0).unwrap().get("Version"), Some(Some("1.10.0")));
     assert_eq!(matrix.row(1).unwrap().get("Version"), Some(Some("0.3.0")));
 
-    let catalog = CranCatalog::from_archive_index_rds(ARCHIVE).expect("archive fixture");
+    let catalog = CranCatalog::from_archive_index_rds(VALID_ARCHIVE).expect("archive fixture");
 
     assert_eq!(catalog.package_count(), 2);
     assert_eq!(catalog.candidate_count(), 3);
-    assert_eq!(catalog.diagnostics().len(), 1);
 
     let history = catalog.candidates_named("rsolvefixture.history").unwrap();
     assert_eq!(
@@ -42,8 +43,8 @@ fn archive_rows_are_not_assumed_to_be_version_ordered() {
 }
 
 #[test]
-fn archive_reader_looks_up_columns_by_name_and_preserves_dependencies() {
-    let object = rd_rds::file::from_bytes(ARCHIVE).expect("archive RDS");
+fn archive_reader_looks_up_columns_and_preserves_dependencies_and_utf8() {
+    let object = rd_rds::file::from_bytes(VALID_ARCHIVE).expect("archive RDS");
     let matrix = rd_rds::package::PackagesMatrix::from_object(&object).expect("archive matrix");
     assert_eq!(matrix.row(1).unwrap().get("Depends"), Some(None));
     assert_eq!(
@@ -51,9 +52,8 @@ fn archive_reader_looks_up_columns_by_name_and_preserves_dependencies() {
         Some(Some("rsolvefixture.history"))
     );
 
-    let catalog = CranCatalog::from_archive_index_rds(ARCHIVE).expect("archive fixture");
+    let catalog = CranCatalog::from_archive_index_rds(VALID_ARCHIVE).expect("archive fixture");
     let release = &catalog.candidates_named("rsolvefixture.history").unwrap()[1];
-
     for (kind, name) in [
         (rsolve_core::DependencyKind::Depends, "R"),
         (
@@ -94,9 +94,20 @@ fn archive_reader_looks_up_columns_by_name_and_preserves_dependencies() {
 }
 
 #[test]
-fn malformed_archive_row_is_skipped_with_source_index_and_package() {
-    let catalog = CranCatalog::from_archive_index_rds(ARCHIVE).expect("archive fixture");
-    let diagnostic = &catalog.diagnostics()[0];
+fn archive_semantic_invalid_rows_fail_without_partial_catalog() {
+    let error = CranCatalog::from_archive_index_rds(ARCHIVE).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("record 3 (rsolvefixture.broken)")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("1 semantic archive index record(s)")
+    );
+    assert_eq!(error.diagnostics().len(), 1);
+    let diagnostic = &error.diagnostics()[0];
 
     assert_eq!(diagnostic.record_index(), 3);
     assert_eq!(diagnostic.package(), Some("rsolvefixture.broken"));
@@ -104,12 +115,6 @@ fn malformed_archive_row_is_skipped_with_source_index_and_package() {
         diagnostic.error(),
         CranRecordError::InvalidVersion(_)
     ));
-    assert!(
-        catalog
-            .candidates_named("rsolvefixture.broken")
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[test]

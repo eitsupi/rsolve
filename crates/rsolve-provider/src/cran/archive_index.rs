@@ -5,14 +5,28 @@ use std::fmt;
 
 use rd_rds::{file::ReadOptions, package::PackagesMatrix};
 
-use super::catalog::{CranCatalog, catalog_from_observations, observation_from_fields};
+use super::catalog::{
+    CranCatalog, CranDiagnostic, catalog_from_observations, observation_from_fields,
+};
 
-/// A structural failure while reading an archive package index.
+/// A structural or semantic failure while reading and validating an archive
+/// package index.
 #[derive(Debug)]
 pub enum CranArchiveIndexError {
     Decode(rd_rds::file::ReadError),
     Matrix(rd_rds::package::ViewError),
     MissingColumn(&'static str),
+    Semantic(Box<[CranDiagnostic]>),
+}
+
+impl CranArchiveIndexError {
+    /// Returns all semantic row diagnostics in source order.
+    pub fn diagnostics(&self) -> &[CranDiagnostic] {
+        match self {
+            Self::Semantic(diagnostics) => diagnostics,
+            Self::Decode(_) | Self::Matrix(_) | Self::MissingColumn(_) => &[],
+        }
+    }
 }
 
 impl fmt::Display for CranArchiveIndexError {
@@ -26,6 +40,25 @@ impl fmt::Display for CranArchiveIndexError {
                     "archive index matrix is missing required column {column}"
                 )
             }
+            Self::Semantic(diagnostics) => {
+                if diagnostics.is_empty() {
+                    return formatter.write_str("semantic archive index records are invalid");
+                }
+                write!(
+                    formatter,
+                    "{} semantic archive index record(s) are invalid: {}",
+                    diagnostics.len(),
+                    diagnostics[0]
+                )?;
+                if diagnostics.len() > 1 {
+                    write!(
+                        formatter,
+                        ", and {} additional diagnostic(s)",
+                        diagnostics.len() - 1
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -36,6 +69,7 @@ impl Error for CranArchiveIndexError {
             Self::Decode(error) => Some(error),
             Self::Matrix(error) => Some(error),
             Self::MissingColumn(_) => None,
+            Self::Semantic(_) => None,
         }
     }
 }
@@ -86,6 +120,6 @@ impl CranCatalog {
             (row.index(), package, observation_from_fields(&field_refs))
         });
 
-        Ok(catalog_from_observations(observations))
+        catalog_from_observations(observations).map_err(CranArchiveIndexError::Semantic)
     }
 }

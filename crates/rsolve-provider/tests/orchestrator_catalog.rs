@@ -97,25 +97,9 @@ fn unconstrained_dependency_accepts_any_version() {
 fn a_malformed_record_is_reported_not_silently_dropped() {
     let mut broken = PACKAGES.to_vec();
     broken.extend_from_slice(b"\nPackage: rsolvefixture.broken\nVersion: not-a-version\n");
-    let c = CranCatalog::from_packages(&broken).expect("one bad record must not fail the index");
-    assert!(
-        !c.diagnostics().is_empty(),
-        "a skipped record must leave a diagnostic behind"
-    );
-    // `candidates_named` returns None only for an unparseable name, so the
-    // meaningful check is that the record contributed no candidate at all.
-    assert!(
-        !c.packages()
-            .any(|(name, _)| name.as_str() == "rsolvefixture.broken"),
-        "the malformed record must not enter the catalog"
-    );
-    let good = CranCatalog::from_packages(PACKAGES).unwrap();
-    assert_eq!(
-        c.candidate_count(),
-        good.candidate_count(),
-        "a skipped record must not change the candidate count"
-    );
-    let d = &c.diagnostics()[0];
+    let error = CranCatalog::from_packages(&broken).unwrap_err();
+    assert_eq!(error.diagnostics().len(), 1);
+    let d = &error.diagnostics()[0];
     assert_eq!(
         d.package(),
         Some("rsolvefixture.broken"),
