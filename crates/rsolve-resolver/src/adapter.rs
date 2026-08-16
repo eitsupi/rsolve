@@ -601,7 +601,18 @@ impl fmt::Display for ResolutionFailure {
             Self::CandidateLoad { package, source } => {
                 write!(f, "candidate load for {package:?} failed: {source}")
             }
-            Self::NoSolution { diagnostic } => write!(f, "no resolution: {}", diagnostic.summary),
+            Self::NoSolution { diagnostic } => {
+                f.write_str("no resolution")?;
+                if let Some(policy) = diagnostic.publication_policy() {
+                    write!(
+                        f,
+                        " (publication policy evidence in proof: cutoff {}, {} rejection(s))",
+                        policy.cutoff.date(),
+                        policy.rejections.len()
+                    )?;
+                }
+                write!(f, ": {}", diagnostic.summary)
+            }
             Self::InstalledNameConflict {
                 name,
                 first_identity,

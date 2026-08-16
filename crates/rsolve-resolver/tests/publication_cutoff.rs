@@ -232,6 +232,11 @@ fn transitive_publication_proof_reports_all_stable_reasons() {
         .collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
+    let display = error.to_string();
+    assert!(display.contains("publication policy evidence in proof"));
+    assert!(display.contains("cutoff 2026-06-01"));
+    assert!(display.contains("2 rejection(s)"));
+    assert!(display.contains("Derived"));
     let ResolutionFailure::NoSolution { diagnostic } = error else {
         panic!("expected no-solution failure from final proof");
     };
@@ -280,6 +285,11 @@ fn mixed_publication_and_missing_proof_remains_generic_no_solution() {
         .collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
+    let display = error.to_string();
+    assert!(display.contains("publication policy evidence in proof"));
+    assert!(display.contains("cutoff 2026-06-01"));
+    assert!(display.contains("1 rejection(s)"));
+    assert!(display.contains("Derived"));
     let ResolutionFailure::NoSolution { diagnostic } = error else {
         panic!("expected no-solution failure");
     };
@@ -393,6 +403,7 @@ fn ordinary_no_solution_has_no_publication_evidence() {
         candidates: [(package("missing"), Vec::new())].into_iter().collect(),
     };
     let error = resolve(&loader, &PreferLocked, request("missing", HashMap::new())).unwrap_err();
+    assert!(error.to_string().starts_with("no resolution: "));
     let ResolutionFailure::NoSolution { diagnostic } = error else {
         panic!("expected no-solution failure");
     };
