@@ -71,6 +71,11 @@ fn canonical_mirror(input: &str) -> Result<Box<str>, ConfigError> {
     let mut url = url::Url::parse(input).map_err(|error| ConfigError::InvalidMirror {
         diagnostic: error.to_string().into(),
     })?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::InvalidMirror {
+            diagnostic: "mirror URL must not include userinfo".into(),
+        });
+    }
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ConfigError::InvalidMirror {
             diagnostic: "mirror must use HTTP or HTTPS".into(),
@@ -211,6 +216,21 @@ mod tests {
             parse_config(Some(DEFAULT_CRAN_MIRROR), &["not-a-version"]),
             Err(ConfigError::InvalidRVersion { .. })
         ));
+    }
+
+    #[test]
+    fn mirror_userinfo_is_rejected_without_network_access() {
+        for mirror in [
+            "https://username@example.test/cran",
+            "https://username:password@example.test/cran",
+        ] {
+            assert_eq!(
+                parse_config(Some(mirror), &[]),
+                Err(ConfigError::InvalidMirror {
+                    diagnostic: "mirror URL must not include userinfo".into(),
+                })
+            );
+        }
     }
 
     #[test]
