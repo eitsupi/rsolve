@@ -48,13 +48,32 @@ fn target() -> ResolutionTarget {
 }
 
 fn release(name: &str, version: &str, publication: Option<&str>) -> PackageRelease {
+    release_with_dependencies(name, version, publication, Vec::new())
+}
+
+fn release_with_dependencies(
+    name: &str,
+    version: &str,
+    publication: Option<&str>,
+    dependencies: Vec<DependencyRequirement>,
+) -> PackageRelease {
+    release_with_namespace(name, version, publication, "cran", dependencies)
+}
+
+fn release_with_namespace(
+    name: &str,
+    version: &str,
+    publication: Option<&str>,
+    namespace: &str,
+    dependencies: Vec<DependencyRequirement>,
+) -> PackageRelease {
     let name = package(name);
     let version = rsolve_core::RPackageVersion::parse(version).unwrap();
     PackageRelease::try_from(ReleaseObservation {
         identity: ReleaseIdentity::new(
             name.clone(),
             Provenance::RegistryRelease {
-                namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                namespace: rsolve_core::PackageNamespace::new(namespace).unwrap(),
                 version: version.clone(),
             },
         ),
@@ -62,7 +81,7 @@ fn release(name: &str, version: &str, publication: Option<&str>) -> PackageRelea
         observed_version: version,
         metadata: ReleaseMetadata::default(),
         publication: publication.map(|value| rsolve_core::ReleasePublication::new(date(value))),
-        dependencies: Vec::new(),
+        dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
@@ -128,6 +147,93 @@ fn cooldown_excludes_newer_release_and_selects_mature_fallback() {
         resolution.selected(&name).unwrap().version().as_str(),
         "1.0.0"
     );
+}
+
+fn hard_dependency(name: &str) -> DependencyRequirement {
+    DependencyRequirement::new(
+        DependencyKind::Depends,
+        package(name),
+        DependencySourceConstraint::Any,
+        VersionConstraint::unconstrained(),
+    )
+}
+
+#[test]
+fn publication_ineligible_transitive_dependency_backtracks_parent_version() {
+    let loader = FixtureLoader {
+        candidates: [
+            (
+                package("parent"),
+                vec![
+                    release_with_dependencies(
+                        "parent",
+                        "2.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("child")],
+                    ),
+                    release("parent", "1.0.0", Some("2026-01-01")),
+                ],
+            ),
+            (package("child"), vec![release("child", "1.0.0", None)]),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let resolution = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap();
+    assert_eq!(
+        resolution
+            .selected(&package("parent"))
+            .unwrap()
+            .version()
+            .as_str(),
+        "1.0.0"
+    );
+}
+
+#[test]
+fn transitive_publication_proof_reports_all_stable_reasons() {
+    let loader = FixtureLoader {
+        candidates: [
+            (
+                package("parent"),
+                vec![
+                    release_with_dependencies(
+                        "parent",
+                        "2.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("childnew")],
+                    ),
+                    release_with_dependencies(
+                        "parent",
+                        "1.0.0",
+                        Some("2026-01-01"),
+                        vec![hard_dependency("childunknown")],
+                    ),
+                ],
+            ),
+            (
+                package("childnew"),
+                vec![release("childnew", "1.0.0", Some("2026-07-01"))],
+            ),
+            (
+                package("childunknown"),
+                vec![release("childunknown", "1.0.0", None)],
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let error = resolve(&loader, &PreferLocked, request("parent", HashMap::new())).unwrap_err();
+    let ResolutionFailure::PublicationIneligible { rejections, .. } = error else {
+        panic!("expected publication policy failure from final proof");
+    };
+    assert!(matches!(
+        rejections.as_ref(),
+        [
+            PublicationRejection::PublicationCooldown { identity: first, .. },
+            PublicationRejection::PublicationUnknown { identity: second }
+        ] if first.name().as_str() == "childnew" && second.name().as_str() == "childunknown"
+    ));
 }
 
 #[test]
@@ -222,6 +328,27 @@ fn mixed_publication_rejections_are_lossless_and_stable() {
             PublicationRejection::PublicationCooldown { .. },
             PublicationRejection::PublicationUnknown { .. }
         ]
+    ));
+}
+
+#[test]
+fn same_version_eligible_identity_survives_ineligible_identity() {
+    let loader = FixtureLoader {
+        candidates: [(
+            package("demo"),
+            vec![
+                release_with_namespace("demo", "1.0.0", None, "other", Vec::new()),
+                release("demo", "1.0.0", Some("2026-01-01")),
+            ],
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let resolution = resolve(&loader, &PreferLocked, request("demo", HashMap::new())).unwrap();
+    assert!(matches!(
+        resolution.selected(&package("demo")).unwrap().identity().provenance(),
+        rsolve_core::Provenance::RegistryRelease { namespace, .. }
+            if namespace.as_str() == "cran"
     ));
 }
 

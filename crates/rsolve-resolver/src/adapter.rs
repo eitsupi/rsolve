@@ -7,8 +7,8 @@ use std::error::Error;
 use std::fmt;
 
 use pubgrub::{
-    Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
-    PubGrubError, Ranges, resolve,
+    Dependencies, DependencyConstraints, DependencyProvider, DerivationTree, External,
+    PackageResolutionStatistics, PubGrubError, Ranges, resolve,
 };
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
@@ -25,6 +25,30 @@ enum PackageId {
     Subject(SolverKey),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderMessage {
+    Text(String),
+    Publication {
+        cutoff: PublicationDate,
+        rejections: Vec<PublicationRejection>,
+    },
+}
+
+impl fmt::Display for ProviderMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(message) => f.write_str(message),
+            Self::Publication { rejections, .. } => {
+                write!(
+                    f,
+                    "{} publication-ineligible candidate(s)",
+                    rejections.len()
+                )
+            }
+        }
+    }
+}
+
 impl fmt::Display for PackageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -37,16 +61,7 @@ impl fmt::Display for PackageId {
 #[derive(Debug)]
 struct AdapterError {
     package: SolverKey,
-    source: AdapterErrorSource,
-}
-
-#[derive(Debug)]
-enum AdapterErrorSource {
-    CandidateLoad(Box<CandidateLoadError>),
-    PublicationIneligible {
-        cutoff: PublicationDate,
-        rejections: Box<[PublicationRejection]>,
-    },
+    source: Box<CandidateLoadError>,
 }
 
 impl fmt::Display for AdapterError {
@@ -57,30 +72,14 @@ impl fmt::Display for AdapterError {
 
 impl Error for AdapterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match &self.source {
-            AdapterErrorSource::CandidateLoad(source) => Some(source.as_ref()),
-            AdapterErrorSource::PublicationIneligible { .. } => None,
-        }
-    }
-}
-
-impl fmt::Display for AdapterErrorSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CandidateLoad(source) => source.fmt(f),
-            Self::PublicationIneligible { cutoff, rejections } => write!(
-                f,
-                "publication cutoff {cutoff} rejected {} candidate(s)",
-                rejections.len()
-            ),
-        }
+        Some(self.source.as_ref())
     }
 }
 
 fn candidate_load_error(package: SolverKey, source: CandidateLoadError) -> Box<AdapterError> {
     Box::new(AdapterError {
         package,
-        source: AdapterErrorSource::CandidateLoad(Box::new(source)),
+        source: Box::new(source),
     })
 }
 
@@ -225,56 +224,106 @@ impl<'a> Provider<'a> {
                 range.is_none_or(|range| range.contains(candidate.version()))
             })
             .collect();
-        if let Some(cutoff) = self.request.publication_cutoff.map(|cutoff| cutoff.date()) {
-            let mut rejections = eligible
-                .iter()
-                .filter_map(|candidate| {
-                    if candidate.is_r_base_package()
-                        || locked
-                            .as_ref()
-                            .is_some_and(|identity| candidate.identity() == identity)
-                    {
-                        return None;
-                    }
-                    match candidate.publication() {
-                        Some(publication) if publication.date() > cutoff => {
-                            Some(PublicationRejection::PublicationCooldown {
-                                identity: candidate.identity().clone(),
-                                published: publication.date(),
-                            })
-                        }
-                        Some(_) => None,
-                        None => Some(PublicationRejection::PublicationUnknown {
-                            identity: candidate.identity().clone(),
-                        }),
-                    }
-                })
-                .collect::<Vec<_>>();
+        if self.request.publication_cutoff.is_some() {
+            let candidates_before_policy = eligible.clone();
+            let rejections = self.publication_rejections(&eligible, locked.as_ref());
             if !rejections.is_empty() {
-                rejections.sort_by(|left, right| {
-                    publication_rejection_sort_key(left).cmp(&publication_rejection_sort_key(right))
-                });
                 eligible.retain(|candidate| {
-                    candidate.is_r_base_package()
-                        || locked
-                            .as_ref()
-                            .is_some_and(|identity| candidate.identity() == identity)
-                        || candidate
-                            .publication()
-                            .is_some_and(|publication| publication.date() <= cutoff)
+                    !rejections.iter().any(|rejection| match rejection {
+                        PublicationRejection::PublicationCooldown { identity, .. }
+                        | PublicationRejection::PublicationUnknown { identity } => {
+                            candidate.identity() == identity
+                        }
+                    })
                 });
+                // PubGrub must be allowed to inspect one rejected version so that
+                // the rejection becomes an incompatibility and can backtrack.
                 if eligible.is_empty() {
-                    return Err(Box::new(AdapterError {
-                        package: subject.clone(),
-                        source: AdapterErrorSource::PublicationIneligible {
-                            cutoff,
-                            rejections: rejections.into_boxed_slice(),
-                        },
-                    }));
+                    eligible = candidates_before_policy;
                 }
             }
         }
         Ok(use_candidates(&mut eligible, &context))
+    }
+
+    fn publication_rejections(
+        &self,
+        candidates: &[PackageRelease],
+        locked: Option<&ReleaseIdentity>,
+    ) -> Vec<PublicationRejection> {
+        let Some(cutoff) = self.request.publication_cutoff.map(|cutoff| cutoff.date()) else {
+            return Vec::new();
+        };
+        let mut rejections = candidates
+            .iter()
+            .filter_map(|candidate| {
+                if candidate.is_r_base_package()
+                    || locked.is_some_and(|identity| candidate.identity() == identity)
+                {
+                    return None;
+                }
+                match candidate.publication() {
+                    Some(publication) if publication.date() > cutoff => {
+                        Some(PublicationRejection::PublicationCooldown {
+                            identity: candidate.identity().clone(),
+                            published: publication.date(),
+                        })
+                    }
+                    Some(_) => None,
+                    None => Some(PublicationRejection::PublicationUnknown {
+                        identity: candidate.identity().clone(),
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        rejections.sort_by(|left, right| {
+            publication_rejection_sort_key(left).cmp(&publication_rejection_sort_key(right))
+        });
+        rejections
+    }
+
+    fn publication_rejections_for_version(
+        &self,
+        subject: &SolverKey,
+        version: &RPackageVersion,
+    ) -> Result<Vec<PublicationRejection>, Box<AdapterError>> {
+        let decision = self.lock_decision(subject);
+        let required = match &decision {
+            LockDecision::Require(identity) => Some(identity),
+            _ => None,
+        };
+        let locked = match &decision {
+            LockDecision::Prefer(identity) | LockDecision::Require(identity) => {
+                Some(identity.clone())
+            }
+            LockDecision::Unlocked => None,
+        };
+        let candidates = self.candidates(subject)?;
+        let matching = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.version() == version
+                    && required
+                        .as_ref()
+                        .is_none_or(|identity| candidate.identity() == *identity)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let rejections = self.publication_rejections(&matching, locked.as_ref());
+        if rejections.is_empty() {
+            return Ok(rejections);
+        }
+        if matching.iter().any(|candidate| {
+            !rejections.iter().any(|rejection| match rejection {
+                PublicationRejection::PublicationCooldown { identity, .. }
+                | PublicationRejection::PublicationUnknown { identity } => {
+                    candidate.identity() == identity
+                }
+            })
+        }) {
+            return Ok(Vec::new());
+        }
+        Ok(rejections)
     }
 
     fn compare_candidates(
@@ -319,10 +368,10 @@ impl<'a> Provider<'a> {
         candidate.ok_or_else(|| {
             Box::new(AdapterError {
                 package: subject.clone(),
-                source: AdapterErrorSource::CandidateLoad(Box::new(CandidateLoadError::new(
+                source: Box::new(CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
                     format!("selected version {version} was not in the loaded catalog"),
-                ))),
+                )),
             })
         })
     }
@@ -333,7 +382,7 @@ impl DependencyProvider for Provider<'_> {
     type V = RPackageVersion;
     type VS = Ranges<RPackageVersion>;
     type Priority = (Reverse<usize>, String);
-    type M = String;
+    type M = ProviderMessage;
     type Err = Box<AdapterError>;
 
     fn prioritize(
@@ -388,7 +437,9 @@ impl DependencyProvider for Provider<'_> {
             PackageId::Root => {
                 let root_version = RPackageVersion::parse("0.0").expect("root version");
                 if version != &root_version {
-                    return Ok(Dependencies::Unavailable("unknown root version".to_owned()));
+                    return Ok(Dependencies::Unavailable(ProviderMessage::Text(
+                        "unknown root version".to_owned(),
+                    )));
                 }
                 let mut dependencies = Vec::new();
                 dependencies.push((
@@ -409,6 +460,18 @@ impl DependencyProvider for Provider<'_> {
                 Ok(Dependencies::Available(DependencyConstraints::default()))
             }
             PackageId::Subject(subject) => {
+                let rejections = self.publication_rejections_for_version(subject, version)?;
+                if !rejections.is_empty() {
+                    let cutoff = self
+                        .request
+                        .publication_cutoff
+                        .expect("publication rejections require a cutoff")
+                        .date();
+                    return Ok(Dependencies::Unavailable(ProviderMessage::Publication {
+                        cutoff,
+                        rejections,
+                    }));
+                }
                 let release = self.candidate_for_version(subject, version)?;
                 let mut dependencies = Vec::new();
                 for dependency in release.dependencies().iter().filter(|dependency| {
@@ -420,10 +483,10 @@ impl DependencyProvider for Provider<'_> {
                     )
                 }) {
                     if let DependencySourceConstraint::Git { .. } = &dependency.source {
-                        return Ok(Dependencies::Unavailable(format!(
+                        return Ok(Dependencies::Unavailable(ProviderMessage::Text(format!(
                             "Git-sourced dependencies are not supported for package {}",
                             dependency.name
-                        )));
+                        ))));
                     }
                     dependencies.push((
                         PackageId::Subject(self.subject_for_dependency(dependency)?),
@@ -471,7 +534,6 @@ pub enum ResolutionFailure {
         second_identity: Box<rsolve_core::ReleaseIdentity>,
     },
     PublicationIneligible {
-        package: Box<SolverKey>,
         cutoff: PublicationDate,
         rejections: Box<[PublicationRejection]>,
     },
@@ -510,13 +572,9 @@ impl fmt::Display for ResolutionFailure {
                 identity_sort_key(first_identity),
                 identity_sort_key(second_identity),
             ),
-            Self::PublicationIneligible {
-                package,
-                cutoff,
-                rejections,
-            } => write!(
+            Self::PublicationIneligible { cutoff, rejections } => write!(
                 f,
-                "publication cutoff {cutoff} rejected {} candidate(s) for {package:?}",
+                "publication cutoff {cutoff} rejected {} candidate(s)",
                 rejections.len()
             ),
             Self::Solver { diagnostic } => write!(f, "resolver failure: {}", diagnostic.summary),
@@ -618,18 +676,9 @@ fn subject_rank(subject: &SolverKey) -> u8 {
 }
 
 fn map_adapter_error(error: AdapterError) -> ResolutionFailure {
-    let AdapterError { package, source } = error;
-    match source {
-        AdapterErrorSource::CandidateLoad(source) => {
-            ResolutionFailure::CandidateLoad { package, source }
-        }
-        AdapterErrorSource::PublicationIneligible { cutoff, rejections } => {
-            ResolutionFailure::PublicationIneligible {
-                package: Box::new(package),
-                cutoff,
-                rejections,
-            }
-        }
+    ResolutionFailure::CandidateLoad {
+        package: error.package,
+        source: error.source,
     }
 }
 
@@ -638,8 +687,55 @@ fn map_error(error: PubGrubError<Provider<'_>>) -> ResolutionFailure {
         PubGrubError::ErrorRetrievingDependencies { source, .. }
         | PubGrubError::ErrorChoosingVersion { source, .. }
         | PubGrubError::ErrorInShouldCancel(source) => map_adapter_error(*source),
-        PubGrubError::NoSolution(tree) => ResolutionFailure::NoSolution {
-            diagnostic: ResolutionDiagnostic::new(format!("{tree:?}")),
-        },
+        PubGrubError::NoSolution(tree) => {
+            publication_failure_from_tree(&tree).unwrap_or_else(|| ResolutionFailure::NoSolution {
+                diagnostic: ResolutionDiagnostic::new(format!("{tree:?}")),
+            })
+        }
+    }
+}
+
+fn publication_failure_from_tree(
+    tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
+) -> Option<ResolutionFailure> {
+    let mut reasons = Vec::new();
+    collect_publication_rejections(tree, &mut reasons);
+    if reasons.is_empty() {
+        return None;
+    }
+    reasons.sort_by(|left, right| {
+        left.0.cmp(&right.0).then_with(|| {
+            publication_rejection_sort_key(&left.1).cmp(&publication_rejection_sort_key(&right.1))
+        })
+    });
+    reasons.dedup();
+    let cutoff = reasons[0].0;
+    let rejections = reasons
+        .into_iter()
+        .map(|(_, rejection)| rejection)
+        .collect();
+    Some(ResolutionFailure::PublicationIneligible { cutoff, rejections })
+}
+
+fn collect_publication_rejections(
+    tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
+    reasons: &mut Vec<(PublicationDate, PublicationRejection)>,
+) {
+    match tree {
+        DerivationTree::External(External::Custom(
+            _,
+            _,
+            ProviderMessage::Publication { cutoff, rejections },
+        )) => reasons.extend(
+            rejections
+                .iter()
+                .cloned()
+                .map(|rejection| (*cutoff, rejection)),
+        ),
+        DerivationTree::External(_) => {}
+        DerivationTree::Derived(derived) => {
+            collect_publication_rejections(&derived.cause1, reasons);
+            collect_publication_rejections(&derived.cause2, reasons);
+        }
     }
 }
