@@ -272,26 +272,27 @@ pub(super) fn distributions_for_observation(
     let registry = observation
         .distribution_registry
         .resolve(configured_registry);
-    let mut distributions = release
-        .distributions()
-        .iter()
-        .cloned()
-        .map(|mut distribution| {
-            distribution.registry = registry.clone();
-            distribution.artifacts.clear();
-            distribution
-        })
-        .collect::<Vec<_>>();
-    if distributions.is_empty() {
-        distributions.push(Distribution {
+    let mut distributions = match release.distributions() {
+        [] => vec![Distribution {
             registry: registry.clone(),
             channel: rsolve_core::DistributionChannel::new("source")
                 .expect("fixed channel is valid"),
             snapshot: None,
             artifacts: Vec::new(),
             observed_metadata: DistributionMetadata::default(),
-        });
-    }
+        }],
+        [template] => {
+            let mut distribution = template.clone();
+            distribution.registry = registry;
+            distribution.artifacts.clear();
+            vec![distribution]
+        }
+        _ => {
+            return Err(EvidenceCompositionError::Invalid(
+                "artifact-bound observation has multiple distribution templates".into(),
+            ));
+        }
+    };
     let locator = ArtifactLocator::new(&artifact.locator)
         .map_err(|error| EvidenceCompositionError::Invalid(error.to_string()))?;
     let upstream_checksums = artifact

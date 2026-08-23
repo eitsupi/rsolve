@@ -5,8 +5,9 @@ use crate::snapshot::{
 };
 use rsolve_core::{
     Artifact, ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
-    PackageName, PackageNamespace, PackageRelease, RPackageVersion, RegistryId, RelationOp,
-    SourceArtifact, VersionClause, VersionConstraint,
+    Distribution, DistributionChannel, DistributionMetadata, PackageName, PackageNamespace,
+    PackageRelease, RPackageVersion, RegistryId, RelationOp, SourceArtifact, VersionClause,
+    VersionConstraint,
 };
 
 fn source(kind: &str, digest: u8) -> SourceInput {
@@ -35,6 +36,18 @@ fn release_with_preexisting_artifact(fields: &[(&str, &str)]) -> PackageRelease 
             upstream_checksums: vec![],
             size: None,
         }));
+    PackageRelease::try_from(observation).unwrap()
+}
+
+fn release_with_multiple_distribution_templates(fields: &[(&str, &str)]) -> PackageRelease {
+    let mut observation = super::super::catalog::observation_from_fields(fields).unwrap();
+    observation.distributions.push(Distribution {
+        registry: RegistryId::new("other-registry").unwrap(),
+        channel: DistributionChannel::new("binary").unwrap(),
+        snapshot: None,
+        artifacts: vec![],
+        observed_metadata: DistributionMetadata::default(),
+    });
     PackageRelease::try_from(observation).unwrap()
 }
 
@@ -453,6 +466,21 @@ fn preexisting_release_artifacts_are_not_projected_without_occurrence_evidence()
             .iter()
             .any(|locator| locator.contains("unobserved.example"))
     );
+}
+
+#[test]
+fn multiple_distribution_templates_fail_closed_for_artifact_observations() {
+    let mut observations = fixture_observations();
+    observations[0].release = Some(release_with_multiple_distribution_templates(&[
+        ("Package", "P3MOverlay"),
+        ("Version", "1.0"),
+    ]));
+    let error = compose_snapshot(context(), observations).unwrap_err();
+    assert!(matches!(
+        error,
+        EvidenceCompositionError::Invalid(message)
+            if message.contains("multiple distribution templates")
+    ));
 }
 
 #[test]
