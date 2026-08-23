@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn build_and_publish_returns_the_generation_it_pinned_before_unlock() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    let input = present_input();
+    let reference =
+        SnapshotGenerationBuilder::new(input.clone(), dir.path().join("reference-generation.redb"))
+            .build()
+            .unwrap();
+    let expected_generation = reference.generation().to_owned();
+
+    let returned = store.build_and_publish(input).unwrap();
+    assert_eq!(returned.header().generation, expected_generation);
+    assert_eq!(
+        returned
+            .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.read_current().unwrap().header().generation,
+        expected_generation
+    );
+}
+
+#[test]
 fn store_publishes_strict_pointer_and_pins_readers() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();

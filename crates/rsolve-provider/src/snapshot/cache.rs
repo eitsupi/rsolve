@@ -140,11 +140,18 @@ impl SnapshotStore {
         let generation = SnapshotGenerationBuilder::new(input, &staging_path)
             .build()
             .map_err(SnapshotPublishError::Build)?;
+        let generation_name = generation.generation().to_owned();
         self.publish_generation(&lock, generation)
             .map_err(SnapshotPublishError::Store)?;
+        // Pin the generation that this operation published before releasing
+        // the lock. A later publisher may replace `current` immediately after
+        // unlock, but must not change the loader returned by this operation.
+        let loader = self
+            .open_generation_locked(&generation_name)
+            .map_err(SnapshotPublishError::Reopen)?;
         drop(lock);
         drop(staging_cleanup);
-        self.read_current().map_err(SnapshotPublishError::Reopen)
+        Ok(loader)
     }
 
     fn unique_staging_path(&self) -> Result<PathBuf, SnapshotStoreError> {
@@ -182,17 +189,7 @@ impl SnapshotStore {
                 store_candidate_error(format!("unable to read current pointer: {error}"))
             })?;
         let pointer = decode_pointer(&pointer_bytes, &self.registry_id)?;
-        let generation_path = self
-            .root
-            .join(GENERATIONS_DIR)
-            .join(format!("{}.redb", pointer.generation));
-        let loader =
-            ReadOnlySnapshotCandidateLoader::open(&generation_path, self.registry_id.clone())?;
-        if loader.header().generation != pointer.generation {
-            return Err(store_candidate_error(
-                "current pointer generation does not match generation header",
-            ));
-        }
+        let loader = self.open_generation_locked(&pointer.generation)?;
         let header_bytes = super::encode_header(loader.header()).map_err(|error| {
             store_candidate_error(format!("unable to encode generation header: {error}"))
         })?;
@@ -200,6 +197,26 @@ impl SnapshotStore {
         if actual_header_sha256 != pointer.header_sha256 {
             return Err(store_candidate_error(
                 "current pointer header digest mismatch",
+            ));
+        }
+        Ok(loader)
+    }
+
+    fn open_generation_locked(
+        &self,
+        generation: &str,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, CandidateLoadError> {
+        let generation_path = self
+            .root
+            .join(GENERATIONS_DIR)
+            .join(format!("{generation}.redb"));
+        let loader =
+            ReadOnlySnapshotCandidateLoader::open(&generation_path, self.registry_id.clone())?;
+        if loader.header().registry_id != self.registry_id.as_str()
+            || loader.header().generation != generation
+        {
+            return Err(store_candidate_error(
+                "generation identity does not match the requested store generation",
             ));
         }
         Ok(loader)
