@@ -1,9 +1,10 @@
 use super::*;
+use crate::{LockedPackage, LockedResolution};
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, DependencyKind, DependencyRequirement,
-    DependencySourceConstraint, PackageName, PackageNamespace, PackageRelease, Provenance,
-    RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ResolutionTarget,
-    SolverKey, VersionConstraint,
+    DependencySourceConstraint, GitCommitId, NormalizedGitUrl, PackageName, PackageNamespace,
+    PackageRelease, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
+    ReleaseObservation, ResolutionTarget, Sha256Digest, SolverKey, SourceScheme, VersionConstraint,
 };
 use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_resolver::R_BASE_PACKAGE_NAMES;
@@ -123,6 +124,35 @@ fn release_at_version(name: &PackageName, value: &str) -> PackageRelease {
         dependencies: Vec::new(),
         distributions: Vec::new(),
     })
+    .unwrap()
+}
+
+fn release_with_identity(identity: ReleaseIdentity, version: RPackageVersion) -> PackageRelease {
+    PackageRelease::try_from(ReleaseObservation {
+        observed_package: identity.name().clone(),
+        observed_version: version.clone(),
+        metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        identity,
+        publication: None,
+        dependencies: Vec::new(),
+        distributions: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn lock_for_identity(identity: ReleaseIdentity, version: RPackageVersion) -> Lockfile {
+    Lockfile::new(vec![LockedResolution {
+        target: ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        environment: EnvironmentId::new("default").unwrap(),
+        publication_cutoff: None,
+        packages: vec![LockedPackage {
+            identity,
+            version,
+            published_version_spelling: None,
+            dependencies: Vec::new(),
+            metadata_sha256: Sha256Digest::new("0".repeat(64)).unwrap(),
+        }],
+    }])
     .unwrap()
 }
 
@@ -452,6 +482,92 @@ fn require_exact_identity_mismatch_diagnostics_are_order_independent() {
             second_release.clone(),
         ]),
         run(vec![refreshed_root, second_release, first_release])
+    );
+}
+
+#[test]
+fn require_exact_rejects_same_git_commit_with_changed_semantic_version() {
+    let name = PackageName::new("gitpkg").unwrap();
+    let identity = ReleaseIdentity::new(
+        name.clone(),
+        Provenance::GitCommit {
+            repository: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
+            commit: GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            subdirectory: None,
+        },
+    );
+    let lock = lock_for_identity(identity.clone(), RPackageVersion::parse("1.0").unwrap());
+    let error = resolve_with_lock_policy(
+        manifest_for(name),
+        &lock,
+        &EnvironmentId::new("default").unwrap(),
+        LockResolutionPolicy::RequireExact,
+        &FixtureLoader {
+            package: release_with_identity(identity, RPackageVersion::parse("2.0").unwrap()),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CranResolutionError::Lock(LockError::ExactIdentitySetMismatch { missing, extra })
+            if missing.iter().any(|value| value.ends_with("@1"))
+                && extra.iter().any(|value| value.ends_with("@2"))
+    ));
+}
+
+#[test]
+fn require_exact_rejects_same_immutable_source_with_changed_semantic_version() {
+    let name = PackageName::new("immutablepkg").unwrap();
+    let identity = ReleaseIdentity::new(
+        name.clone(),
+        Provenance::ImmutableSource {
+            scheme: SourceScheme::new("sha256").unwrap(),
+            digest: Sha256Digest::new("a".repeat(64)).unwrap(),
+        },
+    );
+    let lock = lock_for_identity(identity.clone(), RPackageVersion::parse("1.0").unwrap());
+    let error = resolve_with_lock_policy(
+        manifest_for(name),
+        &lock,
+        &EnvironmentId::new("default").unwrap(),
+        LockResolutionPolicy::RequireExact,
+        &FixtureLoader {
+            package: release_with_identity(identity, RPackageVersion::parse("2.0").unwrap()),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CranResolutionError::Lock(LockError::ExactIdentitySetMismatch { missing, extra })
+            if missing.iter().any(|value| value.ends_with("@1"))
+                && extra.iter().any(|value| value.ends_with("@2"))
+    ));
+}
+
+#[test]
+fn require_exact_treats_trailing_zero_versions_as_semantically_equal() {
+    let name = PackageName::new("registrypkg").unwrap();
+    let identity = ReleaseIdentity::new(
+        name.clone(),
+        Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: RPackageVersion::parse("4.4").unwrap(),
+        },
+    );
+    let lock = lock_for_identity(identity.clone(), RPackageVersion::parse("4.4").unwrap());
+    let resolution = resolve_with_lock_policy(
+        manifest_for(name),
+        &lock,
+        &EnvironmentId::new("default").unwrap(),
+        LockResolutionPolicy::RequireExact,
+        &FixtureLoader {
+            package: release_with_identity(identity, RPackageVersion::parse("4.4.0").unwrap()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        resolution.packages().first().unwrap().version().as_str(),
+        "4.4.0"
     );
 }
 

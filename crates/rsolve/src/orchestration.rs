@@ -179,32 +179,46 @@ fn verify_exact_identity_set(
     let expected = consumed
         .packages()
         .iter()
-        .map(|package| package.identity.clone())
+        .map(|package| (package.identity.clone(), package.version.clone()))
         .collect::<HashSet<_>>();
     let actual = resolution
         .packages()
         .iter()
         .filter(|package| !package.identity().provenance().is_r_base_package())
-        .map(|package| package.identity().clone())
+        .map(|package| (package.identity().clone(), package.version().clone()))
         .collect::<HashSet<_>>();
     if expected == actual {
         return Ok(());
     }
     let missing = expected
         .difference(&actual)
-        .map(identity_key)
+        .map(|(identity, version)| semantic_identity_key(identity, version))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let extra = actual
         .difference(&expected)
-        .map(identity_key)
+        .map(|(identity, version)| semantic_identity_key(identity, version))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     Err(CranResolutionError::Lock(
         LockError::ExactIdentitySetMismatch { missing, extra },
     ))
+}
+
+fn semantic_identity_key(
+    identity: &rsolve_core::ReleaseIdentity,
+    version: &rsolve_core::RPackageVersion,
+) -> String {
+    let count = version.canonical_component_count();
+    let canonical_version = version
+        .components()
+        .take(count)
+        .map(|component| component.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{}@{canonical_version}", identity_key(identity))
 }
 
 pub(super) fn resolve_request(
