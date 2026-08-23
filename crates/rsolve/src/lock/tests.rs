@@ -44,6 +44,18 @@ fn environment() -> EnvironmentId {
     EnvironmentId::new("default").unwrap()
 }
 
+fn manifest_for(name: &str, constraint: VersionConstraint) -> Manifest {
+    Manifest::new(
+        VersionConstraint::from_clause(RelationOp::Ge, version("4.0")),
+        crate::manifest::ManifestTarget::new(target().r_version),
+        vec![crate::manifest::ManifestDependency::new(
+            package(name),
+            constraint,
+        )],
+    )
+    .unwrap()
+}
+
 fn digest() -> Sha256Digest {
     Sha256Digest::new("0".repeat(64)).unwrap()
 }
@@ -251,6 +263,144 @@ fn publication_cutoff_is_reconstructed_from_lock() {
         request.publication_cutoff.map(|cutoff| cutoff.date()),
         Some(rsolve_core::PublicationCutoff::new(cutoff).date())
     );
+}
+
+#[test]
+fn consume_locked_graph_preserves_locked_records_without_a_loader() {
+    let root = release("root", "1.0.0");
+    let dependency = release("dependency", "2.0.0");
+    let mut root_package = LockedPackage::from_release(&root);
+    root_package.dependencies = vec![package("dependency")];
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![root_package, LockedPackage::from_release(&dependency)],
+    }])
+    .unwrap();
+    let before = lock.clone();
+
+    let graph = lock
+        .consume_locked_graph(
+            manifest_for("root", VersionConstraint::unconstrained()),
+            &environment(),
+        )
+        .unwrap();
+
+    assert_eq!(lock, before);
+    assert_eq!(graph.target(), &target());
+    assert_eq!(graph.environment(), &environment());
+    assert_eq!(graph.packages(), lock.single_resolution().unwrap().packages);
+    let root_package = graph
+        .packages()
+        .iter()
+        .find(|locked| locked.identity.name() == &package("root"))
+        .unwrap();
+    assert_eq!(root_package.dependencies, vec![package("dependency")]);
+}
+
+#[test]
+fn consume_locked_graph_rejects_root_and_r_constraint_mismatches() {
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![LockedPackage::from_release(&release("root", "1.0.0"))],
+    }])
+    .unwrap();
+    assert!(matches!(
+        lock.consume_locked_graph(
+            manifest_for("missing", VersionConstraint::unconstrained()),
+            &environment(),
+        ),
+        Err(LockError::DirectRootMissing { name }) if name == "missing"
+    ));
+    assert!(matches!(
+        lock.consume_locked_graph(
+            manifest_for("root", VersionConstraint::from_clause(RelationOp::Ge, version("2.0"))),
+            &environment(),
+        ),
+        Err(LockError::DirectRootVersionMismatch { name }) if name == "root"
+    ));
+    let r_mismatch = Manifest::new(
+        VersionConstraint::from_clause(RelationOp::Ge, version("5.0")),
+        crate::manifest::ManifestTarget::new(target().r_version),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        lock.consume_locked_graph(r_mismatch, &environment()),
+        Err(LockError::RRequirementMismatch)
+    );
+    let other_environment = EnvironmentId::new("other").unwrap();
+    assert!(matches!(
+        lock.consume_locked_graph(
+            manifest_for("root", VersionConstraint::unconstrained()),
+            &other_environment,
+        ),
+        Err(LockError::EnvironmentMismatch { .. })
+    ));
+    let target_mismatch = Manifest::new(
+        VersionConstraint::from_clause(RelationOp::Ge, version("4.0")),
+        crate::manifest::ManifestTarget::new(version("4.5.0")),
+        vec![crate::manifest::ManifestDependency::new(
+            package("root"),
+            VersionConstraint::unconstrained(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        lock.consume_locked_graph(target_mismatch, &environment()),
+        Err(LockError::TargetMismatch)
+    );
+}
+
+#[test]
+fn consume_locked_graph_checks_base_root_against_target_r_version() {
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: Vec::new(),
+    }])
+    .unwrap();
+    let exact_target = manifest_for(
+        "methods",
+        VersionConstraint::from_clause(RelationOp::Eq, version("4.4.0")),
+    );
+    assert!(
+        lock.consume_locked_graph(exact_target, &environment())
+            .is_ok()
+    );
+    let wrong_target = manifest_for(
+        "methods",
+        VersionConstraint::from_clause(RelationOp::Eq, version("4.3.0")),
+    );
+    assert!(matches!(
+        lock.consume_locked_graph(wrong_target, &environment()),
+        Err(LockError::DirectRootVersionMismatch { name }) if name == "methods"
+    ));
+}
+
+#[test]
+fn consume_locked_graph_rejects_unreachable_locked_packages() {
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![
+            LockedPackage::from_release(&release("root", "1.0.0")),
+            LockedPackage::from_release(&release("extra", "1.0.0")),
+        ],
+    }])
+    .unwrap();
+    assert!(matches!(
+        lock.consume_locked_graph(
+            manifest_for("root", VersionConstraint::unconstrained()),
+            &environment(),
+        ),
+        Err(LockError::UnreachablePackage { package }) if package == "extra"
+    ));
 }
 
 #[test]

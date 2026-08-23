@@ -13,16 +13,17 @@ mod prepared_snapshot;
 pub mod wire;
 
 pub use lock::{
-    EnvironmentId, EnvironmentIdError, LockError, LockedPackage, LockedResolution, Lockfile,
+    ConsumedLockedGraph, EnvironmentId, EnvironmentIdError, LockError, LockedPackage,
+    LockedResolution, Lockfile, consume_locked_graph,
 };
 pub use manifest::{
     Manifest, ManifestDependency, ManifestError, ManifestTarget, compose_resolution_request,
     compose_resolution_request_with_locked,
 };
 pub use orchestration::{
-    CranResolutionError, CranResolutionOutcome, ResolutionMode, resolve_from_cran,
+    CranResolutionError, CranResolutionOutcome, LockResolutionPolicy, resolve_from_cran,
     resolve_from_cran_with_publication_cutoff, resolve_with_loader,
-    resolve_with_loader_with_publication_cutoff, resolve_with_lock,
+    resolve_with_loader_with_publication_cutoff, resolve_with_lock_policy,
 };
 pub use pak::{
     PakArtifact, PakInstallRequest, PakInstallResult, PakInstalledPackage, PakProcessConfig,

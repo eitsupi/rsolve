@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -11,10 +12,10 @@ use rsolve_provider::cran::{
 use rsolve_provider::{SnapshotStore, SnapshotStoreError};
 use rsolve_resolver::{
     DefaultCandidatePreference, PreferLocked, RBasePackageOverlay, RequireLocked,
-    ResolutionFailure, Resolver,
+    ResolutionFailure, Resolver, Unlocked,
 };
 
-use crate::lock::{EnvironmentId, LockError, Lockfile};
+use crate::lock::{ConsumedLockedGraph, EnvironmentId, LockError, Lockfile, identity_key};
 use crate::manifest::{Manifest, ManifestError, compose_resolution_request};
 use std::io;
 use tempfile::tempdir;
@@ -83,11 +84,13 @@ impl Error for CranResolutionError {
     }
 }
 
-/// Whether a lock is a soft preference or an exact constraint.
+/// Whether resolver verification treats locked identities as a preference or
+/// an exact constraint. Direct lock consumption is exposed separately through
+/// [`crate::lock::ConsumedLockedGraph`] and never invokes a resolver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResolutionMode {
-    Normal,
-    Frozen,
+pub enum LockResolutionPolicy {
+    Prefer,
+    RequireExact,
 }
 
 /// A concrete CRAN resolution together with its per-package refresh diagnostics.
@@ -134,43 +137,98 @@ pub fn resolve_with_loader_with_publication_cutoff(
 
 /// Resolve a manifest using a shared logical lock and an injected loader.
 ///
-/// The lock contributes identities only; resolver policy remains owned by
-/// `rsolve-resolver`, where normal mode uses `PreferLocked` and frozen mode uses
-/// `RequireLocked`.
-pub fn resolve_with_lock(
+/// This is the resolver verification/update path; use
+/// [`Lockfile::consume_locked_graph`] when the locked graph must be consumed
+/// directly without candidate loading. `RequireExact` additionally applies
+/// consume applicability and exact non-base identity-set verification after
+/// resolution; metadata digests and dependency-edge metadata are not part of
+/// that postcondition.
+pub fn resolve_with_lock_policy(
     manifest: Manifest,
     lockfile: &Lockfile,
     environment: &EnvironmentId,
-    mode: ResolutionMode,
+    policy: LockResolutionPolicy,
     loader: &dyn CandidateLoader,
 ) -> Result<Resolution, CranResolutionError> {
+    let consumed = if policy == LockResolutionPolicy::RequireExact {
+        Some(
+            lockfile
+                .consume_locked_graph(manifest.clone(), environment)
+                .map_err(CranResolutionError::Lock)?,
+        )
+    } else {
+        None
+    };
     let request = lockfile
         .resolution_request(manifest, environment)
         .map_err(CranResolutionError::Lock)?;
     let overlay =
         RBasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
             .map_err(CranResolutionError::Refresh)?;
-    resolve_request_with_mode(request, &overlay, mode)
+    let resolution = resolve_request_with_policy(request, &overlay, policy)?;
+    if let Some(consumed) = consumed {
+        verify_exact_identity_set(&resolution, &consumed)?;
+    }
+    Ok(resolution)
+}
+
+fn verify_exact_identity_set(
+    resolution: &Resolution,
+    consumed: &ConsumedLockedGraph,
+) -> Result<(), CranResolutionError> {
+    let expected = consumed
+        .packages()
+        .iter()
+        .map(|package| package.identity.clone())
+        .collect::<HashSet<_>>();
+    let actual = resolution
+        .packages()
+        .iter()
+        .filter(|package| !package.identity().provenance().is_r_base_package())
+        .map(|package| package.identity().clone())
+        .collect::<HashSet<_>>();
+    if expected == actual {
+        return Ok(());
+    }
+    let missing = expected
+        .difference(&actual)
+        .map(identity_key)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let extra = actual
+        .difference(&expected)
+        .map(identity_key)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Err(CranResolutionError::Lock(
+        LockError::ExactIdentitySetMismatch { missing, extra },
+    ))
 }
 
 pub(super) fn resolve_request(
     request: rsolve_core::ResolutionRequest,
     loader: &dyn CandidateLoader,
 ) -> Result<Resolution, CranResolutionError> {
-    resolve_request_with_mode(request, loader, ResolutionMode::Normal)
+    let preference = DefaultCandidatePreference;
+    let unlocked = Unlocked;
+    Resolver::new(loader, &preference, &unlocked)
+        .resolve(request)
+        .map_err(CranResolutionError::Resolution)
 }
 
-fn resolve_request_with_mode(
+fn resolve_request_with_policy(
     request: rsolve_core::ResolutionRequest,
     loader: &dyn CandidateLoader,
-    mode: ResolutionMode,
+    policy: LockResolutionPolicy,
 ) -> Result<Resolution, CranResolutionError> {
     let preference = DefaultCandidatePreference;
     let prefer = PreferLocked;
     let require = RequireLocked;
-    let lock_policy: &dyn rsolve_resolver::LockUpdatePolicy = match mode {
-        ResolutionMode::Normal => &prefer,
-        ResolutionMode::Frozen => &require,
+    let lock_policy: &dyn rsolve_resolver::LockUpdatePolicy = match policy {
+        LockResolutionPolicy::Prefer => &prefer,
+        LockResolutionPolicy::RequireExact => &require,
     };
     Resolver::new(loader, &preference, lock_policy)
         .resolve(request)
@@ -278,7 +336,12 @@ mod tests {
                         .iter()
                         .any(|release| release.identity().name() == name) =>
                 {
-                    Ok(self.packages.clone())
+                    Ok(self
+                        .packages
+                        .iter()
+                        .filter(|release| release.identity().name() == name)
+                        .cloned()
+                        .collect())
                 }
                 SolverKey::InstalledName(_) | SolverKey::R => Ok(Vec::new()),
                 _ => Err(CandidateLoadError::new(
@@ -503,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_boundary_uses_soft_fallback_and_frozen_exact_policy() {
+    fn lock_boundary_uses_prefer_fallback_and_require_exact_policy() {
         let name = PackageName::new("choice").unwrap();
         let old = release_at_version(&name, "1.0.0");
         let newer = release_at_version(&name, "2.0.0");
@@ -519,24 +582,191 @@ mod tests {
         let loader = ChoiceLoader {
             packages: vec![newer.clone()],
         };
-        let normal = resolve_with_lock(
+        let normal = resolve_with_lock_policy(
             manifest_for(name.clone()),
             &lock,
             &environment,
-            ResolutionMode::Normal,
+            LockResolutionPolicy::Prefer,
             &loader,
         )
         .unwrap();
         assert_eq!(normal.selected(&name).unwrap().version(), newer.version());
         assert!(
-            resolve_with_lock(
+            resolve_with_lock_policy(
                 manifest_for(name),
                 &lock,
                 &environment,
-                ResolutionMode::Frozen,
+                LockResolutionPolicy::RequireExact,
                 &loader,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn prefer_policy_updates_a_changed_root_without_consume_precondition() {
+        let root = PackageName::new("root").unwrap();
+        let dependency = PackageName::new("dependency").unwrap();
+        let old_root = release_with_dependencies(
+            &root,
+            vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                dependency.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )],
+        );
+        let old_dependency = release_with_dependencies(&dependency, Vec::new());
+        let old_resolution = Resolution::new(
+            ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            vec![
+                rsolve_core::ResolvedPackage::new(SolverKey::InstalledName(root.clone()), old_root),
+                rsolve_core::ResolvedPackage::new(
+                    SolverKey::InstalledName(dependency),
+                    old_dependency,
+                ),
+            ],
+        );
+        let environment = EnvironmentId::new("default").unwrap();
+        let lock = Lockfile::from_resolution(&old_resolution, environment.clone()).unwrap();
+        let changed_manifest = Manifest::new(
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Ge,
+                RPackageVersion::parse("4.0").unwrap(),
+            ),
+            crate::manifest::ManifestTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            vec![crate::manifest::ManifestDependency::new(
+                root.clone(),
+                VersionConstraint::from_clause(
+                    rsolve_core::RelationOp::Ge,
+                    RPackageVersion::parse("2.0.0").unwrap(),
+                ),
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            lock.consume_locked_graph(changed_manifest.clone(), &environment),
+            Err(LockError::DirectRootVersionMismatch { .. })
+        ));
+
+        let newer_root = release_at_version(&root, "2.0.0");
+        let resolution = resolve_with_lock_policy(
+            changed_manifest,
+            &lock,
+            &environment,
+            LockResolutionPolicy::Prefer,
+            &ChoiceLoader {
+                packages: vec![newer_root.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.selected(&root).unwrap().version(),
+            newer_root.version()
+        );
+    }
+
+    #[test]
+    fn require_exact_rejects_new_transitive_identity_from_upstream_metadata() {
+        let root = PackageName::new("root").unwrap();
+        let extra = PackageName::new("extra").unwrap();
+        let old_resolution = Resolution::new(
+            ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            vec![rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(root.clone()),
+                release_at_version(&root, "1.0.0"),
+            )],
+        );
+        let environment = EnvironmentId::new("default").unwrap();
+        let lock = Lockfile::from_resolution(&old_resolution, environment.clone()).unwrap();
+        let refreshed_root = release_with_dependencies(
+            &root,
+            vec![DependencyRequirement::new(
+                DependencyKind::Imports,
+                extra.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )],
+        );
+        let error = resolve_with_lock_policy(
+            manifest_for(root),
+            &lock,
+            &environment,
+            LockResolutionPolicy::RequireExact,
+            &ChoiceLoader {
+                packages: vec![
+                    refreshed_root,
+                    release_with_dependencies(&extra, Vec::new()),
+                ],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CranResolutionError::Lock(LockError::ExactIdentitySetMismatch { missing, extra })
+                if missing.is_empty() && extra.len() == 1
+        ));
+    }
+
+    #[test]
+    fn require_exact_identity_mismatch_diagnostics_are_order_independent() {
+        let root = PackageName::new("root").unwrap();
+        let first = PackageName::new("first").unwrap();
+        let second = PackageName::new("second").unwrap();
+        let lock = Lockfile::from_resolution(
+            &Resolution::new(
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+                vec![rsolve_core::ResolvedPackage::new(
+                    SolverKey::InstalledName(root.clone()),
+                    release_at_version(&root, "1.0.0"),
+                )],
+            ),
+            EnvironmentId::new("default").unwrap(),
+        )
+        .unwrap();
+        let environment = EnvironmentId::new("default").unwrap();
+        let refreshed_root = release_with_dependencies(
+            &root,
+            vec![
+                DependencyRequirement::new(
+                    DependencyKind::Imports,
+                    first.clone(),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                ),
+                DependencyRequirement::new(
+                    DependencyKind::Imports,
+                    second.clone(),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                ),
+            ],
+        );
+        let first_release = release_with_dependencies(&first, Vec::new());
+        let second_release = release_with_dependencies(&second, Vec::new());
+        let run = |packages| {
+            let Err(CranResolutionError::Lock(LockError::ExactIdentitySetMismatch {
+                missing,
+                extra,
+            })) = resolve_with_lock_policy(
+                manifest_for(root.clone()),
+                &lock,
+                &environment,
+                LockResolutionPolicy::RequireExact,
+                &ChoiceLoader { packages },
+            )
+            else {
+                panic!("expected deterministic exact identity mismatch");
+            };
+            (missing, extra)
+        };
+        assert_eq!(
+            run(vec![
+                refreshed_root.clone(),
+                first_release.clone(),
+                second_release.clone(),
+            ]),
+            run(vec![refreshed_root, second_release, first_release])
         );
     }
 

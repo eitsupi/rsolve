@@ -19,6 +19,38 @@ pub use rsolve_core::{EnvironmentId, EnvironmentIdError};
 
 use crate::manifest::{Manifest, ManifestError};
 
+/// An immutable, validated projection of a lockfile for direct consumption.
+///
+/// This graph preserves the locked identities, versions, metadata digests, and
+/// selected dependency edges. It deliberately does not re-check transitive
+/// version constraints, upstream metadata, release eligibility, or publication
+/// policy: those facts cannot be proven from a lockfile alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsumedLockedGraph {
+    target: ResolutionTarget,
+    environment: EnvironmentId,
+    publication_cutoff: Option<PublicationDate>,
+    packages: Vec<LockedPackage>,
+}
+
+impl ConsumedLockedGraph {
+    pub fn target(&self) -> &ResolutionTarget {
+        &self.target
+    }
+
+    pub fn environment(&self) -> &EnvironmentId {
+        &self.environment
+    }
+
+    pub fn publication_cutoff(&self) -> Option<&PublicationDate> {
+        self.publication_cutoff.as_ref()
+    }
+
+    pub fn packages(&self) -> &[LockedPackage] {
+        &self.packages
+    }
+}
+
 /// One validated logical release in a lockfile.
 ///
 /// This type has complete-record equality but deliberately no `Hash`: an
@@ -250,6 +282,78 @@ impl Lockfile {
         ))
     }
 
+    /// Consume this lock as a directly usable, immutable graph.
+    ///
+    /// This operation takes no candidate loader, cache, store, or network
+    /// capability. It returns only the validated graph projection.
+    ///
+    /// Validation covers lock self-consistency, environment and target
+    /// agreement, the manifest R requirement, direct roots, installed-name
+    /// uniqueness, dangling edges, and graph reachability. It does not verify
+    /// transitive version constraints, upstream metadata, release eligibility,
+    /// or publication policy because those facts are not represented by the
+    /// lockfile.
+    pub fn consume_locked_graph(
+        &self,
+        manifest: Manifest,
+        environment: &EnvironmentId,
+    ) -> Result<ConsumedLockedGraph, LockError> {
+        let resolution = self.single_resolution()?;
+        validate_canonical_resolution(resolution)?;
+        let request = self.resolution_request(manifest.clone(), environment)?;
+        if !manifest
+            .r_requirement
+            .satisfies(&resolution.target.r_version)
+        {
+            return Err(LockError::RRequirementMismatch);
+        }
+
+        let by_name = resolution
+            .packages
+            .iter()
+            .map(|package| (package.identity.name().clone(), package))
+            .collect::<BTreeMap<_, _>>();
+        let mut reachable = BTreeSet::new();
+        for requirement in &request.requirements {
+            let name = &requirement.name;
+            if is_r_base_name(name) {
+                if !requirement
+                    .constraint
+                    .satisfies(&resolution.target.r_version)
+                {
+                    return Err(LockError::DirectRootVersionMismatch {
+                        name: name.to_string(),
+                    });
+                }
+                continue;
+            }
+            let package = by_name
+                .get(name)
+                .ok_or_else(|| LockError::DirectRootMissing {
+                    name: name.to_string(),
+                })?;
+            if !requirement.constraint.satisfies(&package.version) {
+                return Err(LockError::DirectRootVersionMismatch {
+                    name: name.to_string(),
+                });
+            }
+            mark_reachable(package, &by_name, &mut reachable)?;
+        }
+        for package in &resolution.packages {
+            if !reachable.contains(package.identity.name()) {
+                return Err(LockError::UnreachablePackage {
+                    package: package.identity.name().to_string(),
+                });
+            }
+        }
+        Ok(ConsumedLockedGraph {
+            target: resolution.target.clone(),
+            environment: resolution.environment.clone(),
+            publication_cutoff: resolution.publication_cutoff,
+            packages: resolution.packages.clone(),
+        })
+    }
+
     pub fn validate(&self) -> Result<(), LockError> {
         validate_resolution_count(self.resolutions.len())?;
         self.validate_contents()
@@ -307,6 +411,16 @@ impl Lockfile {
     }
 }
 
+/// Consume a lockfile as an immutable graph without exposing any resolver or
+/// candidate-loading capability.
+pub fn consume_locked_graph(
+    manifest: Manifest,
+    lockfile: &Lockfile,
+    environment: &EnvironmentId,
+) -> Result<ConsumedLockedGraph, LockError> {
+    lockfile.consume_locked_graph(manifest, environment)
+}
+
 fn validate_resolution_count(found: usize) -> Result<(), LockError> {
     if found == 1 {
         Ok(())
@@ -344,6 +458,21 @@ pub enum LockError {
         found: String,
     },
     Manifest(ManifestError),
+    NonCanonical,
+    RRequirementMismatch,
+    DirectRootMissing {
+        name: String,
+    },
+    DirectRootVersionMismatch {
+        name: String,
+    },
+    UnreachablePackage {
+        package: String,
+    },
+    ExactIdentitySetMismatch {
+        missing: Vec<String>,
+        extra: Vec<String>,
+    },
 }
 
 impl fmt::Display for LockError {
@@ -382,8 +511,73 @@ impl fmt::Display for LockError {
                 "lock environment {expected} does not match requested environment {found}"
             ),
             Self::Manifest(error) => write!(f, "manifest composition failed: {error}"),
+            Self::NonCanonical => f.write_str("lock contents are not in canonical order"),
+            Self::RRequirementMismatch => {
+                f.write_str("manifest R requirement is not satisfied by the lock target")
+            }
+            Self::DirectRootMissing { name } => {
+                write!(f, "direct manifest root {name} is absent from the lock")
+            }
+            Self::DirectRootVersionMismatch { name } => {
+                write!(
+                    f,
+                    "locked version for direct manifest root {name} does not satisfy manifest constraint"
+                )
+            }
+            Self::UnreachablePackage { package } => {
+                write!(
+                    f,
+                    "locked package {package} is unreachable from manifest roots"
+                )
+            }
+            Self::ExactIdentitySetMismatch { missing, extra } => write!(
+                f,
+                "exact lock identity set mismatch (missing: {missing:?}, extra: {extra:?})"
+            ),
         }
     }
+}
+
+fn is_r_base_name(name: &PackageName) -> bool {
+    name.as_str() == "R" || rsolve_resolver::is_r_base_package_name(name)
+}
+
+fn mark_reachable(
+    package: &LockedPackage,
+    by_name: &BTreeMap<PackageName, &LockedPackage>,
+    reachable: &mut BTreeSet<PackageName>,
+) -> Result<(), LockError> {
+    if !reachable.insert(package.identity.name().clone()) {
+        return Ok(());
+    }
+    for dependency in &package.dependencies {
+        let dependency_package =
+            by_name
+                .get(dependency)
+                .ok_or_else(|| LockError::DanglingDependency {
+                    package: package.identity.name().to_string(),
+                    dependency: dependency.to_string(),
+                })?;
+        mark_reachable(dependency_package, by_name, reachable)?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_resolution(resolution: &LockedResolution) -> Result<(), LockError> {
+    let mut packages = resolution.packages.clone();
+    packages.sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
+    if packages != resolution.packages {
+        return Err(LockError::NonCanonical);
+    }
+    if resolution.packages.iter().any(|package| {
+        package
+            .dependencies
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    }) {
+        return Err(LockError::NonCanonical);
+    }
+    Ok(())
 }
 
 fn ensure_installed_names(packages: &[LockedPackage]) -> Result<(), LockError> {
@@ -563,7 +757,7 @@ fn provenance_rank(provenance: &Provenance) -> u8 {
 
 /// Stable human-readable diagnostic identity. This is not the future wire
 /// encoding; it exists only for typed error messages and comparisons.
-fn identity_key(identity: &ReleaseIdentity) -> String {
+pub(crate) fn identity_key(identity: &ReleaseIdentity) -> String {
     match identity.provenance() {
         Provenance::RBasePackage { r_version } => {
             format!("{}:r-base:{}", identity.name(), r_version.as_str())
