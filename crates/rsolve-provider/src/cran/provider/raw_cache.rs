@@ -309,6 +309,10 @@ impl RawCache {
                 _ => response_headers.cache_control.clone(),
             },
         };
+        if !cache_control_policy(&write.cache_control, std::time::Duration::ZERO).can_store() {
+            self.remove_entry(key)?;
+            return Ok(());
+        }
         let header = self.header_for_write(key, &write)?;
         self.write_entry(key, header, &write.body)
     }
@@ -835,6 +839,25 @@ mod tests {
             entry.cache_control,
             CacheControlHeader::Valid("max-age=120".into())
         );
+    }
+
+    #[test]
+    fn raw_cache_304_no_store_evicts_without_republishing() {
+        let store = store();
+        let cache = RawCache::open(&store).unwrap();
+        let key = key(&store);
+        cache.publish(&key, write(b"body")).unwrap();
+        cache
+            .update_validated_at_with_headers(
+                &key,
+                "2026-08-23T00:00:10Z".parse().unwrap(),
+                &TransportResponseHeaders {
+                    cache_control: CacheControlHeader::Valid("no-store".into()),
+                    ..TransportResponseHeaders::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(cache.lookup(&key), RawCacheLookup::Missing));
     }
 
     #[test]

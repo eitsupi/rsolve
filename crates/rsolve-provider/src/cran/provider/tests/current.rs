@@ -501,6 +501,74 @@ fn stale_current_cache_revalidates_with_validators_and_304() {
 }
 
 #[test]
+fn stale_current_cache_304_no_store_evicts_entry_after_reuse() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: TransportResponseHeaders {
+                etag: Some("\"current-etag\"".into()),
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "no-cache".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(cache),
+    );
+    first.ensure_current().unwrap();
+
+    let second_transport = session_transport(
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: TransportResponseHeaders {
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "no-store".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
+    );
+    second
+        .ensure_current()
+        .expect("validated cached body remains usable for this refresh");
+    let key = crate::cran::provider::raw_cache::RawCache::open(&store)
+        .unwrap()
+        .key(&current_rds_url(), RawCacheRepresentation::CurrentRds)
+        .unwrap();
+    assert!(matches!(
+        crate::cran::provider::raw_cache::RawCache::open(&store)
+            .unwrap()
+            .lookup(&key),
+        RawCacheLookup::Missing
+    ));
+}
+
+#[test]
 fn fresh_semantically_invalid_current_cache_recovers_unconditionally() {
     let directory = tempfile::tempdir().unwrap();
     let store = crate::snapshot::SnapshotStore::open(
