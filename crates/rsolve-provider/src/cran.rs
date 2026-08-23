@@ -3,6 +3,7 @@
 mod archive_index;
 mod catalog;
 mod dcf;
+pub(crate) mod evidence;
 mod history;
 pub(crate) mod provider;
 

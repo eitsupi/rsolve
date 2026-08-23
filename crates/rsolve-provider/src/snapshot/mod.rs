@@ -721,7 +721,9 @@ fn prepare(
     Ok((header, histories))
 }
 
-fn source_observation(input: &SourceInput) -> Result<SourceObservationV1, SnapshotError> {
+pub(crate) fn source_observation(
+    input: &SourceInput,
+) -> Result<SourceObservationV1, SnapshotError> {
     let content = hex(&input.content_sha256);
     let id = hex(&hash_parts(
         b"rsolve.metadata-source-id\0v1",
@@ -1369,7 +1371,7 @@ fn parse_hex_32(value: &str) -> Result<[u8; 32], SnapshotError> {
     Ok(result)
 }
 
-fn encode_history(history: &PackageHistoryV1) -> Result<Vec<u8>, SnapshotError> {
+pub(crate) fn encode_history(history: &PackageHistoryV1) -> Result<Vec<u8>, SnapshotError> {
     let payload = postcard::to_stdvec(&PostcardHistoryV1(history.clone()))?;
     if payload.len() > HISTORY_LIMIT - HISTORY_PREFIX_LEN {
         return Err(SnapshotError::Invalid(
