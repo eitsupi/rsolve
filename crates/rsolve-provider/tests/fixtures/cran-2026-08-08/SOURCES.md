@@ -29,7 +29,8 @@ fictional phrase.
 | `synthetic-native-utf8-archive-PACKAGES.rds` | 1 | Uncompressed format-2 archive matrix with valid native/unknown UTF-8; SHA-256 `b84f460daf88744203ee0c83e1c25e003cc427ec568969ae4bee85d34dd9355c` |
 | `synthetic-invalid-utf8-archive-PACKAGES.rds` | 1 | Uncompressed format-2 archive matrix with invalid native/unknown UTF-8; SHA-256 `a06ffff79234e515c73780e666d691e8c77582d28aaa14e49004ade5f8ae7b8b` |
 | `synthetic-matrix-archive-overlay-PACKAGES.rds` | 2 | Matrix 1.7-6 root release followed by a matching Recommended-path overlay; SHA-256 `3a0700effafc53513b91a326239ae5d6df82fec6b566499e6a802c71bdddeb46` |
-| `synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds` | 2 | Matrix root/Recommended-path pair with mismatched MD5sum, which must fail closed; SHA-256 `d9d8821bb57307b76718e3a2429b51c2e4143e79e7c53bc9dbfa2bf69768af04` |
+| `synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds` | 2 | Matrix root/Recommended-path pair with mismatched MD5sum, where the root remains eligible and the overlay remains scoped evidence; SHA-256 `d9d8821bb57307b76718e3a2429b51c2e4143e79e7c53bc9dbfa2bf69768af04` |
+| `synthetic-matrix-archive-root-duplicate-PACKAGES.rds` | 2 | Matrix pathless-root duplicate with conflicting dependencies and MD5sum, which must fail closed; SHA-256 `af4edebafab12ba6824449fcc4b909917f28d968cb1858825bb7748e246c3b73` |
 | `synthetic-matrix-archive-overlay-p3m-PACKAGES.rds` | 2 | P3M-shaped Matrix overlay-first pair without MD5sum; the root row must be retained; SHA-256 `873dd4279923c5c6b9938e8f049ec2bff4b6bca6fd2c0e6928d559c6d7fc3c5f` |
 | `synthetic-matrix-archive-wrong-root.rds` | 1 | Invalid fast-path wrong root type fixture; SHA-256 `715f0358ada164c6b70b892b14b21ba58b5b30cfb8aac581a4aa2cca84231a57` |
 | `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `fabb389fc6fc1cf4951a76121c644df269150184aa7e1860a547b2f064ec2a4c` |
@@ -48,7 +49,7 @@ fictional phrase.
 
 | Record | Structural reason |
 | --- | --- |
-| `rsolvefixture.core` | Exercises all five dependency fields (`Depends`, `Imports`, `LinkingTo`, `Suggests`, `Enhances`), unknown `Published`, and `Priority`, `Path`, `OS_type`, `Archs`, and both license metadata fields. |
+| `rsolvefixture.core` | Exercises all five dependency fields (`Depends`, `Imports`, `LinkingTo`, `Suggests`, `Enhances`), unknown `Published`, and `Priority`, `Repository`, `OS_type`, `Archs`, and both license metadata fields. |
 | `rsolvefixture.folded` | Has exactly 24 continuation lines in one value, plus UTF-8 text and an unknown `Published` field. |
 | `rsolvefixture.rare` | Keeps the rare-field values together and uses fictional license metadata, including a positive `License_restricts_use` value. |
 | `rsolvefixture.plain` | Provides an ordinary record with the common required index fields. |

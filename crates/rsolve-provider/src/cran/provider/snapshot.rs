@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::super::catalog::{CranCatalog, CranCatalogObservation};
+use super::super::catalog::{CranCatalog, CranCatalogObservation, CranCatalogRecordScope};
 use super::super::evidence::{CranEvidenceObservation, DistributionRegistryBinding};
 use super::refresher::decode_gzip;
 use super::{CranCurrentIndexRepresentation, CranRefreshSession, Transport};
@@ -60,10 +60,22 @@ pub(super) fn index_record_to_evidence(
 ) -> CranEvidenceObservation {
     let package = record.package().as_str();
     let version = record.release().version();
-    let locator = if current {
-        format!("{base_url}/src/contrib/{package}_{version}.tar.gz")
-    } else {
-        format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
+    let locator = match record.scope() {
+        CranCatalogRecordScope::Root if current => {
+            format!("{base_url}/src/contrib/{package}_{version}.tar.gz")
+        }
+        CranCatalogRecordScope::Root => {
+            format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
+        }
+        CranCatalogRecordScope::RecommendedOverlay { .. } => {
+            let path = record
+                .fields()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("Path"))
+                .map(|(_, value)| value.as_str())
+                .expect("validated Recommended overlay must retain Path");
+            format!("{base_url}/src/contrib/{path}/{package}_{version}.tar.gz")
+        }
     };
     record_to_evidence(
         record,
@@ -120,6 +132,7 @@ fn record_to_evidence(
         axes: evidence_axes(record.release(), occurrence, freshness),
         release: Some(record.release().clone()),
         distribution_registry: DistributionRegistryBinding::ConfiguredContext,
+        scope: record.scope().clone(),
     }
 }
 

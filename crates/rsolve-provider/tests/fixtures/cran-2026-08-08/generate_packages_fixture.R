@@ -46,7 +46,7 @@ packages <- c(
         "Suggests: rsolvefixture.suggest\n",
         "Enhances: rsolvefixture.enhance\n",
         "Priority: fixture-primary\n",
-        "Path: synthetic/core\n",
+        "Repository: synthetic/core\n",
         "OS_type: fixture-unix\n",
         "Archs: fixture-x86, fixture-arm\n",
         "License: RSOLVE Fictional Terms Core\n",
@@ -70,7 +70,7 @@ packages <- c(
         "Package: rsolvefixture.rare\n",
         "Version: 1.0.0\n",
         "Priority: fixture-secondary\n",
-        "Path: synthetic/rare\n",
+        "Repository: synthetic/rare\n",
         "OS_type: fixture-windows\n",
         "Archs: fixture-riscv, fixture-wasm\n",
         "License: RSOLVE Fictional Terms Restricted\n",
@@ -291,9 +291,9 @@ write_binary_fixture(
     version = 2L
 )
 
-# A current-index-shaped duplicate pair: the root row precedes a Recommended
-# path overlay for the same release identity. The catalog reader must keep
-# the root metadata and suppress only the matching overlay.
+# A current-index-shaped pair: the root row precedes a Recommended path
+# overlay for the same release identity. The catalog reader must keep the
+# root metadata while retaining the overlay only as scoped evidence.
 matrix_overlay_columns <- c(archive_columns, "Path")
 matrix_overlay_archive <- matrix(
     NA_character_,
@@ -330,6 +330,16 @@ matrix_overlay_mismatch[2L, "MD5sum"] <- "00000000000000000000000000000032"
 write_binary_fixture(
     "synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds",
     matrix_overlay_mismatch
+)
+
+# A true pathless root duplicate must remain fail closed. Unlike the
+# Recommended row above, both rows claim the same CRAN root release scope.
+matrix_root_duplicate <- matrix_overlay_archive[c(1L, 1L), , drop = FALSE]
+matrix_root_duplicate[2L, "Depends"] <- "R (>= 4.7), methods"
+matrix_root_duplicate[2L, "MD5sum"] <- "00000000000000000000000000000032"
+write_binary_fixture(
+    "synthetic-matrix-archive-root-duplicate-PACKAGES.rds",
+    matrix_root_duplicate
 )
 
 # P3M-shaped current-index duplicate: the Recommended overlay comes first and

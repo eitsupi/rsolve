@@ -260,6 +260,12 @@ pub(super) fn distributions_for_observation(
     observation: &IndexedObservation,
     configured_registry: &RegistryId,
 ) -> Result<Vec<rsolve_core::Distribution>, EvidenceCompositionError> {
+    if matches!(
+        observation.scope,
+        CranCatalogRecordScope::RecommendedOverlay { .. }
+    ) {
+        return Ok(Vec::new());
+    }
     if !matches!(
         observation.axes.occurrence,
         crate::snapshot::OccurrenceStateV1::ArtifactBound

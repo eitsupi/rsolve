@@ -139,6 +139,74 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
 }
 
 #[test]
+fn recommended_overlay_does_not_invalidate_unrelated_current_candidates() {
+    let current = b"Package: rlang\nVersion: 1.1.0\nLicense: MIT\n\n\
+Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.1.0)\nMD5sum: root\n\n\
+Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\nMD5sum: overlay\nPath: 4.7.0/Recommended\n";
+    let transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: current.to_vec(),
+        },
+    );
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let catalog = session
+        .ensure_current()
+        .expect("a Recommended overlay must not make the complete current index invalid");
+    assert_eq!(catalog.candidates_named("rlang").unwrap().len(), 1);
+    assert_eq!(catalog.candidates_named("survival").unwrap().len(), 1);
+
+    let evidence = session.evidence.borrow();
+    let survival = evidence
+        .iter()
+        .filter(|observation| observation.package.as_str() == "survival")
+        .collect::<Vec<_>>();
+    assert_eq!(survival.len(), 2);
+    let overlay = survival
+        .iter()
+        .find(|observation| {
+            observation
+                .fields
+                .iter()
+                .any(|field| field.name.eq_ignore_ascii_case("Path"))
+        })
+        .expect("Recommended overlay evidence");
+    assert!(matches!(
+        overlay.scope,
+        crate::cran::catalog::CranCatalogRecordScope::RecommendedOverlay { .. }
+    ));
+    assert_eq!(
+        overlay.artifact.as_ref().unwrap().locator,
+        "https://cran.invalid/src/contrib/4.7.0/Recommended/survival_3.8-11.tar.gz"
+    );
+    let root = survival
+        .iter()
+        .find(|observation| {
+            !observation
+                .fields
+                .iter()
+                .any(|field| field.name.eq_ignore_ascii_case("Path"))
+        })
+        .expect("CRAN root evidence");
+    assert!(matches!(
+        root.scope,
+        crate::cran::catalog::CranCatalogRecordScope::Root
+    ));
+    assert_eq!(
+        root.artifact.as_ref().unwrap().locator,
+        "https://cran.invalid/src/contrib/survival_3.8-11.tar.gz"
+    );
+}
+
+#[test]
 fn current_index_transport_or_status_failures_remain_transport_failures() {
     for responses in [
         HashMap::new(),

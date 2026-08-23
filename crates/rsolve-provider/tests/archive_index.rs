@@ -9,6 +9,8 @@ const OVERLAY_ARCHIVE: &[u8] =
 const OVERLAY_MISMATCH_ARCHIVE: &[u8] = include_bytes!(
     "fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-mismatch-PACKAGES.rds"
 );
+const ROOT_DUPLICATE_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-root-duplicate-PACKAGES.rds");
 const P3M_OVERLAY_ARCHIVE: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-p3m-PACKAGES.rds");
 const MATRIX_ARCHIVE_XZ: &[u8] =
@@ -175,8 +177,25 @@ fn archive_root_row_suppresses_matching_recommended_overlay() {
 }
 
 #[test]
-fn archive_mismatched_recommended_overlay_remains_a_conflicting_duplicate() {
-    let error = CranCatalog::from_archive_index_rds(OVERLAY_MISMATCH_ARCHIVE).unwrap_err();
+fn archive_mismatched_recommended_overlay_does_not_conflict_with_root() {
+    let catalog = CranCatalog::from_archive_index_rds(OVERLAY_MISMATCH_ARCHIVE)
+        .expect("Recommended overlay metadata is runtime-specific");
+    assert_eq!(catalog.candidate_count(), 1);
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(
+        release
+            .dependencies()
+            .iter()
+            .find(|dependency| dependency.name.as_str() == "R")
+            .and_then(|dependency| dependency.constraint.clauses.first())
+            .map(|clause| clause.version.as_str()),
+        Some("4.4")
+    );
+}
+
+#[test]
+fn archive_pathless_root_duplicate_conflict_fails_closed() {
+    let error = CranCatalog::from_archive_index_rds(ROOT_DUPLICATE_ARCHIVE).unwrap_err();
     assert!(matches!(
         error
             .diagnostics()

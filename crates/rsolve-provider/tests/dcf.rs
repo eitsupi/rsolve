@@ -29,7 +29,7 @@ fn reads_synthetic_packages_and_preserves_record_values() {
         );
     }
     assert_eq!(core.field("Priority").unwrap().value(), "fixture-primary");
-    assert_eq!(core.field("Path").unwrap().value(), "synthetic/core");
+    assert_eq!(core.field("Repository").unwrap().value(), "synthetic/core");
     assert!(
         core.field("License")
             .unwrap()
@@ -124,7 +124,10 @@ fn parses_a_single_description_record_and_utf8() {
 fn exercises_rare_field_shapes_in_the_generated_fixture() {
     let document = DcfDocument::parse(SYNTHETIC_PACKAGES).unwrap();
     let record = &document.records()[2];
-    assert_eq!(record.field("path").unwrap().value(), "synthetic/rare");
+    assert_eq!(
+        record.field("repository").unwrap().value(),
+        "synthetic/rare"
+    );
     assert_eq!(record.field("os_type").unwrap().value(), "fixture-windows");
     assert_eq!(record.field("license_is_foss").unwrap().value(), "no");
 }

@@ -2,6 +2,8 @@ use std::fmt;
 
 use rsolve_core::{PackageName, PackageRelease, RPackageVersion};
 
+pub(super) use super::super::catalog::CranCatalogRecordScope;
+
 pub(super) use crate::snapshot::{
     ArtifactV1, ChecksumV1, ClauseV1, CoverageV1, DecisionV1, DependencyKindV1, DependencyV1,
     DistributionV1, EligibleReleaseV1, EvidenceAxesV1, EvidenceReferenceV1, EvidenceRoleV1,
@@ -19,6 +21,7 @@ pub(crate) struct CranEvidenceObservation {
     pub(crate) axes: EvidenceAxesV1,
     pub(crate) release: Option<PackageRelease>,
     pub(crate) distribution_registry: DistributionRegistryBinding,
+    pub(crate) scope: CranCatalogRecordScope,
 }
 
 /// Selects the registry attached to an occurrence-scoped distribution.
@@ -84,6 +87,7 @@ pub(super) struct IndexedObservation {
     pub(super) axes: EvidenceAxesV1,
     pub(super) release: Option<PackageRelease>,
     pub(super) distribution_registry: DistributionRegistryBinding,
+    pub(super) scope: CranCatalogRecordScope,
 }
 
 #[derive(Clone)]

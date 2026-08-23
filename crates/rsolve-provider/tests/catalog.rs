@@ -130,7 +130,7 @@ fn dependency_splitter_matches_r_terminal_empty_segment_rules() {
 }
 
 #[test]
-fn current_root_row_suppresses_matching_recommended_overlay() {
+fn root_candidate_excludes_recommended_overlay_metadata() {
     let catalog = CranCatalog::from_packages(
         b"Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.4), methods\nMD5sum: same\n\n\
 Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
@@ -156,26 +156,16 @@ Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recom
 }
 
 #[test]
-fn recommended_overlay_is_retained_without_a_prior_root() {
+fn recommended_overlay_without_root_produces_no_candidate() {
     let catalog = CranCatalog::from_packages(
         b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\nMD5sum: same\n\n",
     )
     .unwrap();
-    let release = &catalog.candidates_named("Matrix").unwrap()[0];
-    assert_eq!(
-        release.metadata().fields().get("Path").map(String::as_str),
-        Some("4.7.0/Recommended")
-    );
-    assert_eq!(
-        release.dependencies()[0].constraint.clauses[0]
-            .version
-            .as_str(),
-        "4.7.0"
-    );
+    assert_eq!(catalog.candidate_count(), 0);
 }
 
 #[test]
-fn overlay_before_root_without_md5_is_suppressed() {
+fn overlay_before_root_without_md5_does_not_change_root_candidate() {
     let catalog = CranCatalog::from_packages(
         b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\n\n\
 Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\n\n",
@@ -192,21 +182,32 @@ Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\n\n",
 }
 
 #[test]
-fn mismatched_recommended_overlays_are_not_suppressed() {
-    for (path, md5) in [
-        ("4.7.0/Other", "same"),
-        ("4.7.0/Recommended", "different"),
-        ("not-a-version/Recommended", "same"),
-    ] {
+fn valid_mismatched_recommended_overlay_is_excluded_from_root_candidate() {
+    let input = b"Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\nMD5sum: same\n\n\
+Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\nMD5sum: different\n\n";
+    let catalog = CranCatalog::from_packages(input).unwrap();
+    let release = &catalog.candidates_named("Matrix").unwrap()[0];
+    assert_eq!(catalog.candidate_count(), 1);
+    assert_eq!(
+        release.dependencies()[0].constraint.clauses[0]
+            .version
+            .as_str(),
+        "3.0.0"
+    );
+}
+
+#[test]
+fn unknown_or_invalid_recommended_paths_fail_closed() {
+    for path in ["4.7.0/Other", "not-a-version/Recommended"] {
         let input = format!(
             "Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\nMD5sum: same\n\n\
-Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: {path}\nMD5sum: {md5}\n\n"
+Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: {path}\nMD5sum: different\n\n"
         );
         let error = CranCatalog::from_packages(input.as_bytes()).unwrap_err();
-        assert!(
-            matches!(error.diagnostics()[0].error(), CranRecordError::Domain(_)),
-            "{path} / {md5:?}"
-        );
+        assert!(matches!(
+            error.diagnostics()[0].error(),
+            CranRecordError::InvalidPath { .. }
+        ));
     }
 }
 
@@ -234,7 +235,10 @@ Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7),, methods\nPath: 4.7.0/Reco
             ));
         } else {
             assert!(
-                matches!(error.diagnostics()[0].error(), CranRecordError::Domain(_)),
+                matches!(
+                    error.diagnostics()[0].error(),
+                    CranRecordError::InvalidPath { .. }
+                ),
                 "{description}"
             );
         }

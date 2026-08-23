@@ -10,6 +10,8 @@ use rsolve_core::{
     VersionConstraint,
 };
 
+mod overlay;
+
 fn source(kind: &str, digest: u8) -> SourceInput {
     SourceInput {
         kind: kind.into(),
@@ -210,6 +212,7 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
             distribution_registry: DistributionRegistryBinding::Explicit(
                 RegistryId::new("p3m").unwrap(),
             ),
+            scope: super::super::catalog::CranCatalogRecordScope::Root,
         },
         CranEvidenceObservation {
             source: history.clone(),
@@ -226,6 +229,7 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
             distribution_registry: DistributionRegistryBinding::Explicit(
                 RegistryId::new("cran").unwrap(),
             ),
+            scope: super::super::catalog::CranCatalogRecordScope::Root,
         },
         CranEvidenceObservation {
             source: history,
@@ -242,6 +246,7 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
             distribution_registry: DistributionRegistryBinding::Explicit(
                 RegistryId::new("cran").unwrap(),
             ),
+            scope: super::super::catalog::CranCatalogRecordScope::Root,
         },
     ]
 }

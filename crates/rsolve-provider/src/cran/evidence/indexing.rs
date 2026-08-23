@@ -46,6 +46,7 @@ pub(super) fn index_observations(
                 axes: observation.axes,
                 release: observation.release,
                 distribution_registry: observation.distribution_registry,
+                scope: observation.scope,
             })
         })
         .collect::<Result<Vec<_>, EvidenceCompositionError>>()?;

@@ -7,7 +7,7 @@ LinkingTo: rsolvefixture.link
 Suggests: rsolvefixture.suggest
 Enhances: rsolvefixture.enhance
 Priority: fixture-primary
-Path: synthetic/core
+Repository: synthetic/core
 OS_type: fixture-unix
 Archs: fixture-x86, fixture-arm
 License: RSOLVE Fictional Terms Core
@@ -53,7 +53,7 @@ Published: 2026-06-25 19:14:59 UTC
 Package: rsolvefixture.rare
 Version: 1.0.0
 Priority: fixture-secondary
-Path: synthetic/rare
+Repository: synthetic/rare
 OS_type: fixture-windows
 Archs: fixture-riscv, fixture-wasm
 License: RSOLVE Fictional Terms Restricted

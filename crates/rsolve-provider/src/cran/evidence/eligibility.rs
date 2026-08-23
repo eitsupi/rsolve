@@ -14,6 +14,16 @@ pub(super) fn compose_history(
     let mut decisions = Vec::new();
     for &index in indexes {
         let observation = &observations[index];
+        if let CranCatalogRecordScope::RecommendedOverlay { runtime } = &observation.scope {
+            decisions.push(DecisionV1 {
+                code: crate::snapshot::DecisionCodeV1::RecommendedOverlaySuppressed,
+                observation_ids: vec![index as u32],
+                detail: format!(
+                    "Recommended overlay for R {runtime} is retained as raw evidence but excluded from CRAN release eligibility"
+                ),
+            });
+            continue;
+        }
         if let Some((code, detail)) = completeness_failure(observation) {
             package_incomplete = true;
             decisions.push(DecisionV1 {

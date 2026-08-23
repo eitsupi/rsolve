@@ -30,6 +30,18 @@ pub(crate) struct CranCatalogObservation {
     package: PackageName,
     fields: Vec<(String, String)>,
     release: PackageRelease,
+    scope: CranCatalogRecordScope,
+}
+
+/// The semantic scope of a CRAN package-index record.
+///
+/// A record under `R/Recommended` describes an R-runtime-specific occurrence,
+/// not the registry release in the CRAN root index.  Keeping this distinction
+/// here makes catalog and evidence selection use the same classification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CranCatalogRecordScope {
+    Root,
+    RecommendedOverlay { runtime: RPackageVersion },
 }
 
 type CatalogRecord = (usize, Option<String>, Vec<(String, String)>);
@@ -49,6 +61,10 @@ impl CranCatalogObservation {
 
     pub(crate) fn release(&self) -> &PackageRelease {
         &self.release
+    }
+
+    pub(crate) fn scope(&self) -> &CranCatalogRecordScope {
+        &self.scope
     }
 }
 
@@ -164,15 +180,22 @@ pub(crate) fn validated_observations_from_fields(
             )
         })
         .collect::<Vec<_>>();
-    let (selected, _) = select_and_aggregate(parsed).map_err(CranCatalogError::Semantic)?;
+    // Validate root records through the ordinary aggregation boundary, while
+    // retaining every valid overlay for lossless evidence persistence.  The
+    // aggregation function deliberately excludes overlays from candidate
+    // selection, so an overlay can never create a metadata conflict with its
+    // root release.
+    select_and_aggregate(parsed.clone()).map_err(CranCatalogError::Semantic)?;
 
-    Ok(selected
+    Ok(parsed
         .into_iter()
-        .map(|(record_index, _, observation)| {
+        .filter_map(|(record_index, _, observation)| {
+            let observation = observation.ok()?;
+            let scope = observation_scope(&observation);
             let package = observation.identity.name().clone();
             let release = PackageRelease::try_from(observation)
                 .expect("catalog validation already accepted the observation");
-            CranCatalogObservation {
+            Some(CranCatalogObservation {
                 record_index,
                 package,
                 fields: fields_by_index
@@ -180,7 +203,8 @@ pub(crate) fn validated_observations_from_fields(
                     .cloned()
                     .expect("selected catalog record must have source fields"),
                 release,
-            }
+                scope,
+            })
         })
         .collect::<Vec<_>>())
 }
@@ -281,6 +305,10 @@ pub enum CranRecordError {
     DuplicateField(String),
     InvalidPackageName(PackageNameError),
     InvalidVersion(RPackageVersionError),
+    InvalidPath {
+        value: String,
+        diagnostic: String,
+    },
     InvalidPublicationDate {
         value: String,
         diagnostic: String,
@@ -301,6 +329,9 @@ impl fmt::Display for CranRecordError {
             Self::DuplicateField(field) => write!(f, "duplicate field {field}"),
             Self::InvalidPackageName(error) => error.fmt(f),
             Self::InvalidVersion(error) => error.fmt(f),
+            Self::InvalidPath { value, diagnostic } => {
+                write!(f, "invalid Path value {value:?}: {diagnostic}")
+            }
             Self::InvalidPublicationDate { value, diagnostic } => {
                 write!(f, "invalid Published value {value:?}: {diagnostic}")
             }
@@ -379,19 +410,6 @@ type SelectedCatalogObservation = (usize, Option<String>, ReleaseObservation);
 fn select_and_aggregate(
     observations: Vec<ParsedCatalogObservation>,
 ) -> Result<(Vec<SelectedCatalogObservation>, ReleaseAggregation), Box<[CranDiagnostic]>> {
-    let mut root_md5_by_identity = HashMap::<ReleaseIdentity, Vec<Option<String>>>::new();
-    for (_, _, observation) in &observations {
-        let Ok(observation) = observation else {
-            continue;
-        };
-        if metadata_field(observation, "Path").is_none() {
-            root_md5_by_identity
-                .entry(observation.identity.clone())
-                .or_default()
-                .push(metadata_field(observation, "MD5sum").map(str::to_owned));
-        }
-    }
-
     let mut diagnostics = Vec::new();
     let mut selected = Vec::new();
     let mut aggregation = ReleaseAggregation::new();
@@ -399,7 +417,10 @@ fn select_and_aggregate(
     for (record_index, package, observation) in observations {
         match observation {
             Ok(observation) => {
-                if should_suppress_overlay(&observation, &root_md5_by_identity) {
+                if matches!(
+                    observation_scope(&observation),
+                    CranCatalogRecordScope::RecommendedOverlay { .. }
+                ) {
                     continue;
                 }
                 if let Err(error) = aggregation.observe(observation.clone()) {
@@ -435,46 +456,11 @@ fn metadata_field<'a>(observation: &'a ReleaseObservation, name: &str) -> Option
         .map(|(_, value)| value.as_str())
 }
 
-fn is_recommended_overlay(observation: &ReleaseObservation) -> bool {
+fn observation_scope(observation: &ReleaseObservation) -> CranCatalogRecordScope {
     let Some(path) = metadata_field(observation, "Path") else {
-        return false;
+        return CranCatalogRecordScope::Root;
     };
-    let Some((version, suffix)) = path.rsplit_once('/') else {
-        return false;
-    };
-    suffix == "Recommended"
-        && !version.is_empty()
-        && RPackageVersion::parse_bare(version).is_ok()
-        && path.matches('/').count() == 1
-}
-
-fn should_suppress_overlay(
-    observation: &ReleaseObservation,
-    root_md5_by_identity: &HashMap<ReleaseIdentity, Vec<Option<String>>>,
-) -> bool {
-    if !is_recommended_overlay(observation) {
-        return false;
-    }
-    let Some(root_md5s) = root_md5_by_identity.get(&observation.identity) else {
-        return false;
-    };
-
-    // A missing MD5 on either row is common in alternate CRAN indexes and
-    // does not prevent selecting the root metadata. If both sides provide a
-    // value, retain the overlay on any mismatch so normal aggregation fails
-    // closed instead of silently discarding conflicting artifact facts.
-    let overlay_md5 = metadata_field(observation, "MD5sum")
-        .filter(|value| !value.trim().is_empty())
-        .map(str::trim);
-    let has_mismatch = root_md5s
-        .iter()
-        .flatten()
-        .filter_map(|value| {
-            let value = value.trim();
-            (!value.is_empty()).then_some(value)
-        })
-        .any(|root_md5| Some(root_md5) != overlay_md5 && overlay_md5.is_some());
-    !has_mismatch
+    classify_path(path).expect("validated CRAN observation must have a valid Path")
 }
 
 pub(super) fn observation_from_fields(
@@ -530,6 +516,9 @@ pub(super) fn observation_from_fields(
         .collect();
     let metadata =
         ReleaseMetadata::new(metadata_fields).map_err(CranRecordError::InvalidMetadata)?;
+    if let Some(path) = field(fields, "Path") {
+        classify_path(path)?;
+    }
     let identity = ReleaseIdentity::new(
         package.clone(),
         Provenance::RegistryRelease {
@@ -555,6 +544,24 @@ pub(super) fn observation_from_fields(
             observed_metadata: DistributionMetadata::default(),
         }],
     })
+}
+
+fn classify_path(value: &str) -> Result<CranCatalogRecordScope, CranRecordError> {
+    let mut segments = value.split('/');
+    let version = segments.next().unwrap_or_default();
+    let suffix = segments.next().unwrap_or_default();
+    if segments.next().is_some() || suffix != "Recommended" || version.is_empty() {
+        return Err(CranRecordError::InvalidPath {
+            value: value.to_owned(),
+            diagnostic: "expected <R version>/Recommended".into(),
+        });
+    }
+    let runtime =
+        RPackageVersion::parse_bare(version).map_err(|error| CranRecordError::InvalidPath {
+            value: value.to_owned(),
+            diagnostic: format!("invalid Recommended runtime version: {error}"),
+        })?;
+    Ok(CranCatalogRecordScope::RecommendedOverlay { runtime })
 }
 
 fn required_field<'a>(
@@ -703,13 +710,22 @@ mod tests {
 
     const MATCHING_PLAIN: &[u8] = b"Package: Matrix\nVersion: 1.7-6\nLicense: RSOLVE Fictional Terms Matrix\nMD5sum: 00000000000000000000000000000031\n\nPackage: Matrix\nVersion: 1.7-6\nLicense: RSOLVE Fictional Terms Matrix\nMD5sum: 00000000000000000000000000000031\nPath: 4.7.0/Recommended\n";
 
-    fn assert_matching_overlay_is_suppressed(observations: &[super::CranCatalogObservation]) {
-        assert_eq!(observations.len(), 1);
+    fn assert_overlay_is_retained_losslessly(observations: &[super::CranCatalogObservation]) {
+        assert_eq!(observations.len(), 2);
+        assert!(matches!(
+            observations[0].scope(),
+            super::CranCatalogRecordScope::Root
+        ));
+        assert!(matches!(
+            observations[1].scope(),
+            super::CranCatalogRecordScope::RecommendedOverlay { .. }
+        ));
         assert!(
-            observations[0]
+            observations[1]
                 .fields()
                 .iter()
-                .all(|(name, _)| !name.eq_ignore_ascii_case("Path"))
+                .any(|(name, value)| name.eq_ignore_ascii_case("Path")
+                    && value == "4.7.0/Recommended")
         );
     }
 
@@ -718,7 +734,7 @@ mod tests {
         let catalog = CranCatalog::from_packages(MATCHING_PLAIN).unwrap();
         assert_eq!(catalog.candidate_count(), 1);
         let observations = CranCatalog::observations_from_packages(MATCHING_PLAIN).unwrap();
-        assert_matching_overlay_is_suppressed(&observations);
+        assert_overlay_is_retained_losslessly(&observations);
     }
 
     #[test]
@@ -727,7 +743,64 @@ mod tests {
         assert_eq!(catalog.candidate_count(), 1);
         let observations =
             CranCatalog::observations_from_archive_index_rds(MATCHING_ARCHIVE).unwrap();
-        assert_matching_overlay_is_suppressed(&observations);
+        assert_overlay_is_retained_losslessly(&observations);
+    }
+
+    #[test]
+    fn mismatched_overlay_is_root_candidate_regardless_of_input_order() {
+        let root = b"Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.1.0)\nMD5sum: root\n\n";
+        let overlay = b"Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\nMD5sum: overlay\nPath: 4.7.0/Recommended\n\n";
+        for input in [
+            [root.as_slice(), overlay.as_slice()].concat(),
+            [overlay.as_slice(), root.as_slice()].concat(),
+        ] {
+            let catalog = CranCatalog::from_packages(&input).unwrap();
+            assert_eq!(catalog.candidate_count(), 1);
+            assert_eq!(
+                catalog.candidates_named("survival").unwrap()[0]
+                    .version()
+                    .to_string(),
+                "3.8-11"
+            );
+            let observations = CranCatalog::observations_from_packages(&input).unwrap();
+            assert_eq!(observations.len(), 2);
+        }
+    }
+
+    #[test]
+    fn overlay_only_never_becomes_a_root_candidate() {
+        let input =
+            b"Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\nPath: 4.7.0/Recommended\n";
+        let catalog = CranCatalog::from_packages(input).unwrap();
+        assert_eq!(catalog.candidate_count(), 0);
+        let observations = CranCatalog::observations_from_packages(input).unwrap();
+        assert_eq!(observations.len(), 1);
+    }
+
+    #[test]
+    fn invalid_recommended_path_fails_closed() {
+        for path in [
+            "Recommended",
+            "4.7.0/Recommended/extra",
+            "latest/Recommended",
+        ] {
+            let input = format!("Package: survival\nVersion: 3.8-11\nPath: {path}\n");
+            let error = CranCatalog::from_packages(input.as_bytes()).unwrap_err();
+            assert!(matches!(
+                error.diagnostics()[0].error(),
+                super::CranRecordError::InvalidPath { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn conflicting_pathless_roots_fail_closed() {
+        let input = b"Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.1.0)\n\nPackage: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\n";
+        let error = CranCatalog::from_packages(input).unwrap_err();
+        assert!(matches!(
+            error.diagnostics()[0].error(),
+            super::CranRecordError::Domain(_)
+        ));
     }
 
     #[test]
