@@ -134,7 +134,7 @@ fn axes(
     }
 }
 
-fn context() -> SnapshotCompositionContext {
+pub(crate) fn context() -> SnapshotCompositionContext {
     SnapshotCompositionContext {
         registry_id: RegistryId::new("cran").unwrap(),
         compatibility_profile: 1,
@@ -152,7 +152,7 @@ fn context() -> SnapshotCompositionContext {
     }
 }
 
-fn fixture_observations() -> Vec<CranEvidenceObservation> {
+pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
     let p3m = source("p3m-current", 1);
     let history = source("cran-history", 2);
     let current_fields = [

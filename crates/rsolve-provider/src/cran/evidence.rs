@@ -4,8 +4,8 @@
 //! inputs already carry validated domain releases and explicit source
 //! evidence; this boundary only combines observations that describe the same
 //! CRAN release identity.
-// The provider-private composition boundary is intentionally not connected to
-// publication orchestration until the follow-up publish-wiring task.
+// This provider-private composition pipeline is retained as the single
+// validated input boundary for the crate-visible publication seam.
 #![allow(dead_code)]
 
 mod eligibility;
@@ -15,9 +15,9 @@ mod release;
 mod types;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
-use types::*;
+pub(crate) use types::*;
 
 /// Compose already validated observations into deterministic snapshot input.
 pub(crate) fn compose_snapshot(

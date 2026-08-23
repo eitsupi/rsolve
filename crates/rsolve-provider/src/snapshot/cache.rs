@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, RegistryId};
@@ -9,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ReadOnlySnapshotCandidateLoader, SnapshotHeaderV1, ValidatedGeneration, decode_header, hex,
-    parse_hex_32, validate_generation,
+    ReadOnlySnapshotCandidateLoader, SnapshotBuildInput, SnapshotError, SnapshotGenerationBuilder,
+    SnapshotHeaderV1, ValidatedGeneration, decode_header, hex, parse_hex_32, validate_generation,
 };
 
 const CURRENT_NAME: &str = "current";
@@ -18,6 +19,7 @@ const REFRESH_LOCK_NAME: &str = "refresh.lock";
 const GENERATIONS_DIR: &str = "generations";
 const TMP_DIR: &str = "tmp";
 const POINTER_LIMIT: usize = 16 * 1024;
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +36,33 @@ pub enum SnapshotStoreError {
     Io(io::Error),
     Invalid(Box<str>),
     Busy,
+}
+
+#[derive(Debug)]
+pub(crate) enum SnapshotPublishError {
+    Build(SnapshotError),
+    Store(SnapshotStoreError),
+    Reopen(CandidateLoadError),
+}
+
+impl fmt::Display for SnapshotPublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build(error) => write!(f, "snapshot generation build failed: {error}"),
+            Self::Store(error) => write!(f, "snapshot publication failed: {error}"),
+            Self::Reopen(error) => write!(f, "published snapshot reopen failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotPublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::Reopen(error) => Some(error),
+        }
+    }
 }
 
 impl fmt::Display for SnapshotStoreError {
@@ -92,6 +121,51 @@ impl SnapshotStore {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Builds, validates, publishes, and reopens one immutable generation.
+    /// The refresh lock spans staging and pointer publication, then is
+    /// released before the final readback acquires it again.
+    pub(crate) fn build_and_publish(
+        &self,
+        input: SnapshotBuildInput,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError> {
+        let lock = self
+            .acquire_refresh_lock(RefreshLockMode::Blocking)
+            .map_err(SnapshotPublishError::Store)?;
+        let staging_path = self
+            .unique_staging_path()
+            .map_err(SnapshotPublishError::Store)?;
+        let staging_cleanup = TemporaryPath(staging_path.clone());
+        let generation = SnapshotGenerationBuilder::new(input, &staging_path)
+            .build()
+            .map_err(SnapshotPublishError::Build)?;
+        self.publish_generation(&lock, generation)
+            .map_err(SnapshotPublishError::Store)?;
+        drop(lock);
+        drop(staging_cleanup);
+        self.read_current().map_err(SnapshotPublishError::Reopen)
+    }
+
+    fn unique_staging_path(&self) -> Result<PathBuf, SnapshotStoreError> {
+        let pid = std::process::id();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| store_invalid(error.to_string()))?
+            .as_nanos();
+        for _ in 0..128 {
+            let sequence = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .root
+                .join(TMP_DIR)
+                .join(format!(".rsolve-staged-{pid}-{timestamp}-{sequence}.redb"));
+            if !path.exists() {
+                return Ok(path);
+            }
+        }
+        Err(store_invalid(
+            "unable to allocate a unique snapshot staging path",
+        ))
     }
 
     pub fn read_current(&self) -> Result<ReadOnlySnapshotCandidateLoader, CandidateLoadError> {

@@ -6,6 +6,7 @@ mod dcf;
 pub(crate) mod evidence;
 mod history;
 pub(crate) mod provider;
+pub(crate) mod publish;
 
 pub use archive_index::CranArchiveIndexError;
 pub use catalog::{
