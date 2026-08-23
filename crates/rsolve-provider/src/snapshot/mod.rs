@@ -446,10 +446,7 @@ impl SnapshotGenerationBuilder {
         let generation = generation_id(&self.input, &header);
         header.generation = generation.clone();
         let header_bytes = encode_header(&header)?;
-        let parent = self
-            .destination
-            .parent()
-            .ok_or_else(|| SnapshotError::Invalid("generation destination has no parent".into()))?;
+        let parent = destination_parent(&self.destination);
         fs::create_dir_all(parent)?;
         let temp = create_temporary_generation(parent)?;
         write_generation(&temp.path, &header_bytes, &histories)?;
@@ -469,6 +466,13 @@ impl SnapshotGenerationBuilder {
     }
 }
 
+fn destination_parent(destination: &Path) -> &Path {
+    destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn prepare(
     input: &SnapshotBuildInput,
 ) -> Result<(SnapshotHeaderV1, BTreeMap<String, Vec<u8>>), SnapshotError> {
@@ -479,12 +483,23 @@ fn prepare(
     let mut sources = input
         .sources
         .iter()
-        .map(source_observation)
+        .enumerate()
+        .map(|(input_index, source)| -> Result<_, SnapshotError> {
+            Ok((input_index, source_observation(source)?))
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    sources.sort_by(|a, b| a.id.cmp(&b.id));
-    if sources.windows(2).any(|w| w[0].id == w[1].id) {
+    sources.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    if sources.windows(2).any(|w| w[0].1.id == w[1].1.id) {
         return Err(SnapshotError::Invalid("duplicate source id".into()));
     }
+    let mut source_index_remap = vec![0_u32; sources.len()];
+    for (sorted_index, (input_index, _)) in sources.iter().enumerate() {
+        source_index_remap[*input_index] = sorted_index as u32;
+    }
+    let sources = sources
+        .into_iter()
+        .map(|(_, source)| source)
+        .collect::<Vec<_>>();
     let source_indexes = sources
         .iter()
         .enumerate()
@@ -492,9 +507,21 @@ fn prepare(
         .collect::<BTreeMap<_, _>>();
     let mut histories = BTreeMap::new();
     for history in &input.histories {
-        validate_history(history, &source_indexes, sources.len())?;
-        let encoded = encode_history(history)?;
-        if histories.insert(history.package.clone(), encoded).is_some() {
+        let mut canonical_history = history.clone();
+        for observation in &mut canonical_history.observations {
+            let input_index = usize::try_from(observation.source_index).map_err(|_| {
+                SnapshotError::Invalid("observation source index is out of range".into())
+            })?;
+            observation.source_index = *source_index_remap.get(input_index).ok_or_else(|| {
+                SnapshotError::Invalid("observation source index is out of range".into())
+            })?;
+        }
+        validate_history(&canonical_history, &source_indexes, sources.len())?;
+        let encoded = encode_history(&canonical_history)?;
+        if histories
+            .insert(canonical_history.package.clone(), encoded)
+            .is_some()
+        {
             return Err(SnapshotError::Invalid("duplicate package history".into()));
         }
     }
@@ -1638,6 +1665,39 @@ mod tests {
             }],
         }
     }
+
+    fn two_source_input() -> (SnapshotBuildInput, [String; 2]) {
+        let mut input = input();
+        input.sources.push(SourceInput {
+            kind: "archive-packages".into(),
+            representation: "gzip-dcf".into(),
+            content_sha256: [8; 32],
+            etag: None,
+            last_modified: None,
+            observed_at: "2026-08-23T00:00:00Z".into(),
+            endpoint: "https://example.test/Archive/PACKAGES.gz".into(),
+        });
+        let source_ids = input
+            .sources
+            .iter()
+            .map(|source| source_observation(source).unwrap().id)
+            .collect::<Vec<_>>();
+        input.coverage.source_ids = source_ids.clone();
+        let mut second_observation = input.histories[0].observations[0].clone();
+        second_observation.id = 1;
+        second_observation.source_index = 1;
+        second_observation.record_index = 1;
+        input.histories[0].observations.push(second_observation);
+        (input, [source_ids[0].clone(), source_ids[1].clone()])
+    }
+
+    fn stored_history(path: &Path) -> PackageHistoryV1 {
+        let database = ReadOnlyDatabase::open(path).unwrap();
+        let read = database.begin_read().unwrap();
+        let table = read.open_table(PACKAGE_HISTORIES).unwrap();
+        let bytes = table.get("foo").unwrap().unwrap();
+        decode_history(bytes.value()).unwrap()
+    }
     #[test]
     fn build_reopens_and_is_deterministic() {
         let dir = tempdir().unwrap();
@@ -1655,6 +1715,53 @@ mod tests {
         );
         assert_eq!(a.generation(), b.generation());
         assert_eq!(a.header_bytes(), b.header_bytes());
+    }
+
+    #[test]
+    fn source_reordering_remaps_observations_without_mutating_input() {
+        let dir = tempdir().unwrap();
+        let (canonical_input, input_source_ids) = two_source_input();
+        let mut reversed_input = canonical_input.clone();
+        reversed_input.sources.reverse();
+        reversed_input.histories[0].observations[0].source_index = 1;
+        reversed_input.histories[0].observations[1].source_index = 0;
+
+        let first = SnapshotGenerationBuilder::new(
+            canonical_input.clone(),
+            dir.path().join("canonical.redb"),
+        )
+        .build()
+        .unwrap();
+        let second = SnapshotGenerationBuilder::new(
+            reversed_input.clone(),
+            dir.path().join("reversed.redb"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(first.generation(), second.generation());
+        assert_eq!(first.header_bytes(), second.header_bytes());
+        assert_eq!(canonical_input.histories[0].observations[0].source_index, 0);
+        assert_eq!(canonical_input.histories[0].observations[1].source_index, 1);
+        let history = stored_history(second.path());
+        for (observation, input_source_id) in history.observations.iter().zip(input_source_ids) {
+            assert_eq!(
+                second.header().sources[observation.source_index as usize].id,
+                input_source_id
+            );
+        }
+    }
+
+    #[test]
+    fn bare_destination_uses_current_directory_without_changing_it() {
+        assert_eq!(
+            destination_parent(Path::new("generation.redb")),
+            Path::new(".")
+        );
+        assert_eq!(
+            destination_parent(Path::new("nested/generation.redb")),
+            Path::new("nested")
+        );
     }
     #[test]
     fn envelope_rejects_trailing_and_corruption() {
