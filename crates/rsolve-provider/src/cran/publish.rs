@@ -123,6 +123,14 @@ mod tests {
     use rsolve_core::{CandidateLoader, PackageName, PackageRelease, RegistryId, SolverKey};
     use tempfile::tempdir;
 
+    fn observations_from_endpoint(endpoint: &str) -> Vec<CranEvidenceObservation> {
+        let mut observations = fixture_observations();
+        for observation in &mut observations {
+            observation.source.endpoint = format!("{endpoint}/PACKAGES");
+        }
+        observations
+    }
+
     fn read_versions(loader: &ReadOnlySnapshotCandidateLoader) -> Vec<String> {
         loader
             .releases(&SolverKey::InstalledName(
@@ -297,8 +305,8 @@ mod tests {
         let first = publish_snapshot_with_endpoint(
             &store,
             first_context,
-            fixture_observations(),
-            "https://cran.example",
+            observations_from_endpoint("https://mirror-a.example"),
+            "https://mirror-a.example",
         )
         .unwrap();
         let generation = first.header().generation.to_owned();
@@ -318,8 +326,8 @@ mod tests {
         let second = publish_snapshot_with_endpoint(
             &store,
             second_context,
-            fixture_observations(),
-            "https://cran.example",
+            observations_from_endpoint("https://mirror-a.example"),
+            "https://mirror-a.example",
         )
         .unwrap();
         assert_eq!(second.header().generation, generation);
@@ -337,9 +345,9 @@ mod tests {
             crate::cran::CranSnapshotCacheStatus::Fresh
         );
         let expected_a = crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap())
-            .with_expected_endpoint("https://cran.example");
+            .with_expected_endpoint("https://mirror-a.example");
         let expected_b = crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap())
-            .with_expected_endpoint("https://other.example");
+            .with_expected_endpoint("https://mirror-b.example");
         assert!(matches!(
             crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
             crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
@@ -415,8 +423,8 @@ mod tests {
         publish_snapshot_with_endpoint(
             &store,
             context,
-            fixture_observations(),
-            "https://cran.example",
+            observations_from_endpoint("https://cran-history.example"),
+            "https://cran-history.example",
         )
         .unwrap();
         let at_thirty_seconds = |endpoint: &str| {
@@ -424,7 +432,7 @@ mod tests {
                 .with_expected_endpoint(endpoint)
         };
         let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
-            inspect_cran_snapshot_cache(&store, &at_thirty_seconds("https://cran.example"))
+            inspect_cran_snapshot_cache(&store, &at_thirty_seconds("https://cran-history.example"))
         else {
             panic!("expected compatible generation");
         };
@@ -439,6 +447,68 @@ mod tests {
             diagnostic
                 .diagnostic()
                 .contains("different acquisition endpoint")
+        );
+    }
+
+    #[test]
+    fn identical_cross_mirror_refresh_does_not_extend_header_provenance() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let t0 = "2026-08-23T00:00:00Z";
+        let t2 = "2026-08-23T02:00:00Z";
+        let mut first_context = context();
+        first_context.created_at = t0.into();
+        let first = publish_snapshot_with_endpoint(
+            &store,
+            first_context,
+            observations_from_endpoint("https://mirror-a.example"),
+            "https://mirror-a.example",
+        )
+        .unwrap();
+        let generation = first.header().generation.to_owned();
+        let generation_path = directory
+            .path()
+            .join("generations")
+            .join(format!("{generation}.redb"));
+        let before = std::fs::read(&generation_path).unwrap();
+
+        let mut second_context = context();
+        second_context.created_at = t2.into();
+        let second = publish_snapshot_with_endpoint(
+            &store,
+            second_context,
+            observations_from_endpoint("https://mirror-b.example"),
+            "https://mirror-b.example",
+        )
+        .unwrap();
+        assert_eq!(second.header().generation, generation);
+        assert_eq!(std::fs::read(&generation_path).unwrap(), before);
+
+        let expected_b = CranSnapshotCachePolicy::at(t2.parse().unwrap())
+            .with_expected_endpoint("https://mirror-b.example");
+        let CranSnapshotCacheResult::Compatible { loader, diagnostic } =
+            inspect_cran_snapshot_cache(&store, &expected_b)
+        else {
+            panic!("identical cross-mirror refresh should retain a compatible generation");
+        };
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Stale);
+        assert!(
+            diagnostic
+                .endpoints()
+                .all(|endpoint| endpoint.contains("mirror-a.example"))
+        );
+        assert!(
+            diagnostic
+                .endpoints()
+                .all(|endpoint| !endpoint.contains("mirror-b.example"))
+        );
+        assert!(
+            loader
+                .header()
+                .sources
+                .iter()
+                .all(|source| source.endpoint.contains("mirror-a.example"))
         );
     }
 }
