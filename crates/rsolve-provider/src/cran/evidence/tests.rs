@@ -189,6 +189,9 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
                 FreshnessStateV1::CurrentGeneration,
             ),
             release: Some(release(&current_fields)),
+            distribution_registry: DistributionRegistryBinding::Explicit(
+                RegistryId::new("p3m").unwrap(),
+            ),
         },
         CranEvidenceObservation {
             source: history.clone(),
@@ -202,6 +205,9 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
                 FreshnessStateV1::BulkGeneration,
             ),
             release: Some(release(&history_fields)),
+            distribution_registry: DistributionRegistryBinding::Explicit(
+                RegistryId::new("cran").unwrap(),
+            ),
         },
         CranEvidenceObservation {
             source: history,
@@ -215,6 +221,9 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
                 FreshnessStateV1::BulkGeneration,
             ),
             release: Some(release(&old_fields)),
+            distribution_registry: DistributionRegistryBinding::Explicit(
+                RegistryId::new("cran").unwrap(),
+            ),
         },
     ]
 }
@@ -232,6 +241,7 @@ fn composes_source_scoped_occurrences_and_canonical_only_history_release() {
     assert_eq!(history.eligible_releases[1].version, "1.0");
     let old = &history.eligible_releases[0];
     assert_eq!(old.distributions.len(), 1);
+    assert_eq!(old.distributions[0].registry, "cran");
     assert_eq!(old.distributions[0].artifacts.len(), 1);
     assert!(
         old.distributions[0].artifacts[0]
@@ -260,7 +270,19 @@ fn composes_source_scoped_occurrences_and_canonical_only_history_release() {
     assert_eq!(old.publication.as_deref(), Some("2025-08-20"));
     assert!(old.evidence[0].roles.contains(&EvidenceRoleV1::Publication));
     let merged = &history.eligible_releases[1];
-    assert_eq!(merged.distributions[0].artifacts.len(), 2);
+    assert_eq!(merged.distributions.len(), 2);
+    assert!(
+        merged
+            .distributions
+            .iter()
+            .any(|distribution| distribution.registry == "p3m")
+    );
+    assert!(
+        merged
+            .distributions
+            .iter()
+            .any(|distribution| distribution.registry == "cran")
+    );
     assert!(
         merged
             .distributions
@@ -346,6 +368,12 @@ fn absent_occurrence_artifact_cannot_contribute_a_distribution() {
         .unwrap();
     assert_eq!(current.distributions[0].artifacts.len(), 1);
     assert!(
+        current
+            .distributions
+            .iter()
+            .all(|distribution| distribution.registry != "p3m")
+    );
+    assert!(
         current.distributions[0].artifacts[0]
             .locator
             .contains("cran.example")
@@ -361,6 +389,34 @@ fn absent_occurrence_artifact_cannot_contribute_a_distribution() {
         .find(|evidence| evidence.observation_id == p3m.id)
         .unwrap();
     assert!(!p3m_evidence.roles.contains(&EvidenceRoleV1::Artifact));
+}
+
+#[test]
+fn configured_context_binding_resolves_to_the_store_registry() {
+    let mut observations = fixture_observations();
+    for observation in &mut observations {
+        observation.distribution_registry = DistributionRegistryBinding::ConfiguredContext;
+    }
+    let mut configured = context();
+    configured.registry_id = RegistryId::new("internal-cran-mirror").unwrap();
+    let input = compose_snapshot(configured, observations).unwrap();
+    let history = input
+        .histories
+        .iter()
+        .find(|history| history.package == "P3MOverlay")
+        .unwrap();
+    assert!(history.eligible_releases.iter().all(|release| {
+        release
+            .distributions
+            .iter()
+            .all(|distribution| distribution.registry == "internal-cran-mirror")
+    }));
+    assert!(
+        history
+            .eligible_releases
+            .iter()
+            .all(|release| release.namespace == "cran")
+    );
 }
 
 #[test]

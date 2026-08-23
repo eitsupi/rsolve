@@ -3,7 +3,7 @@
 use sha2::{Digest, Sha256};
 
 use super::super::catalog::{CranCatalog, CranCatalogObservation};
-use super::super::evidence::CranEvidenceObservation;
+use super::super::evidence::{CranEvidenceObservation, DistributionRegistryBinding};
 use super::refresher::decode_gzip;
 use super::{CranCurrentIndexRepresentation, CranRefreshSession, Transport};
 use crate::snapshot::{
@@ -119,6 +119,7 @@ fn record_to_evidence(
         artifact,
         axes: evidence_axes(record.release(), occurrence, freshness),
         release: Some(record.release().clone()),
+        distribution_registry: DistributionRegistryBinding::ConfiguredContext,
     }
 }
 

@@ -7,6 +7,7 @@ pub(super) fn compose_history(
     package: &PackageName,
     indexes: &[usize],
     observations: &[IndexedObservation],
+    configured_registry: &rsolve_core::RegistryId,
 ) -> Result<PackageHistoryV1, EvidenceCompositionError> {
     let mut groups = BTreeMap::<IdentityKey, Vec<(usize, PackageRelease)>>::new();
     let mut package_incomplete = false;
@@ -62,20 +63,24 @@ pub(super) fn compose_history(
             });
             continue;
         }
-        let pending =
-            match super::release::merge_release_group(&entries, &authoritative, observations) {
-                Ok(pending) => pending,
-                Err(error @ EvidenceCompositionError::Invalid(_)) => return Err(error),
-                Err(error) => {
-                    package_incomplete = true;
-                    decisions.push(DecisionV1 {
-                        code: crate::snapshot::DecisionCodeV1::SemanticConflict,
-                        observation_ids,
-                        detail: error.to_string(),
-                    });
-                    continue;
-                }
-            };
+        let pending = match super::release::merge_release_group(
+            &entries,
+            &authoritative,
+            observations,
+            configured_registry,
+        ) {
+            Ok(pending) => pending,
+            Err(error @ EvidenceCompositionError::Invalid(_)) => return Err(error),
+            Err(error) => {
+                package_incomplete = true;
+                decisions.push(DecisionV1 {
+                    code: crate::snapshot::DecisionCodeV1::SemanticConflict,
+                    observation_ids,
+                    detail: error.to_string(),
+                });
+                continue;
+            }
+        };
         if entries.len() > 1 {
             decisions.push(DecisionV1 {
                 code: crate::snapshot::DecisionCodeV1::EquivalentMerge,

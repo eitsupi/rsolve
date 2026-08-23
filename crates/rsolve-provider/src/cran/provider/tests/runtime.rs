@@ -1,5 +1,5 @@
 use super::*;
-use rsolve_core::{Artifact, PackageRelease, UpstreamChecksum};
+use rsolve_core::{Artifact, PackageRelease, Provenance, UpstreamChecksum};
 
 fn release_for<'a>(releases: &'a [PackageRelease], version: &str) -> &'a PackageRelease {
     releases
@@ -312,12 +312,25 @@ fn production_refresh_propagates_configured_registry_id_to_header_and_loader() {
         store.read_current().unwrap().header().registry_id,
         registry.as_str()
     );
-    assert!(
-        !loader
-            .releases(&SolverKey::InstalledName(
-                PackageName::new("Matrix").unwrap()
-            ))
-            .unwrap()
-            .is_empty()
-    );
+    let releases = loader
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    assert!(!releases.is_empty());
+    for release in releases {
+        match release.identity().provenance() {
+            Provenance::RegistryRelease { namespace, .. } => {
+                assert_eq!(namespace.as_str(), "cran")
+            }
+            provenance => panic!("unexpected CRAN identity provenance: {provenance:?}"),
+        }
+        assert!(!release.distributions().is_empty());
+        assert!(
+            release
+                .distributions()
+                .iter()
+                .all(|distribution| distribution.registry.as_str() == registry.as_str())
+        );
+    }
 }

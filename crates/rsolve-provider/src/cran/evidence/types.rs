@@ -18,6 +18,27 @@ pub(crate) struct CranEvidenceObservation {
     pub(crate) artifact: Option<OccurrenceArtifactV1>,
     pub(crate) axes: EvidenceAxesV1,
     pub(crate) release: Option<PackageRelease>,
+    pub(crate) distribution_registry: DistributionRegistryBinding,
+}
+
+/// Selects the registry attached to an occurrence-scoped distribution.
+///
+/// Production acquisition observes a single configured endpoint and resolves
+/// that endpoint to the composition context. Cross-source fixtures and future
+/// multi-source acquisition can explicitly retain their own registry identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DistributionRegistryBinding {
+    ConfiguredContext,
+    Explicit(rsolve_core::RegistryId),
+}
+
+impl DistributionRegistryBinding {
+    pub(super) fn resolve(&self, configured: &rsolve_core::RegistryId) -> rsolve_core::RegistryId {
+        match self {
+            Self::ConfiguredContext => configured.clone(),
+            Self::Explicit(registry) => registry.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +83,7 @@ pub(super) struct IndexedObservation {
     pub(super) artifact: Option<OccurrenceArtifactV1>,
     pub(super) axes: EvidenceAxesV1,
     pub(super) release: Option<PackageRelease>,
+    pub(super) distribution_registry: DistributionRegistryBinding,
 }
 
 #[derive(Clone)]

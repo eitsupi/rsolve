@@ -31,6 +31,7 @@ pub(crate) fn compose_snapshot(
     }
 
     let indexed = indexing::index_observations(observations)?;
+    let configured_registry = context.registry_id.clone();
 
     let mut histories = Vec::with_capacity(indexed.package_indexes.len());
     for (package, indexes) in &indexed.package_indexes {
@@ -38,6 +39,7 @@ pub(crate) fn compose_snapshot(
             package,
             indexes,
             &indexed.observations,
+            &configured_registry,
         )?);
     }
 

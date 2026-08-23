@@ -9,6 +9,7 @@ pub(super) fn merge_release_group(
     entries: &[(usize, PackageRelease)],
     authoritative: &[&(usize, PackageRelease)],
     observations: &[IndexedObservation],
+    configured_registry: &rsolve_core::RegistryId,
 ) -> Result<PendingRelease, EvidenceCompositionError> {
     let first = &entries[0].1;
     let identity = first.identity().clone();
@@ -59,8 +60,11 @@ pub(super) fn merge_release_group(
     for (index, release) in entries {
         let authoritative_semantics =
             super::eligibility::semantics_authoritative(&observations[*index].axes);
-        let observed_distributions =
-            super::projection::distributions_for_observation(release, &observations[*index])?;
+        let observed_distributions = super::projection::distributions_for_observation(
+            release,
+            &observations[*index],
+            configured_registry,
+        )?;
         for distribution in &observed_distributions {
             merge_distribution(&mut distributions, distribution, &identity_label)?;
         }

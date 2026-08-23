@@ -1,7 +1,7 @@
 use super::types::*;
 use rsolve_core::{
     Artifact, ArtifactLocator, Distribution, DistributionMetadata, PackageRelease, RPackageVersion,
-    RelationOp, Sha256Digest, SourceArtifact, UpstreamChecksum,
+    RegistryId, RelationOp, Sha256Digest, SourceArtifact, UpstreamChecksum,
 };
 
 pub(super) fn to_wire_release(
@@ -258,6 +258,7 @@ pub(super) fn relation_op_rank(op: RelationOpV1) -> u8 {
 pub(super) fn distributions_for_observation(
     release: &PackageRelease,
     observation: &IndexedObservation,
+    configured_registry: &RegistryId,
 ) -> Result<Vec<rsolve_core::Distribution>, EvidenceCompositionError> {
     if !matches!(
         observation.axes.occurrence,
@@ -268,18 +269,22 @@ pub(super) fn distributions_for_observation(
     let Some(artifact) = &observation.artifact else {
         return Ok(Vec::new());
     };
+    let registry = observation
+        .distribution_registry
+        .resolve(configured_registry);
     let mut distributions = release
         .distributions()
         .iter()
         .cloned()
         .map(|mut distribution| {
+            distribution.registry = registry.clone();
             distribution.artifacts.clear();
             distribution
         })
         .collect::<Vec<_>>();
     if distributions.is_empty() {
         distributions.push(Distribution {
-            registry: rsolve_core::RegistryId::new("cran").expect("fixed registry is valid"),
+            registry: registry.clone(),
             channel: rsolve_core::DistributionChannel::new("source")
                 .expect("fixed channel is valid"),
             snapshot: None,
