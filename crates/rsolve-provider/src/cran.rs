@@ -18,3 +18,4 @@ pub use provider::{
     CranCandidateSnapshot, CranCurrentIndexRepresentation, CranFastPathStatus,
     CranRefreshDiagnostic, CranRefreshSource, CranSnapshotRefresher, CranSnapshotRefresherError,
 };
+pub use publish::CranSnapshotPublishError;

@@ -23,6 +23,35 @@ pub struct CranCatalog {
     candidates: BTreeMap<PackageName, Vec<PackageRelease>>,
 }
 
+/// One validated CRAN catalog record together with its lossless source fields.
+#[derive(Clone, Debug)]
+pub(crate) struct CranCatalogObservation {
+    record_index: usize,
+    package: PackageName,
+    fields: Vec<(String, String)>,
+    release: PackageRelease,
+}
+
+type CatalogRecord = (usize, Option<String>, Vec<(String, String)>);
+
+impl CranCatalogObservation {
+    pub(crate) fn record_index(&self) -> usize {
+        self.record_index
+    }
+
+    pub(crate) fn package(&self) -> &PackageName {
+        &self.package
+    }
+
+    pub(crate) fn fields(&self) -> &[(String, String)] {
+        &self.fields
+    }
+
+    pub(crate) fn release(&self) -> &PackageRelease {
+        &self.release
+    }
+}
+
 impl CranCatalog {
     /// Parses and converts a plain `src/contrib/PACKAGES` snapshot.
     ///
@@ -58,6 +87,29 @@ impl CranCatalog {
         catalog_from_observations(observations).map_err(CranCatalogError::Semantic)
     }
 
+    pub(crate) fn observations_from_packages(
+        input: &[u8],
+    ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
+        let document = DcfDocument::parse(input).map_err(CranCatalogError::Dcf)?;
+        let records = document
+            .records()
+            .iter()
+            .enumerate()
+            .map(|(record_index, record)| {
+                let package = record
+                    .field("Package")
+                    .map(|field| field.value().to_owned());
+                let fields = record
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name().to_owned(), field.value().to_owned()))
+                    .collect();
+                (record_index, package, fields)
+            })
+            .collect();
+        validated_observations_from_fields(records)
+    }
+
     /// Returns all candidates for a canonical package name in version order.
     pub fn candidates(&self, name: &PackageName) -> &[PackageRelease] {
         self.candidates.get(name).map(Vec::as_slice).unwrap_or(&[])
@@ -89,6 +141,49 @@ impl CranCatalog {
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
     }
+}
+
+pub(crate) fn validated_observations_from_fields(
+    records: Vec<CatalogRecord>,
+) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
+    let parsed = records
+        .iter()
+        .map(|(record_index, package, fields)| {
+            let field_refs = fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            (
+                *record_index,
+                package.clone(),
+                observation_from_fields(&field_refs),
+            )
+        })
+        .collect::<Vec<_>>();
+    catalog_from_observations(
+        parsed
+            .iter()
+            .map(|(index, package, observation)| (*index, package.clone(), observation.clone())),
+    )
+    .map_err(CranCatalogError::Semantic)?;
+
+    Ok(parsed
+        .into_iter()
+        .zip(records)
+        .filter_map(|((record_index, _, observation), (_, _, fields))| {
+            observation.ok().map(|observation| {
+                let package = observation.identity.name().clone();
+                let release = PackageRelease::try_from(observation)
+                    .expect("catalog validation already accepted the observation");
+                CranCatalogObservation {
+                    record_index,
+                    package,
+                    fields,
+                    release,
+                }
+            })
+        })
+        .collect::<Vec<_>>())
 }
 
 /// A failure while parsing the index as DCF syntax or converting parsed

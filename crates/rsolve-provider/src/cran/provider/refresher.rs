@@ -8,8 +8,10 @@ use std::rc::Rc;
 use flate2::read::GzDecoder;
 use rsolve_core::{CandidateLoadError, PackageName};
 
+use super::super::publish::{CranSnapshotPublishError, default_context, publish_snapshot};
 use super::transport::UreqTransport;
 use super::{CranCandidateSnapshot, CranRefreshDiagnostic, CranRefreshSession};
+use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotStore};
 
 /// A transport-neutral failure constructing the CRAN snapshot refresher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +71,22 @@ impl CranSnapshotRefresher {
         roots: &[PackageName],
     ) -> Result<CranCandidateSnapshot, CandidateLoadError> {
         self.session.borrow_mut().refresh_packages(roots)
+    }
+
+    /// Refreshes the requested CRAN packages and atomically publishes their
+    /// validated source observations into the persistent snapshot store.
+    /// The returned loader is transport-free and pins the committed generation.
+    pub fn refresh_and_publish_snapshot(
+        &self,
+        store: &SnapshotStore,
+        roots: &[PackageName],
+    ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
+        let observations = self
+            .session
+            .borrow_mut()
+            .refresh_snapshot_observations(roots)
+            .map_err(CranSnapshotPublishError::Acquisition)?;
+        publish_snapshot(store, default_context(), observations)
     }
 }
 

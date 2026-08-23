@@ -1,4 +1,24 @@
 use super::*;
+use rsolve_core::{Artifact, PackageRelease, UpstreamChecksum};
+
+fn release_for<'a>(releases: &'a [PackageRelease], version: &str) -> &'a PackageRelease {
+    releases
+        .iter()
+        .find(|release| release.version().as_str() == version)
+        .unwrap_or_else(|| panic!("missing fixture release {version}"))
+}
+
+fn source_artifact(release: &PackageRelease) -> &rsolve_core::SourceArtifact {
+    release
+        .distributions()
+        .iter()
+        .flat_map(|distribution| distribution.artifacts.iter())
+        .map(|artifact| match artifact {
+            Artifact::Source(source) => source,
+        })
+        .next()
+        .expect("published fixture release should have a source artifact")
+}
 
 #[test]
 fn runtime_loader_caches_each_package_provider_and_its_candidates() {
@@ -107,4 +127,156 @@ fn runtime_loader_size_mismatch_is_a_hard_acquisition_error() {
         CandidateLoadErrorCategory::TransportFailure
     );
     assert!(error.diagnostic().contains("size mismatch"));
+}
+
+#[test]
+fn production_refresh_publishes_fixture_evidence_and_preserves_old_generation_on_failure() {
+    let current = b"Package: Matrix\nVersion: 1.8-0\nLicense: RSOLVE Fictional Current\n";
+    let transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: current.to_vec(),
+        },
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let loader = crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        transport,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    )
+    .expect("fixture acquisition should publish a snapshot");
+    let releases = loader
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    let old = source_artifact(release_for(&releases, "1.6-5"));
+    assert_eq!(
+        old.locator.as_str(),
+        "https://cran.invalid/src/contrib/Archive/Matrix/Matrix_1.6-5.tar.gz"
+    );
+    assert_eq!(old.size, Some(OLD_TAR.len() as u64));
+    assert!(old.upstream_checksums.is_empty());
+    assert!(
+        !loader
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap()
+            ))
+            .unwrap()
+            .is_empty()
+    );
+    let generation = loader.header().generation.clone();
+
+    let failed = FixtureTransport {
+        responses: HashMap::new(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let result = crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        failed,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    );
+    assert!(matches!(
+        result,
+        Err(crate::cran::CranSnapshotPublishError::Acquisition(_))
+    ));
+    assert_eq!(
+        store.read_current().unwrap().header().generation,
+        generation
+    );
+}
+
+#[test]
+fn production_refresh_publishes_current_and_archive_index_evidence() {
+    let current = b"Package: Matrix\nVersion: 1.8-0\nLicense: RSOLVE Fictional Current\n";
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: current.to_vec(),
+        },
+    );
+    transport.responses.insert(
+        fast_url(),
+        TransportResponse {
+            status: 200,
+            body: FAST.to_vec(),
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let loader = crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        transport,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    )
+    .expect("current and archive-index fixtures should publish");
+    let releases = loader
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    let current = source_artifact(release_for(&releases, "1.8-0"));
+    assert_eq!(
+        current.locator.as_str(),
+        "https://cran.invalid/src/contrib/Matrix_1.8-0.tar.gz"
+    );
+    assert_eq!(current.size, None);
+    assert!(current.upstream_checksums.is_empty());
+    for (version, checksum) in [
+        ("1.6-5", "00000000000000000000000000000021"),
+        ("1.7-0", "00000000000000000000000000000022"),
+    ] {
+        let artifact = source_artifact(release_for(&releases, version));
+        assert_eq!(
+            artifact.locator.as_str(),
+            format!("https://cran.invalid/src/contrib/Archive/Matrix/Matrix_{version}.tar.gz")
+        );
+        assert_eq!(artifact.size, None);
+        assert_eq!(
+            artifact.upstream_checksums,
+            vec![UpstreamChecksum::Md5(checksum.into())]
+        );
+    }
+    assert!(
+        loader
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap()
+            ))
+            .unwrap()
+            .len()
+            >= 2
+    );
+    assert!(requests.borrow().contains(&current_plain_url()));
+    assert!(requests.borrow().contains(&fast_url()));
+    assert!(!requests.borrow().iter().any(|url| url == &history_url()));
+    assert!(!requests.borrow().iter().any(|url| url == &old_url()));
 }

@@ -6,7 +6,8 @@ use std::fmt;
 use rd_rds::{NativeEncodingPolicy, file::ReadOptions, package::PackagesMatrix};
 
 use super::catalog::{
-    CranCatalog, CranDiagnostic, catalog_from_observations, observation_from_fields,
+    CranCatalog, CranCatalogObservation, CranDiagnostic, catalog_from_observations,
+    observation_from_fields, validated_observations_from_fields,
 };
 
 /// A structural or semantic failure while reading and validating an archive
@@ -131,5 +132,41 @@ impl CranCatalog {
         });
 
         catalog_from_observations(observations).map_err(CranArchiveIndexError::Semantic)
+    }
+
+    pub(crate) fn observations_from_archive_index_rds(
+        input: &[u8],
+    ) -> Result<Vec<CranCatalogObservation>, CranArchiveIndexError> {
+        let object = rd_rds::file::from_bytes_with_options(input, &provider_rds_read_options())
+            .map_err(CranArchiveIndexError::Decode)?;
+        let matrix = PackagesMatrix::from_object(&object).map_err(CranArchiveIndexError::Matrix)?;
+        for column in ["Package", "Version"] {
+            if matrix.column(column).is_none() {
+                return Err(CranArchiveIndexError::MissingColumn(column));
+            }
+        }
+        let records = matrix
+            .rows()
+            .map(|row| {
+                let package = row.get("Package").flatten().map(str::to_owned);
+                let fields = matrix
+                    .column_names()
+                    .filter_map(|column| {
+                        row.get(column)
+                            .flatten()
+                            .map(|value| (column.to_owned(), value.to_owned()))
+                    })
+                    .collect::<Vec<_>>();
+                (row.index(), package, fields)
+            })
+            .collect();
+        validated_observations_from_fields(records).map_err(|error| match error {
+            super::catalog::CranCatalogError::Dcf(_) => {
+                CranArchiveIndexError::Semantic(Box::new([]))
+            }
+            super::catalog::CranCatalogError::Semantic(diagnostics) => {
+                CranArchiveIndexError::Semantic(diagnostics)
+            }
+        })
     }
 }

@@ -10,21 +10,29 @@ use std::rc::Rc;
 
 use super::archive_index::provider_rds_read_options;
 use super::catalog::CranCatalog;
+use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
 use super::history::CranHistoryError;
 use super::history::{ArchiveEntry, enumerate_archive_rds_for_provider};
+use crate::snapshot::FreshnessStateV1;
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
     ReleaseAggregation, SolverKey,
 };
 
 mod refresher;
+mod snapshot;
 mod transport;
 
 #[cfg(test)]
 use refresher::canonical_base_url;
 pub use refresher::{CranSnapshotRefresher, CranSnapshotRefresherError};
 use refresher::{decode_gzip, extract_description};
+#[cfg(test)]
+pub(crate) use snapshot::refresh_and_publish_with_transport;
+use snapshot::{
+    current_records, index_record_to_evidence, source_input, tarball_record_to_evidence,
+};
 pub(crate) use transport::Transport;
 #[cfg(test)]
 pub(crate) use transport::{TransportError, TransportResponse};
@@ -129,6 +137,7 @@ pub(crate) struct CranProvider<T> {
     source: CandidateSource,
     diagnostics: Vec<CranRefreshDiagnostic>,
     loaded: RefCell<Option<Result<Vec<PackageRelease>, CandidateLoadError>>>,
+    evidence: Option<Rc<RefCell<Vec<CranEvidenceObservation>>>>,
 }
 
 impl<T: Transport> CranProvider<T> {
@@ -205,6 +214,7 @@ impl<T: Transport> CranProvider<T> {
             source,
             diagnostics,
             loaded: RefCell::new(None),
+            evidence: None,
         })
     }
 
@@ -218,6 +228,7 @@ impl<T: Transport> CranProvider<T> {
         package: PackageName,
         source: CandidateSource,
         diagnostics: Vec<CranRefreshDiagnostic>,
+        evidence: Option<Rc<RefCell<Vec<CranEvidenceObservation>>>>,
     ) -> Self {
         Self {
             package,
@@ -226,6 +237,7 @@ impl<T: Transport> CranProvider<T> {
             source,
             diagnostics,
             loaded: RefCell::new(None),
+            evidence,
         }
     }
 
@@ -315,6 +327,31 @@ impl<T: Transport> CranProvider<T> {
                     ),
                 )
             })?;
+            if let Some(evidence) = &self.evidence {
+                let source = source_input("cran-archive-tarball", "tar.gz", &url, &response.body);
+                let records =
+                    CranCatalog::observations_from_packages(&description).map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::MetadataInvalid,
+                            format!(
+                                "invalid DESCRIPTION in {}: {error}",
+                                entry.source_archive_relative_path()
+                            ),
+                        )
+                    })?;
+                let mut captured = evidence.borrow_mut();
+                for record in records
+                    .iter()
+                    .filter(|record| record.package() == entry.package())
+                {
+                    captured.push(tarball_record_to_evidence(
+                        record,
+                        source.clone(),
+                        url.clone(),
+                        response.body.len() as u64,
+                    ));
+                }
+            }
             releases.extend(catalog.candidates(entry.package()).iter().cloned());
         }
         Ok(releases)
@@ -479,6 +516,7 @@ struct CranRefreshSession<T> {
     history: Option<Result<HistorySource, CandidateLoadError>>,
     packages: HashMap<PackageName, Vec<PackageRelease>>,
     diagnostics: Vec<CranRefreshDiagnostic>,
+    evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
 }
 
 #[derive(Clone)]
@@ -504,6 +542,7 @@ impl<T: Transport> CranRefreshSession<T> {
             history: None,
             packages: HashMap::new(),
             diagnostics: Vec::new(),
+            evidence: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -563,6 +602,43 @@ impl<T: Transport> CranRefreshSession<T> {
             };
             match parsed {
                 Ok(catalog) => {
+                    let records =
+                        current_records(representation, &response.body).map_err(|error| {
+                            let diagnostic = format!(
+                                "validated current index could not be projected losslessly: {error}"
+                            );
+                            self.push_current_diagnostic(
+                                endpoint.clone(),
+                                representation,
+                                Some(response.status),
+                                diagnostic.clone(),
+                            );
+                            CandidateLoadError::new(
+                                CandidateLoadErrorCategory::MetadataInvalid,
+                                diagnostic,
+                            )
+                        })?;
+                    let source = source_input(
+                        "cran-current",
+                        match representation {
+                            CranCurrentIndexRepresentation::Rds => "rds",
+                            CranCurrentIndexRepresentation::Gzip => "gzip",
+                            CranCurrentIndexRepresentation::PlainDcf => "dcf",
+                        },
+                        &endpoint,
+                        &response.body,
+                    );
+                    self.evidence
+                        .borrow_mut()
+                        .extend(records.iter().map(|record| {
+                            index_record_to_evidence(
+                                record,
+                                source.clone(),
+                                &self.base_url,
+                                true,
+                                FreshnessStateV1::CurrentGeneration,
+                            )
+                        }));
                     self.diagnostics.push(CranRefreshDiagnostic {
                         endpoint: endpoint.into(),
                         status: Some(response.status),
@@ -733,6 +809,32 @@ impl<T: Transport> CranRefreshSession<T> {
                     &provider_rds_read_options(),
                 ) {
                     Ok(catalog) => {
+                        let records = match CranCatalog::observations_from_archive_index_rds(
+                            &response.body,
+                        ) {
+                            Ok(records) => records,
+                            Err(error) => {
+                                return Err(CandidateLoadError::new(
+                                    CandidateLoadErrorCategory::MetadataInvalid,
+                                    format!(
+                                        "validated archive index could not be projected losslessly: {error}"
+                                    ),
+                                ));
+                            }
+                        };
+                        let source =
+                            source_input("cran-archive-index", "rds", &endpoint, &response.body);
+                        self.evidence
+                            .borrow_mut()
+                            .extend(records.iter().map(|record| {
+                                index_record_to_evidence(
+                                    record,
+                                    source.clone(),
+                                    &self.base_url,
+                                    false,
+                                    FreshnessStateV1::BulkGeneration,
+                                )
+                            }));
                         package_diagnostics.push(CranRefreshDiagnostic {
                             endpoint: endpoint.clone().into_boxed_str(),
                             status: Some(response.status),
@@ -812,6 +914,7 @@ impl<T: Transport> CranRefreshSession<T> {
             package.clone(),
             source,
             provider_diagnostics,
+            Some(Rc::clone(&self.evidence)),
         );
         self.diagnostics
             .extend(provider.diagnostics().iter().cloned());

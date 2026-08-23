@@ -2,29 +2,36 @@
 // This seam is crate-visible for the provider orchestration layer while its
 // parent module remains crate-private; public item visibility avoids exposing
 // it through the external CRAN API.
-// The seam is not called by the legacy package-refresh path yet, so retain
-// dead-code checking suppression until that production path is migrated.
-#![allow(dead_code)]
 
 use std::error::Error;
 use std::fmt;
 
+use crate::snapshot::CoverageV1;
 use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotPublishError, SnapshotStore};
+use rsolve_core::{CandidateLoadError, RegistryId};
 
 use super::evidence::{
     CranEvidenceObservation, EvidenceCompositionError, SnapshotCompositionContext, compose_snapshot,
 };
 
-/// A lossless boundary error for CRAN snapshot refresh publication.
+/// A public category-and-diagnostic error for CRAN snapshot publication.
+///
+/// Composition and publication error values remain provider-private; their
+/// stable diagnostic text is exposed here so callers can report failures
+/// without depending on snapshot implementation details.
 #[derive(Debug)]
 pub enum CranSnapshotPublishError {
-    Composition(EvidenceCompositionError),
-    Publication(SnapshotPublishError),
+    Acquisition(CandidateLoadError),
+    Composition(Box<str>),
+    Publication(Box<str>),
 }
 
 impl fmt::Display for CranSnapshotPublishError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Acquisition(error) => {
+                write!(formatter, "CRAN snapshot acquisition failed: {error}")
+            }
             Self::Composition(error) => {
                 write!(formatter, "CRAN snapshot composition failed: {error}")
             }
@@ -38,26 +45,51 @@ impl fmt::Display for CranSnapshotPublishError {
 impl Error for CranSnapshotPublishError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Composition(error) => Some(error),
-            Self::Publication(error) => Some(error),
+            Self::Acquisition(error) => Some(error),
+            Self::Composition(_) | Self::Publication(_) => None,
         }
     }
 }
 
-/// Compose validated CRAN evidence and atomically publish the resulting
-/// generation. The returned loader is reopened only after publication lock
-/// release, so resolver-facing state is always read from the committed
-/// current pointer.
+pub(crate) fn default_context() -> SnapshotCompositionContext {
+    SnapshotCompositionContext {
+        registry_id: RegistryId::new("cran").expect("fixed CRAN registry id is valid"),
+        compatibility_profile: 1,
+        parser_schema: 1,
+        normalization_policy: 1,
+        created_at: jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+        producer: "rsolve-provider/cran".into(),
+        coverage: CoverageV1 {
+            state: "partial".into(),
+            scope: "requested-packages".into(),
+            freshness: "current".into(),
+            source_ids: Vec::new(),
+            missing_evidence: Vec::new(),
+        },
+    }
+}
+
+/// Compose validated CRAN evidence and atomically publish one generation.
+/// The returned loader pins the generation published by this operation while
+/// the publication lock is held, before the lock is released. A later
+/// publication may replace the store's current pointer without changing the
+/// generation observed through this loader.
 pub fn publish_snapshot(
     store: &SnapshotStore,
     context: SnapshotCompositionContext,
     observations: Vec<CranEvidenceObservation>,
 ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
     let input =
-        compose_snapshot(context, observations).map_err(CranSnapshotPublishError::Composition)?;
+        compose_snapshot(context, observations).map_err(|error: EvidenceCompositionError| {
+            CranSnapshotPublishError::Composition(error.to_string().into_boxed_str())
+        })?;
     store
         .build_and_publish(input)
-        .map_err(CranSnapshotPublishError::Publication)
+        .map_err(|error: SnapshotPublishError| {
+            CranSnapshotPublishError::Publication(error.to_string().into_boxed_str())
+        })
 }
 
 #[cfg(test)]
@@ -169,9 +201,7 @@ mod tests {
         invalid_context.created_at = "not-a-timestamp".into();
         assert!(matches!(
             publish_snapshot(&store, invalid_context, fixture_observations()),
-            Err(CranSnapshotPublishError::Publication(
-                SnapshotPublishError::Build(_)
-            ))
+            Err(CranSnapshotPublishError::Publication(_))
         ));
         assert_eq!(
             store.read_current().unwrap().header().generation,
