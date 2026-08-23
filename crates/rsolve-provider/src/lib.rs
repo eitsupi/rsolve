@@ -6,4 +6,4 @@
 pub mod cran;
 pub(crate) mod snapshot;
 
-pub use snapshot::ReadOnlySnapshotCandidateLoader;
+pub use snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotStore, SnapshotStoreError};
