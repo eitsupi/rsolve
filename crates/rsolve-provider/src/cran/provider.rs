@@ -9,8 +9,11 @@ use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 
+use self::raw_cache::{
+    RawCache, RawCacheEntry, RawCacheLookup, RawCacheRepresentation, RawCacheWrite,
+};
 use super::archive_index::provider_rds_read_options;
-use super::catalog::CranCatalog;
+use super::catalog::{CranCatalog, CranCatalogObservation};
 use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
 use super::history::CranHistoryError;
@@ -23,18 +26,18 @@ use rsolve_core::{
     ReleaseAggregation, SolverKey,
 };
 
-// The raw-response/cache integration consumes this crate-private policy seam
-// in the next transport layer; keep it available without coupling snapshot
-// inspection to response headers.
+// Raw-response/cache integration consumes this provider-private policy seam
+// without coupling semantic snapshot inspection to response headers.
 pub mod cache_policy;
 mod negative;
-// Raw-cache APIs are intentionally unconnected until the refresh/304 slice.
+// Raw-cache APIs remain provider-private and are used by current-index refresh.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) mod raw_cache;
 mod refresher;
 mod snapshot;
 mod transport;
 
+use self::cache_policy::{cache_control_policy, permits_reuse};
 use negative::FastPathFailure;
 #[cfg(test)]
 use refresher::canonical_base_url;
@@ -45,9 +48,11 @@ pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
     current_records, index_record_to_evidence, source_input, tarball_record_to_evidence,
 };
-pub(crate) use transport::Transport;
 #[cfg(test)]
-pub(crate) use transport::{TransportError, TransportResponse, TransportValidators};
+pub(crate) use transport::TransportError;
+pub(crate) use transport::{
+    Transport, TransportResponse, TransportResponseHeaders, TransportValidators,
+};
 
 // This is a CRAN transport defense limit, not a generic artifact-size contract.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
@@ -856,6 +861,8 @@ impl CranCandidateSnapshot {
 struct CranRefreshSession<T> {
     base_url: Box<str>,
     transport: Rc<T>,
+    raw_cache: Option<RawCache>,
+    test_now: Option<jiff::Timestamp>,
     current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
     history: Option<Result<HistorySource, CandidateLoadError>>,
     packages: HashMap<PackageName, Result<Vec<PackageRelease>, CandidateLoadError>>,
@@ -869,17 +876,125 @@ enum HistorySource {
     Absent,
 }
 
+struct CurrentBody {
+    body: Vec<u8>,
+    observed_at_timestamp: jiff::Timestamp,
+    observed_at: String,
+    etag: Option<Box<str>>,
+    last_modified: Option<Box<str>>,
+    cache_control: self::cache_policy::CacheControlHeader,
+}
+
+#[derive(Clone, Copy)]
+enum CurrentBodyOrigin {
+    Cached,
+    Network200,
+    Revalidated304,
+}
+
+impl CurrentBody {
+    fn from_cache(entry: RawCacheEntry) -> Self {
+        Self {
+            body: entry.body,
+            observed_at_timestamp: entry.observed_at,
+            observed_at: entry.observed_at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            etag: entry.etag,
+            last_modified: entry.last_modified,
+            cache_control: entry.cache_control,
+        }
+    }
+
+    fn from_response(response: TransportResponse, observed_at: jiff::Timestamp) -> Self {
+        let TransportResponse { body, headers, .. } = response;
+        Self {
+            body,
+            observed_at_timestamp: observed_at,
+            observed_at: observed_at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            etag: headers.etag,
+            last_modified: headers.last_modified,
+            cache_control: headers.cache_control,
+        }
+    }
+
+    fn source(
+        &self,
+        representation: CranCurrentIndexRepresentation,
+        endpoint: &str,
+    ) -> crate::snapshot::SourceInput {
+        snapshot::source_input_with_metadata(
+            "cran-current",
+            match representation {
+                CranCurrentIndexRepresentation::Rds => "rds",
+                CranCurrentIndexRepresentation::Gzip => "gzip",
+                CranCurrentIndexRepresentation::PlainDcf => "dcf",
+            },
+            endpoint,
+            &self.body,
+            self.observed_at.clone(),
+            self.etag.clone(),
+            self.last_modified.clone(),
+        )
+    }
+}
+
 impl<T: Transport> CranRefreshSession<T> {
     fn new(transport: Rc<T>, base_url: impl AsRef<str>) -> Self {
+        Self::new_with_clock(transport, base_url, None, None)
+    }
+
+    fn new_with_clock(
+        transport: Rc<T>,
+        base_url: impl AsRef<str>,
+        test_now: Option<jiff::Timestamp>,
+        raw_cache: Option<RawCache>,
+    ) -> Self {
         Self {
             base_url: base_url.as_ref().trim_end_matches('/').into(),
             transport,
+            raw_cache,
+            test_now,
             current: None,
             history: None,
             packages: HashMap::new(),
             diagnostics: Vec::new(),
             evidence: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    fn now(&self) -> jiff::Timestamp {
+        self.test_now.unwrap_or_else(jiff::Timestamp::now)
+    }
+
+    fn attach_raw_cache(&mut self, cache: RawCache) {
+        self.raw_cache = Some(cache);
+    }
+
+    fn parse_current_body(
+        representation: CranCurrentIndexRepresentation,
+        body: &[u8],
+    ) -> Result<(CranCatalog, Vec<CranCatalogObservation>), String> {
+        let catalog = match representation {
+            CranCurrentIndexRepresentation::Rds => {
+                CranCatalog::from_archive_index_rds_with_options(body, &provider_rds_read_options())
+                    .map_err(|error| error.to_string())?
+            }
+            CranCurrentIndexRepresentation::Gzip => {
+                let decoded = decode_gzip(body)?;
+                CranCatalog::from_packages(&decoded).map_err(|error| error.to_string())?
+            }
+            CranCurrentIndexRepresentation::PlainDcf => {
+                CranCatalog::from_packages(body).map_err(|error| error.to_string())?
+            }
+        };
+        let records = current_records(representation, body)?;
+        Ok((catalog, records))
+    }
+
+    fn cache_error(error: impl std::fmt::Display) -> CandidateLoadError {
+        CandidateLoadError::new(
+            CandidateLoadErrorCategory::SnapshotInvalid,
+            format!("CRAN current raw cache is invalid: {error}"),
+        )
     }
 
     fn ensure_current(&mut self) -> Result<Rc<CranCatalog>, CandidateLoadError> {
@@ -895,106 +1010,259 @@ impl<T: Transport> CranRefreshSession<T> {
         let mut saw_metadata_invalid = false;
         for (representation, filename) in representations {
             let endpoint = format!("{}/src/contrib/{filename}", self.base_url);
-            let response = match self.transport.get(&endpoint) {
-                Ok(response) => response,
-                Err(error) => {
-                    self.push_current_diagnostic(
-                        endpoint.clone(),
-                        representation,
-                        None,
-                        format!("transport failure: {error}"),
-                    );
-                    failures.push(error.to_string());
-                    continue;
+            let cache_key = self
+                .raw_cache
+                .as_ref()
+                .map(|cache| {
+                    cache
+                        .key(
+                            &endpoint,
+                            match representation {
+                                CranCurrentIndexRepresentation::Rds => {
+                                    RawCacheRepresentation::CurrentRds
+                                }
+                                CranCurrentIndexRepresentation::Gzip => {
+                                    RawCacheRepresentation::CurrentGzip
+                                }
+                                CranCurrentIndexRepresentation::PlainDcf => {
+                                    RawCacheRepresentation::CurrentDcf
+                                }
+                            },
+                        )
+                        .map_err(Self::cache_error)
+                })
+                .transpose()?;
+            let mut candidate = None;
+            let mut origin = None;
+            let mut network_attempted = false;
+            if let (Some(cache), Some(key)) = (&self.raw_cache, &cache_key) {
+                match cache.lookup(key) {
+                    RawCacheLookup::Hit(entry) => {
+                        let policy = cache_control_policy(
+                            &entry.cache_control,
+                            DEFAULT_COMPATIBLE_GENERATION_TTL,
+                        );
+                        if permits_reuse(self.now(), entry.validated_at, policy) {
+                            candidate = Some(CurrentBody::from_cache(entry));
+                            origin = Some(CurrentBodyOrigin::Cached);
+                        } else {
+                            network_attempted = true;
+                            let validators = TransportValidators::from_values(
+                                entry.etag.as_deref(),
+                                entry.last_modified.as_deref(),
+                            );
+                            let response = if validators.if_none_match.is_some()
+                                || validators.if_modified_since.is_some()
+                            {
+                                self.transport.get_with_validators(&endpoint, &validators)
+                            } else {
+                                self.transport.get(&endpoint)
+                            };
+                            match response {
+                                Ok(response)
+                                    if response.status == 304 && response.body.is_empty() =>
+                                {
+                                    let mut body = CurrentBody::from_cache(entry);
+                                    if !matches!(
+                                        response.headers.cache_control,
+                                        self::cache_policy::CacheControlHeader::Absent
+                                    ) {
+                                        body.cache_control = response.headers.cache_control.clone();
+                                    }
+                                    if response.headers.etag.is_some() {
+                                        body.etag = response.headers.etag.clone();
+                                    }
+                                    if response.headers.last_modified.is_some() {
+                                        body.last_modified = response.headers.last_modified.clone();
+                                    }
+                                    candidate = Some(body);
+                                    origin = Some(CurrentBodyOrigin::Revalidated304);
+                                }
+                                Ok(response) if response.status == 200 => {
+                                    candidate =
+                                        Some(CurrentBody::from_response(response, self.now()));
+                                    origin = Some(CurrentBodyOrigin::Network200);
+                                }
+                                Ok(response) => {
+                                    let diagnostic = format!(
+                                        "unexpected current index status {}",
+                                        response.status
+                                    );
+                                    self.push_current_diagnostic(
+                                        endpoint.clone(),
+                                        representation,
+                                        Some(response.status),
+                                        diagnostic.clone(),
+                                    );
+                                    failures.push(diagnostic);
+                                }
+                                Err(error) => {
+                                    let diagnostic = format!("transport failure: {error}");
+                                    self.push_current_diagnostic(
+                                        endpoint.clone(),
+                                        representation,
+                                        None,
+                                        diagnostic.clone(),
+                                    );
+                                    failures.push(diagnostic);
+                                }
+                            }
+                        }
+                    }
+                    RawCacheLookup::Missing | RawCacheLookup::Corrupt(_) => {}
                 }
-            };
-            if response.status != 200 {
-                let diagnostic = format!("unexpected current index status {}", response.status);
-                self.push_current_diagnostic(
-                    endpoint,
-                    representation,
-                    Some(response.status),
-                    diagnostic.clone(),
-                );
-                failures.push(diagnostic);
-                continue;
             }
-            let parsed = match representation {
-                CranCurrentIndexRepresentation::Rds => {
-                    CranCatalog::from_archive_index_rds_with_options(
-                        &response.body,
-                        &provider_rds_read_options(),
-                    )
-                    .map_err(|error| error.to_string())
+            if candidate.is_none() && !network_attempted {
+                match self.transport.get(&endpoint) {
+                    Ok(response) if response.status == 200 => {
+                        candidate = Some(CurrentBody::from_response(response, self.now()));
+                        origin = Some(CurrentBodyOrigin::Network200);
+                    }
+                    Ok(response) => {
+                        let diagnostic =
+                            format!("unexpected current index status {}", response.status);
+                        self.push_current_diagnostic(
+                            endpoint.clone(),
+                            representation,
+                            Some(response.status),
+                            diagnostic.clone(),
+                        );
+                        failures.push(diagnostic);
+                    }
+                    Err(error) => {
+                        let diagnostic = format!("transport failure: {error}");
+                        self.push_current_diagnostic(
+                            endpoint.clone(),
+                            representation,
+                            None,
+                            diagnostic.clone(),
+                        );
+                        failures.push(diagnostic);
+                    }
                 }
-                CranCurrentIndexRepresentation::Gzip => {
-                    decode_gzip(&response.body).and_then(|body| {
-                        CranCatalog::from_packages(&body).map_err(|error| error.to_string())
-                    })
+            }
+            let mut retried_unconditionally = false;
+            while let Some(body) = candidate.take() {
+                let parsed = Self::parse_current_body(representation, &body.body);
+                let (catalog, records) = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(error)
+                        if matches!(
+                            origin,
+                            Some(CurrentBodyOrigin::Cached | CurrentBodyOrigin::Revalidated304)
+                        ) && !retried_unconditionally =>
+                    {
+                        retried_unconditionally = true;
+                        let cached_error = error;
+                        match self.transport.get(&endpoint) {
+                            Ok(response) if response.status == 200 => {
+                                candidate = Some(CurrentBody::from_response(response, self.now()));
+                                origin = Some(CurrentBodyOrigin::Network200);
+                                continue;
+                            }
+                            Ok(response) => {
+                                let diagnostic = format!(
+                                    "cached current index was invalid ({cached_error}) and unconditional recovery returned HTTP {}",
+                                    response.status,
+                                );
+                                self.push_current_diagnostic(
+                                    endpoint.clone(),
+                                    representation,
+                                    Some(response.status),
+                                    diagnostic.clone(),
+                                );
+                                failures.push(diagnostic);
+                            }
+                            Err(fetch_error) => {
+                                let diagnostic = format!(
+                                    "cached current index was invalid ({cached_error}) and unconditional recovery failed: {fetch_error}"
+                                );
+                                self.push_current_diagnostic(
+                                    endpoint.clone(),
+                                    representation,
+                                    None,
+                                    diagnostic.clone(),
+                                );
+                                failures.push(diagnostic);
+                            }
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        self.push_current_diagnostic(
+                            endpoint.clone(),
+                            representation,
+                            Some(200),
+                            error.clone(),
+                        );
+                        failures.push(error);
+                        saw_metadata_invalid = true;
+                        break;
+                    }
+                };
+                let mut body = Some(body);
+                let source = body
+                    .as_ref()
+                    .expect("validated current body")
+                    .source(representation, &endpoint);
+                if let (Some(cache), Some(key), Some(CurrentBodyOrigin::Network200)) =
+                    (&self.raw_cache, &cache_key, origin)
+                {
+                    let body = body.take().expect("validated current body");
+                    cache
+                        .publish(
+                            key,
+                            RawCacheWrite {
+                                status: 200,
+                                body: body.body,
+                                observed_at: body.observed_at_timestamp,
+                                validated_at: body.observed_at_timestamp,
+                                etag: body.etag,
+                                last_modified: body.last_modified,
+                                cache_control: body.cache_control,
+                            },
+                        )
+                        .map_err(Self::cache_error)?;
+                } else if let (Some(cache), Some(key), Some(CurrentBodyOrigin::Revalidated304)) =
+                    (&self.raw_cache, &cache_key, origin)
+                {
+                    let body = body.as_ref().expect("validated current body");
+                    let headers = TransportResponseHeaders {
+                        etag: body.etag.clone(),
+                        last_modified: body.last_modified.clone(),
+                        cache_control: body.cache_control.clone(),
+                    };
+                    let validated_at = self.now();
+                    cache
+                        .update_validated_at_with_headers(key, validated_at, &headers)
+                        .map_err(Self::cache_error)?;
                 }
-                CranCurrentIndexRepresentation::PlainDcf => {
-                    CranCatalog::from_packages(&response.body).map_err(|error| error.to_string())
-                }
-            };
-            match parsed {
-                Ok(catalog) => {
-                    let records =
-                        current_records(representation, &response.body).map_err(|error| {
-                            let diagnostic = format!(
-                                "validated current index could not be projected losslessly: {error}"
-                            );
-                            self.push_current_diagnostic(
-                                endpoint.clone(),
-                                representation,
-                                Some(response.status),
-                                diagnostic.clone(),
-                            );
-                            CandidateLoadError::new(
-                                CandidateLoadErrorCategory::MetadataInvalid,
-                                diagnostic,
-                            )
-                        })?;
-                    let source = source_input(
-                        "cran-current",
-                        match representation {
-                            CranCurrentIndexRepresentation::Rds => "rds",
-                            CranCurrentIndexRepresentation::Gzip => "gzip",
-                            CranCurrentIndexRepresentation::PlainDcf => "dcf",
+                self.evidence
+                    .borrow_mut()
+                    .extend(records.iter().map(|record| {
+                        index_record_to_evidence(
+                            record,
+                            source.clone(),
+                            &self.base_url,
+                            true,
+                            FreshnessStateV1::CurrentGeneration,
+                        )
+                    }));
+                self.diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into(),
+                    status: Some(
+                        if matches!(origin, Some(CurrentBodyOrigin::Revalidated304)) {
+                            304
+                        } else {
+                            200
                         },
-                        &endpoint,
-                        &response.body,
-                    );
-                    self.evidence
-                        .borrow_mut()
-                        .extend(records.iter().map(|record| {
-                            index_record_to_evidence(
-                                record,
-                                source.clone(),
-                                &self.base_url,
-                                true,
-                                FreshnessStateV1::CurrentGeneration,
-                            )
-                        }));
-                    self.diagnostics.push(CranRefreshDiagnostic {
-                        endpoint: endpoint.into(),
-                        status: Some(response.status),
-                        status_detail: CranFastPathStatus::Available,
-                        source: CranRefreshSource::CurrentIndex(representation),
-                    });
-                    let catalog = Rc::new(catalog);
-                    self.current = Some(Ok(Rc::clone(&catalog)));
-                    return Ok(catalog);
-                }
-                Err(error) => {
-                    self.push_current_diagnostic(
-                        endpoint,
-                        representation,
-                        Some(response.status),
-                        error.clone(),
-                    );
-                    failures.push(error);
-                    saw_metadata_invalid = true;
-                }
+                    ),
+                    status_detail: CranFastPathStatus::Available,
+                    source: CranRefreshSource::CurrentIndex(representation),
+                });
+                let catalog = Rc::new(catalog);
+                self.current = Some(Ok(Rc::clone(&catalog)));
+                return Ok(catalog);
             }
         }
         let error = CandidateLoadError::new(

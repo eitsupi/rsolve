@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use super::cache_policy::{CacheControlHeader, CacheControlPolicy, cache_control_policy};
-use super::transport::TransportResponse;
+use super::cache_policy::{CacheControlHeader, cache_control_policy};
+use super::transport::{TransportResponse, TransportResponseHeaders};
 use super::{MAX_RESPONSE_BYTES, SnapshotStore};
 
 const RAW_CACHE_DIRECTORY: &str = "raw-cache";
@@ -210,6 +210,14 @@ impl RawCache {
         })
     }
 
+    pub(crate) fn key(
+        &self,
+        endpoint: &str,
+        representation: RawCacheRepresentation,
+    ) -> Result<RawCacheKey, RawCacheError> {
+        RawCacheKey::new(&self.registry_id, endpoint, representation)
+    }
+
     pub(crate) fn lookup(&self, key: &RawCacheKey) -> RawCacheLookup {
         if let Err(error) = self.validate_key_registry(key) {
             return RawCacheLookup::Corrupt(error.to_string().into_boxed_str());
@@ -245,10 +253,7 @@ impl RawCache {
                 "only HTTP 200 responses may be stored in the raw cache".into(),
             ));
         }
-        if matches!(
-            cache_control_policy(&write.cache_control, std::time::Duration::ZERO),
-            CacheControlPolicy::NoStore
-        ) {
+        if !cache_control_policy(&write.cache_control, std::time::Duration::ZERO).can_store() {
             self.remove_entry(key)?;
             return Ok(RawCachePublishOutcome::NoStore);
         }
@@ -263,6 +268,19 @@ impl RawCache {
         &self,
         key: &RawCacheKey,
         validated_at: jiff::Timestamp,
+    ) -> Result<(), RawCacheError> {
+        self.update_validated_at_with_headers(
+            key,
+            validated_at,
+            &TransportResponseHeaders::default(),
+        )
+    }
+
+    pub(crate) fn update_validated_at_with_headers(
+        &self,
+        key: &RawCacheKey,
+        validated_at: jiff::Timestamp,
+        response_headers: &TransportResponseHeaders,
     ) -> Result<(), RawCacheError> {
         let entry = match self.lookup(key) {
             RawCacheLookup::Hit(entry) => entry,
@@ -281,9 +299,15 @@ impl RawCache {
             body: entry.body,
             observed_at: entry.observed_at,
             validated_at,
-            etag: entry.etag,
-            last_modified: entry.last_modified,
-            cache_control: entry.cache_control,
+            etag: response_headers.etag.clone().or(entry.etag),
+            last_modified: response_headers
+                .last_modified
+                .clone()
+                .or(entry.last_modified),
+            cache_control: match &response_headers.cache_control {
+                CacheControlHeader::Absent => entry.cache_control,
+                _ => response_headers.cache_control.clone(),
+            },
         };
         let header = self.header_for_write(key, &write)?;
         self.write_entry(key, header, &write.body)

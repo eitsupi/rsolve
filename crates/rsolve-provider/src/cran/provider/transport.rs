@@ -16,7 +16,6 @@ pub(crate) struct TransportValidators {
 }
 
 impl TransportValidators {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn from_values(
         if_none_match: Option<&str>,
         if_modified_since: Option<&str>,

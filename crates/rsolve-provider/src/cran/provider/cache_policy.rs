@@ -13,7 +13,6 @@ pub enum CacheControlHeader {
 }
 
 /// The cache action selected from a validated Cache-Control header.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheControlPolicy {
     /// The representation must not be retained for later reuse.
@@ -26,7 +25,6 @@ pub enum CacheControlPolicy {
     Fallback(Duration),
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 impl CacheControlPolicy {
     pub fn can_store(self) -> bool {
         !matches!(self, Self::NoStore)
@@ -42,7 +40,6 @@ impl CacheControlPolicy {
 
 /// Resolve Cache-Control precedence without depending on transport or cache
 /// storage. Unknown extension directives are intentionally ignored.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn cache_control_policy(
     header: &CacheControlHeader,
     fallback_ttl: Duration,
@@ -133,7 +130,6 @@ pub fn cache_control_policy(
 
 /// Future observations never qualify as fresh, even when a server supplied a
 /// positive lifetime.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn permits_reuse(
     now: jiff::Timestamp,
     observed_at: jiff::Timestamp,

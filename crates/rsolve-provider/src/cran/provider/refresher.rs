@@ -6,7 +6,7 @@ use std::path::Component;
 use std::rc::Rc;
 
 use flate2::read::GzDecoder;
-use rsolve_core::{CandidateLoadError, PackageName};
+use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageName};
 
 use super::super::publish::{
     CranSnapshotPublishError, default_context, publish_snapshot_with_endpoint,
@@ -87,11 +87,18 @@ impl CranSnapshotRefresher {
         store: &SnapshotStore,
         roots: &[PackageName],
     ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
-        let observations = self
-            .session
-            .borrow_mut()
+        let raw_cache = super::raw_cache::RawCache::open(store).map_err(|error| {
+            CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                format!("unable to open CRAN current raw cache: {error}"),
+            ))
+        })?;
+        let mut session = self.session.borrow_mut();
+        session.attach_raw_cache(raw_cache);
+        let observations = session
             .refresh_snapshot_observations(roots)
             .map_err(CranSnapshotPublishError::Acquisition)?;
+        drop(session);
         publish_snapshot_with_endpoint(
             store,
             default_context(store.registry_id().clone()),

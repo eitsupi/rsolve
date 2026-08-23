@@ -1,4 +1,5 @@
 use super::*;
+use crate::cran::provider::raw_cache::{RawCacheLookup, RawCacheRepresentation, RawCacheWrite};
 
 #[test]
 fn current_rds_provider_path_assumes_utf8_for_native_format_two_strings() {
@@ -302,6 +303,352 @@ fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
         error.category(),
         CandidateLoadErrorCategory::MetadataInvalid
     );
+}
+
+#[test]
+fn persistent_current_rds_cache_reuse_avoids_a_second_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: TransportResponseHeaders {
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=3600".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let first_requests = first_transport.requests.clone();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(cache),
+    );
+    first.ensure_current().unwrap();
+    assert_eq!(
+        first_requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url == current_rds_url())
+            .count(),
+        1
+    );
+
+    let second_transport = FixtureTransport {
+        responses: HashMap::new(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let second_requests = second_transport.requests.clone();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(cache),
+    );
+    second.ensure_current().unwrap();
+    assert!(second_requests.borrow().is_empty());
+}
+
+#[test]
+fn persistent_refresh_path_uses_current_cache_across_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        first_transport,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    )
+    .unwrap();
+
+    let second_transport = FixtureTransport::fallback(FAST.to_vec(), 200);
+    let requests = second_transport.requests.clone();
+    crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        second_transport,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    )
+    .unwrap();
+    assert!(
+        !requests
+            .borrow()
+            .iter()
+            .any(|request| request.url == current_rds_url())
+    );
+}
+
+#[test]
+fn stale_current_cache_revalidates_with_validators_and_304() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let etag = "\"current-etag\"";
+    let first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: TransportResponseHeaders {
+                etag: Some(etag.into()),
+                last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "no-cache".into(),
+                ),
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(cache),
+    );
+    first.ensure_current().unwrap();
+
+    let second_transport = session_transport(
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: TransportResponseHeaders {
+                etag: Some("\"refreshed-etag\"".into()),
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=120".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let second_requests = second_transport.requests.clone();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_rds_url(), RawCacheRepresentation::CurrentRds)
+        .unwrap();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(cache),
+    );
+    second.ensure_current().unwrap();
+    let requests = second_requests.borrow();
+    let request = requests
+        .iter()
+        .find(|request| request.url == current_rds_url())
+        .unwrap();
+    assert_eq!(request.validators.if_none_match.as_deref(), Some(etag));
+    assert_eq!(
+        request.validators.if_modified_since.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+    drop(requests);
+    let evidence = second.evidence.borrow();
+    let source = &evidence[0].source;
+    assert_eq!(source.observed_at, "2026-08-23T00:00:00Z");
+    assert_eq!(source.etag.as_deref(), Some("\"refreshed-etag\""));
+    assert_eq!(
+        source.last_modified.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+    let RawCacheLookup::Hit(entry) = RawCache::open(&store).unwrap().lookup(&key) else {
+        panic!("expected revalidated raw cache entry")
+    };
+    assert_eq!(entry.observed_at, t0);
+    assert_eq!(entry.validated_at, "2026-08-23T00:00:01Z".parse().unwrap());
+    assert_eq!(entry.etag.as_deref(), Some("\"refreshed-etag\""));
+    assert_eq!(
+        entry.last_modified.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+    assert_eq!(
+        entry.cache_control,
+        crate::cran::provider::cache_policy::CacheControlHeader::Valid("max-age=120".into())
+    );
+}
+
+#[test]
+fn fresh_semantically_invalid_current_cache_recovers_unconditionally() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_rds_url(), RawCacheRepresentation::CurrentRds)
+        .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    cache
+        .publish(
+            &key,
+            RawCacheWrite {
+                status: 200,
+                body: WRONG_ROOT.to_vec(),
+                observed_at: t0,
+                validated_at: t0,
+                etag: None,
+                last_modified: None,
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=3600".into(),
+                ),
+            },
+        )
+        .unwrap();
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
+    );
+    session.ensure_current().unwrap();
+    let requests = requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url == current_rds_url())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn stale_current_cache_without_validators_uses_unconditional_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: TransportResponseHeaders {
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "no-cache".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(cache),
+    );
+    first.ensure_current().unwrap();
+
+    let second_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let requests = second_transport.requests.clone();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(cache),
+    );
+    second.ensure_current().unwrap();
+    let request = requests
+        .borrow()
+        .iter()
+        .find(|request| request.url == current_rds_url())
+        .unwrap()
+        .clone();
+    assert_eq!(request.validators, TransportValidators::default());
+}
+
+#[test]
+fn invalid_network_current_response_is_not_persisted() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_rds_url(), RawCacheRepresentation::CurrentRds)
+        .unwrap();
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: WRONG_ROOT.to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:00Z".parse().unwrap()),
+        Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
+    );
+    assert!(session.ensure_current().is_err());
+    assert!(matches!(
+        crate::cran::provider::raw_cache::RawCache::open(&store)
+            .unwrap()
+            .lookup(&key),
+        RawCacheLookup::Missing
+    ));
 }
 
 #[test]

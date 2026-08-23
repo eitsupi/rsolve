@@ -18,15 +18,35 @@ pub(super) fn source_input(
     endpoint: &str,
     body: &[u8],
 ) -> SourceInput {
+    source_input_with_metadata(
+        kind,
+        representation,
+        endpoint,
+        body,
+        jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+        None,
+        None,
+    )
+}
+
+pub(super) fn source_input_with_metadata(
+    kind: &str,
+    representation: &str,
+    endpoint: &str,
+    body: &[u8],
+    observed_at: String,
+    etag: Option<Box<str>>,
+    last_modified: Option<Box<str>>,
+) -> SourceInput {
     SourceInput {
         kind: kind.into(),
         representation: representation.into(),
         content_sha256: Sha256::digest(body).into(),
-        etag: None,
-        last_modified: None,
-        observed_at: jiff::Timestamp::now()
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
-            .to_string(),
+        etag: etag.map(|value| value.into_string()),
+        last_modified: last_modified.map(|value| value.into_string()),
+        observed_at,
         endpoint: endpoint.into(),
     }
 }
@@ -187,7 +207,18 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
     super::super::publish::CranSnapshotPublishError,
 > {
     let effective_endpoint = base_url.as_ref().to_owned();
-    let mut session = CranRefreshSession::new(std::rc::Rc::new(transport), &effective_endpoint);
+    let raw_cache = super::raw_cache::RawCache::open(store).map_err(|error| {
+        super::super::publish::CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
+            CandidateLoadErrorCategory::SnapshotInvalid,
+            format!("unable to open CRAN current raw cache: {error}"),
+        ))
+    })?;
+    let mut session = CranRefreshSession::new_with_clock(
+        std::rc::Rc::new(transport),
+        &effective_endpoint,
+        None,
+        Some(raw_cache),
+    );
     let observations = session
         .refresh_snapshot_observations(roots)
         .map_err(super::super::publish::CranSnapshotPublishError::Acquisition)?;
