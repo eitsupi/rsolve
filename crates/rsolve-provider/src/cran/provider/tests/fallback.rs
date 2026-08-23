@@ -7,7 +7,7 @@ fn absent_fast_path_falls_back_lazily_without_reprobe() {
     let provider = provider(transport);
     assert!(matches!(
         provider.diagnostics()[0].status_detail(),
-        CranFastPathStatus::Absent { status: 404 }
+        CranFastPathStatus::Unsupported { status: 404 }
     ));
     assert_eq!(requests.borrow().len(), 2);
     assert_eq!(requests.borrow()[0], fast_url());
@@ -115,7 +115,7 @@ fn gone_fast_path_is_absent_and_shared_history_is_fetched_once() {
             .find(|diagnostic| diagnostic.endpoint() == fast_url())
             .unwrap()
             .status_detail(),
-        &CranFastPathStatus::Absent { status: 410 }
+        &CranFastPathStatus::Unsupported { status: 410 }
     );
     assert_eq!(
         requests
@@ -291,6 +291,168 @@ fn fast_path_failure_is_not_hidden_by_absent_history() {
                     CranFastPathStatus::Absent { status: 404 }
                 )
         }));
+    }
+}
+
+#[test]
+fn unsupported_fast_path_and_empty_sources_are_negative_cached() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: Other\nVersion: 1.0.0\n".to_vec(),
+        },
+    );
+    transport.responses.insert(
+        history_url(),
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let package = PackageName::new("Matrix").unwrap();
+    for _ in 0..2 {
+        let snapshot = session
+            .refresh_packages(std::slice::from_ref(&package))
+            .unwrap();
+        assert!(
+            snapshot
+                .releases(&SolverKey::InstalledName(package.clone()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let request_count = requests.borrow().len();
+    let diagnostic_count = session.diagnostics.len();
+    assert_eq!(request_count, 5);
+    assert_eq!(diagnostic_count, 5);
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|url| *url == &fast_url())
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|url| *url == &history_url())
+            .count(),
+        1
+    );
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::ArchiveFastPath
+            && diagnostic.status_detail() == &CranFastPathStatus::Unsupported { status: 404 }
+    }));
+}
+
+#[test]
+fn invalid_fast_path_failure_is_negative_cached_with_stable_error() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+        },
+    );
+    transport.responses.insert(
+        fast_url(),
+        TransportResponse {
+            status: 500,
+            body: Vec::new(),
+        },
+    );
+    transport.responses.insert(
+        history_url(),
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let package = PackageName::new("Matrix").unwrap();
+    let first = session
+        .refresh_packages(std::slice::from_ref(&package))
+        .unwrap_err();
+    let request_count = requests.borrow().len();
+    let diagnostic_count = session.diagnostics.len();
+    let second = session
+        .refresh_packages(std::slice::from_ref(&package))
+        .unwrap_err();
+    assert_eq!(
+        first.category(),
+        CandidateLoadErrorCategory::TransportFailure
+    );
+    assert_eq!(second.category(), first.category());
+    assert_eq!(second.diagnostic(), first.diagnostic());
+    assert_eq!(requests.borrow().len(), request_count);
+    assert_eq!(session.diagnostics.len(), diagnostic_count);
+}
+
+#[test]
+fn tarball_transport_and_metadata_failures_are_negative_cached() {
+    let mut malformed = OLD_TAR.to_vec();
+    malformed[0] ^= 1;
+    for (status, body, category) in [
+        (
+            503,
+            Vec::new(),
+            CandidateLoadErrorCategory::TransportFailure,
+        ),
+        (200, malformed, CandidateLoadErrorCategory::MetadataInvalid),
+    ] {
+        let mut transport = session_transport(
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 404,
+                body: Vec::new(),
+            },
+            TransportResponse {
+                status: 200,
+                body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            },
+        );
+        transport
+            .responses
+            .insert(old_url(), TransportResponse { status, body });
+        let requests = Rc::clone(&transport.requests);
+        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let package = PackageName::new("Matrix").unwrap();
+        let first = session
+            .refresh_packages(std::slice::from_ref(&package))
+            .unwrap_err();
+        let request_count = requests.borrow().len();
+        let diagnostic_count = session.diagnostics.len();
+        let second = session
+            .refresh_packages(std::slice::from_ref(&package))
+            .unwrap_err();
+        assert_eq!(first.category(), category);
+        assert_eq!(second.category(), first.category());
+        assert_eq!(second.diagnostic(), first.diagnostic());
+        assert_eq!(requests.borrow().len(), request_count);
+        assert_eq!(session.diagnostics.len(), diagnostic_count);
     }
 }
 

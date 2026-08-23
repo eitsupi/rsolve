@@ -20,10 +20,12 @@ use rsolve_core::{
     ReleaseAggregation, SolverKey,
 };
 
+mod negative;
 mod refresher;
 mod snapshot;
 mod transport;
 
+use negative::FastPathFailure;
 #[cfg(test)]
 use refresher::canonical_base_url;
 pub use refresher::{CranSnapshotRefresher, CranSnapshotRefresherError};
@@ -77,8 +79,17 @@ impl Error for CranProviderError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CranFastPathStatus {
     Available,
-    Absent { status: u16 },
-    Invalid { status: u16, diagnostic: Box<str> },
+    /// The archive index capability is not exposed by this repository.
+    Unsupported {
+        status: u16,
+    },
+    Absent {
+        status: u16,
+    },
+    Invalid {
+        status: u16,
+        diagnostic: Box<str>,
+    },
 }
 
 /// The representation attempted for the shared current CRAN index.
@@ -192,8 +203,8 @@ impl<T: Transport> CranProvider<T> {
             diagnostics.push(CranRefreshDiagnostic {
                 endpoint: endpoint.clone().into_boxed_str(),
                 status: Some(response.status),
-                status_detail: if response.status == 404 {
-                    CranFastPathStatus::Absent {
+                status_detail: if matches!(response.status, 404 | 410) {
+                    CranFastPathStatus::Unsupported {
                         status: response.status,
                     }
                 } else {
@@ -514,7 +525,7 @@ struct CranRefreshSession<T> {
     transport: Rc<T>,
     current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
     history: Option<Result<HistorySource, CandidateLoadError>>,
-    packages: HashMap<PackageName, Vec<PackageRelease>>,
+    packages: HashMap<PackageName, Result<Vec<PackageRelease>, CandidateLoadError>>,
     diagnostics: Vec<CranRefreshDiagnostic>,
     evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
 }
@@ -523,14 +534,6 @@ struct CranRefreshSession<T> {
 enum HistorySource {
     Available(Rc<[ArchiveEntry]>),
     Absent,
-}
-
-enum FastPathFailure {
-    Absent,
-    Invalid {
-        category: CandidateLoadErrorCategory,
-        diagnostic: Box<str>,
-    },
 }
 
 impl<T: Transport> CranRefreshSession<T> {
@@ -777,9 +780,18 @@ impl<T: Transport> CranRefreshSession<T> {
         &mut self,
         package: &PackageName,
     ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
-        if let Some(candidates) = self.packages.get(package) {
-            return Ok(candidates.clone());
+        if let Some(result) = self.packages.get(package) {
+            return result.clone();
         }
+        let result = self.refresh_package_uncached(package);
+        self.packages.insert(package.clone(), result.clone());
+        result
+    }
+
+    fn refresh_package_uncached(
+        &mut self,
+        package: &PackageName,
+    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
         let current = self.ensure_current()?.candidates(package).to_vec();
         let endpoint = format!(
             "{}/src/contrib/Archive/{}/PACKAGES.rds",
@@ -866,7 +878,7 @@ impl<T: Transport> CranRefreshSession<T> {
             Ok(response) => {
                 let status = response.status;
                 let status_detail = if matches!(status, 404 | 410) {
-                    CranFastPathStatus::Absent { status }
+                    CranFastPathStatus::Unsupported { status }
                 } else {
                     CranFastPathStatus::Invalid {
                         status,
@@ -880,7 +892,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     source: CranRefreshSource::ArchiveFastPath,
                 });
                 if matches!(status, 404 | 410) {
-                    Err(FastPathFailure::Absent)
+                    Err(FastPathFailure::Unsupported)
                 } else {
                     Err(FastPathFailure::Invalid {
                         category: CandidateLoadErrorCategory::TransportFailure,
@@ -898,12 +910,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 provider_diagnostics = package_diagnostics;
                 source
             }
-            Err(failure) => match self.resolve_fast_path_failure(
-                package,
-                &current,
-                package_diagnostics,
-                failure,
-            )? {
+            Err(failure) => match self.resolve_fast_path_failure(package_diagnostics, failure)? {
                 Some(source) => source,
                 None => return Ok(current),
             },
@@ -930,37 +937,7 @@ impl<T: Transport> CranRefreshSession<T> {
         }
         let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
-        self.packages.insert(package.clone(), candidates.clone());
         Ok(candidates)
-    }
-
-    fn resolve_fast_path_failure(
-        &mut self,
-        package: &PackageName,
-        current: &[PackageRelease],
-        mut package_diagnostics: Vec<CranRefreshDiagnostic>,
-        failure: FastPathFailure,
-    ) -> Result<Option<CandidateSource>, CandidateLoadError> {
-        // Record the fast-path attempt before probing history so diagnostics
-        // follow the actual endpoint order. History itself is cached by the
-        // session and contributes at most one diagnostic.
-        self.diagnostics.append(&mut package_diagnostics);
-        match self.ensure_history()? {
-            HistorySource::Available(entries) => Ok(Some(CandidateSource::Fallback(entries))),
-            HistorySource::Absent => match failure {
-                FastPathFailure::Absent => {
-                    self.packages.insert(package.clone(), current.to_vec());
-                    Ok(None)
-                }
-                FastPathFailure::Invalid {
-                    category,
-                    diagnostic,
-                } => Err(CandidateLoadError::new(
-                    category,
-                    format!("{diagnostic}; archive history is absent"),
-                )),
-            },
-        }
     }
 
     fn refresh_packages(
@@ -971,7 +948,16 @@ impl<T: Transport> CranRefreshSession<T> {
             self.refresh_package(package)?;
         }
         Ok(CranCandidateSnapshot {
-            candidates: self.packages.clone(),
+            candidates: self
+                .packages
+                .iter()
+                .filter_map(|(package, result)| {
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(|candidates| (package.clone(), candidates.clone()))
+                })
+                .collect(),
         })
     }
 }

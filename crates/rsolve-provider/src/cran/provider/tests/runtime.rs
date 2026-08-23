@@ -30,7 +30,7 @@ fn runtime_loader_caches_each_package_provider_and_its_candidates() {
     assert_eq!(loader.releases(&package).unwrap().len(), 2);
     assert!(matches!(
         loader.diagnostics()[0].status_detail(),
-        CranFastPathStatus::Absent { status: 404 }
+        CranFastPathStatus::Unsupported { status: 404 }
     ));
     assert_eq!(requests.borrow().len(), 4);
     assert_eq!(requests.borrow()[0], fast_url());
