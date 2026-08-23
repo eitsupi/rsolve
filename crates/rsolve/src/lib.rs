@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod lock;
 pub mod manifest;
+pub(crate) mod metadata_cache;
 pub mod orchestration;
 pub mod pak;
 pub mod wire;

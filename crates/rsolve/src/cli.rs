@@ -10,6 +10,7 @@ use tempfile::NamedTempFile;
 
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
+use crate::metadata_cache::MetadataCache;
 use crate::{
     EnvironmentId, Lockfile, Manifest, ManifestDependency, ManifestTarget, from_toml,
     resolve_from_cran_with_publication_cutoff, to_toml,
@@ -51,6 +52,9 @@ pub struct LockCommand {
     /// Lockfile destination. Defaults to rsolve.lock.
     #[arg(long, default_value = DEFAULT_OUTPUT)]
     pub output: PathBuf,
+    /// Metadata cache root. Defaults to the platform cache directory.
+    #[arg(long, value_name = "ROOT")]
+    pub metadata_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -91,6 +95,7 @@ trait ResolutionBackend {
         manifest: Manifest,
         mirror: &str,
         cutoff: Option<PublicationDate>,
+        metadata_cache: &MetadataCache,
     ) -> Result<ResolvedData, CliError>;
 }
 
@@ -107,6 +112,7 @@ impl ResolutionBackend for CranBackend {
         manifest: Manifest,
         mirror: &str,
         cutoff: Option<PublicationDate>,
+        _metadata_cache: &MetadataCache,
     ) -> Result<ResolvedData, CliError> {
         let outcome = resolve_from_cran_with_publication_cutoff(manifest, mirror, cutoff)
             .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
@@ -169,7 +175,9 @@ fn run_lock_with_backend(
     .map_err(|error| value_error(format!("invalid manifest: {error}")))?;
 
     let requested_package_count = command.package.len();
-    let resolved = backend.resolve(manifest, &mirror, cutoff)?;
+    let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
+        .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
+    let resolved = backend.resolve(manifest, &mirror, cutoff, &metadata_cache)?;
     let environment = EnvironmentId::new("default")
         .map_err(|error| CliError::Operational(format!("invalid environment: {error}")))?;
     let lock = Lockfile::from_resolution_with_publication_cutoff(
@@ -450,6 +458,8 @@ mod tests {
             "2026-06-24",
             "--output",
             "custom.lock",
+            "--metadata-cache",
+            "custom-cache",
         ])
         .unwrap();
         let Command::Lock(lock) = command.command;
@@ -457,6 +467,7 @@ mod tests {
         assert_eq!(lock.package, vec!["Matrix".to_owned(), "stats".to_owned()]);
         assert_eq!(lock.publication_cutoff.as_deref(), Some("2026-06-24"));
         assert_eq!(lock.output, PathBuf::from("custom.lock"));
+        assert_eq!(lock.metadata_cache, Some(PathBuf::from("custom-cache")));
         let defaults = CommandLine::try_parse_from([
             "rsolve",
             "lock",
@@ -587,6 +598,7 @@ mod tests {
             cran_mirror: "https://user:password@example.test".into(),
             publication_cutoff: None,
             output: temp_path("missing-parent").join("parent").join("lock"),
+            metadata_cache: None,
         };
         let result = run_lock_with_backend(command, &PanicBackend);
         assert!(matches!(result, Err(CliError::Value(message)) if message.contains("userinfo")));
@@ -662,6 +674,7 @@ mod tests {
             _manifest: Manifest,
             _mirror: &str,
             _cutoff: Option<PublicationDate>,
+            _metadata_cache: &MetadataCache,
         ) -> Result<ResolvedData, CliError> {
             panic!("resolution must not be called after validation failure")
         }
@@ -755,6 +768,7 @@ mod tests {
             manifest: Manifest,
             _mirror: &str,
             cutoff: Option<PublicationDate>,
+            _metadata_cache: &MetadataCache,
         ) -> Result<ResolvedData, CliError> {
             let loader = MatrixLoader {
                 releases: vec![
@@ -779,6 +793,7 @@ mod tests {
             cran_mirror: DEFAULT_CRAN_MIRROR.into(),
             publication_cutoff: None,
             output,
+            metadata_cache: Some(temp_path("matrix-metadata-cache")),
         }
     }
 
@@ -873,6 +888,7 @@ mod tests {
                 _manifest: Manifest,
                 _mirror: &str,
                 _cutoff: Option<PublicationDate>,
+                _metadata_cache: &MetadataCache,
             ) -> Result<ResolvedData, CliError> {
                 Err(CliError::Operational("injected resolution failure".into()))
             }
