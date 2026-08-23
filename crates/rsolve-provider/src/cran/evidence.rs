@@ -144,6 +144,15 @@ pub(crate) fn compose_snapshot(
         .collect::<Result<Vec<_>, EvidenceCompositionError>>()?;
     for observation in &mut indexed {
         if let Some(artifact) = &mut observation.artifact {
+            if artifact
+                .checksums
+                .iter()
+                .any(|checksum| checksum.algorithm != checksum.algorithm.to_ascii_lowercase())
+            {
+                return Err(EvidenceCompositionError::Invalid(
+                    "occurrence checksum algorithm must be lowercase".into(),
+                ));
+            }
             artifact.checksums.sort_by(|left, right| {
                 (&left.algorithm, &left.value).cmp(&(&right.algorithm, &right.value))
             });
@@ -811,7 +820,7 @@ fn relation_op_rank(op: RelationOpV1) -> u8 {
     op as u8
 }
 
-type DependencySemanticKey = (u8, String, Vec<(u8, Vec<u32>, String)>);
+type DependencySemanticKey = (u8, String, Vec<(u8, Vec<u32>)>);
 
 fn canonical_dependency_semantics(
     dependencies: &[DependencyRequirement],
@@ -832,7 +841,6 @@ fn canonical_dependency_semantics(
                             .components()
                             .take(version.canonical_component_count())
                             .collect::<Vec<_>>(),
-                        clause.version.to_string(),
                     ))
                 })
                 .collect::<Result<Vec<_>, EvidenceCompositionError>>()?;
@@ -1076,6 +1084,21 @@ mod tests {
                 namespace: PackageNamespace::new("cran").unwrap(),
             },
             VersionConstraint::unconstrained(),
+        )];
+        PackageRelease::try_from(observation).unwrap()
+    }
+
+    fn release_with_dependency_version_spelling(spelling: &str) -> PackageRelease {
+        let fields = [("Package", "P3MOverlay"), ("Version", "1.0")];
+        let mut observation = super::super::catalog::observation_from_fields(&fields).unwrap();
+        observation.dependencies = vec![DependencyRequirement::new(
+            DependencyKind::Depends,
+            PackageName::new("R").unwrap(),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(
+                RelationOp::Ge,
+                RPackageVersion::parse(spelling).unwrap(),
+            ),
         )];
         PackageRelease::try_from(observation).unwrap()
     }
@@ -1447,6 +1470,14 @@ mod tests {
         }];
         let error = compose_snapshot(context(), invalid_digest).unwrap_err();
         assert!(matches!(error, EvidenceCompositionError::Invalid(_)));
+
+        let mut uppercase_algorithm = fixture_observations();
+        uppercase_algorithm[0].artifact.as_mut().unwrap().checksums = vec![ChecksumV1 {
+            algorithm: "SHA256".into(),
+            value: "00".repeat(32),
+        }];
+        let error = compose_snapshot(context(), uppercase_algorithm).unwrap_err();
+        assert!(matches!(error, EvidenceCompositionError::Invalid(_)));
     }
 
     #[test]
@@ -1755,6 +1786,27 @@ mod tests {
         )
         .build()
         .unwrap();
+    }
+
+    #[test]
+    fn equivalent_dependency_version_spellings_merge_authoritative_observations() {
+        let mut observations = fixture_observations();
+        observations[0].release = Some(release_with_dependency_version_spelling("4.4"));
+        observations[1].release = Some(release_with_dependency_version_spelling("4.4.0"));
+        observations[1].axes.publication = PublicationStateV1::Unknown;
+        let input = compose_snapshot(context(), observations).unwrap();
+        let history = input
+            .histories
+            .iter()
+            .find(|history| history.package == "P3MOverlay")
+            .unwrap();
+        assert!(matches!(history.state, LookupStateV1::Present));
+        assert!(history.decisions.iter().any(|decision| {
+            matches!(
+                decision.code,
+                crate::snapshot::DecisionCodeV1::EquivalentMerge
+            ) && decision.observation_ids.len() == 2
+        }));
     }
 
     #[test]
