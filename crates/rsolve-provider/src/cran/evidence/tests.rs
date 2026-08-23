@@ -39,10 +39,15 @@ fn release_with_preexisting_artifact(fields: &[(&str, &str)]) -> PackageRelease 
     PackageRelease::try_from(observation).unwrap()
 }
 
-fn release_with_multiple_distribution_templates(fields: &[(&str, &str)]) -> PackageRelease {
+fn release_with_multiple_distribution_templates(
+    fields: &[(&str, &str)],
+    first_registry: &str,
+    second_registry: &str,
+) -> PackageRelease {
     let mut observation = super::super::catalog::observation_from_fields(fields).unwrap();
+    observation.distributions[0].registry = RegistryId::new(first_registry).unwrap();
     observation.distributions.push(Distribution {
-        registry: RegistryId::new("other-registry").unwrap(),
+        registry: RegistryId::new(second_registry).unwrap(),
         channel: DistributionChannel::new("binary").unwrap(),
         snapshot: None,
         artifacts: vec![],
@@ -471,15 +476,65 @@ fn preexisting_release_artifacts_are_not_projected_without_occurrence_evidence()
 #[test]
 fn multiple_distribution_templates_fail_closed_for_artifact_observations() {
     let mut observations = fixture_observations();
-    observations[0].release = Some(release_with_multiple_distribution_templates(&[
-        ("Package", "P3MOverlay"),
-        ("Version", "1.0"),
-    ]));
+    observations[0].release = Some(release_with_multiple_distribution_templates(
+        &[("Package", "P3MOverlay"), ("Version", "1.0")],
+        "cran",
+        "other-registry",
+    ));
     let error = compose_snapshot(context(), observations).unwrap_err();
     assert!(matches!(
         error,
         EvidenceCompositionError::Invalid(message)
-            if message.contains("multiple distribution templates")
+            if message.contains("ambiguous distribution templates")
+    ));
+}
+
+#[test]
+fn matching_distribution_template_is_selected_without_projecting_unrelated_templates() {
+    let mut observations = fixture_observations();
+    observations[0].release = Some(release_with_multiple_distribution_templates(
+        &[("Package", "P3MOverlay"), ("Version", "1.0")],
+        "p3m",
+        "other-registry",
+    ));
+    let input = compose_snapshot(context(), observations).unwrap();
+    let history = input
+        .histories
+        .iter()
+        .find(|history| history.package == "P3MOverlay")
+        .unwrap();
+    let current = history
+        .eligible_releases
+        .iter()
+        .find(|release| release.version == "1.0")
+        .unwrap();
+    assert!(
+        current
+            .distributions
+            .iter()
+            .all(|distribution| distribution.registry != "other-registry")
+    );
+    assert!(
+        current
+            .distributions
+            .iter()
+            .any(|distribution| distribution.registry == "p3m")
+    );
+}
+
+#[test]
+fn multiple_matching_distribution_templates_fail_closed() {
+    let mut observations = fixture_observations();
+    observations[0].release = Some(release_with_multiple_distribution_templates(
+        &[("Package", "P3MOverlay"), ("Version", "1.0")],
+        "p3m",
+        "p3m",
+    ));
+    let error = compose_snapshot(context(), observations).unwrap_err();
+    assert!(matches!(
+        error,
+        EvidenceCompositionError::Invalid(message)
+            if message.contains("ambiguous distribution templates")
     ));
 }
 

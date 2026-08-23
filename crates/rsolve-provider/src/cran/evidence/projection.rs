@@ -287,10 +287,20 @@ pub(super) fn distributions_for_observation(
             distribution.artifacts.clear();
             vec![distribution]
         }
-        _ => {
-            return Err(EvidenceCompositionError::Invalid(
-                "artifact-bound observation has multiple distribution templates".into(),
-            ));
+        templates => {
+            let matching = templates
+                .iter()
+                .filter(|template| template.registry == registry)
+                .collect::<Vec<_>>();
+            let [template] = matching.as_slice() else {
+                return Err(EvidenceCompositionError::Invalid(
+                    "artifact-bound observation has ambiguous distribution templates".into(),
+                ));
+            };
+            let mut distribution = (*template).clone();
+            distribution.registry = registry;
+            distribution.artifacts.clear();
+            vec![distribution]
         }
     };
     let locator = ArtifactLocator::new(&artifact.locator)
