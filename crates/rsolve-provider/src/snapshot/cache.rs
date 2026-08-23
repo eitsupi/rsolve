@@ -123,6 +123,10 @@ impl SnapshotStore {
         &self.root
     }
 
+    pub(crate) fn registry_id(&self) -> &RegistryId {
+        &self.registry_id
+    }
+
     /// Builds, validates, publishes, and opens one immutable generation while
     /// holding the refresh lock. The resulting loader is pinned before the
     /// lock is released and returned directly after unlock, so a concurrent

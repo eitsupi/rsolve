@@ -51,9 +51,9 @@ impl Error for CranSnapshotPublishError {
     }
 }
 
-pub(crate) fn default_context() -> SnapshotCompositionContext {
+pub(crate) fn default_context(registry_id: RegistryId) -> SnapshotCompositionContext {
     SnapshotCompositionContext {
-        registry_id: RegistryId::new("cran").expect("fixed CRAN registry id is valid"),
+        registry_id,
         compatibility_profile: 1,
         parser_schema: 1,
         normalization_policy: 1,

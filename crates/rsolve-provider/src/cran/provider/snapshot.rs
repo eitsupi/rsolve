@@ -178,7 +178,7 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
         .map_err(super::super::publish::CranSnapshotPublishError::Acquisition)?;
     super::super::publish::publish_snapshot(
         store,
-        super::super::publish::default_context(),
+        super::super::publish::default_context(store.registry_id().clone()),
         observations,
     )
 }

@@ -280,3 +280,44 @@ fn production_refresh_publishes_current_and_archive_index_evidence() {
     assert!(!requests.borrow().iter().any(|url| url == &history_url()));
     assert!(!requests.borrow().iter().any(|url| url == &old_url()));
 }
+
+#[test]
+fn production_refresh_propagates_configured_registry_id_to_header_and_loader() {
+    let transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+        },
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let registry = rsolve_core::RegistryId::new("configured-cran-mirror").unwrap();
+    let store = crate::snapshot::SnapshotStore::open(directory.path(), registry.clone()).unwrap();
+    let loader = crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        transport,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    )
+    .expect("configured registry publication should succeed");
+    assert_eq!(loader.header().registry_id, registry.as_str());
+    assert_eq!(
+        store.read_current().unwrap().header().registry_id,
+        registry.as_str()
+    );
+    assert!(
+        !loader
+            .releases(&SolverKey::InstalledName(
+                PackageName::new("Matrix").unwrap()
+            ))
+            .unwrap()
+            .is_empty()
+    );
+}

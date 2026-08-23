@@ -86,7 +86,11 @@ impl CranSnapshotRefresher {
             .borrow_mut()
             .refresh_snapshot_observations(roots)
             .map_err(CranSnapshotPublishError::Acquisition)?;
-        publish_snapshot(store, default_context(), observations)
+        publish_snapshot(
+            store,
+            default_context(store.registry_id().clone()),
+            observations,
+        )
     }
 }
 
