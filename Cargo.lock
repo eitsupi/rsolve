@@ -851,8 +851,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rd-rds"
-version = "0.3.1"
-source = "git+https://github.com/eitsupi/r-documentation-rs?rev=dcedec3efe3b9c3e8eee31aae4cb9080f09d6f6c#dcedec3efe3b9c3e8eee31aae4cb9080f09d6f6c"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf9515c75d24b41617a4863bd78bca58ac1b2db5df63adf500d553e6b653e79c"
 dependencies = [
  "bzip2",
  "flate2",

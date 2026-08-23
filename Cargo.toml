@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.92"
 publish = false
 
 [workspace.dependencies]
@@ -14,7 +14,7 @@ deb822-fast = "0.2"
 md-5 = "0.10"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 percent-encoding = "2.3.2"
-rd-rds = "0.3.1"
+rd-rds = "0.4.0"
 pubgrub = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.10"
@@ -29,6 +29,3 @@ tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 url = "2"
 windows-sys = "0.61"
-
-[patch.crates-io]
-rd-rds = { git = "https://github.com/eitsupi/r-documentation-rs", rev = "dcedec3efe3b9c3e8eee31aae4cb9080f09d6f6c" }
