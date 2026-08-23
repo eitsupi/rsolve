@@ -8,7 +8,9 @@ use std::rc::Rc;
 use flate2::read::GzDecoder;
 use rsolve_core::{CandidateLoadError, PackageName};
 
-use super::super::publish::{CranSnapshotPublishError, default_context, publish_snapshot};
+use super::super::publish::{
+    CranSnapshotPublishError, default_context, publish_snapshot_with_endpoint,
+};
 use super::transport::UreqTransport;
 use super::{CranCandidateSnapshot, CranRefreshDiagnostic, CranRefreshSession};
 use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotStore};
@@ -64,6 +66,10 @@ impl CranSnapshotRefresher {
         diagnostics
     }
 
+    pub fn canonical_endpoint(&self) -> Box<str> {
+        self.session.borrow().base_url.clone()
+    }
+
     /// Refreshes exactly these package names, then returns a transport-free
     /// snapshot containing all package results cached by this refresher.
     pub fn refresh_packages(
@@ -86,10 +92,11 @@ impl CranSnapshotRefresher {
             .borrow_mut()
             .refresh_snapshot_observations(roots)
             .map_err(CranSnapshotPublishError::Acquisition)?;
-        publish_snapshot(
+        publish_snapshot_with_endpoint(
             store,
             default_context(store.registry_id().clone()),
             observations,
+            &self.session.borrow().base_url,
         )
     }
 }

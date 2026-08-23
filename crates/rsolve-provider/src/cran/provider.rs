@@ -128,6 +128,7 @@ pub struct CranSnapshotCachePolicy {
     pub compatibility_profile: u32,
     pub parser_schema: u32,
     pub normalization_policy: u32,
+    pub expected_endpoint: Option<Box<str>>,
 }
 
 impl CranSnapshotCachePolicy {
@@ -138,7 +139,13 @@ impl CranSnapshotCachePolicy {
             compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
             parser_schema: CRAN_PARSER_SCHEMA,
             normalization_policy: CRAN_NORMALIZATION_POLICY,
+            expected_endpoint: None,
         }
+    }
+
+    pub fn with_expected_endpoint(mut self, endpoint: impl AsRef<str>) -> Self {
+        self.expected_endpoint = Some(endpoint.as_ref().trim_end_matches('/').to_owned().into());
+        self
     }
 }
 
@@ -277,6 +284,45 @@ pub fn inspect_cran_snapshot_cache(
             ).into(),
         });
     }
+    let validation = store.read_current_validation().ok().flatten();
+    let header_source_identities = header
+        .sources
+        .iter()
+        .map(|source| (source.id.as_str(), source.content_sha256.as_str()))
+        .collect::<Vec<_>>();
+    let validation_matches = validation.as_ref().is_some_and(|record| {
+        record.registry_id == header.registry_id
+            && record.generation == header.generation
+            && record.compatibility_profile == header.compatibility_profile
+            && record.parser_schema == header.parser_schema
+            && record.normalization_policy == header.normalization_policy
+            && policy
+                .expected_endpoint
+                .as_deref()
+                .is_none_or(|endpoint| record.effective_endpoint == endpoint)
+            && record
+                .sources
+                .iter()
+                .map(|source| (source.id.as_str(), source.content_sha256.as_str()))
+                .collect::<Vec<_>>()
+                == header_source_identities
+    });
+    let validation_timestamp = validation
+        .clone()
+        .filter(|_| validation_matches)
+        .and_then(|record| record.validated_at.parse::<jiff::Timestamp>().ok());
+    let endpoint_provenance_matches = policy.expected_endpoint.as_deref().is_none_or(|expected| {
+        validation_matches
+            || header
+                .sources
+                .iter()
+                .all(|source| endpoint_belongs_to(&source.endpoint, expected))
+    });
+    let diagnostic_endpoints = validation
+        .as_ref()
+        .filter(|_| validation_matches)
+        .map(canonical_validation_endpoints)
+        .unwrap_or_else(|| canonical_endpoints(header));
     let mut oldest_source_age = 0_i64;
     let mut future_source = false;
     for source in &header.sources {
@@ -295,6 +341,11 @@ pub fn inspect_cran_snapshot_cache(
         future_source |= age < 0;
         oldest_source_age = oldest_source_age.max(age.max(0));
     }
+    if let Some(validated_at) = validation_timestamp {
+        let age = policy.now.duration_since(validated_at).as_secs();
+        future_source = age < 0;
+        oldest_source_age = age.max(0);
+    }
     if header.sources.is_empty() {
         return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
             status: CranSnapshotCacheStatus::Corrupt,
@@ -304,7 +355,8 @@ pub fn inspect_cran_snapshot_cache(
         });
     }
     let age_seconds = u64::try_from(oldest_source_age).unwrap_or(u64::MAX);
-    let fresh = !future_source
+    let fresh = endpoint_provenance_matches
+        && !future_source
         && oldest_source_age <= i64::try_from(policy.fallback_ttl.as_secs()).unwrap_or(i64::MAX);
     let status = if fresh {
         CranSnapshotCacheStatus::Fresh
@@ -314,9 +366,11 @@ pub fn inspect_cran_snapshot_cache(
     let diagnostic = CranSnapshotCacheDiagnostic {
         status,
         age_seconds: Some(age_seconds),
-        endpoints: canonical_endpoints(header),
+        endpoints: diagnostic_endpoints,
         diagnostic: if fresh {
             "compatible CRAN snapshot generation is within the fallback freshness TTL".into()
+        } else if !endpoint_provenance_matches {
+            "CRAN snapshot evidence belongs to a different acquisition endpoint; it is not fresh for online reuse".into()
         } else if future_source {
             "CRAN snapshot source timestamp is in the future; generation is not fresh for online reuse".into()
         } else {
@@ -329,11 +383,32 @@ pub fn inspect_cran_snapshot_cache(
     }
 }
 
+fn endpoint_belongs_to(endpoint: &str, base: &str) -> bool {
+    endpoint == base
+        || endpoint
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn canonical_endpoints(header: &crate::snapshot::SnapshotHeaderV1) -> Vec<Box<str>> {
     let mut endpoints = header
         .sources
         .iter()
         .map(|source| source.endpoint.clone())
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints.into_iter().map(String::into_boxed_str).collect()
+}
+
+fn canonical_validation_endpoints(record: &crate::snapshot::CurrentValidationV1) -> Vec<Box<str>> {
+    let mut endpoints = record
+        .sources
+        .iter()
+        .flat_map(|source| source.endpoint.split('\n'))
+        .chain(record.effective_endpoint.split('\n'))
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     endpoints.sort();
     endpoints.dedup();

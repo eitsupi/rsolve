@@ -15,6 +15,7 @@ use super::{
 };
 
 const CURRENT_NAME: &str = "current";
+const CURRENT_VALIDATION_NAME: &str = "current-validation";
 const REFRESH_LOCK_NAME: &str = "refresh.lock";
 const GENERATIONS_DIR: &str = "generations";
 const TMP_DIR: &str = "tmp";
@@ -29,6 +30,72 @@ struct CurrentPointerV1 {
     registry_id: String,
     generation: String,
     header_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurrentValidationSourceV1 {
+    pub(crate) id: String,
+    pub(crate) content_sha256: String,
+    pub(crate) endpoint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurrentValidationV1 {
+    pub(crate) format: String,
+    pub(crate) version: u32,
+    pub(crate) registry_id: String,
+    pub(crate) generation: String,
+    pub(crate) compatibility_profile: u32,
+    pub(crate) parser_schema: u32,
+    pub(crate) normalization_policy: u32,
+    pub(crate) validated_at: String,
+    pub(crate) effective_endpoint: String,
+    pub(crate) sources: Vec<CurrentValidationSourceV1>,
+}
+
+struct CurrentValidationFacts {
+    registry_id: String,
+    compatibility_profile: u32,
+    parser_schema: u32,
+    normalization_policy: u32,
+    validated_at: String,
+    effective_endpoint: String,
+    sources: Vec<CurrentValidationSourceV1>,
+}
+
+fn current_validation_facts(
+    input: &SnapshotBuildInput,
+) -> Result<CurrentValidationFacts, SnapshotError> {
+    let mut sources = input
+        .sources
+        .iter()
+        .map(|source| {
+            let observed = super::source_observation(source)?;
+            Ok(CurrentValidationSourceV1 {
+                id: observed.id,
+                content_sha256: observed.content_sha256,
+                endpoint: observed.endpoint,
+            })
+        })
+        .collect::<Result<Vec<_>, SnapshotError>>()?;
+    sources.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut endpoints = sources
+        .iter()
+        .map(|source| source.endpoint.clone())
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    Ok(CurrentValidationFacts {
+        registry_id: input.registry_id.to_string(),
+        compatibility_profile: input.compatibility_profile,
+        parser_schema: input.parser_schema,
+        normalization_policy: input.normalization_policy,
+        validated_at: input.created_at.clone(),
+        effective_endpoint: endpoints.join("\n"),
+        sources,
+    })
 }
 
 #[derive(Debug)]
@@ -135,7 +202,15 @@ impl SnapshotStore {
         &self,
         input: SnapshotBuildInput,
     ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError> {
-        self.build_and_publish_inner(input, |_| {})
+        self.build_and_publish_inner(input, None, |_| {})
+    }
+
+    pub(crate) fn build_and_publish_with_endpoint(
+        &self,
+        input: SnapshotBuildInput,
+        effective_endpoint: impl Into<Box<str>>,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError> {
+        self.build_and_publish_inner(input, Some(effective_endpoint.into()), |_| {})
     }
 
     #[cfg(test)]
@@ -147,12 +222,13 @@ impl SnapshotStore {
     where
         F: FnOnce(&Self),
     {
-        self.build_and_publish_inner(input, after_unlock)
+        self.build_and_publish_inner(input, None, after_unlock)
     }
 
     fn build_and_publish_inner<F>(
         &self,
         input: SnapshotBuildInput,
+        effective_endpoint: Option<Box<str>>,
         after_unlock: F,
     ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError>
     where
@@ -165,6 +241,11 @@ impl SnapshotStore {
             .unique_staging_path()
             .map_err(SnapshotPublishError::Store)?;
         let staging_cleanup = TemporaryPath(staging_path.clone());
+        let validation_facts = effective_endpoint
+            .as_ref()
+            .map(|_| current_validation_facts(&input))
+            .transpose()
+            .map_err(SnapshotPublishError::Build)?;
         let generation = SnapshotGenerationBuilder::new(input, &staging_path)
             .build()
             .map_err(SnapshotPublishError::Build)?;
@@ -177,6 +258,17 @@ impl SnapshotStore {
         let loader = self
             .open_generation_locked(&generation_name)
             .map_err(SnapshotPublishError::Reopen)?;
+        if let (Some(validation_facts), Some(effective_endpoint)) =
+            (validation_facts, effective_endpoint)
+        {
+            self.write_current_validation(
+                &lock,
+                loader.header(),
+                validation_facts,
+                Some(effective_endpoint),
+            )
+            .map_err(SnapshotPublishError::Store)?;
+        }
         drop(lock);
         drop(staging_cleanup);
         after_unlock(self);
@@ -244,6 +336,127 @@ impl SnapshotStore {
             ));
         }
         Ok(Some(loader))
+    }
+
+    pub(crate) fn read_current_validation(
+        &self,
+    ) -> Result<Option<CurrentValidationV1>, SnapshotStoreError> {
+        let _refresh_lock = self.acquire_refresh_lock(RefreshLockMode::Blocking)?;
+        let bytes = match read_at_most(&self.root.join(CURRENT_VALIDATION_NAME), POINTER_LIMIT) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let record = serde_json::from_slice::<CurrentValidationV1>(&bytes).map_err(|error| {
+            store_invalid(format!("invalid current validation record: {error}"))
+        })?;
+        if serde_json::to_vec(&record)
+            .map_err(|error| store_invalid(format!("invalid current validation record: {error}")))?
+            != bytes
+        {
+            return Err(store_invalid(
+                "current validation record is not canonical JSON",
+            ));
+        }
+        if record.format != "rsolve-metadata-current-validation" || record.version != 1 {
+            return Err(store_invalid(
+                "unknown current validation record format or version",
+            ));
+        }
+        if record.registry_id != self.registry_id.as_str()
+            || record.generation.len() != 64
+            || parse_hex_32(&record.generation).is_err()
+            || record.compatibility_profile == 0
+            || record.parser_schema == 0
+            || record.normalization_policy == 0
+            || !super::is_rfc3339_seconds(&record.validated_at)
+            || record.effective_endpoint.is_empty()
+            || record.sources.is_empty()
+            || record
+                .sources
+                .windows(2)
+                .any(|pair| pair[0].id >= pair[1].id)
+        {
+            return Err(store_invalid("current validation record is not canonical"));
+        }
+        if record.sources.iter().any(|source| {
+            source.id.len() != 64
+                || parse_hex_32(&source.id).is_err()
+                || parse_hex_32(&source.content_sha256).is_err()
+                || source.endpoint.is_empty()
+        }) {
+            return Err(store_invalid(
+                "current validation source identity is invalid",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    fn write_current_validation(
+        &self,
+        lock: &RefreshLock,
+        header: &SnapshotHeaderV1,
+        facts: CurrentValidationFacts,
+        effective_endpoint: Option<Box<str>>,
+    ) -> Result<(), SnapshotStoreError> {
+        if lock.path != self.root.join(REFRESH_LOCK_NAME) {
+            return Err(store_invalid("refresh lock belongs to another store"));
+        }
+        let effective_endpoint = effective_endpoint
+            .map(String::from)
+            .unwrap_or_else(|| facts.effective_endpoint.clone());
+        if effective_endpoint.is_empty() {
+            return Err(store_invalid(
+                "current validation effective endpoint must not be empty",
+            ));
+        }
+        let record = CurrentValidationV1 {
+            format: "rsolve-metadata-current-validation".into(),
+            version: 1,
+            registry_id: facts.registry_id,
+            generation: header.generation.clone(),
+            compatibility_profile: facts.compatibility_profile,
+            parser_schema: facts.parser_schema,
+            normalization_policy: facts.normalization_policy,
+            validated_at: facts.validated_at,
+            effective_endpoint,
+            sources: facts.sources,
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|error| {
+            store_invalid(format!("unable to encode current validation: {error}"))
+        })?;
+        let (temp, mut file) = self.unique_validation_file()?;
+        let temp_cleanup = TemporaryPath(temp.clone());
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        super::replace_file(&temp, &self.root.join(CURRENT_VALIDATION_NAME))
+            .map_err(SnapshotStoreError::Io)?;
+        sync_file(&self.root.join(CURRENT_VALIDATION_NAME)).map_err(SnapshotStoreError::Io)?;
+        sync_directory(&self.root).map_err(SnapshotStoreError::Io)?;
+        drop(temp_cleanup);
+        Ok(())
+    }
+
+    fn unique_validation_file(&self) -> Result<(PathBuf, File), SnapshotStoreError> {
+        let pid = std::process::id();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| store_invalid(error.to_string()))?
+            .as_nanos();
+        for sequence in 0..128_u32 {
+            let path = self.root.join(format!(
+                ".rsolve-current-validation-{pid}-{timestamp}-{sequence}.tmp"
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(store_invalid(
+            "unable to allocate current validation temp file",
+        ))
     }
 
     fn open_generation_locked(

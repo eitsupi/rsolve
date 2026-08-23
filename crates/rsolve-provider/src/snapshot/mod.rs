@@ -54,6 +54,7 @@ pub use generation::{
 };
 
 mod cache;
+pub(crate) use cache::CurrentValidationV1;
 pub(crate) use cache::SnapshotPublishError;
 pub use cache::{SnapshotStore, SnapshotStoreError};
 

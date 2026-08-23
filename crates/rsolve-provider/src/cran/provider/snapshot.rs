@@ -186,14 +186,16 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
     crate::snapshot::ReadOnlySnapshotCandidateLoader,
     super::super::publish::CranSnapshotPublishError,
 > {
-    let mut session = CranRefreshSession::new(std::rc::Rc::new(transport), base_url);
+    let effective_endpoint = base_url.as_ref().to_owned();
+    let mut session = CranRefreshSession::new(std::rc::Rc::new(transport), &effective_endpoint);
     let observations = session
         .refresh_snapshot_observations(roots)
         .map_err(super::super::publish::CranSnapshotPublishError::Acquisition)?;
-    super::super::publish::publish_snapshot(
+    super::super::publish::publish_snapshot_with_endpoint(
         store,
         super::super::publish::default_context(store.registry_id().clone()),
         observations,
+        effective_endpoint,
     )
 }
 

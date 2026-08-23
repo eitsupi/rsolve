@@ -77,6 +77,7 @@ pub(crate) fn default_context(registry_id: RegistryId) -> SnapshotCompositionCon
 /// the publication lock is held, before the lock is released. A later
 /// publication may replace the store's current pointer without changing the
 /// generation observed through this loader.
+#[cfg(test)]
 pub fn publish_snapshot(
     store: &SnapshotStore,
     context: SnapshotCompositionContext,
@@ -88,6 +89,23 @@ pub fn publish_snapshot(
         })?;
     store
         .build_and_publish(input)
+        .map_err(|error: SnapshotPublishError| {
+            CranSnapshotPublishError::Publication(error.to_string().into_boxed_str())
+        })
+}
+
+pub(crate) fn publish_snapshot_with_endpoint(
+    store: &SnapshotStore,
+    context: SnapshotCompositionContext,
+    observations: Vec<CranEvidenceObservation>,
+    effective_endpoint: impl AsRef<str>,
+) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
+    let input =
+        compose_snapshot(context, observations).map_err(|error: EvidenceCompositionError| {
+            CranSnapshotPublishError::Composition(error.to_string().into_boxed_str())
+        })?;
+    store
+        .build_and_publish_with_endpoint(input, effective_endpoint.as_ref())
         .map_err(|error: SnapshotPublishError| {
             CranSnapshotPublishError::Publication(error.to_string().into_boxed_str())
         })
@@ -220,18 +238,33 @@ mod tests {
         let directory = tempdir().unwrap();
         let store =
             SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
-        publish_snapshot(&store, context(), fixture_observations()).unwrap();
+        let mut current_context = context();
+        current_context.created_at = jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        publish_snapshot_with_endpoint(
+            &store,
+            current_context,
+            fixture_observations(),
+            "https://cran.example",
+        )
+        .unwrap();
 
-        let fresh = CranSnapshotCachePolicy::at("2026-08-23T00:30:00Z".parse().unwrap());
+        let fresh = CranSnapshotCachePolicy::default();
         let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
             inspect_cran_snapshot_cache(&store, &fresh)
         else {
             panic!("expected compatible generation");
         };
         assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Fresh);
-        assert_eq!(diagnostic.age_seconds(), Some(1800));
+        assert!(diagnostic.age_seconds().unwrap() < 60);
 
-        let stale = CranSnapshotCachePolicy::at("2026-08-23T02:00:00Z".parse().unwrap());
+        let stale = CranSnapshotCachePolicy::at(
+            fresh
+                .now
+                .checked_add(jiff::SignedDuration::from_secs(7200))
+                .unwrap(),
+        );
         let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
             inspect_cran_snapshot_cache(&store, &stale)
         else {
@@ -249,6 +282,163 @@ mod tests {
         assert_eq!(
             diagnostic.status(),
             CranSnapshotCacheStatus::RevisionIncompatible
+        );
+    }
+
+    #[test]
+    fn identical_refresh_advances_validation_without_mutating_generation_bytes() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let t0 = "2026-08-23T00:00:00Z";
+        let t2 = "2026-08-23T02:00:00Z";
+        let mut first_context = context();
+        first_context.created_at = t0.into();
+        let first = publish_snapshot_with_endpoint(
+            &store,
+            first_context,
+            fixture_observations(),
+            "https://cran.example",
+        )
+        .unwrap();
+        let generation = first.header().generation.to_owned();
+        let generation_path = directory
+            .path()
+            .join("generations")
+            .join(format!("{generation}.redb"));
+        let before = std::fs::read(&generation_path).unwrap();
+        let stale = crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap());
+        assert!(matches!(
+            crate::cran::inspect_cran_snapshot_cache(&store, &stale),
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+        let mut second_context = context();
+        second_context.created_at = t2.into();
+        let second = publish_snapshot_with_endpoint(
+            &store,
+            second_context,
+            fixture_observations(),
+            "https://cran.example",
+        )
+        .unwrap();
+        assert_eq!(second.header().generation, generation);
+        assert_eq!(std::fs::read(&generation_path).unwrap(), before);
+        let crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. } =
+            crate::cran::inspect_cran_snapshot_cache(
+                &store,
+                &crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap()),
+            )
+        else {
+            panic!("identical successful refresh should validate current content");
+        };
+        assert_eq!(
+            diagnostic.status(),
+            crate::cran::CranSnapshotCacheStatus::Fresh
+        );
+        let expected_a = crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap())
+            .with_expected_endpoint("https://cran.example");
+        let expected_b = crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap())
+            .with_expected_endpoint("https://other.example");
+        assert!(matches!(
+            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Fresh
+        ));
+        assert!(matches!(
+            crate::cran::inspect_cran_snapshot_cache(&store, &expected_b),
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+
+        let validation_path = directory.path().join("current-validation");
+        let read_validation = || -> crate::snapshot::CurrentValidationV1 {
+            serde_json::from_slice(&std::fs::read(&validation_path).unwrap()).unwrap()
+        };
+        let write_validation = |validation: &crate::snapshot::CurrentValidationV1| {
+            std::fs::write(&validation_path, serde_json::to_vec(validation).unwrap()).unwrap();
+        };
+        let mut validation = read_validation();
+        validation.effective_endpoint = "https://other.example".into();
+        write_validation(&validation);
+        let mismatched = crate::cran::inspect_cran_snapshot_cache(
+            &store,
+            &crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap())
+                .with_expected_endpoint("https://configured.example"),
+        );
+        assert!(matches!(
+            mismatched,
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+        let mut validation = read_validation();
+        validation.generation = "0".repeat(64);
+        write_validation(&validation);
+        assert!(matches!(
+            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+        let mut validation = read_validation();
+        validation.compatibility_profile = 2;
+        write_validation(&validation);
+        assert!(matches!(
+            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+        let mut validation = read_validation();
+        validation.sources[0].content_sha256 = "0".repeat(64);
+        validation.sources[0].id = "0".repeat(64);
+        write_validation(&validation);
+        assert!(matches!(
+            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+        std::fs::write(&validation_path, b"{").unwrap();
+        let malformed = crate::cran::inspect_cran_snapshot_cache(&store, &stale);
+        assert!(matches!(
+            malformed,
+            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+        ));
+    }
+
+    #[test]
+    fn online_endpoint_provenance_blocks_recent_evidence_from_another_mirror() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let mut context = context();
+        context.created_at = "2026-08-23T00:00:00Z".into();
+        publish_snapshot_with_endpoint(
+            &store,
+            context,
+            fixture_observations(),
+            "https://cran.example",
+        )
+        .unwrap();
+        let at_thirty_seconds = |endpoint: &str| {
+            CranSnapshotCachePolicy::at("2026-08-23T00:00:30Z".parse().unwrap())
+                .with_expected_endpoint(endpoint)
+        };
+        let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
+            inspect_cran_snapshot_cache(&store, &at_thirty_seconds("https://cran.example"))
+        else {
+            panic!("expected compatible generation");
+        };
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Fresh);
+        let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
+            inspect_cran_snapshot_cache(&store, &at_thirty_seconds("https://other.example"))
+        else {
+            panic!("expected compatible generation");
+        };
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Stale);
+        assert!(
+            diagnostic
+                .diagnostic()
+                .contains("different acquisition endpoint")
         );
     }
 }
