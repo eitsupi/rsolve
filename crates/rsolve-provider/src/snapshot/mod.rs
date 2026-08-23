@@ -2019,6 +2019,18 @@ mod tests {
         write.commit().unwrap();
     }
 
+    fn corrupt_stored_history(path: &Path, package: &str) {
+        let database = Database::create(path).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut table = write.open_table(PACKAGE_HISTORIES).unwrap();
+            table
+                .insert(package, b"corrupt history".as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
     fn rewrite_stored_header(path: &Path, mutate: impl FnOnce(&mut SnapshotHeaderV1)) {
         let database = Database::create(path).unwrap();
         let write = database.begin_write().unwrap();
@@ -2361,14 +2373,7 @@ mod tests {
             .root()
             .join(format!("generations/{generation_id}.redb"));
 
-        let database = Database::create(&final_path).unwrap();
-        let write = database.begin_write().unwrap();
-        {
-            let mut table = write.open_table(PACKAGE_HISTORIES).unwrap();
-            table.insert("foo", b"corrupt history".as_slice()).unwrap();
-        }
-        write.commit().unwrap();
-        drop(database);
+        corrupt_stored_history(&final_path, "foo");
         assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_err());
 
         let replacement_path = store.root().join("tmp/replacement.redb");
@@ -2394,6 +2399,45 @@ mod tests {
                 .len(),
             1
         );
+        assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn store_repairs_corrupt_generation_while_old_reader_is_pinned() {
+        let dir = tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let initial_path = store.root().join("tmp/initial.redb");
+        let initial = SnapshotGenerationBuilder::new(present_input(), &initial_path)
+            .build()
+            .unwrap();
+        let generation_id = initial.generation().to_owned();
+        let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+        store.publish_generation(&lock, initial).unwrap();
+        drop(lock);
+
+        let final_path = store
+            .root()
+            .join(format!("generations/{generation_id}.redb"));
+        let old_reader = store.read_current().unwrap();
+        let corrupt_path = store.root().join("tmp/corrupt.redb");
+        std::fs::copy(&final_path, &corrupt_path).unwrap();
+        corrupt_stored_history(&corrupt_path, "foo");
+        replace_file(&corrupt_path, &final_path).unwrap();
+        assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_err());
+
+        let replacement_path = store.root().join("tmp/replacement.redb");
+        let replacement = SnapshotGenerationBuilder::new(present_input(), &replacement_path)
+            .build()
+            .unwrap();
+        let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+        store.publish_generation(&lock, replacement).unwrap();
+        drop(lock);
+
+        let package = SolverKey::InstalledName(PackageName::new("foo").unwrap());
+        assert_eq!(old_reader.releases(&package).unwrap().len(), 1);
+        let new_reader = store.read_current().unwrap();
+        assert_eq!(new_reader.header().generation, generation_id);
+        assert_eq!(new_reader.releases(&package).unwrap().len(), 1);
         assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_ok());
     }
 
