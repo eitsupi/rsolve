@@ -586,6 +586,13 @@ fn store_rejects_broken_pointer_and_cleans_orphans_without_touching_current() {
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
+
+    std::fs::remove_file(store.root().join("current")).unwrap();
+    let error = store.read_current().err().unwrap();
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::SnapshotInvalid
+    );
 }
 
 #[test]
