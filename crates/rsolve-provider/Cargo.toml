@@ -17,3 +17,11 @@ tar = { workspace = true }
 ureq = { workspace = true }
 url = { workspace = true }
 jiff = { workspace = true }
+postcard = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -4,3 +4,4 @@
 //! CLI orchestration.
 
 pub mod cran;
+pub(crate) mod snapshot;
