@@ -28,6 +28,9 @@ use rsolve_core::{
 // inspection to response headers.
 pub mod cache_policy;
 mod negative;
+// Raw-cache APIs are intentionally unconnected until the refresh/304 slice.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) mod raw_cache;
 mod refresher;
 mod snapshot;
 mod transport;

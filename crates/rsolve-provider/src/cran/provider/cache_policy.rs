@@ -1,7 +1,10 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// Typed presence state for the Cache-Control response header.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value")]
 pub enum CacheControlHeader {
     #[default]
     Absent,
