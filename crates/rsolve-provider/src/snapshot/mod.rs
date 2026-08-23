@@ -8,7 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -583,13 +584,23 @@ impl SnapshotGenerationBuilder {
         fs::create_dir_all(parent)?;
         let temp = create_temporary_generation(parent)?;
         write_generation(&temp.path, &header_bytes, &histories)?;
-        fs::hard_link(&temp.path, &self.destination).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                SnapshotError::Invalid("generation destination already exists".into())
-            } else {
-                error.into()
-            }
-        })?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.destination)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    SnapshotError::Invalid("generation destination already exists".into())
+                } else {
+                    error.into()
+                }
+            })?;
+        if let Err(error) = replace_file(&temp.path, &self.destination) {
+            let _ = fs::remove_file(&self.destination);
+            return Err(error.into());
+        }
+        sync_file(&self.destination)?;
+        sync_directory(parent)?;
         Ok(ValidatedGeneration {
             path: self.destination,
             generation,
@@ -1438,6 +1449,82 @@ pub fn decode_header(bytes: &[u8]) -> Result<SnapshotHeaderV1, SnapshotError> {
     Ok(header)
 }
 
+pub(crate) fn read_generation_header(path: impl AsRef<Path>) -> Result<Vec<u8>, SnapshotError> {
+    let database = ReadOnlyDatabase::open(path.as_ref())?;
+    let read = database.begin_read()?;
+    let table = read.open_table(SNAPSHOT_HEADER)?;
+    let value = table
+        .get(HEADER_KEY)?
+        .ok_or_else(|| SnapshotError::Invalid("snapshot header is missing".into()))?;
+    if value.value().len() > HEADER_LIMIT {
+        return Err(SnapshotError::Invalid(
+            "snapshot header exceeds its byte limit".into(),
+        ));
+    }
+    Ok(value.value().to_vec())
+}
+
+/// Fully validate a read-only generation, including every package history and
+/// the header's aggregate counts and history manifest.
+pub(crate) fn validate_generation(
+    path: impl AsRef<Path>,
+    configured_registry_id: &RegistryId,
+) -> Result<SnapshotHeaderV1, SnapshotError> {
+    let database = ReadOnlyDatabase::open(path.as_ref())?;
+    let read = database.begin_read()?;
+    let header_table = read.open_table(SNAPSHOT_HEADER)?;
+    let stored_header = header_table
+        .get(HEADER_KEY)?
+        .ok_or_else(|| SnapshotError::Invalid("snapshot header is missing".into()))?;
+    let header_bytes = stored_header.value();
+    let header = decode_header(header_bytes)?;
+    if header.registry_id != configured_registry_id.as_str() {
+        return Err(SnapshotError::Invalid(
+            "snapshot registry does not match configured registry".into(),
+        ));
+    }
+    let source_indexes = header
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| (source.id.clone(), index as u32))
+        .collect::<BTreeMap<_, _>>();
+    let history_table = read.open_table(PACKAGE_HISTORIES)?;
+    let mut count = 0_u64;
+    let mut observation_count = 0_u64;
+    let mut eligible_count = 0_u64;
+    let mut incomplete_count = 0_u64;
+    let mut manifest_entries = BTreeMap::new();
+    for row in history_table.iter()? {
+        let (key, value) = row?;
+        let key = key.value();
+        let history = decode_history(value.value())?;
+        if history.package != key {
+            return Err(SnapshotError::Invalid(
+                "history key/package mismatch".into(),
+            ));
+        }
+        validate_history(&history, &source_indexes, header.sources.len())?;
+        observation_count += history.observations.len() as u64;
+        eligible_count += history.eligible_releases.len() as u64;
+        incomplete_count += u64::from(matches!(history.state, LookupStateV1::Incomplete));
+        manifest_entries.insert(key.to_owned(), value.value().to_vec());
+        count += 1;
+    }
+    if header.package_count != count
+        || header.observation_count != observation_count
+        || header.eligible_release_count != eligible_count
+        || header.incomplete_package_count != incomplete_count
+        || header.history_manifest_sha256 != hex(&history_manifest(&manifest_entries))
+        || header.generation != generation_id_from_header(&header)
+    {
+        return Err(SnapshotError::Invalid(
+            "history count or manifest mismatch".into(),
+        ));
+    }
+    Ok(header)
+}
+
 fn write_generation(
     path: &Path,
     header: &[u8],
@@ -1460,58 +1547,65 @@ fn write_generation(
     }
     database.compact()?;
     drop(database);
-    let readonly = ReadOnlyDatabase::open(path)?;
-    let read = readonly.begin_read()?;
-    let header_table = read.open_table(SNAPSHOT_HEADER)?;
-    let stored = header_table
-        .get(HEADER_KEY)?
-        .ok_or_else(|| SnapshotError::Invalid("snapshot header was not published".into()))?;
-    if stored.value() != header {
+    let parsed_header = decode_header(header)?;
+    let registry_id = RegistryId::new(&parsed_header.registry_id)
+        .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
+    let validated_header = validate_generation(path, &registry_id)?;
+    if encode_header(&validated_header)? != header
+        || validated_header.package_count != histories.len() as u64
+    {
         return Err(SnapshotError::Invalid(
-            "snapshot header changed after compact".into(),
+            "snapshot validation does not match staged input".into(),
         ));
     }
-    let parsed_header = decode_header(stored.value())?;
-    let history_table = read.open_table(PACKAGE_HISTORIES)?;
-    let mut count = 0_u64;
-    let mut observation_count = 0_u64;
-    let mut eligible_count = 0_u64;
-    let mut incomplete_count = 0_u64;
-    let mut manifest_entries = BTreeMap::new();
-    for row in history_table.iter()? {
-        let (key, value) = row?;
-        let key = key.value();
-        let history = decode_history(value.value())?;
-        if history.package != key {
-            return Err(SnapshotError::Invalid(
-                "history key/package mismatch".into(),
-            ));
-        }
-        validate_history(
-            &history,
-            &parsed_header
-                .sources
-                .iter()
-                .enumerate()
-                .map(|(i, source)| (source.id.clone(), i as u32))
-                .collect(),
-            parsed_header.sources.len(),
-        )?;
-        observation_count += history.observations.len() as u64;
-        eligible_count += history.eligible_releases.len() as u64;
-        incomplete_count += u64::from(matches!(history.state, LookupStateV1::Incomplete));
-        manifest_entries.insert(key.to_owned(), value.value().to_vec());
-        count += 1;
-    }
-    if count != histories.len() as u64
-        || parsed_header.package_count != count
-        || parsed_header.observation_count != observation_count
-        || parsed_header.eligible_release_count != eligible_count
-        || parsed_header.incomplete_package_count != incomplete_count
-        || parsed_header.history_manifest_sha256 != hex(&history_manifest(&manifest_entries))
-        || parsed_header.generation != generation_id_from_header(&parsed_header)
+    sync_file(path)?;
+    Ok(())
+}
+
+fn sync_file(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
     {
-        return Err(SnapshotError::Invalid("history count mismatch".into()));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -2249,6 +2343,59 @@ mod tests {
     }
 
     #[test]
+    fn store_repairs_corrupt_same_generation_before_republishing_pointer() {
+        let dir = tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let initial_path = store.root().join("tmp/initial.redb");
+        let initial = SnapshotGenerationBuilder::new(present_input(), &initial_path)
+            .build()
+            .unwrap();
+        let generation_id = initial.generation().to_owned();
+        let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+        store.publish_generation(&lock, initial).unwrap();
+        drop(lock);
+        let pointer = std::fs::read(store.root().join("current")).unwrap();
+        let final_path = store
+            .root()
+            .join(format!("generations/{generation_id}.redb"));
+
+        let database = Database::create(&final_path).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut table = write.open_table(PACKAGE_HISTORIES).unwrap();
+            table.insert("foo", b"corrupt history".as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+        drop(database);
+        assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_err());
+
+        let replacement_path = store.root().join("tmp/replacement.redb");
+        let replacement = SnapshotGenerationBuilder::new(present_input(), &replacement_path)
+            .build()
+            .unwrap();
+        assert_eq!(replacement.generation(), generation_id);
+        let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+        store.publish_generation(&lock, replacement).unwrap();
+        drop(lock);
+
+        assert!(!replacement_path.exists());
+        assert_eq!(
+            std::fs::read(store.root().join("current")).unwrap(),
+            pointer
+        );
+        let loader = store.read_current().unwrap();
+        assert_eq!(loader.header().generation, generation_id);
+        assert_eq!(
+            loader
+                .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_ok());
+    }
+
+    #[test]
     fn store_rejects_a_semantic_collision_without_overwrite() {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
@@ -2266,11 +2413,12 @@ mod tests {
         let final_path = store
             .root()
             .join(format!("generations/{}.redb", replacement.generation()));
-        std::fs::hard_link(&staged, &final_path).unwrap();
+        std::fs::copy(&staged, &final_path).unwrap();
         let before = stored_header(&final_path);
         let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
         assert!(store.publish_generation(&lock, replacement).is_err());
         drop(lock);
+        assert!(replacement_path.exists());
         assert_eq!(stored_header(&final_path), before);
         assert_eq!(stored_header(&final_path), original.header_bytes());
     }
@@ -2425,7 +2573,7 @@ mod tests {
         let new_final = store
             .root()
             .join(format!("generations/{new_generation}.redb"));
-        std::fs::hard_link(&new_path, &new_final).unwrap();
+        std::fs::copy(&new_path, &new_final).unwrap();
         assert_eq!(
             store.read_current().unwrap().header.generation,
             old_generation
@@ -2492,7 +2640,7 @@ mod tests {
         let unclean_final = store
             .root()
             .join(format!("generations/{unclean_generation}.redb"));
-        std::fs::hard_link(store.root().join("tmp/unclean.redb"), &unclean_final).unwrap();
+        std::fs::copy(store.root().join("tmp/unclean.redb"), &unclean_final).unwrap();
         let pointer = format!(
             "{{\"format\":\"rsolve-metadata-current\",\"version\":1,\"registry_id\":\"cran\",\"generation\":\"{unclean_generation}\",\"header_sha256\":\"{}\"}}",
             "0".repeat(64)
@@ -2640,7 +2788,7 @@ mod tests {
         let final_path = store
             .root()
             .join(format!("generations/{}.redb", generation.generation()));
-        std::fs::hard_link(&staged, &final_path).unwrap();
+        std::fs::copy(&staged, &final_path).unwrap();
         let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
         store.cleanup(&lock, &[]).unwrap();
         drop(lock);

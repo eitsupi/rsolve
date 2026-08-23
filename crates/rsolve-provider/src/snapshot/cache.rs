@@ -4,14 +4,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use redb::{ReadOnlyDatabase, ReadableDatabase};
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, RegistryId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    HEADER_KEY, ReadOnlySnapshotCandidateLoader, SNAPSHOT_HEADER, SnapshotHeaderV1,
-    ValidatedGeneration, decode_header, hex, parse_hex_32,
+    ReadOnlySnapshotCandidateLoader, SnapshotHeaderV1, ValidatedGeneration, decode_header, hex,
+    parse_hex_32, validate_generation,
 };
 
 const CURRENT_NAME: &str = "current";
@@ -180,29 +179,62 @@ impl SnapshotStore {
         {
             return Err(store_invalid("validated generation does not match store"));
         }
-        let source_header = read_generation_header(&staged_path).map_err(store_invalid)?;
-        if source_header != header_bytes {
-            return Err(store_invalid("validated generation header changed"));
+        let source_header =
+            validate_generation(&staged_path, &self.registry_id).map_err(store_invalid)?;
+        if source_header != header {
+            return Err(store_invalid("validated generation changed"));
         }
         sync_file(&staged_path).map_err(SnapshotStoreError::Io)?;
         let final_path = self
             .root
             .join(GENERATIONS_DIR)
             .join(format!("{}.redb", generation.generation()));
-        let final_header = if final_path.exists() {
-            let existing_header_bytes =
-                read_generation_header(&final_path).map_err(store_invalid)?;
-            let existing_header = decode_header(&existing_header_bytes).map_err(store_invalid)?;
-            if !same_semantic_generation(&existing_header, &header) {
-                return Err(store_invalid("generation filename collision"));
+        let final_is_regular = match fs::symlink_metadata(&final_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(store_invalid("generation path is not a regular file"));
+                }
+                true
             }
-            existing_header_bytes
-        } else {
-            fs::hard_link(&staged_path, &final_path)?;
-            sync_file(&final_path).map_err(SnapshotStoreError::Io)?;
-            header_bytes.to_vec()
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
         };
-        fs::remove_file(&staged_path)?;
+        let (final_header, staged_reused) = if final_is_regular {
+            let existing_header = super::read_generation_header(&final_path)
+                .and_then(|bytes| super::decode_header(&bytes))
+                .ok();
+            match existing_header {
+                Some(existing_header) => {
+                    if !same_semantic_generation(&existing_header, &header) {
+                        return Err(store_invalid("generation filename collision"));
+                    }
+                    if validate_generation(&final_path, &self.registry_id).is_ok() {
+                        (
+                            super::encode_header(&existing_header).map_err(store_invalid)?,
+                            true,
+                        )
+                    } else {
+                        super::replace_file(&staged_path, &final_path)
+                            .map_err(SnapshotStoreError::Io)?;
+                        sync_file(&final_path).map_err(SnapshotStoreError::Io)?;
+                        (header_bytes.to_vec(), false)
+                    }
+                }
+                None => {
+                    super::replace_file(&staged_path, &final_path)
+                        .map_err(SnapshotStoreError::Io)?;
+                    sync_file(&final_path).map_err(SnapshotStoreError::Io)?;
+                    (header_bytes.to_vec(), false)
+                }
+            }
+        } else {
+            super::replace_file(&staged_path, &final_path).map_err(SnapshotStoreError::Io)?;
+            sync_file(&final_path).map_err(SnapshotStoreError::Io)?;
+            (header_bytes.to_vec(), false)
+        };
+        if staged_reused {
+            fs::remove_file(&staged_path)?;
+        }
         sync_directory(&self.root.join(GENERATIONS_DIR)).map_err(SnapshotStoreError::Io)?;
         let pointer = CurrentPointerV1 {
             format: "rsolve-metadata-current".into(),
@@ -338,29 +370,6 @@ fn decode_pointer_store(
         ));
     }
     Ok(pointer)
-}
-
-fn read_generation_header(path: &Path) -> Result<Vec<u8>, SnapshotStoreError> {
-    if !is_regular_file(path) {
-        return Err(store_invalid("generation path is not a regular file"));
-    }
-    let database =
-        ReadOnlyDatabase::open(path).map_err(|error| store_invalid(error.to_string()))?;
-    let read = database
-        .begin_read()
-        .map_err(|error| store_invalid(error.to_string()))?;
-    let table = read
-        .open_table(SNAPSHOT_HEADER)
-        .map_err(|error| store_invalid(error.to_string()))?;
-    let value = table
-        .get(HEADER_KEY)
-        .map_err(|error| store_invalid(error.to_string()))?
-        .ok_or_else(|| store_invalid("generation header is missing"))?;
-    let value = value.value();
-    if value.len() > super::HEADER_LIMIT {
-        return Err(store_invalid("generation header exceeds byte limit"));
-    }
-    Ok(value.to_vec())
 }
 
 /// Read at most `max_bytes` while retaining one extra byte to detect overflow.
