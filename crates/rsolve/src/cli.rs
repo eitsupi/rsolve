@@ -11,9 +11,9 @@ use tempfile::NamedTempFile;
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
 use crate::metadata_cache::MetadataCache;
+use crate::orchestration::{cran_registry_id, resolve_from_cran_with_store};
 use crate::{
-    EnvironmentId, Lockfile, Manifest, ManifestDependency, ManifestTarget, from_toml,
-    resolve_from_cran_with_publication_cutoff, to_toml,
+    EnvironmentId, Lockfile, Manifest, ManifestDependency, ManifestTarget, from_toml, to_toml,
 };
 
 const DEFAULT_CRAN_MIRROR: &str = "https://cloud.r-project.org";
@@ -112,9 +112,13 @@ impl ResolutionBackend for CranBackend {
         manifest: Manifest,
         mirror: &str,
         cutoff: Option<PublicationDate>,
-        _metadata_cache: &MetadataCache,
+        metadata_cache: &MetadataCache,
     ) -> Result<ResolvedData, CliError> {
-        let outcome = resolve_from_cran_with_publication_cutoff(manifest, mirror, cutoff)
+        let registry_id = cran_registry_id(mirror);
+        let store = metadata_cache
+            .open_store(registry_id)
+            .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
+        let outcome = resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
             .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
         let warnings = outcome
             .diagnostics()

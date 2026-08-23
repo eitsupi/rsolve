@@ -10,9 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)] // Used when the provider-backed store seam is connected.
 const CACHE_VERSION: &str = "v1";
-#[allow(dead_code)] // Used when the provider-backed store seam is connected.
 const REGISTRIES_DIRECTORY: &str = "registries";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,7 +47,6 @@ pub(crate) enum MetadataCacheError {
         path: PathBuf,
         message: String,
     },
-    #[allow(dead_code)] // Used when the provider-backed store seam is connected.
     Store {
         path: PathBuf,
         source: SnapshotStoreError,
@@ -106,9 +103,6 @@ pub(crate) struct MetadataCache {
     root: PathBuf,
 }
 
-// Store path/open helpers are kept crate-private for the next provider wiring
-// step; this task only resolves and passes the cache context to the backend.
-#[allow(dead_code)]
 impl MetadataCache {
     pub(crate) fn resolve(explicit_root: Option<&Path>) -> Result<Self, MetadataCacheError> {
         let root = match explicit_root {
@@ -141,6 +135,7 @@ impl MetadataCache {
         prepare_root(root)
     }
 
+    #[allow(dead_code)] // Test support inspects the resolved root directly.
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -228,7 +223,6 @@ fn prepare_root(root: PathBuf) -> Result<MetadataCache, MetadataCacheError> {
     Ok(MetadataCache { root })
 }
 
-#[allow(dead_code)] // Used by MetadataCache::store_path in provider wiring.
 fn registry_digest(registry_id: &RegistryId) -> String {
     Sha256::digest(registry_id.as_str().as_bytes())
         .iter()
