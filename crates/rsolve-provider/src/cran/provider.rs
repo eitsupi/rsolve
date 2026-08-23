@@ -329,7 +329,7 @@ impl<T: Transport> CranProvider<T> {
                     ),
                 )
             })?;
-            let catalog = CranCatalog::from_packages(&description).map_err(|error| {
+            let catalog = CranCatalog::from_description(&description).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
                     format!(
@@ -341,7 +341,7 @@ impl<T: Transport> CranProvider<T> {
             if let Some(evidence) = &self.evidence {
                 let source = source_input("cran-archive-tarball", "tar.gz", &url, &response.body);
                 let records =
-                    CranCatalog::observations_from_packages(&description).map_err(|error| {
+                    CranCatalog::observations_from_description(&description).map_err(|error| {
                         CandidateLoadError::new(
                             CandidateLoadErrorCategory::MetadataInvalid,
                             format!(

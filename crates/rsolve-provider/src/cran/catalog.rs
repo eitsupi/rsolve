@@ -46,6 +46,18 @@ pub(crate) enum CranCatalogRecordScope {
 
 type CatalogRecord = (usize, Option<String>, Vec<(String, String)>);
 
+/// Identifies the source format whose records are being parsed.
+///
+/// CRAN's `PACKAGES` indexes use `Path` to identify Recommended overlays and
+/// therefore require strict validation. A package archive's `DESCRIPTION` may
+/// contain an unrelated `Path` metadata field, so it must remain a root
+/// release without applying the index-only overlay interpretation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CranCatalogRecordContext {
+    PackagesIndex,
+    Description,
+}
+
 impl CranCatalogObservation {
     pub(crate) fn record_index(&self) -> usize {
         self.record_index
@@ -98,13 +110,70 @@ impl CranCatalog {
                     .iter()
                     .map(|field| (field.name(), field.value()))
                     .collect::<Vec<_>>();
-                (record_index, package, observation_from_fields(&fields))
+                (
+                    record_index,
+                    package,
+                    observation_from_fields_with_context(
+                        &fields,
+                        CranCatalogRecordContext::PackagesIndex,
+                    ),
+                )
             });
-        catalog_from_observations(observations).map_err(CranCatalogError::Semantic)
+        catalog_from_observations_with_context(
+            observations,
+            CranCatalogRecordContext::PackagesIndex,
+        )
+        .map_err(CranCatalogError::Semantic)
+    }
+
+    /// Parses a package archive's `DESCRIPTION` DCF record.
+    ///
+    /// Unlike a `PACKAGES` index, a `DESCRIPTION` record treats `Path` as
+    /// ordinary package metadata. Archive descriptions are root releases and
+    /// do not describe Recommended overlays.
+    pub(crate) fn from_description(input: &[u8]) -> Result<Self, CranCatalogError> {
+        let document = DcfDocument::parse(input).map_err(CranCatalogError::Dcf)?;
+        let observations = document
+            .records()
+            .iter()
+            .enumerate()
+            .map(|(record_index, record)| {
+                let package = record
+                    .field("Package")
+                    .map(|field| field.value().to_owned());
+                let fields = record
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name(), field.value()))
+                    .collect::<Vec<_>>();
+                (
+                    record_index,
+                    package,
+                    observation_from_fields_with_context(
+                        &fields,
+                        CranCatalogRecordContext::Description,
+                    ),
+                )
+            });
+        catalog_from_observations_with_context(observations, CranCatalogRecordContext::Description)
+            .map_err(CranCatalogError::Semantic)
     }
 
     pub(crate) fn observations_from_packages(
         input: &[u8],
+    ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
+        Self::observations_from_dcf(input, CranCatalogRecordContext::PackagesIndex)
+    }
+
+    pub(crate) fn observations_from_description(
+        input: &[u8],
+    ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
+        Self::observations_from_dcf(input, CranCatalogRecordContext::Description)
+    }
+
+    fn observations_from_dcf(
+        input: &[u8],
+        context: CranCatalogRecordContext,
     ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
         let document = DcfDocument::parse(input).map_err(CranCatalogError::Dcf)?;
         let records = document
@@ -123,7 +192,7 @@ impl CranCatalog {
                 (record_index, package, fields)
             })
             .collect();
-        validated_observations_from_fields(records)
+        validated_observations_from_fields_with_context(records, context)
     }
 
     /// Returns all candidates for a canonical package name in version order.
@@ -162,6 +231,16 @@ impl CranCatalog {
 pub(crate) fn validated_observations_from_fields(
     records: Vec<CatalogRecord>,
 ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
+    validated_observations_from_fields_with_context(
+        records,
+        CranCatalogRecordContext::PackagesIndex,
+    )
+}
+
+pub(crate) fn validated_observations_from_fields_with_context(
+    records: Vec<CatalogRecord>,
+    context: CranCatalogRecordContext,
+) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
     let fields_by_index = records
         .iter()
         .map(|(record_index, _, fields)| (*record_index, fields.clone()))
@@ -176,7 +255,7 @@ pub(crate) fn validated_observations_from_fields(
             (
                 *record_index,
                 package.clone(),
-                observation_from_fields(&field_refs),
+                observation_from_fields_with_context(&field_refs, context),
             )
         })
         .collect::<Vec<_>>();
@@ -185,13 +264,13 @@ pub(crate) fn validated_observations_from_fields(
     // aggregation function deliberately excludes overlays from candidate
     // selection, so an overlay can never create a metadata conflict with its
     // root release.
-    select_and_aggregate(parsed.clone()).map_err(CranCatalogError::Semantic)?;
+    select_and_aggregate(parsed.clone(), context).map_err(CranCatalogError::Semantic)?;
 
     Ok(parsed
         .into_iter()
         .filter_map(|(record_index, _, observation)| {
             let observation = observation.ok()?;
-            let scope = observation_scope(&observation);
+            let scope = observation_scope(&observation, context);
             let package = observation.identity.name().clone();
             let release = PackageRelease::try_from(observation)
                 .expect("catalog validation already accepted the observation");
@@ -384,8 +463,24 @@ where
         ),
     >,
 {
+    catalog_from_observations_with_context(observations, CranCatalogRecordContext::PackagesIndex)
+}
+
+pub(super) fn catalog_from_observations_with_context<I>(
+    observations: I,
+    context: CranCatalogRecordContext,
+) -> Result<CranCatalog, Box<[CranDiagnostic]>>
+where
+    I: IntoIterator<
+        Item = (
+            usize,
+            Option<String>,
+            Result<ReleaseObservation, CranRecordError>,
+        ),
+    >,
+{
     let observations = observations.into_iter().collect::<Vec<_>>();
-    let (_, aggregation) = select_and_aggregate(observations)?;
+    let (_, aggregation) = select_and_aggregate(observations, context)?;
 
     let mut candidates: BTreeMap<PackageName, Vec<PackageRelease>> = BTreeMap::new();
     for release in aggregation.releases() {
@@ -409,6 +504,7 @@ type SelectedCatalogObservation = (usize, Option<String>, ReleaseObservation);
 
 fn select_and_aggregate(
     observations: Vec<ParsedCatalogObservation>,
+    context: CranCatalogRecordContext,
 ) -> Result<(Vec<SelectedCatalogObservation>, ReleaseAggregation), Box<[CranDiagnostic]>> {
     let mut diagnostics = Vec::new();
     let mut selected = Vec::new();
@@ -418,7 +514,7 @@ fn select_and_aggregate(
         match observation {
             Ok(observation) => {
                 if matches!(
-                    observation_scope(&observation),
+                    observation_scope(&observation, context),
                     CranCatalogRecordScope::RecommendedOverlay { .. }
                 ) {
                     continue;
@@ -456,15 +552,30 @@ fn metadata_field<'a>(observation: &'a ReleaseObservation, name: &str) -> Option
         .map(|(_, value)| value.as_str())
 }
 
-fn observation_scope(observation: &ReleaseObservation) -> CranCatalogRecordScope {
+fn observation_scope(
+    observation: &ReleaseObservation,
+    context: CranCatalogRecordContext,
+) -> CranCatalogRecordScope {
     let Some(path) = metadata_field(observation, "Path") else {
         return CranCatalogRecordScope::Root;
     };
-    classify_path(path).expect("validated CRAN observation must have a valid Path")
+    match context {
+        CranCatalogRecordContext::PackagesIndex => {
+            classify_path(path).expect("validated CRAN observation must have a valid Path")
+        }
+        CranCatalogRecordContext::Description => CranCatalogRecordScope::Root,
+    }
 }
 
 pub(super) fn observation_from_fields(
     fields: &[(&str, &str)],
+) -> Result<ReleaseObservation, CranRecordError> {
+    observation_from_fields_with_context(fields, CranCatalogRecordContext::PackagesIndex)
+}
+
+pub(super) fn observation_from_fields_with_context(
+    fields: &[(&str, &str)],
+    context: CranCatalogRecordContext,
 ) -> Result<ReleaseObservation, CranRecordError> {
     reject_duplicate_fields(fields)?;
     let package_value = required_field(fields, "Package")?;
@@ -516,7 +627,9 @@ pub(super) fn observation_from_fields(
         .collect();
     let metadata =
         ReleaseMetadata::new(metadata_fields).map_err(CranRecordError::InvalidMetadata)?;
-    if let Some(path) = field(fields, "Path") {
+    if matches!(context, CranCatalogRecordContext::PackagesIndex)
+        && let Some(path) = field(fields, "Path")
+    {
         classify_path(path)?;
     }
     let identity = ReleaseIdentity::new(
@@ -791,6 +904,30 @@ mod tests {
                 super::CranRecordError::InvalidPath { .. }
             ));
         }
+    }
+
+    #[test]
+    fn description_path_is_preserved_as_root_metadata() {
+        let input = b"Package: survival\nVersion: 3.8-11\nPath: source/archive\n";
+        let catalog = CranCatalog::from_description(input).unwrap();
+        let release = &catalog.candidates_named("survival").unwrap()[0];
+        assert_eq!(
+            release.metadata().fields().get("Path").map(String::as_str),
+            Some("source/archive")
+        );
+
+        let observations = CranCatalog::observations_from_description(input).unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].scope(),
+            super::CranCatalogRecordScope::Root
+        ));
+        assert!(
+            observations[0]
+                .fields()
+                .iter()
+                .any(|(name, value)| name == "Path" && value == "source/archive")
+        );
     }
 
     #[test]
