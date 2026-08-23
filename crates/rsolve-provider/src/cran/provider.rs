@@ -7,6 +7,7 @@ use std::error::Error;
 #[cfg(test)]
 use std::fmt;
 use std::rc::Rc;
+use std::time::Duration;
 
 use super::archive_index::provider_rds_read_options;
 use super::catalog::CranCatalog;
@@ -14,7 +15,9 @@ use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
 use super::history::CranHistoryError;
 use super::history::{ArchiveEntry, enumerate_archive_rds_for_provider};
+use crate::SnapshotStore;
 use crate::snapshot::FreshnessStateV1;
+use crate::snapshot::ReadOnlySnapshotCandidateLoader;
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
     ReleaseAggregation, SolverKey,
@@ -106,6 +109,235 @@ pub enum CranRefreshSource {
     ArchiveFastPath,
     ArchiveHistory,
     CurrentIndex(CranCurrentIndexRepresentation),
+}
+
+/// The default period for which a compatible CRAN generation can be reused
+/// online when the server has not supplied a stronger freshness policy.
+pub const CRAN_COMPATIBILITY_PROFILE: u32 = 1;
+pub const CRAN_PARSER_SCHEMA: u32 = 1;
+pub const CRAN_NORMALIZATION_POLICY: u32 = 1;
+pub const DEFAULT_COMPATIBLE_GENERATION_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Clock and compatibility policy used by the CRAN snapshot reuse boundary.
+/// Supplying an explicit timestamp keeps this decision deterministic in tests
+/// and leaves room for HTTP cache policy to take precedence later.
+#[derive(Clone, Debug)]
+pub struct CranSnapshotCachePolicy {
+    pub now: jiff::Timestamp,
+    pub fallback_ttl: Duration,
+    pub compatibility_profile: u32,
+    pub parser_schema: u32,
+    pub normalization_policy: u32,
+}
+
+impl CranSnapshotCachePolicy {
+    pub fn at(now: jiff::Timestamp) -> Self {
+        Self {
+            now,
+            fallback_ttl: DEFAULT_COMPATIBLE_GENERATION_TTL,
+            compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+            parser_schema: CRAN_PARSER_SCHEMA,
+            normalization_policy: CRAN_NORMALIZATION_POLICY,
+        }
+    }
+}
+
+impl Default for CranSnapshotCachePolicy {
+    fn default() -> Self {
+        Self::at(jiff::Timestamp::now())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CranSnapshotCacheStatus {
+    Fresh,
+    Stale,
+    Missing,
+    RevisionIncompatible,
+    Corrupt,
+    Incomplete,
+}
+
+/// A typed explanation for reusing or rejecting the provider-owned current
+/// generation. Local generation names and paths are intentionally omitted.
+#[derive(Clone, Debug)]
+pub struct CranSnapshotCacheDiagnostic {
+    status: CranSnapshotCacheStatus,
+    age_seconds: Option<u64>,
+    endpoints: Vec<Box<str>>,
+    diagnostic: Box<str>,
+}
+
+impl std::fmt::Display for CranSnapshotCacheDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {}", self.status, self.diagnostic)
+    }
+}
+
+impl std::error::Error for CranSnapshotCacheDiagnostic {}
+
+impl CranSnapshotCacheDiagnostic {
+    pub fn new(
+        status: CranSnapshotCacheStatus,
+        age_seconds: Option<u64>,
+        endpoints: impl IntoIterator<Item = impl Into<Box<str>>>,
+        diagnostic: impl Into<Box<str>>,
+    ) -> Self {
+        let mut endpoints = endpoints.into_iter().map(Into::into).collect::<Vec<_>>();
+        endpoints.sort();
+        endpoints.dedup();
+        Self {
+            status,
+            age_seconds,
+            endpoints,
+            diagnostic: diagnostic.into(),
+        }
+    }
+    pub fn status(&self) -> CranSnapshotCacheStatus {
+        self.status
+    }
+    pub fn age_seconds(&self) -> Option<u64> {
+        self.age_seconds
+    }
+    pub fn endpoints(&self) -> impl Iterator<Item = &str> {
+        self.endpoints.iter().map(Box::as_ref)
+    }
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+
+    pub fn is_routine_online_fallback(&self) -> bool {
+        matches!(self.status, CranSnapshotCacheStatus::Missing)
+    }
+
+    pub fn closure_incomplete(error: &rsolve_core::CandidateLoadError) -> Self {
+        let status = match error.category() {
+            rsolve_core::CandidateLoadErrorCategory::SnapshotInvalid => {
+                CranSnapshotCacheStatus::Corrupt
+            }
+            _ => CranSnapshotCacheStatus::Incomplete,
+        };
+        Self {
+            status,
+            age_seconds: None,
+            endpoints: Vec::new(),
+            diagnostic: format!(
+                "cached CRAN generation cannot be used for the requested dependency closure: {error}"
+            )
+            .into(),
+        }
+    }
+}
+
+pub enum CranSnapshotCacheResult {
+    Compatible {
+        loader: Box<ReadOnlySnapshotCandidateLoader>,
+        diagnostic: CranSnapshotCacheDiagnostic,
+    },
+    Rejected(CranSnapshotCacheDiagnostic),
+}
+
+/// Inspect the current immutable generation without transport. This is the
+/// sole CRAN freshness boundary; resolver traversal remains loader-only.
+pub fn inspect_cran_snapshot_cache(
+    store: &SnapshotStore,
+    policy: &CranSnapshotCachePolicy,
+) -> CranSnapshotCacheResult {
+    let loader = match store.read_current_optional() {
+        Ok(Some(loader)) => loader,
+        Ok(None) => {
+            return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
+                status: CranSnapshotCacheStatus::Missing,
+                age_seconds: None,
+                endpoints: Vec::new(),
+                diagnostic: "current CRAN snapshot pointer is missing".into(),
+            });
+        }
+        Err(error) => {
+            return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
+                status: CranSnapshotCacheStatus::Corrupt,
+                age_seconds: None,
+                endpoints: Vec::new(),
+                diagnostic: error.diagnostic().into(),
+            });
+        }
+    };
+    let header = loader.header();
+    if header.compatibility_profile != policy.compatibility_profile
+        || header.parser_schema != policy.parser_schema
+        || header.normalization_policy != policy.normalization_policy
+    {
+        return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
+            status: CranSnapshotCacheStatus::RevisionIncompatible,
+            age_seconds: None,
+            endpoints: canonical_endpoints(header),
+            diagnostic: format!(
+                "CRAN snapshot compatibility revisions are incompatible (profile {}, parser {}, normalization {})",
+                header.compatibility_profile, header.parser_schema, header.normalization_policy
+            ).into(),
+        });
+    }
+    let mut oldest_source_age = 0_i64;
+    let mut future_source = false;
+    for source in &header.sources {
+        let observed = match source.observed_at.parse::<jiff::Timestamp>() {
+            Ok(observed) => observed,
+            Err(error) => {
+                return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
+                    status: CranSnapshotCacheStatus::Corrupt,
+                    age_seconds: None,
+                    endpoints: Vec::new(),
+                    diagnostic: format!("invalid source observed_at: {error}").into(),
+                });
+            }
+        };
+        let age = policy.now.duration_since(observed).as_secs();
+        future_source |= age < 0;
+        oldest_source_age = oldest_source_age.max(age.max(0));
+    }
+    if header.sources.is_empty() {
+        return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
+            status: CranSnapshotCacheStatus::Corrupt,
+            age_seconds: None,
+            endpoints: Vec::new(),
+            diagnostic: "CRAN snapshot has no source observations".into(),
+        });
+    }
+    let age_seconds = u64::try_from(oldest_source_age).unwrap_or(u64::MAX);
+    let fresh = !future_source
+        && oldest_source_age <= i64::try_from(policy.fallback_ttl.as_secs()).unwrap_or(i64::MAX);
+    let status = if fresh {
+        CranSnapshotCacheStatus::Fresh
+    } else {
+        CranSnapshotCacheStatus::Stale
+    };
+    let diagnostic = CranSnapshotCacheDiagnostic {
+        status,
+        age_seconds: Some(age_seconds),
+        endpoints: canonical_endpoints(header),
+        diagnostic: if fresh {
+            "compatible CRAN snapshot generation is within the fallback freshness TTL".into()
+        } else if future_source {
+            "CRAN snapshot source timestamp is in the future; generation is not fresh for online reuse".into()
+        } else {
+            "compatible CRAN snapshot generation is stale but remains usable offline".into()
+        },
+    };
+    CranSnapshotCacheResult::Compatible {
+        loader: Box::new(loader),
+        diagnostic,
+    }
+}
+
+fn canonical_endpoints(header: &crate::snapshot::SnapshotHeaderV1) -> Vec<Box<str>> {
+    let mut endpoints = header
+        .sources
+        .iter()
+        .map(|source| source.endpoint.clone())
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints.into_iter().map(String::into_boxed_str).collect()
 }
 
 /// A transport-neutral diagnostic from refreshing one package's CRAN source.

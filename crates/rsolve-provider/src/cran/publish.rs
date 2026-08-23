@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::fmt;
 
+use super::provider::{CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA};
 use crate::snapshot::CoverageV1;
 use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotPublishError, SnapshotStore};
 use rsolve_core::{CandidateLoadError, RegistryId};
@@ -54,9 +55,9 @@ impl Error for CranSnapshotPublishError {
 pub(crate) fn default_context(registry_id: RegistryId) -> SnapshotCompositionContext {
     SnapshotCompositionContext {
         registry_id,
-        compatibility_profile: 1,
-        parser_schema: 1,
-        normalization_policy: 1,
+        compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+        parser_schema: CRAN_PARSER_SCHEMA,
+        normalization_policy: CRAN_NORMALIZATION_POLICY,
         created_at: jiff::Timestamp::now()
             .strftime("%Y-%m-%dT%H:%M:%SZ")
             .to_string(),
@@ -96,6 +97,10 @@ pub fn publish_snapshot(
 mod tests {
     use super::*;
     use crate::cran::evidence::tests::{context, fixture_observations};
+    use crate::cran::{
+        CranSnapshotCachePolicy, CranSnapshotCacheResult, CranSnapshotCacheStatus,
+        inspect_cran_snapshot_cache,
+    };
     use crate::snapshot::SnapshotGenerationBuilder;
     use rsolve_core::{CandidateLoader, PackageName, PackageRelease, RegistryId, SolverKey};
     use tempfile::tempdir;
@@ -208,5 +213,42 @@ mod tests {
             generation
         );
         assert_eq!(read_versions(&pinned), ["0.9", "1.0"]);
+    }
+
+    #[test]
+    fn cache_policy_reuses_fresh_generation_and_rejects_stale_or_incompatible() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        publish_snapshot(&store, context(), fixture_observations()).unwrap();
+
+        let fresh = CranSnapshotCachePolicy::at("2026-08-23T00:30:00Z".parse().unwrap());
+        let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
+            inspect_cran_snapshot_cache(&store, &fresh)
+        else {
+            panic!("expected compatible generation");
+        };
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Fresh);
+        assert_eq!(diagnostic.age_seconds(), Some(1800));
+
+        let stale = CranSnapshotCachePolicy::at("2026-08-23T02:00:00Z".parse().unwrap());
+        let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
+            inspect_cran_snapshot_cache(&store, &stale)
+        else {
+            panic!("stale compatible generation should remain usable");
+        };
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Stale);
+
+        let mut incompatible = stale;
+        incompatible.parser_schema = 2;
+        let CranSnapshotCacheResult::Rejected(diagnostic) =
+            inspect_cran_snapshot_cache(&store, &incompatible)
+        else {
+            panic!("revision mismatch must reject reuse");
+        };
+        assert_eq!(
+            diagnostic.status(),
+            CranSnapshotCacheStatus::RevisionIncompatible
+        );
     }
 }

@@ -129,7 +129,7 @@ impl ResolutionBackend for CranBackend {
             resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
         }
         .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
-        let warnings = outcome
+        let warnings: Vec<String> = outcome
             .diagnostics()
             .iter()
             .filter_map(|diagnostic| match diagnostic.status_detail() {
@@ -140,11 +140,48 @@ impl ResolutionBackend for CranBackend {
                 )),
             })
             .collect();
+        let mut warnings = warnings;
+        warnings.extend(render_cache_warnings(outcome.cache_diagnostics()));
         Ok(ResolvedData {
             resolution: outcome.resolution().clone(),
             warnings,
         })
     }
+}
+
+fn render_cache_warnings(
+    diagnostics: &[rsolve_provider::cran::CranSnapshotCacheDiagnostic],
+) -> Vec<String> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            !matches!(
+                diagnostic.status(),
+                rsolve_provider::cran::CranSnapshotCacheStatus::Fresh
+                    | rsolve_provider::cran::CranSnapshotCacheStatus::Missing
+            )
+        })
+        .map(|diagnostic| {
+            let sources = diagnostic.endpoints().collect::<Vec<_>>().join(", ");
+            let age = diagnostic
+                .age_seconds()
+                .map(|seconds| format!("; age {seconds}s"))
+                .unwrap_or_default();
+            if sources.is_empty() {
+                format!(
+                    "CRAN snapshot cache {:?}{age}: {}",
+                    diagnostic.status(),
+                    diagnostic.diagnostic()
+                )
+            } else {
+                format!(
+                    "CRAN snapshot cache {:?}{age}; sources: {sources}: {}",
+                    diagnostic.status(),
+                    diagnostic.diagnostic()
+                )
+            }
+        })
+        .collect()
 }
 
 /// Execute a parsed command. Successful commands write no stdout.

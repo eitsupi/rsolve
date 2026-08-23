@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn read_current_optional_distinguishes_missing_pointer_from_corruption() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    assert!(store.read_current_optional().unwrap().is_none());
+    std::fs::write(store.root().join("current"), b"not-json").unwrap();
+    assert!(store.read_current_optional().is_err());
+}
+
+#[test]
 fn build_and_publish_returns_the_generation_it_pinned_before_unlock() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();

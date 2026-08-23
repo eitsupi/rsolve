@@ -28,6 +28,35 @@ fn output_write_is_noop_for_identical_bytes() {
 }
 
 #[test]
+fn cache_warning_renderer_filters_fresh_and_missing_but_reports_stale_sources() {
+    use rsolve_provider::cran::{CranSnapshotCacheDiagnostic, CranSnapshotCacheStatus};
+    let diagnostics = vec![
+        CranSnapshotCacheDiagnostic::new(
+            CranSnapshotCacheStatus::Fresh,
+            Some(10),
+            ["https://fresh.example"],
+            "fresh",
+        ),
+        CranSnapshotCacheDiagnostic::new(
+            CranSnapshotCacheStatus::Missing,
+            None,
+            std::iter::empty::<&str>(),
+            "missing",
+        ),
+        CranSnapshotCacheDiagnostic::new(
+            CranSnapshotCacheStatus::Stale,
+            Some(7200),
+            ["https://z.example", "https://a.example"],
+            "stale",
+        ),
+    ];
+    let warnings = render_cache_warnings(&diagnostics);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("age 7200s"));
+    assert!(warnings[0].contains("https://a.example, https://z.example"));
+}
+
+#[test]
 fn output_write_replaces_atomically_and_preserves_on_invalid_target() {
     let path = temp_path("replace");
     fs::write(&path, b"old").unwrap();

@@ -7,7 +7,8 @@ use rsolve_core::{
     Resolution, SolverKey,
 };
 use rsolve_provider::cran::{
-    CranRefreshDiagnostic, CranSnapshotPublishError, CranSnapshotRefresherError,
+    CranRefreshDiagnostic, CranSnapshotCacheDiagnostic, CranSnapshotPublishError,
+    CranSnapshotRefresherError,
 };
 use rsolve_provider::{SnapshotStore, SnapshotStoreError};
 use rsolve_resolver::{
@@ -44,6 +45,7 @@ pub enum CranResolutionError {
     TemporaryStore(io::Error),
     Refresh(CandidateLoadError),
     Offline(CandidateLoadError),
+    Cache(CranSnapshotCacheDiagnostic),
     Publish(CranSnapshotPublishError),
     Resolution(ResolutionFailure),
 }
@@ -62,6 +64,7 @@ impl fmt::Display for CranResolutionError {
             }
             Self::Refresh(error) => write!(formatter, "CRAN refresh failed: {error}"),
             Self::Offline(error) => write!(formatter, "offline CRAN snapshot failed: {error}"),
+            Self::Cache(error) => write!(formatter, "CRAN snapshot cache rejected: {error}"),
             Self::Publish(error) => write!(formatter, "CRAN snapshot publication failed: {error}"),
             Self::Resolution(error) => write!(formatter, "resolution failed: {error}"),
         }
@@ -78,6 +81,7 @@ impl Error for CranResolutionError {
             Self::TemporaryStore(error) => Some(error),
             Self::Refresh(error) => Some(error),
             Self::Offline(error) => Some(error),
+            Self::Cache(error) => Some(error),
             Self::Publish(error) => Some(error),
             Self::Resolution(error) => Some(error),
         }
@@ -98,6 +102,7 @@ pub enum LockResolutionPolicy {
 pub struct CranResolutionOutcome {
     pub(super) resolution: Resolution,
     pub(super) diagnostics: Vec<CranRefreshDiagnostic>,
+    pub(super) cache_diagnostics: Vec<CranSnapshotCacheDiagnostic>,
 }
 
 impl CranResolutionOutcome {
@@ -107,6 +112,10 @@ impl CranResolutionOutcome {
 
     pub fn diagnostics(&self) -> &[CranRefreshDiagnostic] {
         &self.diagnostics
+    }
+
+    pub fn cache_diagnostics(&self) -> &[CranSnapshotCacheDiagnostic] {
+        &self.cache_diagnostics
     }
 }
 

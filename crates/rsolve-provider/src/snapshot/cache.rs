@@ -205,6 +205,16 @@ impl SnapshotStore {
     }
 
     pub fn read_current(&self) -> Result<ReadOnlySnapshotCandidateLoader, CandidateLoadError> {
+        self.read_current_optional()?
+            .ok_or_else(|| store_candidate_error("current snapshot pointer is missing"))
+    }
+
+    /// Read the current generation, distinguishing an absent pointer from a
+    /// present but corrupt or unreadable cache. No repair or network access is
+    /// performed.
+    pub fn read_current_optional(
+        &self,
+    ) -> Result<Option<ReadOnlySnapshotCandidateLoader>, CandidateLoadError> {
         // Serialize pointer reads with publication and cleanup.  The loader must be
         // opened while this lock is held so cleanup cannot remove the generation
         // selected by the pointer before the read-only database pins it.
@@ -213,10 +223,15 @@ impl SnapshotStore {
             .map_err(|error| {
                 store_candidate_error(format!("unable to acquire snapshot refresh lock: {error}"))
             })?;
-        let pointer_bytes =
-            read_at_most(&self.root.join(CURRENT_NAME), POINTER_LIMIT).map_err(|error| {
-                store_candidate_error(format!("unable to read current pointer: {error}"))
-            })?;
+        let pointer_bytes = match read_at_most(&self.root.join(CURRENT_NAME), POINTER_LIMIT) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(store_candidate_error(format!(
+                    "unable to read current pointer: {error}"
+                )));
+            }
+        };
         let pointer = decode_pointer(&pointer_bytes, &self.registry_id)?;
         let loader = self.open_generation_locked(&pointer.generation)?;
         let header_bytes = super::encode_header(loader.header()).map_err(|error| {
@@ -228,7 +243,7 @@ impl SnapshotStore {
                 "current pointer header digest mismatch",
             ));
         }
-        Ok(loader)
+        Ok(Some(loader))
     }
 
     fn open_generation_locked(
