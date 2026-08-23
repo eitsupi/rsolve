@@ -96,6 +96,14 @@ impl SnapshotStore {
     }
 
     pub fn read_current(&self) -> Result<ReadOnlySnapshotCandidateLoader, CandidateLoadError> {
+        // Serialize pointer reads with publication and cleanup.  The loader must be
+        // opened while this lock is held so cleanup cannot remove the generation
+        // selected by the pointer before the read-only database pins it.
+        let _refresh_lock = self
+            .acquire_refresh_lock(RefreshLockMode::Blocking)
+            .map_err(|error| {
+                store_candidate_error(format!("unable to acquire snapshot refresh lock: {error}"))
+            })?;
         let pointer_bytes =
             read_at_most(&self.root.join(CURRENT_NAME), POINTER_LIMIT).map_err(|error| {
                 store_candidate_error(format!("unable to read current pointer: {error}"))

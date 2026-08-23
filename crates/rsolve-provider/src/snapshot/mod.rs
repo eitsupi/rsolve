@@ -2316,6 +2316,90 @@ mod tests {
     }
 
     #[test]
+    fn read_current_serializes_generation_open_with_cleanup() {
+        let dir = tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let staged_path = store.root().join("tmp/current.redb");
+        let generation = SnapshotGenerationBuilder::new(present_input(), &staged_path)
+            .build()
+            .unwrap();
+        let publish_lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+        store.publish_generation(&publish_lock, generation).unwrap();
+        drop(publish_lock);
+        let lock = store
+            .acquire_refresh_lock(RefreshLockMode::Blocking)
+            .unwrap();
+
+        let ready_path = dir.path().join("read-current-child-ready");
+        let attempt_path = dir.path().join("read-current-child-attempt");
+        let go_path = dir.path().join("read-current-child-go");
+        let done_path = dir.path().join("read-current-child-done");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("snapshot::tests::read_current_lock_child_probe")
+            .arg("--nocapture")
+            .env("RSOLVE_READ_CURRENT_CHILD_ROOT", dir.path())
+            .env("RSOLVE_READ_CURRENT_CHILD_READY", &ready_path)
+            .env("RSOLVE_READ_CURRENT_CHILD_ATTEMPT", &attempt_path)
+            .env("RSOLVE_READ_CURRENT_CHILD_GO", &go_path)
+            .env("RSOLVE_READ_CURRENT_CHILD_DONE", &done_path)
+            .spawn()
+            .unwrap();
+
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_path.exists() {
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "child did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Keep the refresh lock held while the child enters read_current.  A
+        // cleanup/publish operation cannot remove the selected generation until
+        // the loader has been opened and validated.
+        std::fs::write(&go_path, b"").unwrap();
+        while !attempt_path.exists() {
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "child did not attempt read_current"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let blocked_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < blocked_deadline {
+            assert!(
+                !done_path.exists(),
+                "read_current completed while the refresh lock was held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        drop(lock);
+        assert!(child.wait().unwrap().success());
+        assert!(done_path.exists());
+    }
+
+    #[test]
+    fn read_current_lock_child_probe() {
+        let Ok(root) = std::env::var("RSOLVE_READ_CURRENT_CHILD_ROOT") else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_READY").unwrap());
+        let attempt = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_ATTEMPT").unwrap());
+        let go = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_GO").unwrap());
+        let done = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_DONE").unwrap());
+        let store = SnapshotStore::open(root, RegistryId::new("cran").unwrap()).unwrap();
+        std::fs::write(ready, b"").unwrap();
+        while !go.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::write(attempt, b"").unwrap();
+        assert!(store.read_current().is_ok());
+        std::fs::write(done, b"").unwrap();
+    }
+
+    #[test]
     fn cleanup_preserves_retained_final_orphan_and_current() {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
