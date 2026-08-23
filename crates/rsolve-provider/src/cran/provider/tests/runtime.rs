@@ -66,14 +66,17 @@ fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -104,7 +107,7 @@ fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
         !requests
             .borrow()
             .iter()
-            .any(|url| url.contains("/Archive/methods/PACKAGES.rds"))
+            .any(|url| url.url.contains("/Archive/methods/PACKAGES.rds"))
     );
     assert!(session.diagnostics.iter().any(|diagnostic| {
         diagnostic.source()
@@ -136,14 +139,17 @@ fn production_refresh_publishes_fixture_evidence_and_preserves_old_generation_on
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let directory = tempfile::tempdir().unwrap();
@@ -208,14 +214,17 @@ fn production_refresh_publishes_current_and_archive_index_evidence() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -223,6 +232,7 @@ fn production_refresh_publishes_current_and_archive_index_evidence() {
         TransportResponse {
             status: 200,
             body: FAST.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -275,8 +285,18 @@ fn production_refresh_publishes_current_and_archive_index_evidence() {
             .len()
             >= 2
     );
-    assert!(requests.borrow().contains(&current_plain_url()));
-    assert!(requests.borrow().contains(&fast_url()));
+    assert!(
+        requests
+            .borrow()
+            .iter()
+            .any(|request| request == &current_plain_url())
+    );
+    assert!(
+        requests
+            .borrow()
+            .iter()
+            .any(|request| request == &fast_url())
+    );
     assert!(!requests.borrow().iter().any(|url| url == &history_url()));
     assert!(!requests.borrow().iter().any(|url| url == &old_url()));
 }
@@ -287,14 +307,17 @@ fn production_refresh_propagates_configured_registry_id_to_header_and_loader() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            ..TransportResponse::default()
         },
     );
     let directory = tempfile::tempdir().unwrap();

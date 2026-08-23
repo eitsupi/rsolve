@@ -86,14 +86,17 @@ fn gone_fast_path_is_absent_and_shared_history_is_fetched_once() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -101,6 +104,7 @@ fn gone_fast_path_is_absent_and_shared_history_is_fetched_once() {
         TransportResponse {
             status: 410,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -135,14 +139,17 @@ fn absent_fast_path_and_absent_history_use_current_candidates_only() {
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 200,
                 body: current.to_vec(),
+                ..TransportResponse::default()
             },
         );
         transport.responses.insert(
@@ -150,6 +157,7 @@ fn absent_fast_path_and_absent_history_use_current_candidates_only() {
             TransportResponse {
                 status: fast_status,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
         );
         transport.responses.insert(
@@ -157,6 +165,7 @@ fn absent_fast_path_and_absent_history_use_current_candidates_only() {
             TransportResponse {
                 status: history_status,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
         );
         let requests = Rc::clone(&transport.requests);
@@ -201,14 +210,17 @@ fn archive_candidates_are_retained_when_current_index_lacks_package() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"Package: other\nVersion: 1.0.0\n".to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -216,6 +228,7 @@ fn archive_candidates_are_retained_when_current_index_lacks_package() {
         TransportResponse {
             status: 200,
             body: FAST.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -242,24 +255,29 @@ fn fast_path_failure_is_not_hidden_by_absent_history() {
         TransportResponse {
             status: 500,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: WRONG_ROOT.to_vec(),
+            ..TransportResponse::default()
         },
     ] {
         let mut transport = session_transport(
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 200,
                 body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+                ..TransportResponse::default()
             },
         );
         transport
@@ -270,6 +288,7 @@ fn fast_path_failure_is_not_hidden_by_absent_history() {
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
         );
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -300,14 +319,17 @@ fn unsupported_fast_path_and_empty_sources_are_negative_cached() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"Package: Other\nVersion: 1.0.0\n".to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -315,6 +337,7 @@ fn unsupported_fast_path_and_empty_sources_are_negative_cached() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -363,14 +386,17 @@ fn invalid_fast_path_failure_is_negative_cached_with_stable_error() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -378,6 +404,7 @@ fn invalid_fast_path_failure_is_negative_cached_with_stable_error() {
         TransportResponse {
             status: 500,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -385,6 +412,7 @@ fn invalid_fast_path_failure_is_negative_cached_with_stable_error() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -424,19 +452,22 @@ fn tarball_transport_and_metadata_failures_are_negative_cached() {
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 200,
                 body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+                ..TransportResponse::default()
             },
         );
         transport
             .responses
-            .insert(old_url(), TransportResponse { status, body });
+            .insert(old_url(), TransportResponse::new(status, body));
         let requests = Rc::clone(&transport.requests);
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
         let package = PackageName::new("Matrix").unwrap();

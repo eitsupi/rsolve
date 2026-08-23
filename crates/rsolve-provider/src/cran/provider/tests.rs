@@ -44,18 +44,37 @@ const NEW_TAR: &[u8] =
 #[derive(Clone)]
 struct FixtureTransport {
     responses: HashMap<String, TransportResponse>,
-    requests: Rc<RefCell<Vec<String>>>,
+    requests: Rc<RefCell<Vec<FixtureRequest>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FixtureRequest {
+    url: String,
+    validators: TransportValidators,
+}
+
+impl PartialEq<String> for FixtureRequest {
+    fn eq(&self, other: &String) -> bool {
+        self.url == *other
+    }
+}
+
+impl PartialEq<FixtureRequest> for String {
+    fn eq(&self, other: &FixtureRequest) -> bool {
+        *self == other.url
+    }
 }
 
 impl FixtureTransport {
     fn fallback(fast: Vec<u8>, status: u16) -> Self {
         let mut responses = HashMap::new();
-        responses.insert(fast_url(), TransportResponse { status, body: fast });
+        responses.insert(fast_url(), TransportResponse::new(status, fast));
         responses.insert(
             history_url(),
             TransportResponse {
                 status: 200,
                 body: HISTORY.to_vec(),
+                ..TransportResponse::default()
             },
         );
         responses.insert(
@@ -63,6 +82,7 @@ impl FixtureTransport {
             TransportResponse {
                 status: 200,
                 body: OLD_TAR.to_vec(),
+                ..TransportResponse::default()
             },
         );
         responses.insert(
@@ -70,6 +90,7 @@ impl FixtureTransport {
             TransportResponse {
                 status: 200,
                 body: NEW_TAR.to_vec(),
+                ..TransportResponse::default()
             },
         );
         Self {
@@ -81,12 +102,39 @@ impl FixtureTransport {
 
 impl Transport for FixtureTransport {
     fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
-        self.requests.borrow_mut().push(url.to_owned());
+        self.get_with_validators(url, &TransportValidators::default())
+    }
+
+    fn get_with_validators(
+        &self,
+        url: &str,
+        validators: &TransportValidators,
+    ) -> Result<TransportResponse, TransportError> {
+        self.requests.borrow_mut().push(FixtureRequest {
+            url: url.to_owned(),
+            validators: validators.clone(),
+        });
         self.responses
             .get(url)
             .cloned()
             .ok_or_else(|| TransportError::new(format!("fixture has no response for {url}")))
     }
+}
+
+#[test]
+fn fixture_transport_observes_conditional_validators() {
+    let transport = FixtureTransport::fallback(FAST.to_vec(), 200);
+    let validators = TransportValidators::from_values(
+        Some("\"fixture-etag\""),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+    let response = transport
+        .get_with_validators(&fast_url(), &validators)
+        .unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(transport.requests.borrow().len(), 1);
+    assert_eq!(transport.requests.borrow()[0].url, fast_url());
+    assert_eq!(transport.requests.borrow()[0].validators, validators);
 }
 
 fn fast_url() -> String {
@@ -162,6 +210,7 @@ fn session_transport(
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     for package in ["methods", "rsolvefixture.plain"] {
@@ -170,6 +219,7 @@ fn session_transport(
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
         );
     }
@@ -178,6 +228,7 @@ fn session_transport(
         TransportResponse {
             status: 200,
             body: HISTORY.to_vec(),
+            ..TransportResponse::default()
         },
     );
     responses.insert(
@@ -185,6 +236,7 @@ fn session_transport(
         TransportResponse {
             status: 200,
             body: OLD_TAR.to_vec(),
+            ..TransportResponse::default()
         },
     );
     responses.insert(
@@ -192,6 +244,7 @@ fn session_transport(
         TransportResponse {
             status: 200,
             body: NEW_TAR.to_vec(),
+            ..TransportResponse::default()
         },
     );
     FixtureTransport {

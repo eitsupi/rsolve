@@ -6,14 +6,17 @@ fn current_rds_provider_path_assumes_utf8_for_native_format_two_strings() {
         TransportResponse {
             status: 200,
             body: NATIVE_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -36,14 +39,17 @@ fn current_rds_provider_path_rejects_invalid_native_utf8() {
         TransportResponse {
             status: 200,
             body: INVALID_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -84,14 +90,17 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: consistent.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -113,14 +122,17 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: conflicting.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -147,14 +159,17 @@ Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\nMD5sum: overlay\nPath: 
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -216,6 +231,7 @@ fn current_index_transport_or_status_failures_remain_transport_failures() {
                 TransportResponse {
                     status: 404,
                     body: Vec::new(),
+                    ..TransportResponse::default()
                 },
             ),
             (
@@ -223,6 +239,7 @@ fn current_index_transport_or_status_failures_remain_transport_failures() {
                 TransportResponse {
                     status: 410,
                     body: Vec::new(),
+                    ..TransportResponse::default()
                 },
             ),
             (
@@ -230,6 +247,7 @@ fn current_index_transport_or_status_failures_remain_transport_failures() {
                 TransportResponse {
                     status: 503,
                     body: Vec::new(),
+                    ..TransportResponse::default()
                 },
             ),
         ]),
@@ -255,6 +273,7 @@ fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
         TransportResponse {
             status: 200,
             body: WRONG_ROOT.to_vec(),
+            ..TransportResponse::default()
         },
     );
     responses.insert(
@@ -262,6 +281,7 @@ fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     responses.insert(
@@ -269,6 +289,7 @@ fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
         TransportResponse {
             status: 503,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let transport = FixtureTransport {
@@ -289,14 +310,17 @@ fn current_absence_with_absent_archive_sources_is_empty() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"Package: other\nVersion: 1.0.0\n".to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.insert(
@@ -304,6 +328,7 @@ fn current_absence_with_absent_archive_sources_is_empty() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);

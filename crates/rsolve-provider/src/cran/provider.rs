@@ -23,6 +23,10 @@ use rsolve_core::{
     ReleaseAggregation, SolverKey,
 };
 
+// The raw-response/cache integration consumes this crate-private policy seam
+// in the next transport layer; keep it available without coupling snapshot
+// inspection to response headers.
+pub mod cache_policy;
 mod negative;
 mod refresher;
 mod snapshot;
@@ -40,7 +44,7 @@ use snapshot::{
 };
 pub(crate) use transport::Transport;
 #[cfg(test)]
-pub(crate) use transport::{TransportError, TransportResponse};
+pub(crate) use transport::{TransportError, TransportResponse, TransportValidators};
 
 // This is a CRAN transport defense limit, not a generic artifact-size contract.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;

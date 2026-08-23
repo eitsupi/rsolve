@@ -26,14 +26,17 @@ fn invalid_gzip_current_index_falls_back_to_plain_once() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"not gzip".to_vec(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -72,14 +75,17 @@ fn invalid_rds_current_index_falls_back_to_gzip() {
         TransportResponse {
             status: 200,
             body: vec![0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00],
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: encoder.finish().unwrap(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 500,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -106,14 +112,17 @@ fn semantic_invalid_current_index_falls_back_to_gzip() {
         TransportResponse {
             status: 200,
             body: SEMANTIC_INVALID_FAST.to_vec(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: encoder.finish().unwrap(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 500,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
     );
     let requests = Rc::clone(&transport.requests);
@@ -151,14 +160,17 @@ fn history_transport_and_metadata_failures_remain_hard_failures() {
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 404,
                 body: Vec::new(),
+                ..TransportResponse::default()
             },
             TransportResponse {
                 status: 200,
                 body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+                ..TransportResponse::default()
             },
         );
         transport.responses.insert(
@@ -166,6 +178,7 @@ fn history_transport_and_metadata_failures_remain_hard_failures() {
             TransportResponse {
                 status: history_status,
                 body: history_body,
+                ..TransportResponse::default()
             },
         );
         let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
@@ -186,14 +199,17 @@ fn history_transport_error_is_hard_failure_after_absent_fast_path() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.remove(&history_url());
@@ -222,14 +238,17 @@ fn fast_path_transport_error_is_diagnostic_and_falls_back() {
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 404,
             body: Vec::new(),
+            ..TransportResponse::default()
         },
         TransportResponse {
             status: 200,
             body: current.to_vec(),
+            ..TransportResponse::default()
         },
     );
     transport.responses.remove(&fast_url());
@@ -281,6 +300,7 @@ fn semantically_invalid_description_is_metadata_invalid() {
         TransportResponse {
             status: 200,
             body: invalid.clone(),
+            ..TransportResponse::default()
         },
     );
     invalid.resize(NEW_TAR.len(), 0);
@@ -289,6 +309,7 @@ fn semantically_invalid_description_is_metadata_invalid() {
         TransportResponse {
             status: 200,
             body: invalid,
+            ..TransportResponse::default()
         },
     );
     let provider = provider(transport);
