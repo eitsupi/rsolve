@@ -123,13 +123,37 @@ impl SnapshotStore {
         &self.root
     }
 
-    /// Builds, validates, publishes, and reopens one immutable generation.
-    /// The refresh lock spans staging and pointer publication, then is
-    /// released before the final readback acquires it again.
+    /// Builds, validates, publishes, and opens one immutable generation while
+    /// holding the refresh lock. The resulting loader is pinned before the
+    /// lock is released and returned directly after unlock, so a concurrent
+    /// publisher cannot change which generation this call returns.
     pub(crate) fn build_and_publish(
         &self,
         input: SnapshotBuildInput,
     ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError> {
+        self.build_and_publish_inner(input, |_| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_and_publish_with_test_hook<F>(
+        &self,
+        input: SnapshotBuildInput,
+        after_unlock: F,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError>
+    where
+        F: FnOnce(&Self),
+    {
+        self.build_and_publish_inner(input, after_unlock)
+    }
+
+    fn build_and_publish_inner<F>(
+        &self,
+        input: SnapshotBuildInput,
+        after_unlock: F,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError>
+    where
+        F: FnOnce(&Self),
+    {
         let lock = self
             .acquire_refresh_lock(RefreshLockMode::Blocking)
             .map_err(SnapshotPublishError::Store)?;
@@ -151,6 +175,7 @@ impl SnapshotStore {
             .map_err(SnapshotPublishError::Reopen)?;
         drop(lock);
         drop(staging_cleanup);
+        after_unlock(self);
         Ok(loader)
     }
 

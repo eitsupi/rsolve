@@ -27,6 +27,44 @@ fn build_and_publish_returns_the_generation_it_pinned_before_unlock() {
 }
 
 #[test]
+fn build_and_publish_returns_a_even_if_b_publishes_before_return() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    let returned = store
+        .build_and_publish_with_test_hook(present_input(), |store| {
+            let mut second_input = present_input();
+            second_input.sources[0].content_sha256 = [9; 32];
+            second_input.coverage.source_ids =
+                vec![source_observation(&second_input.sources[0]).unwrap().id];
+            let second_path = store.root().join("tmp/interleaving-second.redb");
+            let second = SnapshotGenerationBuilder::new(second_input, &second_path)
+                .build()
+                .unwrap();
+            let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+            store.publish_generation(&lock, second).unwrap();
+            drop(lock);
+        })
+        .unwrap();
+    let current = store.read_current().unwrap();
+
+    assert_ne!(returned.header().generation, current.header().generation);
+    assert_eq!(
+        returned
+            .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        current
+            .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn store_publishes_strict_pointer_and_pins_readers() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
