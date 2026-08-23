@@ -146,6 +146,10 @@ impl CranCatalog {
 pub(crate) fn validated_observations_from_fields(
     records: Vec<CatalogRecord>,
 ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
+    let fields_by_index = records
+        .iter()
+        .map(|(record_index, _, fields)| (*record_index, fields.clone()))
+        .collect::<HashMap<_, _>>();
     let parsed = records
         .iter()
         .map(|(record_index, package, fields)| {
@@ -160,28 +164,23 @@ pub(crate) fn validated_observations_from_fields(
             )
         })
         .collect::<Vec<_>>();
-    catalog_from_observations(
-        parsed
-            .iter()
-            .map(|(index, package, observation)| (*index, package.clone(), observation.clone())),
-    )
-    .map_err(CranCatalogError::Semantic)?;
+    let (selected, _) = select_and_aggregate(parsed).map_err(CranCatalogError::Semantic)?;
 
-    Ok(parsed
+    Ok(selected
         .into_iter()
-        .zip(records)
-        .filter_map(|((record_index, _, observation), (_, _, fields))| {
-            observation.ok().map(|observation| {
-                let package = observation.identity.name().clone();
-                let release = PackageRelease::try_from(observation)
-                    .expect("catalog validation already accepted the observation");
-                CranCatalogObservation {
-                    record_index,
-                    package,
-                    fields,
-                    release,
-                }
-            })
+        .map(|(record_index, _, observation)| {
+            let package = observation.identity.name().clone();
+            let release = PackageRelease::try_from(observation)
+                .expect("catalog validation already accepted the observation");
+            CranCatalogObservation {
+                record_index,
+                package,
+                fields: fields_by_index
+                    .get(&record_index)
+                    .cloned()
+                    .expect("selected catalog record must have source fields"),
+                release,
+            }
         })
         .collect::<Vec<_>>())
 }
@@ -355,6 +354,31 @@ where
     >,
 {
     let observations = observations.into_iter().collect::<Vec<_>>();
+    let (_, aggregation) = select_and_aggregate(observations)?;
+
+    let mut candidates: BTreeMap<PackageName, Vec<PackageRelease>> = BTreeMap::new();
+    for release in aggregation.releases() {
+        candidates
+            .entry(release.identity().name().clone())
+            .or_default()
+            .push(release.clone());
+    }
+    for releases in candidates.values_mut() {
+        releases.sort_by(|left, right| left.version().cmp(right.version()));
+    }
+    Ok(CranCatalog { candidates })
+}
+
+type ParsedCatalogObservation = (
+    usize,
+    Option<String>,
+    Result<ReleaseObservation, CranRecordError>,
+);
+type SelectedCatalogObservation = (usize, Option<String>, ReleaseObservation);
+
+fn select_and_aggregate(
+    observations: Vec<ParsedCatalogObservation>,
+) -> Result<(Vec<SelectedCatalogObservation>, ReleaseAggregation), Box<[CranDiagnostic]>> {
     let mut root_md5_by_identity = HashMap::<ReleaseIdentity, Vec<Option<String>>>::new();
     for (_, _, observation) in &observations {
         let Ok(observation) = observation else {
@@ -368,8 +392,9 @@ where
         }
     }
 
-    let mut aggregation = ReleaseAggregation::new();
     let mut diagnostics = Vec::new();
+    let mut selected = Vec::new();
+    let mut aggregation = ReleaseAggregation::new();
 
     for (record_index, package, observation) in observations {
         match observation {
@@ -377,12 +402,14 @@ where
                 if should_suppress_overlay(&observation, &root_md5_by_identity) {
                     continue;
                 }
-                if let Err(error) = aggregation.observe(observation) {
+                if let Err(error) = aggregation.observe(observation.clone()) {
                     diagnostics.push(CranDiagnostic {
                         record_index,
                         package,
                         error: CranRecordError::Domain(error),
                     });
+                } else {
+                    selected.push((record_index, package, observation));
                 }
             }
             Err(error) => diagnostics.push(CranDiagnostic {
@@ -393,20 +420,10 @@ where
         }
     }
 
-    let mut candidates: BTreeMap<PackageName, Vec<PackageRelease>> = BTreeMap::new();
-    for release in aggregation.releases() {
-        candidates
-            .entry(release.identity().name().clone())
-            .or_default()
-            .push(release.clone());
-    }
-    for releases in candidates.values_mut() {
-        releases.sort_by(|left, right| left.version().cmp(right.version()));
-    }
     if !diagnostics.is_empty() {
         return Err(diagnostics.into_boxed_slice());
     }
-    Ok(CranCatalog { candidates })
+    Ok((selected, aggregation))
 }
 
 fn metadata_field<'a>(observation: &'a ReleaseObservation, name: &str) -> Option<&'a str> {
@@ -674,4 +691,62 @@ fn parse_constraint(input: &str) -> Result<VersionConstraint, DependencyParseErr
     let version =
         RPackageVersion::parse(version_text).map_err(DependencyParseError::InvalidVersion)?;
     Ok(VersionConstraint::from_clause(*op, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CranCatalog;
+
+    const MATCHING_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-PACKAGES.rds"
+    );
+
+    const MATCHING_PLAIN: &[u8] = b"Package: Matrix\nVersion: 1.7-6\nLicense: RSOLVE Fictional Terms Matrix\nMD5sum: 00000000000000000000000000000031\n\nPackage: Matrix\nVersion: 1.7-6\nLicense: RSOLVE Fictional Terms Matrix\nMD5sum: 00000000000000000000000000000031\nPath: 4.7.0/Recommended\n";
+
+    fn assert_matching_overlay_is_suppressed(observations: &[super::CranCatalogObservation]) {
+        assert_eq!(observations.len(), 1);
+        assert!(
+            observations[0]
+                .fields()
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("Path"))
+        );
+    }
+
+    #[test]
+    fn plain_lossless_observations_share_matching_overlay_selection() {
+        let catalog = CranCatalog::from_packages(MATCHING_PLAIN).unwrap();
+        assert_eq!(catalog.candidate_count(), 1);
+        let observations = CranCatalog::observations_from_packages(MATCHING_PLAIN).unwrap();
+        assert_matching_overlay_is_suppressed(&observations);
+    }
+
+    #[test]
+    fn archive_lossless_observations_share_matching_overlay_selection() {
+        let catalog = CranCatalog::from_archive_index_rds(MATCHING_ARCHIVE).unwrap();
+        assert_eq!(catalog.candidate_count(), 1);
+        let observations =
+            CranCatalog::observations_from_archive_index_rds(MATCHING_ARCHIVE).unwrap();
+        assert_matching_overlay_is_suppressed(&observations);
+    }
+
+    #[test]
+    fn mixed_parse_and_domain_diagnostics_remain_in_source_order() {
+        let input = b"Package: Matrix\nVersion: 1.0\nLicense: root\n\n\
+Package: malformed\n\n\
+Package: Matrix\nVersion: 1.0\nLicense: conflicting\n";
+        let error = CranCatalog::from_packages(input).unwrap_err();
+        let diagnostics = error.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].record_index(), 1);
+        assert!(matches!(
+            diagnostics[0].error(),
+            super::CranRecordError::MissingField("Version")
+        ));
+        assert_eq!(diagnostics[1].record_index(), 2);
+        assert!(matches!(
+            diagnostics[1].error(),
+            super::CranRecordError::Domain(_)
+        ));
+    }
 }
