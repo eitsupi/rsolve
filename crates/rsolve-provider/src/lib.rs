@@ -5,3 +5,5 @@
 
 pub mod cran;
 pub(crate) mod snapshot;
+
+pub use snapshot::ReadOnlySnapshotCandidateLoader;

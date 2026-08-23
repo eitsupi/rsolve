@@ -15,14 +15,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{
     CompactionError, Database, DatabaseError, ReadOnlyDatabase, ReadableDatabase, ReadableTable,
-    TableDefinition,
+    ReadableTableMetadata, TableDefinition,
 };
 use rsolve_core::{
-    Artifact, ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
-    Distribution, DistributionChannel, DistributionMetadata, PackageName, PackageNamespace,
-    PackageRelease, Provenance, PublicationDate, RPackageVersion, RegistryId, RelationOp,
-    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ReleasePublication, Sha256Digest,
-    SnapshotId, SourceArtifact, UpstreamChecksum, VersionClause, VersionConstraint,
+    Artifact, ArtifactLocator, CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader,
+    DependencyKind, DependencyRequirement, DependencySourceConstraint, Distribution,
+    DistributionChannel, DistributionMetadata, PackageName, PackageNamespace, PackageRelease,
+    Provenance, PublicationDate, RPackageVersion, RegistryId, RelationOp, ReleaseIdentity,
+    ReleaseMetadata, ReleaseObservation, ReleasePublication, Sha256Digest, SnapshotId, SolverKey,
+    SourceArtifact, UpstreamChecksum, VersionClause, VersionConstraint,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -379,6 +380,131 @@ pub struct ValidatedGeneration {
     generation: String,
     header: SnapshotHeaderV1,
     header_bytes: Vec<u8>,
+}
+
+/// A transport-free candidate loader backed by one immutable redb generation.
+///
+/// The database is opened read-only and remains pinned for the lifetime of the
+/// loader.  No refresh, pointer publication, repair, or endpoint state is
+/// reachable through this resolver-facing capability.
+pub struct ReadOnlySnapshotCandidateLoader {
+    database: ReadOnlyDatabase,
+    header: SnapshotHeaderV1,
+    source_indexes: BTreeMap<String, u32>,
+}
+
+impl ReadOnlySnapshotCandidateLoader {
+    /// Opens and validates the generation-global coordinates for a configured
+    /// registry.  Package histories remain lazy and are validated when looked
+    /// up.  The configured registry identity is checked against the immutable
+    /// header before the loader is returned.
+    pub fn open(
+        path: impl AsRef<Path>,
+        configured_registry_id: RegistryId,
+    ) -> Result<Self, CandidateLoadError> {
+        let database = ReadOnlyDatabase::open(path.as_ref()).map_err(snapshot_invalid)?;
+        let read = database.begin_read().map_err(snapshot_invalid)?;
+        let header_table = read.open_table(SNAPSHOT_HEADER).map_err(snapshot_invalid)?;
+        let stored_header = header_table
+            .get(HEADER_KEY)
+            .map_err(snapshot_invalid)?
+            .ok_or_else(|| snapshot_invalid("snapshot header is missing"))?;
+        let header_bytes = stored_header.value();
+        let header = decode_header(header_bytes).map_err(snapshot_invalid)?;
+        if header.registry_id != configured_registry_id.as_str() {
+            return Err(snapshot_invalid(format!(
+                "snapshot registry {:?} does not match configured registry {:?}",
+                header.registry_id,
+                configured_registry_id.as_str()
+            )));
+        }
+        let source_indexes = header
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| (source.id.clone(), index as u32))
+            .collect::<BTreeMap<_, _>>();
+        let history_table = read
+            .open_table(PACKAGE_HISTORIES)
+            .map_err(snapshot_invalid)?;
+        if history_table.len().map_err(snapshot_invalid)? != header.package_count {
+            return Err(snapshot_invalid("snapshot package count mismatch"));
+        }
+        drop(history_table);
+        drop(header_table);
+        drop(read);
+        Ok(Self {
+            database,
+            header,
+            source_indexes,
+        })
+    }
+
+    fn releases_for_name(
+        &self,
+        name: &PackageName,
+    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let read = self.database.begin_read().map_err(snapshot_invalid)?;
+        let table = read
+            .open_table(PACKAGE_HISTORIES)
+            .map_err(snapshot_invalid)?;
+        let Some(value) = table.get(name.as_str()).map_err(snapshot_invalid)? else {
+            return if self.header.coverage.state == "complete" {
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("CRAN snapshot has no candidates for {name}"),
+                ))
+            } else {
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("CRAN snapshot is partial for missing package {name}"),
+                ))
+            };
+        };
+        let history = decode_history(value.value()).map_err(package_metadata_invalid)?;
+        if history.package != name.as_str() {
+            return Err(package_metadata_invalid("history key/package mismatch"));
+        }
+        validate_history(&history, &self.source_indexes, self.header.sources.len())
+            .map_err(package_metadata_invalid)?;
+        if !matches!(history.state, LookupStateV1::Present) {
+            return Err(package_metadata_invalid(
+                "package history is incomplete and cannot provide candidates",
+            ));
+        }
+        history
+            .eligible_releases
+            .iter()
+            .map(release_to_domain)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(package_metadata_invalid)
+    }
+}
+
+impl CandidateLoader for ReadOnlySnapshotCandidateLoader {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let SolverKey::InstalledName(name) = package else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("CRAN snapshot does not support solver key {package:?}"),
+            ));
+        };
+        self.releases_for_name(name)
+    }
+}
+
+fn snapshot_invalid(error: impl fmt::Display) -> CandidateLoadError {
+    CandidateLoadError::new(
+        CandidateLoadErrorCategory::SnapshotInvalid,
+        error.to_string(),
+    )
+}
+
+fn package_metadata_invalid(error: impl fmt::Display) -> CandidateLoadError {
+    CandidateLoadError::new(
+        CandidateLoadErrorCategory::MetadataInvalid,
+        error.to_string(),
+    )
 }
 impl ValidatedGeneration {
     pub fn path(&self) -> &Path {
@@ -1691,12 +1817,118 @@ mod tests {
         (input, [source_ids[0].clone(), source_ids[1].clone()])
     }
 
+    fn present_input() -> SnapshotBuildInput {
+        let mut input = input();
+        let package = PackageName::new("foo").unwrap();
+        let version = RPackageVersion::parse("1.0").unwrap();
+        let release = PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                package.clone(),
+                Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: package,
+            observed_version: version,
+            metadata: ReleaseMetadata::default(),
+            publication: None,
+            dependencies: vec![],
+            distributions: vec![],
+        })
+        .unwrap();
+        input.histories[0].state = LookupStateV1::Present;
+        input.histories[0].eligible_releases = vec![EligibleReleaseV1 {
+            package: "foo".into(),
+            version: "1.0".into(),
+            namespace: "cran".into(),
+            metadata: vec![],
+            publication: None,
+            dependencies: vec![],
+            distributions: vec![],
+            metadata_sha256: parse_hex_32(release.metadata_digest().as_str()).unwrap(),
+            evidence: vec![],
+        }];
+        input
+    }
+
+    fn two_present_input() -> SnapshotBuildInput {
+        let mut input = present_input();
+        let mut second = input.histories[0].clone();
+        second.package = "bar".into();
+        second.eligible_releases[0].package = "bar".into();
+        let package = PackageName::new("bar").unwrap();
+        let version = RPackageVersion::parse("1.0").unwrap();
+        let release = PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                package.clone(),
+                Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: package,
+            observed_version: version,
+            metadata: ReleaseMetadata::default(),
+            publication: None,
+            dependencies: vec![],
+            distributions: vec![],
+        })
+        .unwrap();
+        second.eligible_releases[0].metadata_sha256 =
+            parse_hex_32(release.metadata_digest().as_str()).unwrap();
+        input.histories.push(second);
+        input
+    }
+
     fn stored_history(path: &Path) -> PackageHistoryV1 {
         let database = ReadOnlyDatabase::open(path).unwrap();
         let read = database.begin_read().unwrap();
         let table = read.open_table(PACKAGE_HISTORIES).unwrap();
         let bytes = table.get("foo").unwrap().unwrap();
         decode_history(bytes.value()).unwrap()
+    }
+
+    fn rewrite_stored_history(
+        path: &Path,
+        package: &str,
+        mutate: impl FnOnce(&mut PackageHistoryV1),
+    ) {
+        let database = Database::create(path).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut table = write.open_table(PACKAGE_HISTORIES).unwrap();
+            let current = table.get(package).unwrap().unwrap().value().to_vec();
+            let mut history = decode_history(&current).unwrap();
+            mutate(&mut history);
+            let encoded = encode_history(&history).unwrap();
+            table.insert(package, encoded.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    fn rewrite_stored_header(path: &Path, mutate: impl FnOnce(&mut SnapshotHeaderV1)) {
+        let database = Database::create(path).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut table = write.open_table(SNAPSHOT_HEADER).unwrap();
+            let current = table.get(HEADER_KEY).unwrap().unwrap().value().to_vec();
+            let mut header: SnapshotHeaderV1 = serde_json::from_slice(&current).unwrap();
+            mutate(&mut header);
+            let encoded = encode_header(&header).unwrap();
+            table.insert(HEADER_KEY, encoded.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    fn delete_stored_history(path: &Path, package: &str) {
+        let database = Database::create(path).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut table = write.open_table(PACKAGE_HISTORIES).unwrap();
+            table.remove(package).unwrap();
+        }
+        write.commit().unwrap();
     }
     #[test]
     fn build_reopens_and_is_deterministic() {
@@ -1762,6 +1994,161 @@ mod tests {
             destination_parent(Path::new("nested/generation.redb")),
             Path::new("nested")
         );
+    }
+
+    #[test]
+    fn read_only_loader_maps_present_and_missing_states_without_io() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("present.redb");
+        SnapshotGenerationBuilder::new(present_input(), &path)
+            .build()
+            .unwrap();
+        let loader =
+            ReadOnlySnapshotCandidateLoader::open(&path, RegistryId::new("cran").unwrap()).unwrap();
+        let releases = loader
+            .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+            .unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version().to_string(), "1.0");
+        let missing = loader
+            .releases(&SolverKey::InstalledName(PackageName::new("bar").unwrap()))
+            .unwrap_err();
+        assert_eq!(missing.category(), CandidateLoadErrorCategory::NotFound);
+        let unsupported = loader.releases(&SolverKey::R).unwrap_err();
+        assert_eq!(unsupported.category(), CandidateLoadErrorCategory::NotFound);
+    }
+
+    #[test]
+    fn read_only_loader_maps_partial_and_incomplete_missing_states() {
+        let dir = tempdir().unwrap();
+        let mut partial = input();
+        partial.coverage.state = "partial".into();
+        let partial_path = dir.path().join("partial.redb");
+        SnapshotGenerationBuilder::new(partial, &partial_path)
+            .build()
+            .unwrap();
+        let partial_loader =
+            ReadOnlySnapshotCandidateLoader::open(&partial_path, RegistryId::new("cran").unwrap())
+                .unwrap();
+        let partial_error = partial_loader
+            .releases(&SolverKey::InstalledName(PackageName::new("bar").unwrap()))
+            .unwrap_err();
+        assert_eq!(
+            partial_error.category(),
+            CandidateLoadErrorCategory::MetadataInvalid
+        );
+
+        let incomplete_path = dir.path().join("incomplete.redb");
+        SnapshotGenerationBuilder::new(input(), &incomplete_path)
+            .build()
+            .unwrap();
+        let incomplete_loader = ReadOnlySnapshotCandidateLoader::open(
+            &incomplete_path,
+            RegistryId::new("cran").unwrap(),
+        )
+        .unwrap();
+        let incomplete_error = incomplete_loader
+            .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+            .unwrap_err();
+        assert_eq!(
+            incomplete_error.category(),
+            CandidateLoadErrorCategory::MetadataInvalid
+        );
+    }
+
+    #[test]
+    fn read_only_loader_rejects_registry_and_wire_revision_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snapshot.redb");
+        SnapshotGenerationBuilder::new(input(), &path)
+            .build()
+            .unwrap();
+        let wrong_registry =
+            ReadOnlySnapshotCandidateLoader::open(&path, RegistryId::new("private").unwrap())
+                .err()
+                .unwrap();
+        assert_eq!(
+            wrong_registry.category(),
+            CandidateLoadErrorCategory::SnapshotInvalid
+        );
+
+        let revision_path = dir.path().join("revision.redb");
+        SnapshotGenerationBuilder::new(input(), &revision_path)
+            .build()
+            .unwrap();
+        rewrite_stored_header(&revision_path, |header| {
+            header.compatibility_profile = 2;
+        });
+        let revision_error =
+            ReadOnlySnapshotCandidateLoader::open(&revision_path, RegistryId::new("cran").unwrap())
+                .err()
+                .unwrap();
+        assert_eq!(
+            revision_error.category(),
+            CandidateLoadErrorCategory::SnapshotInvalid
+        );
+
+        let count_path = dir.path().join("count.redb");
+        SnapshotGenerationBuilder::new(input(), &count_path)
+            .build()
+            .unwrap();
+        delete_stored_history(&count_path, "foo");
+        let count_error =
+            ReadOnlySnapshotCandidateLoader::open(&count_path, RegistryId::new("cran").unwrap())
+                .err()
+                .unwrap();
+        assert_eq!(
+            count_error.category(),
+            CandidateLoadErrorCategory::SnapshotInvalid
+        );
+    }
+
+    #[test]
+    fn read_only_loader_rejects_corrupt_or_inconsistent_history() {
+        fn bad_digest(history: &mut PackageHistoryV1) {
+            history.eligible_releases[0].metadata_sha256 = [0; 32];
+        }
+        fn bad_key(history: &mut PackageHistoryV1) {
+            history.package = "foo".into();
+        }
+        fn bad_source(history: &mut PackageHistoryV1) {
+            history.observations[0].source_index = 1;
+        }
+        fn bad_namespace(history: &mut PackageHistoryV1) {
+            history.eligible_releases[0].namespace = "bioc".into();
+        }
+        let cases = [
+            ("digest", bad_digest as fn(&mut PackageHistoryV1)),
+            ("key", bad_key),
+            ("source", bad_source),
+            ("namespace", bad_namespace),
+        ];
+        for (label, mutate) in cases {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join(format!("{label}.redb"));
+            SnapshotGenerationBuilder::new(two_present_input(), &path)
+                .build()
+                .unwrap();
+            rewrite_stored_history(&path, "bar", mutate);
+            let loader =
+                ReadOnlySnapshotCandidateLoader::open(&path, RegistryId::new("cran").unwrap())
+                    .unwrap();
+            assert_eq!(
+                loader
+                    .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let error = loader
+                .releases(&SolverKey::InstalledName(PackageName::new("bar").unwrap()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.category(),
+                CandidateLoadErrorCategory::MetadataInvalid
+            );
+        }
     }
     #[test]
     fn envelope_rejects_trailing_and_corruption() {
