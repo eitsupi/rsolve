@@ -21,7 +21,9 @@ use tempfile::tempdir;
 
 #[cfg(test)]
 pub(crate) use crate::prepared_snapshot::collect_cran_dependency_closure;
-pub(crate) use crate::prepared_snapshot::{cran_registry_id, resolve_from_cran_with_store};
+pub(crate) use crate::prepared_snapshot::{
+    cran_registry_id, resolve_from_cran_offline_with_store, resolve_from_cran_with_store,
+};
 
 pub(super) struct CandidateLoaderRef<'a>(pub(super) &'a dyn CandidateLoader);
 
@@ -40,6 +42,7 @@ pub enum CranResolutionError {
     Store(SnapshotStoreError),
     TemporaryStore(io::Error),
     Refresh(CandidateLoadError),
+    Offline(CandidateLoadError),
     Publish(CranSnapshotPublishError),
     Resolution(ResolutionFailure),
 }
@@ -57,6 +60,7 @@ impl fmt::Display for CranResolutionError {
                 write!(formatter, "temporary CRAN snapshot store failed: {error}")
             }
             Self::Refresh(error) => write!(formatter, "CRAN refresh failed: {error}"),
+            Self::Offline(error) => write!(formatter, "offline CRAN snapshot failed: {error}"),
             Self::Publish(error) => write!(formatter, "CRAN snapshot publication failed: {error}"),
             Self::Resolution(error) => write!(formatter, "resolution failed: {error}"),
         }
@@ -72,6 +76,7 @@ impl Error for CranResolutionError {
             Self::Store(error) => Some(error),
             Self::TemporaryStore(error) => Some(error),
             Self::Refresh(error) => Some(error),
+            Self::Offline(error) => Some(error),
             Self::Publish(error) => Some(error),
             Self::Resolution(error) => Some(error),
         }

@@ -55,6 +55,9 @@ pub struct LockCommand {
     /// Metadata cache root. Defaults to the platform cache directory.
     #[arg(long, value_name = "ROOT")]
     pub metadata_cache: Option<PathBuf>,
+    /// Resolve only from the current metadata snapshot without network access.
+    #[arg(long)]
+    pub offline: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -96,6 +99,7 @@ trait ResolutionBackend {
         mirror: &str,
         cutoff: Option<PublicationDate>,
         metadata_cache: &MetadataCache,
+        offline: bool,
     ) -> Result<ResolvedData, CliError>;
 }
 
@@ -113,13 +117,18 @@ impl ResolutionBackend for CranBackend {
         mirror: &str,
         cutoff: Option<PublicationDate>,
         metadata_cache: &MetadataCache,
+        offline: bool,
     ) -> Result<ResolvedData, CliError> {
         let registry_id = cran_registry_id(mirror);
         let store = metadata_cache
             .open_store(registry_id)
             .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
-        let outcome = resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
-            .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
+        let outcome = if offline {
+            crate::orchestration::resolve_from_cran_offline_with_store(manifest, cutoff, &store)
+        } else {
+            resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
+        }
+        .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
         let warnings = outcome
             .diagnostics()
             .iter()
@@ -181,7 +190,7 @@ fn run_lock_with_backend(
     let requested_package_count = command.package.len();
     let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
         .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
-    let resolved = backend.resolve(manifest, &mirror, cutoff, &metadata_cache)?;
+    let resolved = backend.resolve(manifest, &mirror, cutoff, &metadata_cache, command.offline)?;
     let environment = EnvironmentId::new("default")
         .map_err(|error| CliError::Operational(format!("invalid environment: {error}")))?;
     let lock = Lockfile::from_resolution_with_publication_cutoff(
@@ -464,6 +473,7 @@ mod tests {
             "custom.lock",
             "--metadata-cache",
             "custom-cache",
+            "--offline",
         ])
         .unwrap();
         let Command::Lock(lock) = command.command;
@@ -472,6 +482,7 @@ mod tests {
         assert_eq!(lock.publication_cutoff.as_deref(), Some("2026-06-24"));
         assert_eq!(lock.output, PathBuf::from("custom.lock"));
         assert_eq!(lock.metadata_cache, Some(PathBuf::from("custom-cache")));
+        assert!(lock.offline);
         let defaults = CommandLine::try_parse_from([
             "rsolve",
             "lock",
@@ -481,7 +492,8 @@ mod tests {
             "Matrix",
         ])
         .unwrap();
-        let Command::Lock(_defaults) = defaults.command;
+        let Command::Lock(defaults) = defaults.command;
+        assert!(!defaults.offline);
         let multiple_values = CommandLine::try_parse_from([
             "rsolve",
             "lock",
@@ -603,6 +615,7 @@ mod tests {
             publication_cutoff: None,
             output: temp_path("missing-parent").join("parent").join("lock"),
             metadata_cache: None,
+            offline: false,
         };
         let result = run_lock_with_backend(command, &PanicBackend);
         assert!(matches!(result, Err(CliError::Value(message)) if message.contains("userinfo")));
@@ -679,6 +692,7 @@ mod tests {
             _mirror: &str,
             _cutoff: Option<PublicationDate>,
             _metadata_cache: &MetadataCache,
+            _offline: bool,
         ) -> Result<ResolvedData, CliError> {
             panic!("resolution must not be called after validation failure")
         }
@@ -773,6 +787,7 @@ mod tests {
             _mirror: &str,
             cutoff: Option<PublicationDate>,
             _metadata_cache: &MetadataCache,
+            _offline: bool,
         ) -> Result<ResolvedData, CliError> {
             let loader = MatrixLoader {
                 releases: vec![
@@ -790,6 +805,24 @@ mod tests {
         }
     }
 
+    struct ModeBackend<'a> {
+        mode: &'a std::cell::Cell<Option<bool>>,
+    }
+
+    impl ResolutionBackend for ModeBackend<'_> {
+        fn resolve(
+            &self,
+            manifest: Manifest,
+            mirror: &str,
+            cutoff: Option<PublicationDate>,
+            metadata_cache: &MetadataCache,
+            offline: bool,
+        ) -> Result<ResolvedData, CliError> {
+            self.mode.set(Some(offline));
+            MatrixBackend.resolve(manifest, mirror, cutoff, metadata_cache, offline)
+        }
+    }
+
     fn matrix_command(r_version: &str, output: PathBuf) -> LockCommand {
         LockCommand {
             r_version: r_version.into(),
@@ -798,6 +831,25 @@ mod tests {
             publication_cutoff: None,
             output,
             metadata_cache: Some(temp_path("matrix-metadata-cache")),
+            offline: false,
+        }
+    }
+
+    #[test]
+    fn cli_passes_explicit_online_and_offline_modes_to_backend() {
+        for offline in [false, true] {
+            let mode = std::cell::Cell::new(None);
+            let backend = ModeBackend { mode: &mode };
+            let output = temp_path(if offline {
+                "offline-mode"
+            } else {
+                "online-mode"
+            });
+            let mut command = matrix_command("4.4.0", output.clone());
+            command.offline = offline;
+            run_lock_with_backend(command, &backend).unwrap();
+            assert_eq!(mode.get(), Some(offline));
+            fs::remove_file(output).unwrap();
         }
     }
 
@@ -893,6 +945,7 @@ mod tests {
                 _mirror: &str,
                 _cutoff: Option<PublicationDate>,
                 _metadata_cache: &MetadataCache,
+                _offline: bool,
             ) -> Result<ResolvedData, CliError> {
                 Err(CliError::Operational("injected resolution failure".into()))
             }

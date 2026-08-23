@@ -111,18 +111,6 @@ fn collect_cran_dependency_closure_from_loader(
     }
 }
 
-fn try_reuse_current_snapshot(
-    request: &rsolve_core::ResolutionRequest,
-    roots: &[PackageName],
-    loader: &dyn CandidateLoader,
-) -> Option<Result<rsolve_core::Resolution, CranResolutionError>> {
-    collect_cran_dependency_closure_from_loader(roots, loader).ok()?;
-    Some(resolve_prepared_snapshot_without_transport(
-        request.clone(),
-        loader,
-    ))
-}
-
 fn is_remote_cran_package(name: &PackageName) -> bool {
     name.as_str() != "R" && !is_r_base_package_name(name)
 }
@@ -144,14 +132,6 @@ pub(crate) fn resolve_from_cran_with_store(
         .iter()
         .map(|requirement| requirement.name.clone())
         .collect::<Vec<_>>();
-    if let Ok(current) = store.read_current()
-        && let Some(Ok(resolution)) = try_reuse_current_snapshot(&request, &roots, &current)
-    {
-        return Ok(CranResolutionOutcome {
-            resolution,
-            diagnostics: Vec::new(),
-        });
-    }
     let refresher = CranSnapshotRefresher::new(base_url).map_err(CranResolutionError::Provider)?;
     let closure =
         collect_cran_dependency_closure(&roots, |batch| refresher.refresh_packages(batch))
@@ -170,6 +150,43 @@ pub(crate) fn resolve_from_cran_with_store(
     Ok(CranResolutionOutcome {
         resolution,
         diagnostics: refresher.diagnostics(),
+    })
+}
+
+/// Resolve through the configured current generation without creating a
+/// provider refresher. This is the explicit offline policy boundary.
+pub(crate) fn resolve_from_cran_offline_with_store(
+    manifest: Manifest,
+    publication_cutoff: Option<PublicationDate>,
+    store: &SnapshotStore,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
+    let request = crate::manifest::compose_resolution_request(manifest)
+        .map_err(CranResolutionError::Composition)?;
+    let request = request.with_optional_publication_cutoff(
+        publication_cutoff.map(rsolve_core::PublicationCutoff::new),
+    );
+    let roots = request
+        .requirements
+        .iter()
+        .map(|requirement| requirement.name.clone())
+        .collect::<Vec<_>>();
+    if roots.iter().all(|name| !is_remote_cran_package(name)) {
+        let resolution = resolve_prepared_snapshot_without_transport(
+            request,
+            &CranCandidateSnapshot::default(),
+        )?;
+        return Ok(CranResolutionOutcome {
+            resolution,
+            diagnostics: Vec::new(),
+        });
+    }
+    let current = store.read_current().map_err(CranResolutionError::Offline)?;
+    collect_cran_dependency_closure_from_loader(&roots, &current)
+        .map_err(CranResolutionError::Offline)?;
+    let resolution = resolve_prepared_snapshot_without_transport(request, &current)?;
+    Ok(CranResolutionOutcome {
+        resolution,
+        diagnostics: Vec::new(),
     })
 }
 
@@ -194,6 +211,7 @@ mod tests {
         ReleaseMetadata, ReleaseObservation, VersionConstraint,
     };
     use std::collections::BTreeMap;
+    use tempfile::tempdir;
 
     fn release_with_dependencies(
         name: &PackageName,
@@ -251,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_current_snapshot_is_reused_without_refresh_callback() {
+    fn offline_complete_current_snapshot_resolves_without_refresh_callback() {
         let root = PackageName::new("root").unwrap();
         let dependency = PackageName::new("dependency").unwrap();
         let root_release = release_with_dependencies(
@@ -268,9 +286,9 @@ mod tests {
         let request =
             crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
 
-        let reused = try_reuse_current_snapshot(&request, std::slice::from_ref(&root), &current)
-            .expect("complete current coverage should be eligible for reuse")
-            .expect("current snapshot should resolve");
+        collect_cran_dependency_closure_from_loader(std::slice::from_ref(&root), &current)
+            .expect("complete current coverage should be eligible for offline use");
+        let reused = resolve_prepared_snapshot_without_transport(request, &current).unwrap();
 
         assert!(reused.selected(&root).is_some());
         assert!(reused.selected(&dependency).is_some());
@@ -281,20 +299,19 @@ mod tests {
     }
 
     #[test]
-    fn partial_current_snapshot_falls_back_to_full_closure_refresh() {
+    fn online_preparation_refreshes_full_closure_after_partial_current_failure() {
         let root = PackageName::new("root").unwrap();
         let dependency = PackageName::new("dependency").unwrap();
         let root_release = release_with_dependencies(
             &root,
             vec![required_dependency(DependencyKind::Depends, &dependency)],
         );
-        let request =
-            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
         let partial =
             CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release.clone()])]);
-        assert!(
-            try_reuse_current_snapshot(&request, std::slice::from_ref(&root), &partial).is_none()
-        );
+        let error =
+            collect_cran_dependency_closure_from_loader(std::slice::from_ref(&root), &partial)
+                .unwrap_err();
+        assert_eq!(error.category(), CandidateLoadErrorCategory::NotFound);
 
         let complete = CranCandidateSnapshot::from_candidates([
             (root.clone(), vec![root_release]),
@@ -314,15 +331,53 @@ mod tests {
     }
 
     #[test]
-    fn invalid_current_snapshot_is_not_reused() {
+    fn offline_invalid_current_snapshot_preserves_typed_error() {
         let root = PackageName::new("root").unwrap();
-        let request =
-            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
         let invalid = FailingLoader(CandidateLoadError::new(
             CandidateLoadErrorCategory::SnapshotInvalid,
             "current generation is invalid",
         ));
 
-        assert!(try_reuse_current_snapshot(&request, &[root], &invalid).is_none());
+        let error = collect_cran_dependency_closure_from_loader(&[root], &invalid).unwrap_err();
+        assert_eq!(
+            error.category(),
+            CandidateLoadErrorCategory::SnapshotInvalid
+        );
+    }
+
+    #[test]
+    fn offline_missing_current_returns_snapshot_invalid_without_fallback() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), cran_registry_id("https://cran.test")).unwrap();
+        let error = resolve_from_cran_offline_with_store(
+            manifest_for(PackageName::new("remote").unwrap()),
+            None,
+            &store,
+        )
+        .unwrap_err();
+        let CranResolutionError::Offline(error) = error else {
+            panic!("missing current must not fall back to online refresh");
+        };
+        assert_eq!(
+            error.category(),
+            CandidateLoadErrorCategory::SnapshotInvalid
+        );
+    }
+
+    #[test]
+    fn offline_base_package_succeeds_without_current_snapshot() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), cran_registry_id("https://cran.test")).unwrap();
+        let methods = PackageName::new("methods").unwrap();
+        let resolution =
+            resolve_from_cran_offline_with_store(manifest_for(methods.clone()), None, &store)
+                .unwrap()
+                .resolution()
+                .clone();
+
+        assert!(resolution.selected(&methods).is_none());
+        assert!(resolution.packages().is_empty());
     }
 }
