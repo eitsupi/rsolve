@@ -1,5 +1,14 @@
 use std::time::Duration;
 
+/// Typed presence state for the Cache-Control response header.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CacheControlHeader {
+    #[default]
+    Absent,
+    Valid(Box<str>),
+    Invalid,
+}
+
 /// The cache action selected from a validated Cache-Control header.
 #[cfg_attr(not(test), expect(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,9 +40,16 @@ impl CacheControlPolicy {
 /// Resolve Cache-Control precedence without depending on transport or cache
 /// storage. Unknown extension directives are intentionally ignored.
 #[cfg_attr(not(test), expect(dead_code))]
-pub fn cache_control_policy(header: Option<&str>, fallback_ttl: Duration) -> CacheControlPolicy {
-    let Some(header) = header else {
-        return CacheControlPolicy::Fallback(fallback_ttl);
+pub fn cache_control_policy(
+    header: &CacheControlHeader,
+    fallback_ttl: Duration,
+) -> CacheControlPolicy {
+    let CacheControlHeader::Valid(header) = header else {
+        return match header {
+            CacheControlHeader::Absent => CacheControlPolicy::Fallback(fallback_ttl),
+            CacheControlHeader::Invalid => CacheControlPolicy::Revalidate,
+            CacheControlHeader::Valid(_) => unreachable!(),
+        };
     };
     if header.trim().is_empty() {
         return CacheControlPolicy::Revalidate;
@@ -128,7 +144,7 @@ pub fn permits_reuse(
     };
     now.duration_since(observed_at)
         .try_into()
-        .is_ok_and(|age: Duration| age <= ttl)
+        .is_ok_and(|age: Duration| age < ttl)
 }
 
 #[cfg(test)]
@@ -137,50 +153,64 @@ mod tests {
 
     const FALLBACK: Duration = Duration::from_secs(3600);
 
+    fn valid(value: &str) -> CacheControlHeader {
+        CacheControlHeader::Valid(value.into())
+    }
+
     #[test]
     fn cache_control_precedence_is_conservative() {
         assert_eq!(
-            cache_control_policy(None, FALLBACK),
+            cache_control_policy(&CacheControlHeader::Absent, FALLBACK),
             CacheControlPolicy::Fallback(FALLBACK)
         );
         assert_eq!(
-            cache_control_policy(Some("max-age=120"), FALLBACK),
+            cache_control_policy(&CacheControlHeader::Invalid, FALLBACK),
+            CacheControlPolicy::Revalidate
+        );
+        assert_eq!(
+            cache_control_policy(&valid("max-age=120"), FALLBACK),
             CacheControlPolicy::MaxAge(Duration::from_secs(120))
         );
         assert_eq!(
-            cache_control_policy(Some("no-cache, max-age=120"), FALLBACK),
+            cache_control_policy(&valid("no-cache, max-age=120"), FALLBACK),
             CacheControlPolicy::Revalidate
         );
-        assert!(cache_control_policy(Some("no-cache"), FALLBACK).can_store());
-        assert_eq!(cache_control_policy(Some("no-cache"), FALLBACK).ttl(), None);
+        assert!(cache_control_policy(&valid("no-cache"), FALLBACK).can_store());
         assert_eq!(
-            cache_control_policy(Some("no-store, max-age=120"), FALLBACK),
+            cache_control_policy(&valid("no-cache"), FALLBACK).ttl(),
+            None
+        );
+        assert_eq!(
+            cache_control_policy(&valid("no-store, max-age=120"), FALLBACK),
             CacheControlPolicy::NoStore
         );
-        assert!(!cache_control_policy(Some("no-store"), FALLBACK).can_store());
-        assert_eq!(cache_control_policy(Some("no-store"), FALLBACK).ttl(), None);
+        assert!(!cache_control_policy(&valid("no-store"), FALLBACK).can_store());
+        assert_eq!(
+            cache_control_policy(&valid("no-store"), FALLBACK).ttl(),
+            None
+        );
     }
 
     #[test]
     fn malformed_known_directives_revalidate_and_unknown_extensions_are_ignored() {
         assert_eq!(
-            cache_control_policy(Some("max-age=not-a-number"), FALLBACK),
+            cache_control_policy(&valid("max-age=not-a-number"), FALLBACK),
             CacheControlPolicy::Revalidate
         );
         assert_eq!(
-            cache_control_policy(Some("max-age=1, max-age=2"), FALLBACK),
+            cache_control_policy(&valid("max-age=1, max-age=2"), FALLBACK),
             CacheControlPolicy::Revalidate
         );
         assert_eq!(
-            cache_control_policy(Some("max-age=18446744073709551616"), FALLBACK),
+            cache_control_policy(&valid("max-age=18446744073709551616"), FALLBACK),
             CacheControlPolicy::Revalidate
         );
         assert_eq!(
-            cache_control_policy(Some("x-provider-extension=value"), FALLBACK),
+            cache_control_policy(&valid("x-provider-extension=value"), FALLBACK),
             CacheControlPolicy::Fallback(FALLBACK)
         );
         assert_eq!(
-            cache_control_policy(Some("x-provider-extension=value, max-age=120"), FALLBACK),
+            cache_control_policy(&valid("x-provider-extension=value, max-age=120"), FALLBACK),
             CacheControlPolicy::MaxAge(Duration::from_secs(120))
         );
     }
@@ -202,7 +232,17 @@ mod tests {
         let at_boundary = "2026-08-23T00:02:00Z".parse().unwrap();
         let beyond_boundary = "2026-08-23T00:02:01Z".parse().unwrap();
         let policy = CacheControlPolicy::MaxAge(Duration::from_secs(120));
-        assert!(permits_reuse(at_boundary, observed, policy));
+        assert!(!permits_reuse(at_boundary, observed, policy));
         assert!(!permits_reuse(beyond_boundary, observed, policy));
+        assert!(permits_reuse(
+            "2026-08-23T00:01:59Z".parse().unwrap(),
+            observed,
+            policy
+        ));
+        assert!(!permits_reuse(
+            at_boundary,
+            observed,
+            CacheControlPolicy::MaxAge(Duration::ZERO)
+        ));
     }
 }

@@ -3,6 +3,8 @@ use std::fmt;
 use std::io::Read;
 use std::rc::Rc;
 
+use super::cache_policy::CacheControlHeader;
+
 const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
 /// Request validators that may be sent to a server when revalidating a
@@ -34,8 +36,7 @@ impl TransportValidators {
 pub(crate) struct TransportResponseHeaders {
     pub(crate) etag: Option<Box<str>>,
     pub(crate) last_modified: Option<Box<str>>,
-    pub(crate) cache_control: Option<Box<str>>,
-    pub(crate) cache_control_invalid: bool,
+    pub(crate) cache_control: CacheControlHeader,
 }
 
 impl TransportResponseHeaders {
@@ -57,12 +58,11 @@ fn extract_response_headers(
 ) -> TransportResponseHeaders {
     let etag = unique_validator(etag_values);
     let last_modified = unique_validator(last_modified_values);
-    let (cache_control, cache_control_invalid) = combined_cache_control(cache_control_values);
+    let cache_control = combined_cache_control(cache_control_values);
     TransportResponseHeaders {
         etag,
         last_modified,
         cache_control,
-        cache_control_invalid,
     }
 }
 
@@ -72,14 +72,14 @@ fn unique_validator(values: &[Option<&str>]) -> Option<Box<str>> {
         .flatten()
 }
 
-fn combined_cache_control(values: &[Option<&str>]) -> (Option<Box<str>>, bool) {
+fn combined_cache_control(values: &[Option<&str>]) -> CacheControlHeader {
     if values.is_empty() {
-        return (None, false);
+        return CacheControlHeader::Absent;
     }
     let mut combined = String::new();
     for (index, value) in values.iter().enumerate() {
         let Some(value) = value else {
-            return (None, true);
+            return CacheControlHeader::Invalid;
         };
         if index > 0 {
             combined.push(',');
@@ -87,8 +87,8 @@ fn combined_cache_control(values: &[Option<&str>]) -> (Option<Box<str>>, bool) {
         combined.push_str(value);
     }
     match validated_header_value(Some(&combined)) {
-        Some(value) => (Some(value), false),
-        None => (None, true),
+        Some(value) => CacheControlHeader::Valid(value),
+        None => CacheControlHeader::Invalid,
     }
 }
 
@@ -278,7 +278,10 @@ mod tests {
             &[Some("max-age=120")],
         );
         assert_eq!(headers.etag.as_deref(), Some("\"tag-1\""));
-        assert_eq!(headers.cache_control.as_deref(), Some("max-age=120"));
+        assert_eq!(
+            headers.cache_control,
+            CacheControlHeader::Valid("max-age=120".into())
+        );
         let validators = headers.validators();
         assert_eq!(validators.if_none_match.as_deref(), Some("\"tag-1\""));
         assert_eq!(
@@ -294,8 +297,7 @@ mod tests {
         );
         assert_eq!(unsafe_headers.etag, None);
         assert_eq!(unsafe_headers.last_modified, None);
-        assert_eq!(unsafe_headers.cache_control, None);
-        assert!(unsafe_headers.cache_control_invalid);
+        assert_eq!(unsafe_headers.cache_control, CacheControlHeader::Invalid);
     }
 
     #[test]
@@ -319,16 +321,15 @@ mod tests {
         assert_eq!(headers.etag, None);
         assert_eq!(headers.last_modified, None);
         assert_eq!(
-            headers.cache_control.as_deref(),
-            Some("max-age=120,no-cache")
+            headers.cache_control,
+            CacheControlHeader::Valid("max-age=120,no-cache".into())
         );
-        assert!(!headers.cache_control_invalid);
         let validators = headers.validators();
         assert_eq!(validators.if_none_match, None);
         assert_eq!(validators.if_modified_since, None);
         assert_eq!(
             super::super::cache_policy::cache_control_policy(
-                headers.cache_control.as_deref(),
+                &headers.cache_control,
                 std::time::Duration::from_secs(3600),
             ),
             super::super::cache_policy::CacheControlPolicy::Revalidate
@@ -340,8 +341,7 @@ mod tests {
         let oversized = "x".repeat(MAX_HEADER_VALUE_BYTES + 1);
         for values in [&[None][..], &[Some(oversized.as_str())][..]] {
             let headers = extract_response_headers(&[], &[], values);
-            assert_eq!(headers.cache_control, None);
-            assert!(headers.cache_control_invalid);
+            assert_eq!(headers.cache_control, CacheControlHeader::Invalid);
         }
     }
 }
