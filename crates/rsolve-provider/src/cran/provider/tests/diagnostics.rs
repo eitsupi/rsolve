@@ -264,7 +264,57 @@ fn fast_path_transport_error_is_diagnostic_and_falls_back() {
     assert_eq!(diagnostic.status(), None);
     assert!(matches!(
         diagnostic.status_detail(),
-        CranFastPathStatus::Invalid { status: 0, .. }
+        CranFastPathStatus::Invalid {
+            status: 0,
+            diagnostic,
+        } if diagnostic.contains("archive fast path for Matrix failed: transport failure")
+    ));
+}
+
+#[test]
+fn fast_path_unexpected_status_keeps_transport_diagnostic() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+            ..TransportResponse::default()
+        },
+        TransportResponse {
+            status: 404,
+            body: Vec::new(),
+            ..TransportResponse::default()
+        },
+        TransportResponse {
+            status: 200,
+            body: b"Package: Matrix\nVersion: 1.8-0\n".to_vec(),
+            ..TransportResponse::default()
+        },
+    );
+    transport
+        .responses
+        .insert(fast_url(), TransportResponse::new(500, Vec::new()));
+    transport
+        .responses
+        .insert(history_url(), TransportResponse::new(404, Vec::new()));
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let error = session
+        .refresh_packages(&[PackageName::new("Matrix").unwrap()])
+        .unwrap_err();
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::TransportFailure
+    );
+    let diagnostic = session
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.endpoint() == fast_url())
+        .unwrap();
+    assert!(matches!(
+        diagnostic.status_detail(),
+        CranFastPathStatus::Invalid {
+            status: 500,
+            diagnostic,
+        } if diagnostic.contains("archive fast path for Matrix returned unexpected HTTP 500")
     ));
 }
 

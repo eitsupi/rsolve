@@ -142,6 +142,10 @@ fn fast_url() -> String {
 }
 
 fn history_url() -> String {
+    "https://cran.invalid/src/contrib/Meta/archive.rds".to_owned()
+}
+
+fn legacy_history_url() -> String {
     "https://cran.invalid/Meta/archive.rds".to_owned()
 }
 
@@ -296,6 +300,7 @@ fn logical_signature(provider: &CranProvider<FixtureTransport>) -> Vec<String> {
             .collect()
 }
 
+mod archive_cache;
 mod current;
 mod diagnostics;
 mod fallback;

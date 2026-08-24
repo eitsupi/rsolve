@@ -595,7 +595,7 @@ impl<T: Transport> CranProvider<T> {
         transport: &T,
         base_url: &str,
     ) -> Result<CandidateSource, CranProviderError> {
-        let endpoint = format!("{base_url}/Meta/archive.rds");
+        let endpoint = format!("{base_url}/src/contrib/Meta/archive.rds");
         let response = transport
             .get(&endpoint)
             .map_err(|source| CranProviderError::Transport {
@@ -885,6 +885,50 @@ struct CurrentBody {
     cache_control: self::cache_policy::CacheControlHeader,
 }
 
+struct MetadataAcquisitionFailure {
+    status: Option<u16>,
+    category: CandidateLoadErrorCategory,
+    diagnostic: Box<str>,
+}
+
+impl MetadataAcquisitionFailure {
+    fn cache(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: None,
+            category: CandidateLoadErrorCategory::SnapshotInvalid,
+            diagnostic: format!("CRAN metadata raw cache is invalid: {error}").into(),
+        }
+    }
+
+    fn response(status: u16, diagnostic: impl Into<Box<str>>) -> Self {
+        Self {
+            status: Some(status),
+            category: CandidateLoadErrorCategory::TransportFailure,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    fn transport(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: None,
+            category: CandidateLoadErrorCategory::TransportFailure,
+            diagnostic: format!("transport failure: {error}").into(),
+        }
+    }
+
+    fn invalid(status: Option<u16>, diagnostic: impl Into<Box<str>>) -> Self {
+        Self {
+            status,
+            category: CandidateLoadErrorCategory::MetadataInvalid,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    fn into_candidate(self) -> CandidateLoadError {
+        CandidateLoadError::new(self.category, self.diagnostic)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CurrentBodyOrigin {
     Cached,
@@ -921,13 +965,26 @@ impl CurrentBody {
         representation: CranCurrentIndexRepresentation,
         endpoint: &str,
     ) -> crate::snapshot::SourceInput {
-        snapshot::source_input_with_metadata(
+        self.source_as(
             "cran-current",
             match representation {
                 CranCurrentIndexRepresentation::Rds => "rds",
                 CranCurrentIndexRepresentation::Gzip => "gzip",
                 CranCurrentIndexRepresentation::PlainDcf => "dcf",
             },
+            endpoint,
+        )
+    }
+
+    fn source_as(
+        &self,
+        kind: &str,
+        representation: &str,
+        endpoint: &str,
+    ) -> crate::snapshot::SourceInput {
+        snapshot::source_input_with_metadata(
+            kind,
+            representation,
             endpoint,
             &self.body,
             self.observed_at.clone(),
@@ -988,6 +1045,188 @@ impl<T: Transport> CranRefreshSession<T> {
         };
         let records = current_records(representation, body)?;
         Ok((catalog, records))
+    }
+
+    fn acquire_metadata<V, P>(
+        &self,
+        endpoint: &str,
+        representation: RawCacheRepresentation,
+        source_kind: &str,
+        source_representation: &str,
+        parse: P,
+    ) -> Result<(V, crate::snapshot::SourceInput), MetadataAcquisitionFailure>
+    where
+        P: Fn(&[u8]) -> Result<V, String>,
+    {
+        let cache_key = self
+            .raw_cache
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .key(endpoint, representation)
+                    .map_err(MetadataAcquisitionFailure::cache)
+            })
+            .transpose()?;
+        let mut candidate = None;
+        let mut origin = None;
+        let mut network_attempted = false;
+        if let (Some(cache), Some(key)) = (&self.raw_cache, &cache_key) {
+            match cache.lookup(key) {
+                RawCacheLookup::Hit(entry) => {
+                    let policy = cache_control_policy(
+                        &entry.cache_control,
+                        DEFAULT_COMPATIBLE_GENERATION_TTL,
+                    );
+                    if permits_reuse(self.now(), entry.validated_at, policy) {
+                        candidate = Some(CurrentBody::from_cache(entry));
+                        origin = Some(CurrentBodyOrigin::Cached);
+                    } else {
+                        network_attempted = true;
+                        let validators = TransportValidators::from_values(
+                            entry.etag.as_deref(),
+                            entry.last_modified.as_deref(),
+                        );
+                        let response = if validators.if_none_match.is_some()
+                            || validators.if_modified_since.is_some()
+                        {
+                            self.transport.get_with_validators(endpoint, &validators)
+                        } else {
+                            self.transport.get(endpoint)
+                        };
+                        match response {
+                            Ok(response) if response.status == 304 && response.body.is_empty() => {
+                                let mut body = CurrentBody::from_cache(entry);
+                                if !matches!(
+                                    response.headers.cache_control,
+                                    self::cache_policy::CacheControlHeader::Absent
+                                ) {
+                                    body.cache_control = response.headers.cache_control.clone();
+                                }
+                                if response.headers.etag.is_some() {
+                                    body.etag = response.headers.etag.clone();
+                                }
+                                if response.headers.last_modified.is_some() {
+                                    body.last_modified = response.headers.last_modified.clone();
+                                }
+                                candidate = Some(body);
+                                origin = Some(CurrentBodyOrigin::Revalidated304);
+                            }
+                            Ok(response) if response.status == 200 => {
+                                candidate = Some(CurrentBody::from_response(response, self.now()));
+                                origin = Some(CurrentBodyOrigin::Network200);
+                            }
+                            Ok(response) => {
+                                return Err(MetadataAcquisitionFailure::response(
+                                    response.status,
+                                    format!("unexpected metadata status {}", response.status),
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(MetadataAcquisitionFailure::transport(error));
+                            }
+                        }
+                    }
+                }
+                RawCacheLookup::Missing | RawCacheLookup::Corrupt(_) => {}
+            }
+        }
+        if candidate.is_none() && !network_attempted {
+            match self.transport.get(endpoint) {
+                Ok(response) if response.status == 200 => {
+                    candidate = Some(CurrentBody::from_response(response, self.now()));
+                    origin = Some(CurrentBodyOrigin::Network200);
+                }
+                Ok(response) => {
+                    return Err(MetadataAcquisitionFailure::response(
+                        response.status,
+                        format!("unexpected metadata status {}", response.status),
+                    ));
+                }
+                Err(error) => return Err(MetadataAcquisitionFailure::transport(error)),
+            }
+        }
+        let mut retried_unconditionally = false;
+        while let Some(body) = candidate.take() {
+            match parse(&body.body) {
+                Ok(value) => {
+                    let source = body.source_as(source_kind, source_representation, endpoint);
+                    let mut body = Some(body);
+                    if let (Some(cache), Some(key), Some(CurrentBodyOrigin::Network200)) =
+                        (&self.raw_cache, &cache_key, origin)
+                    {
+                        let body = body.take().expect("validated metadata body");
+                        cache
+                            .publish(
+                                key,
+                                RawCacheWrite {
+                                    status: 200,
+                                    body: body.body,
+                                    observed_at: body.observed_at_timestamp,
+                                    validated_at: body.observed_at_timestamp,
+                                    etag: body.etag,
+                                    last_modified: body.last_modified,
+                                    cache_control: body.cache_control,
+                                },
+                            )
+                            .map_err(MetadataAcquisitionFailure::cache)?;
+                    } else if let (
+                        Some(cache),
+                        Some(key),
+                        Some(CurrentBodyOrigin::Revalidated304),
+                    ) = (&self.raw_cache, &cache_key, origin)
+                    {
+                        let body = body.as_ref().expect("validated metadata body");
+                        let headers = TransportResponseHeaders {
+                            etag: body.etag.clone(),
+                            last_modified: body.last_modified.clone(),
+                            cache_control: body.cache_control.clone(),
+                        };
+                        cache
+                            .update_validated_at_with_headers(key, self.now(), &headers)
+                            .map_err(MetadataAcquisitionFailure::cache)?;
+                    }
+                    return Ok((value, source));
+                }
+                Err(error)
+                    if matches!(
+                        origin,
+                        Some(CurrentBodyOrigin::Cached | CurrentBodyOrigin::Revalidated304)
+                    ) && !retried_unconditionally =>
+                {
+                    retried_unconditionally = true;
+                    match self.transport.get(endpoint) {
+                        Ok(response) if response.status == 200 => {
+                            candidate = Some(CurrentBody::from_response(response, self.now()));
+                            origin = Some(CurrentBodyOrigin::Network200);
+                        }
+                        Ok(response) => {
+                            return Err(MetadataAcquisitionFailure::invalid(
+                                Some(response.status),
+                                format!(
+                                    "cached metadata was invalid ({error}) and unconditional recovery returned HTTP {}",
+                                    response.status
+                                ),
+                            ));
+                        }
+                        Err(fetch_error) => {
+                            return Err(MetadataAcquisitionFailure::invalid(
+                                None,
+                                format!(
+                                    "cached metadata was invalid ({error}) and unconditional recovery failed: {fetch_error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(MetadataAcquisitionFailure::invalid(Some(200), error));
+                }
+            }
+        }
+        Err(MetadataAcquisitionFailure::invalid(
+            None,
+            "metadata acquisition produced no body",
+        ))
     }
 
     fn cache_error(error: impl std::fmt::Display) -> CandidateLoadError {
@@ -1302,59 +1541,43 @@ impl<T: Transport> CranRefreshSession<T> {
         if let Some(result) = &self.history {
             return result.clone();
         }
-        let endpoint = format!("{}/Meta/archive.rds", self.base_url);
-        let result = match self.transport.get(&endpoint) {
-            Err(error) => {
-                self.push_history_diagnostic(
-                    endpoint.clone(),
-                    None,
-                    format!("transport failure: {error}"),
-                );
-                Err(CandidateLoadError::new(
-                    CandidateLoadErrorCategory::TransportFailure,
-                    format!("failed to refresh {endpoint}: {error}"),
-                ))
-            }
-            Ok(response) if matches!(response.status, 404 | 410) => {
+        let endpoint = format!("{}/src/contrib/Meta/archive.rds", self.base_url);
+        let result = match self.acquire_metadata(
+            &endpoint,
+            RawCacheRepresentation::ArchiveHistoryRds,
+            "cran-archive-history",
+            "rds",
+            |body| enumerate_archive_rds_for_provider(body).map_err(|error| error.to_string()),
+        ) {
+            Ok((entries, _source)) => Ok(HistorySource::Available(Rc::from(
+                entries.into_boxed_slice(),
+            ))),
+            Err(error) if matches!(error.status, Some(404 | 410)) => {
+                let status = error.status.expect("matched status");
                 self.diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into_boxed_str(),
-                    status: Some(response.status),
-                    status_detail: CranFastPathStatus::Absent {
-                        status: response.status,
-                    },
+                    status: Some(status),
+                    status_detail: CranFastPathStatus::Absent { status },
                     source: CranRefreshSource::ArchiveHistory,
                 });
                 Ok(HistorySource::Absent)
             }
-            Ok(response) if response.status != 200 => {
-                let diagnostic = format!("unexpected archive history status {}", response.status);
-                self.push_history_diagnostic(
-                    endpoint.clone(),
-                    Some(response.status),
-                    diagnostic.clone(),
-                );
+            Err(error) => {
+                let diagnostic = if error.category == CandidateLoadErrorCategory::MetadataInvalid {
+                    format!("invalid CRAN archive history: {}", error.diagnostic)
+                } else {
+                    error.diagnostic.into_string()
+                };
+                self.push_history_diagnostic(endpoint.clone(), error.status, diagnostic.clone());
                 Err(CandidateLoadError::new(
-                    CandidateLoadErrorCategory::TransportFailure,
-                    format!("failed to refresh {endpoint}: HTTP {}", response.status),
+                    error.category,
+                    if let Some(status) = error.status {
+                        format!("failed to refresh {endpoint}: HTTP {status}")
+                    } else {
+                        format!("failed to refresh {endpoint}: {diagnostic}")
+                    },
                 ))
             }
-            Ok(response) => match enumerate_archive_rds_for_provider(&response.body) {
-                Ok(entries) => Ok(HistorySource::Available(Rc::from(
-                    entries.into_boxed_slice(),
-                ))),
-                Err(error) => {
-                    let diagnostic = format!("invalid CRAN archive history: {error}");
-                    self.push_history_diagnostic(
-                        endpoint.clone(),
-                        Some(response.status),
-                        diagnostic.clone(),
-                    );
-                    Err(CandidateLoadError::new(
-                        CandidateLoadErrorCategory::MetadataInvalid,
-                        diagnostic,
-                    ))
-                }
-            },
         };
         self.history = Some(result.clone());
         result
@@ -1400,109 +1623,87 @@ impl<T: Transport> CranRefreshSession<T> {
             package.as_str()
         );
         let mut package_diagnostics = Vec::new();
-        let fast_result = match self.transport.get(&endpoint) {
-            Err(error) => {
+        let fast_result = match self.acquire_metadata(
+            &endpoint,
+            RawCacheRepresentation::PackageArchiveIndexRds,
+            "cran-archive-index",
+            "rds",
+            |body| {
+                let catalog = CranCatalog::from_archive_index_rds_with_options(
+                    body,
+                    &provider_rds_read_options(),
+                )
+                .map_err(|error| error.to_string())?;
+                let records =
+                    CranCatalog::observations_from_archive_index_rds(body).map_err(|error| {
+                        format!(
+                            "validated archive index could not be projected losslessly: {error}"
+                        )
+                    })?;
+                Ok((catalog, records))
+            },
+        ) {
+            Ok(((catalog, records), source)) => {
+                self.evidence
+                    .borrow_mut()
+                    .extend(records.iter().map(|record| {
+                        index_record_to_evidence(
+                            record,
+                            source.clone(),
+                            &self.base_url,
+                            false,
+                            FreshnessStateV1::BulkGeneration,
+                        )
+                    }));
                 package_diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into_boxed_str(),
-                    status: None,
-                    status_detail: CranFastPathStatus::Invalid {
-                        status: 0,
-                        diagnostic: format!("transport failure: {error}").into_boxed_str(),
-                    },
+                    status: Some(200),
+                    status_detail: CranFastPathStatus::Available,
                     source: CranRefreshSource::ArchiveFastPath,
                 });
-                Err(FastPathFailure::Invalid {
-                    category: CandidateLoadErrorCategory::TransportFailure,
-                    diagnostic: format!("archive fast path for {package} failed: {error}").into(),
-                })
+                Ok(CandidateSource::Fast(catalog))
             }
-            Ok(response) if response.status == 200 => {
-                match CranCatalog::from_archive_index_rds_with_options(
-                    &response.body,
-                    &provider_rds_read_options(),
-                ) {
-                    Ok(catalog) => {
-                        let records = match CranCatalog::observations_from_archive_index_rds(
-                            &response.body,
-                        ) {
-                            Ok(records) => records,
-                            Err(error) => {
-                                return Err(CandidateLoadError::new(
-                                    CandidateLoadErrorCategory::MetadataInvalid,
-                                    format!(
-                                        "validated archive index could not be projected losslessly: {error}"
-                                    ),
-                                ));
-                            }
-                        };
-                        let source =
-                            source_input("cran-archive-index", "rds", &endpoint, &response.body);
-                        self.evidence
-                            .borrow_mut()
-                            .extend(records.iter().map(|record| {
-                                index_record_to_evidence(
-                                    record,
-                                    source.clone(),
-                                    &self.base_url,
-                                    false,
-                                    FreshnessStateV1::BulkGeneration,
-                                )
-                            }));
-                        package_diagnostics.push(CranRefreshDiagnostic {
-                            endpoint: endpoint.clone().into_boxed_str(),
-                            status: Some(response.status),
-                            status_detail: CranFastPathStatus::Available,
-                            source: CranRefreshSource::ArchiveFastPath,
-                        });
-                        Ok(CandidateSource::Fast(catalog))
-                    }
-                    Err(error) => {
-                        let diagnostic = format!(
-                            "archive fast path for {package} has invalid metadata: {error}"
-                        );
-                        package_diagnostics.push(CranRefreshDiagnostic {
-                            endpoint: endpoint.clone().into_boxed_str(),
-                            status: Some(response.status),
-                            status_detail: CranFastPathStatus::Invalid {
-                                status: response.status,
-                                diagnostic: diagnostic.clone().into_boxed_str(),
-                            },
-                            source: CranRefreshSource::ArchiveFastPath,
-                        });
-                        Err(FastPathFailure::Invalid {
-                            category: CandidateLoadErrorCategory::MetadataInvalid,
-                            diagnostic: diagnostic.into_boxed_str(),
-                        })
-                    }
-                }
-            }
-            Ok(response) => {
-                let status = response.status;
-                let status_detail = if matches!(status, 404 | 410) {
-                    CranFastPathStatus::Unsupported { status }
-                } else {
-                    CranFastPathStatus::Invalid {
-                        status,
-                        diagnostic: "unexpected fast-path status".into(),
-                    }
-                };
+            Err(error) if matches!(error.status, Some(404 | 410)) => {
+                let status = error.status.expect("matched status");
                 package_diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into_boxed_str(),
                     status: Some(status),
-                    status_detail,
+                    status_detail: CranFastPathStatus::Unsupported { status },
                     source: CranRefreshSource::ArchiveFastPath,
                 });
-                if matches!(status, 404 | 410) {
-                    Err(FastPathFailure::Unsupported)
-                } else {
-                    Err(FastPathFailure::Invalid {
-                        category: CandidateLoadErrorCategory::TransportFailure,
-                        diagnostic: format!(
-                            "archive fast path for {package} returned unexpected HTTP {status}"
-                        )
-                        .into(),
-                    })
+                Err(FastPathFailure::Unsupported)
+            }
+            Err(error) => {
+                let diagnostic = match (error.category, error.status) {
+                    (CandidateLoadErrorCategory::MetadataInvalid, _) => format!(
+                        "archive fast path for {package} has invalid metadata: {}",
+                        error.diagnostic
+                    ),
+                    (CandidateLoadErrorCategory::TransportFailure, Some(status)) => {
+                        format!("archive fast path for {package} returned unexpected HTTP {status}")
+                    }
+                    _ => format!(
+                        "archive fast path for {package} failed: {}",
+                        error.diagnostic
+                    ),
+                };
+                package_diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: error.status,
+                    status_detail: CranFastPathStatus::Invalid {
+                        status: error.status.unwrap_or_default(),
+                        diagnostic: diagnostic.clone().into_boxed_str(),
+                    },
+                    source: CranRefreshSource::ArchiveFastPath,
+                });
+                if error.category == CandidateLoadErrorCategory::SnapshotInvalid {
+                    self.diagnostics.extend(package_diagnostics);
+                    return Err(error.into_candidate());
                 }
+                Err(FastPathFailure::Invalid {
+                    category: error.category,
+                    diagnostic: diagnostic.into_boxed_str(),
+                })
             }
         };
         let mut provider_diagnostics = Vec::new();
