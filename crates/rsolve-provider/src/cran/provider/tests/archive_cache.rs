@@ -483,6 +483,76 @@ fn mixed_archive_semantic_rejection_stays_on_fast_path_without_history_or_tarbal
             diagnostic,
         } if diagnostic.contains("first: record 0 (Matrix):")
     ));
+    let evidence = session.evidence.borrow();
+    let rejected = evidence
+        .iter()
+        .find(|observation| {
+            matches!(
+                observation.axes.semantics,
+                crate::snapshot::SemanticsStateV1::Invalid
+            )
+        })
+        .expect("archive rejection evidence");
+    assert_eq!(rejected.package.as_str(), "Matrix");
+    assert!(rejected.release.is_none());
+    assert!(matches!(
+        rejected.axes.namespace,
+        crate::snapshot::NamespaceStateV1::Established
+    ));
+}
+
+#[test]
+fn archive_rejection_survives_snapshot_roundtrip_and_keeps_valid_sibling_visible() {
+    let (_directory, store) = store();
+    let mut transport = session_transport(
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    transport.responses.insert(
+        fast_url(),
+        TransportResponse::new(200, mixed_semantic_archive_index()),
+    );
+    let loader = refresh_and_publish_with_transport(
+        &store,
+        transport,
+        "https://cran.invalid",
+        &[PackageName::new("Matrix").unwrap()],
+    )
+    .expect("mixed archive snapshot should publish");
+    let releases = loader
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    assert!(
+        releases
+            .iter()
+            .any(|release| release.version().as_str() == "1.7-0")
+    );
+    assert!(
+        releases
+            .iter()
+            .any(|release| release.version().as_str() == "1.7-6")
+    );
+    assert_eq!(loader.header().observation_count, 3);
+
+    let offline = store.read_current().unwrap();
+    let offline_releases = offline
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        offline_releases
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        releases
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

@@ -323,7 +323,7 @@ fn prepare(
     let header = SnapshotHeaderV1 {
         format: "rsolve-metadata-snapshot".into(),
         version: 1,
-        history_encoding: 1,
+        history_encoding: HISTORY_ENCODING,
         normalization_policy: input.normalization_policy,
         compatibility_profile: input.compatibility_profile,
         parser_schema: input.parser_schema,

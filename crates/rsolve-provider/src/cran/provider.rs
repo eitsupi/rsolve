@@ -47,7 +47,8 @@ use refresher::{decode_gzip, extract_description};
 #[cfg(test)]
 pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
-    current_records, index_record_to_evidence, source_input, tarball_record_to_evidence,
+    archive_rejection_to_evidence, current_records, index_record_to_evidence, source_input,
+    tarball_record_to_evidence,
 };
 #[cfg(test)]
 pub(crate) use transport::TransportError;
@@ -1733,6 +1734,16 @@ impl<T: Transport> CranRefreshSession<T> {
                             source.clone(),
                             &self.base_url,
                             false,
+                            FreshnessStateV1::BulkGeneration,
+                        )
+                    }));
+                self.evidence
+                    .borrow_mut()
+                    .extend(rejections.iter().map(|rejection| {
+                        archive_rejection_to_evidence(
+                            rejection,
+                            source.clone(),
+                            &self.base_url,
                             FreshnessStateV1::BulkGeneration,
                         )
                     }));

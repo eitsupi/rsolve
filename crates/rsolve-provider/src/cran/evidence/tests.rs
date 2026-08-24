@@ -657,18 +657,13 @@ fn rejects_overlapping_metadata_conflict() {
         ("License", "GPL"),
         ("Title", "fixture"),
     ]));
-    let input = compose_snapshot(context(), observations).unwrap();
-    let history = input
-        .histories
-        .iter()
-        .find(|history| history.package == "P3MOverlay")
-        .unwrap();
-    assert!(matches!(history.state, LookupStateV1::Incomplete));
-    assert!(history.eligible_releases.is_empty());
-    assert!(history.decisions.iter().any(|decision| matches!(
-        decision.code,
-        crate::snapshot::DecisionCodeV1::SemanticConflict
-    )));
+    assert!(matches!(
+        compose_snapshot(context(), observations),
+        Err(EvidenceCompositionError::Conflict {
+            field: "metadata",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -753,7 +748,7 @@ fn publication_axis_must_match_release_publication() {
 }
 
 #[test]
-fn dependency_conflict_is_a_package_scoped_semantic_decision() {
+fn dependency_conflict_is_a_package_global_failure() {
     let mut observations = fixture_observations();
     observations[0].release = Some(release(&[
         ("Package", "P3MOverlay"),
@@ -768,26 +763,14 @@ fn dependency_conflict_is_a_package_scoped_semantic_decision() {
         ("Published", "2026-08-20"),
         ("Depends", "R (>= 4.1)"),
     ]));
-    let input = compose_snapshot(context(), observations).unwrap();
-    let history = input
-        .histories
-        .iter()
-        .find(|history| history.package == "P3MOverlay")
-        .unwrap();
-    assert!(matches!(history.state, LookupStateV1::Incomplete));
-    assert!(history.eligible_releases.is_empty());
-    let conflict = history
-        .decisions
-        .iter()
-        .find(|decision| {
-            matches!(
-                decision.code,
-                crate::snapshot::DecisionCodeV1::SemanticConflict
-            )
-        })
-        .unwrap();
-    assert_eq!(conflict.observation_ids.len(), 2);
-    assert!(conflict.detail.contains("dependencies"));
+    let error = compose_snapshot(context(), observations).unwrap_err();
+    assert!(matches!(
+        error,
+        EvidenceCompositionError::Conflict {
+            field: "dependencies",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -832,6 +815,67 @@ fn rejected_namespace_is_out_of_scope_without_poisoning_valid_candidates() {
     assert!(matches!(history.state, LookupStateV1::Present));
     assert_eq!(history.eligible_releases.len(), 1);
     assert_eq!(history.eligible_releases[0].version, "1.0");
+}
+
+#[test]
+fn quarantined_archive_release_is_raw_but_valid_siblings_remain_eligible() {
+    let mut observations = fixture_observations();
+    observations[2].release = None;
+    observations[2].axes.semantics = SemanticsStateV1::Invalid;
+    observations[2].axes.publication = PublicationStateV1::Unknown;
+    let input = compose_snapshot(context(), observations).unwrap();
+    let history = input
+        .histories
+        .iter()
+        .find(|history| history.package == "P3MOverlay")
+        .unwrap();
+    assert!(matches!(history.state, LookupStateV1::Present));
+    assert_eq!(history.eligible_releases.len(), 1);
+    assert_eq!(history.eligible_releases[0].version, "1.0");
+    let quarantined = history
+        .observations
+        .iter()
+        .find(|observation| observation.record_index == 21)
+        .unwrap();
+    assert!(matches!(
+        quarantined.axes.semantics,
+        SemanticsStateV1::Invalid
+    ));
+    assert!(history.decisions.iter().any(|decision| {
+        matches!(
+            decision.code,
+            crate::snapshot::DecisionCodeV1::QuarantinedRelease
+        ) && decision.observation_ids == vec![quarantined.id]
+    }));
+}
+
+#[test]
+fn all_quarantined_archive_releases_make_history_incomplete() {
+    let mut observations = fixture_observations();
+    for observation in &mut observations {
+        observation.release = None;
+        observation.axes.semantics = SemanticsStateV1::Invalid;
+        observation.axes.publication = PublicationStateV1::Unknown;
+    }
+    let input = compose_snapshot(context(), observations).unwrap();
+    let history = input
+        .histories
+        .iter()
+        .find(|history| history.package == "P3MOverlay")
+        .unwrap();
+    assert!(matches!(history.state, LookupStateV1::Incomplete));
+    assert!(history.eligible_releases.is_empty());
+    assert_eq!(
+        history
+            .decisions
+            .iter()
+            .filter(|decision| matches!(
+                decision.code,
+                crate::snapshot::DecisionCodeV1::QuarantinedRelease
+            ))
+            .count(),
+        history.observations.len()
+    );
 }
 
 #[test]

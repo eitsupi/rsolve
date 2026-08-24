@@ -25,7 +25,9 @@ pub(super) fn compose_history(
             continue;
         }
         if let Some((code, detail)) = completeness_failure(observation) {
-            package_incomplete = true;
+            if !matches!(code, crate::snapshot::DecisionCodeV1::QuarantinedRelease) {
+                package_incomplete = true;
+            }
             decisions.push(DecisionV1 {
                 code,
                 observation_ids: vec![index as u32],
@@ -81,15 +83,7 @@ pub(super) fn compose_history(
         ) {
             Ok(pending) => pending,
             Err(error @ EvidenceCompositionError::Invalid(_)) => return Err(error),
-            Err(error) => {
-                package_incomplete = true;
-                decisions.push(DecisionV1 {
-                    code: crate::snapshot::DecisionCodeV1::SemanticConflict,
-                    observation_ids,
-                    detail: error.to_string(),
-                });
-                continue;
-            }
+            Err(error @ EvidenceCompositionError::Conflict { .. }) => return Err(error),
         };
         if entries.len() > 1 {
             decisions.push(DecisionV1 {
@@ -218,8 +212,8 @@ pub(super) fn completeness_failure(
             match observation.axes.semantics {
                 crate::snapshot::SemanticsStateV1::Incomplete => None,
                 crate::snapshot::SemanticsStateV1::Invalid => Some((
-                    crate::snapshot::DecisionCodeV1::IncompleteSemantics,
-                    "observation semantics are invalid",
+                    crate::snapshot::DecisionCodeV1::QuarantinedRelease,
+                    "release was quarantined after semantic validation",
                 )),
                 crate::snapshot::SemanticsStateV1::Complete
                 | crate::snapshot::SemanticsStateV1::VerifiedEmpty => None,

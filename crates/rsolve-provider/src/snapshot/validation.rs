@@ -80,7 +80,7 @@ pub(super) fn validate_history(
 pub(super) fn validate_header(header: &SnapshotHeaderV1) -> Result<(), SnapshotError> {
     if header.format != "rsolve-metadata-snapshot"
         || header.version != 1
-        || header.history_encoding != 1
+        || header.history_encoding != HISTORY_ENCODING
         || header.normalization_policy != 1
         || header.compatibility_profile != 1
         || header.parser_schema != 1

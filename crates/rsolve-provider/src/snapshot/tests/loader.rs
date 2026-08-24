@@ -59,6 +59,32 @@ fn read_only_loader_maps_partial_and_incomplete_missing_states() {
 }
 
 #[test]
+fn read_only_loader_reports_all_quarantined_history_as_metadata_invalid() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("quarantined.redb");
+    let mut quarantined = input();
+    quarantined.histories[0].observations[0].axes.semantics = SemanticsStateV1::Invalid;
+    quarantined.histories[0].decisions = vec![DecisionV1 {
+        code: DecisionCodeV1::QuarantinedRelease,
+        observation_ids: vec![0],
+        detail: "release was quarantined after semantic validation".into(),
+    }];
+    SnapshotGenerationBuilder::new(quarantined, &path)
+        .build()
+        .unwrap();
+    let loader =
+        ReadOnlySnapshotCandidateLoader::open(&path, RegistryId::new("cran").unwrap()).unwrap();
+    let error = loader
+        .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+        .unwrap_err();
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::MetadataInvalid
+    );
+    assert!(error.diagnostic().contains("incomplete"));
+}
+
+#[test]
 fn read_only_loader_rejects_registry_and_wire_revision_mismatch() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("snapshot.redb");
@@ -87,6 +113,23 @@ fn read_only_loader_rejects_registry_and_wire_revision_mismatch() {
             .unwrap();
     assert_eq!(
         revision_error.category(),
+        CandidateLoadErrorCategory::SnapshotInvalid
+    );
+
+    let encoding_path = dir.path().join("encoding.redb");
+    let encoding_generation = SnapshotGenerationBuilder::new(input(), &encoding_path)
+        .build()
+        .unwrap();
+    let mut old_encoding = encoding_generation.header().clone();
+    old_encoding.history_encoding = 1;
+    old_encoding.generation = generation_id_from_header(&old_encoding);
+    rewrite_stored_header(&encoding_path, |header| *header = old_encoding);
+    let encoding_error =
+        ReadOnlySnapshotCandidateLoader::open(&encoding_path, RegistryId::new("cran").unwrap())
+            .err()
+            .unwrap();
+    assert_eq!(
+        encoding_error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
 

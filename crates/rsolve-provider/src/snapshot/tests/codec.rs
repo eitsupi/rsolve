@@ -188,4 +188,12 @@ fn header_rejects_observation_timestamp_generation_and_revision_mismatch() {
             .build()
             .is_err()
     );
+
+    let generation = SnapshotGenerationBuilder::new(input(), dir.path().join("encoding.redb"))
+        .build()
+        .unwrap();
+    let mut old_encoding = generation.header().clone();
+    old_encoding.history_encoding = 1;
+    old_encoding.generation = generation_id_from_header(&old_encoding);
+    assert!(decode_header(&encode_header(&old_encoding).unwrap()).is_err());
 }

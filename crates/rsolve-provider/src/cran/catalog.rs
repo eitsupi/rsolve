@@ -44,7 +44,6 @@ pub(crate) struct CranArchiveReleaseRejection {
 }
 
 impl CranArchiveReleaseRejection {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn record_index(&self) -> usize {
         self.record_index
     }
@@ -61,7 +60,6 @@ impl CranArchiveReleaseRejection {
         self.scope.as_ref()
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn fields(&self) -> &[(String, String)] {
         &self.fields
     }

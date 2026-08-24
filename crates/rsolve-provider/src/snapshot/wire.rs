@@ -13,7 +13,8 @@ pub const SNAPSHOT_HEADER: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const PACKAGE_HISTORIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("package_histories");
 pub(super) const HEADER_KEY: &str = "header";
-pub(super) const HISTORY_MAGIC: &[u8; 8] = b"RSLVHST1";
+pub(super) const HISTORY_ENCODING: u32 = 2;
+pub(super) const HISTORY_MAGIC: &[u8; 8] = b"RSLVHST2";
 pub(super) const HISTORY_PREFIX_LEN: usize = 48;
 
 #[derive(Debug)]
@@ -255,6 +256,7 @@ pub enum DecisionCodeV1 {
     UnreachableOccurrence,
     IncompleteSemantics,
     RecommendedOverlaySuppressed,
+    QuarantinedRelease,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecisionV1 {

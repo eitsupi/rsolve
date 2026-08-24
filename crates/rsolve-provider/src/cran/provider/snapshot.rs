@@ -2,7 +2,9 @@
 
 use sha2::{Digest, Sha256};
 
-use super::super::catalog::{CranCatalog, CranCatalogObservation, CranCatalogRecordScope};
+use super::super::catalog::{
+    CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation, CranCatalogRecordScope,
+};
 use super::super::evidence::{CranEvidenceObservation, DistributionRegistryBinding};
 use super::refresher::decode_gzip;
 use super::{CranCurrentIndexRepresentation, CranRefreshSession, Transport};
@@ -129,6 +131,69 @@ pub(super) fn tarball_record_to_evidence(
     )
 }
 
+/// Retains a release-local archive rejection as raw evidence. The provider
+/// projection rejects rows without an attributable package/version/scope as
+/// package-global failures before this bridge is reached.
+pub(super) fn archive_rejection_to_evidence(
+    rejection: &CranArchiveReleaseRejection,
+    source: SourceInput,
+    base_url: &str,
+    freshness: FreshnessStateV1,
+) -> CranEvidenceObservation {
+    let package = rejection
+        .package()
+        .expect("release-local archive rejection must identify a package");
+    let version = rejection
+        .version()
+        .expect("release-local archive rejection must identify a version");
+    let scope = rejection
+        .scope()
+        .expect("release-local archive rejection must identify a scope");
+    let locator = match scope {
+        CranCatalogRecordScope::Root => {
+            format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
+        }
+        CranCatalogRecordScope::RecommendedOverlay { .. } => {
+            let path = rejection
+                .fields()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("Path"))
+                .map(|(_, value)| value.as_str())
+                .expect("validated Recommended overlay must retain Path");
+            format!("{base_url}/src/contrib/{path}/{package}_{version}.tar.gz")
+        }
+    };
+    CranEvidenceObservation {
+        source,
+        package: package.clone(),
+        record_index: rejection.record_index() as u64,
+        fields: rejection
+            .fields()
+            .iter()
+            .map(|(name, value)| FieldV1 {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        artifact: Some(OccurrenceArtifactV1 {
+            locator,
+            checksums: checksums_from_fields(rejection.fields()),
+            size: None,
+        }),
+        axes: EvidenceAxesV1 {
+            parse: ParseStateV1::Valid,
+            namespace: NamespaceStateV1::Established,
+            occurrence: OccurrenceStateV1::ArtifactBound,
+            semantics: SemanticsStateV1::Invalid,
+            publication: PublicationStateV1::Unknown,
+            freshness,
+        },
+        release: None,
+        distribution_registry: DistributionRegistryBinding::ConfiguredContext,
+        scope: scope.clone(),
+    }
+}
+
 fn record_to_evidence(
     record: &CranCatalogObservation,
     source: SourceInput,
@@ -176,8 +241,11 @@ fn evidence_axes(
 }
 
 fn checksums_from_index_fields(record: &CranCatalogObservation) -> Vec<ChecksumV1> {
-    record
-        .fields()
+    checksums_from_fields(record.fields())
+}
+
+fn checksums_from_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
+    fields
         .iter()
         .filter_map(|(name, value)| {
             let algorithm = if name.eq_ignore_ascii_case("MD5sum") {
