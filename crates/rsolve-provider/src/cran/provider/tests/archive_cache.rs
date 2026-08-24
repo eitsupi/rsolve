@@ -276,6 +276,13 @@ fn package_archive_stale_cache_revalidates_once_with_304() {
         requests.borrow()[0].validators.if_none_match.as_deref(),
         Some(etag)
     );
+    let diagnostic = second
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.endpoint() == fast_url())
+        .expect("archive fast-path diagnostic");
+    assert_eq!(diagnostic.status(), Some(304));
+    assert_eq!(diagnostic.status_detail(), &CranFastPathStatus::Available);
     let key = RawCache::open(&store)
         .unwrap()
         .key(&fast_url(), RawCacheRepresentation::PackageArchiveIndexRds)

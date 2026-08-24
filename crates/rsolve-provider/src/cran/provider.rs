@@ -891,6 +891,13 @@ struct MetadataAcquisitionFailure {
     diagnostic: Box<str>,
 }
 
+#[derive(Clone, Copy)]
+enum MetadataAcquisitionOutcome {
+    Cached,
+    Network200,
+    Revalidated304,
+}
+
 impl MetadataAcquisitionFailure {
     fn cache(error: impl std::fmt::Display) -> Self {
         Self {
@@ -1054,7 +1061,10 @@ impl<T: Transport> CranRefreshSession<T> {
         source_kind: &str,
         source_representation: &str,
         parse: P,
-    ) -> Result<(V, crate::snapshot::SourceInput), MetadataAcquisitionFailure>
+    ) -> Result<
+        (V, crate::snapshot::SourceInput, MetadataAcquisitionOutcome),
+        MetadataAcquisitionFailure,
+    >
     where
         P: Fn(&[u8]) -> Result<V, String>,
     {
@@ -1185,7 +1195,22 @@ impl<T: Transport> CranRefreshSession<T> {
                             .update_validated_at_with_headers(key, self.now(), &headers)
                             .map_err(MetadataAcquisitionFailure::cache)?;
                     }
-                    return Ok((value, source));
+                    let outcome = match origin {
+                        Some(CurrentBodyOrigin::Cached) => MetadataAcquisitionOutcome::Cached,
+                        Some(CurrentBodyOrigin::Network200) => {
+                            MetadataAcquisitionOutcome::Network200
+                        }
+                        Some(CurrentBodyOrigin::Revalidated304) => {
+                            MetadataAcquisitionOutcome::Revalidated304
+                        }
+                        None => {
+                            return Err(MetadataAcquisitionFailure::invalid(
+                                None,
+                                "metadata acquisition has no response outcome",
+                            ));
+                        }
+                    };
+                    return Ok((value, source, outcome));
                 }
                 Err(error)
                     if matches!(
@@ -1549,7 +1574,7 @@ impl<T: Transport> CranRefreshSession<T> {
             "rds",
             |body| enumerate_archive_rds_for_provider(body).map_err(|error| error.to_string()),
         ) {
-            Ok((entries, _source)) => Ok(HistorySource::Available(Rc::from(
+            Ok((entries, _source, _outcome)) => Ok(HistorySource::Available(Rc::from(
                 entries.into_boxed_slice(),
             ))),
             Err(error) if matches!(error.status, Some(404 | 410)) => {
@@ -1569,14 +1594,17 @@ impl<T: Transport> CranRefreshSession<T> {
                     error.diagnostic.into_string()
                 };
                 self.push_history_diagnostic(endpoint.clone(), error.status, diagnostic.clone());
-                Err(CandidateLoadError::new(
-                    error.category,
-                    if let Some(status) = error.status {
-                        format!("failed to refresh {endpoint}: HTTP {status}")
-                    } else {
+                let message = match error.category {
+                    CandidateLoadErrorCategory::MetadataInvalid
+                    | CandidateLoadErrorCategory::SnapshotInvalid => {
                         format!("failed to refresh {endpoint}: {diagnostic}")
+                    }
+                    _ => match error.status {
+                        Some(status) => format!("failed to refresh {endpoint}: HTTP {status}"),
+                        None => format!("failed to refresh {endpoint}: {diagnostic}"),
                     },
-                ))
+                };
+                Err(CandidateLoadError::new(error.category, message))
             }
         };
         self.history = Some(result.clone());
@@ -1643,7 +1671,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 Ok((catalog, records))
             },
         ) {
-            Ok(((catalog, records), source)) => {
+            Ok(((catalog, records), source, outcome)) => {
                 self.evidence
                     .borrow_mut()
                     .extend(records.iter().map(|record| {
@@ -1657,7 +1685,11 @@ impl<T: Transport> CranRefreshSession<T> {
                     }));
                 package_diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into_boxed_str(),
-                    status: Some(200),
+                    status: Some(match outcome {
+                        MetadataAcquisitionOutcome::Revalidated304 => 304,
+                        MetadataAcquisitionOutcome::Cached
+                        | MetadataAcquisitionOutcome::Network200 => 200,
+                    }),
                     status_detail: CranFastPathStatus::Available,
                     source: CranRefreshSource::ArchiveFastPath,
                 });

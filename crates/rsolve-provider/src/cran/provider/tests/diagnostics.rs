@@ -190,6 +190,10 @@ fn history_transport_and_metadata_failures_remain_hard_failures() {
             diagnostic.source() == CranRefreshSource::ArchiveHistory
                 && diagnostic.status() == Some(history_status)
         }));
+        if history_status == 200 {
+            assert!(error.diagnostic().contains("invalid CRAN archive history"));
+            assert!(!error.diagnostic().ends_with("HTTP 200"));
+        }
     }
 }
 
