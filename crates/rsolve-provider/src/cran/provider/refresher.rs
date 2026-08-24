@@ -79,6 +79,24 @@ impl CranSnapshotRefresher {
         self.session.borrow_mut().refresh_packages(roots)
     }
 
+    /// Binds a persistent store to this refresher before any package refresh
+    /// begins. Callers that first discover a dependency closure with
+    /// [`refresh_packages`] and publish it later must use this seam so the
+    /// metadata responses acquired during discovery are also persisted.
+    pub fn prepare_persistent_refresh(
+        &self,
+        store: &SnapshotStore,
+    ) -> Result<(), CranSnapshotPublishError> {
+        let raw_cache = super::raw_cache::RawCache::open(store).map_err(|error| {
+            CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                format!("unable to open CRAN current raw cache: {error}"),
+            ))
+        })?;
+        self.session.borrow_mut().attach_raw_cache(raw_cache);
+        Ok(())
+    }
+
     /// Refreshes the requested CRAN packages and atomically publishes their
     /// validated source observations into the persistent snapshot store.
     /// The returned loader is transport-free and pins the committed generation.
@@ -87,14 +105,8 @@ impl CranSnapshotRefresher {
         store: &SnapshotStore,
         roots: &[PackageName],
     ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
-        let raw_cache = super::raw_cache::RawCache::open(store).map_err(|error| {
-            CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
-                CandidateLoadErrorCategory::SnapshotInvalid,
-                format!("unable to open CRAN current raw cache: {error}"),
-            ))
-        })?;
+        self.prepare_persistent_refresh(store)?;
         let mut session = self.session.borrow_mut();
-        session.attach_raw_cache(raw_cache);
         let observations = session
             .refresh_snapshot_observations(roots)
             .map_err(CranSnapshotPublishError::Acquisition)?;

@@ -162,6 +162,19 @@ where
     Ok((loader, diagnostics))
 }
 
+fn prepare_then_refresh<L, P, F>(
+    roots: &[PackageName],
+    mut prepare: P,
+    mut refresh: F,
+) -> Result<L, CranResolutionError>
+where
+    P: FnMut() -> Result<(), CranResolutionError>,
+    F: FnMut(&[PackageName]) -> Result<L, CranResolutionError>,
+{
+    prepare()?;
+    refresh(roots)
+}
+
 fn cache_resolution_error(error: CranResolutionError) -> CandidateLoadError {
     match error {
         CranResolutionError::Resolution(ResolutionFailure::CandidateLoad { source, .. }) => *source,
@@ -257,21 +270,32 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
         CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
     };
     let (loader, cache_diagnostics) = cache_or_refresh(probe, &roots, &request, |batch| {
-        let closure =
-            collect_cran_dependency_closure(batch, |batch| refresher.refresh_packages(batch))
+        prepare_then_refresh(
+            batch,
+            || {
+                refresher
+                    .prepare_persistent_refresh(store)
+                    .map_err(CranResolutionError::Publish)
+            },
+            |batch| {
+                let closure = collect_cran_dependency_closure(batch, |batch| {
+                    refresher.refresh_packages(batch)
+                })
                 .map_err(CranResolutionError::Refresh)?;
-        if closure.is_empty() {
-            return Err(CranResolutionError::Refresh(CandidateLoadError::new(
-                CandidateLoadErrorCategory::MetadataInvalid,
-                format!(
-                    "refresh returned no remote packages for batch of {}",
-                    batch.len()
-                ),
-            )));
-        }
-        refresher
-            .refresh_and_publish_snapshot(store, &closure)
-            .map_err(CranResolutionError::Publish)
+                if closure.is_empty() {
+                    return Err(CranResolutionError::Refresh(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        format!(
+                            "refresh returned no remote packages for batch of {}",
+                            batch.len()
+                        ),
+                    )));
+                }
+                refresher
+                    .refresh_and_publish_snapshot(store, &closure)
+                    .map_err(CranResolutionError::Publish)
+            },
+        )
     })?;
     let resolution = resolve_prepared_snapshot_without_transport(request, &loader)?;
     Ok(CranResolutionOutcome {
@@ -546,6 +570,53 @@ mod tests {
         assert!(reused.contains_package(&dependency));
         assert_eq!(refreshes, 0);
         assert_eq!(diagnostics[0].status(), CranSnapshotCacheStatus::Fresh);
+    }
+
+    #[test]
+    fn persistent_refresh_preparation_precedes_package_refresh() {
+        let root = PackageName::new("root").unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let prepare_events = std::rc::Rc::clone(&events);
+        let refresh_events = std::rc::Rc::clone(&events);
+        prepare_then_refresh(
+            std::slice::from_ref(&root),
+            || {
+                prepare_events.borrow_mut().push("prepare");
+                Ok(())
+            },
+            |_| {
+                refresh_events.borrow_mut().push("refresh_packages");
+                Ok::<_, CranResolutionError>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["prepare", "refresh_packages"]);
+    }
+
+    #[test]
+    fn fresh_generation_reuse_skips_persistent_refresh_preparation() {
+        let root = PackageName::new("root").unwrap();
+        let loader = CranCandidateSnapshot::from_candidates([(
+            root.clone(),
+            vec![release_with_dependencies(&root, Vec::new())],
+        )]);
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
+        let mut preparations = 0;
+        cache_or_refresh(
+            CacheProbe::Compatible {
+                loader,
+                diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(30)),
+            },
+            std::slice::from_ref(&root),
+            &request,
+            |_| {
+                preparations += 1;
+                unreachable!("fresh generation reuse must not prepare a refresh");
+            },
+        )
+        .unwrap();
+        assert_eq!(preparations, 0);
     }
 
     #[test]
