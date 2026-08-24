@@ -23,7 +23,13 @@ impl<T: Transport> CranRefreshSession<T> {
         // session and contributes at most one diagnostic.
         self.diagnostics.append(&mut package_diagnostics);
         match self.ensure_history()? {
-            HistorySource::Available(entries) => Ok(Some(CandidateSource::Fallback(entries))),
+            HistorySource::Available {
+                entries,
+                rejections,
+            } => Ok(Some(CandidateSource::Fallback {
+                entries,
+                rejections,
+            })),
             HistorySource::Absent => match failure {
                 FastPathFailure::Unsupported => Ok(None),
                 FastPathFailure::Invalid {

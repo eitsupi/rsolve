@@ -17,9 +17,13 @@ fn store() -> (tempfile::TempDir, SnapshotStore) {
 }
 
 fn history_response(headers: TransportResponseHeaders) -> TransportResponse {
+    history_response_with_body(HISTORY, headers)
+}
+
+fn history_response_with_body(body: &[u8], headers: TransportResponseHeaders) -> TransportResponse {
     TransportResponse {
         status: 200,
-        body: HISTORY.to_vec(),
+        body: body.to_vec(),
         headers,
     }
 }
@@ -119,7 +123,7 @@ fn archive_history_fresh_cache_hit_avoids_network() {
     );
     assert!(matches!(
         first.ensure_history(),
-        Ok(HistorySource::Available(_))
+        Ok(HistorySource::Available { .. })
     ));
     assert_eq!(first_requests.borrow().len(), 1);
     assert!(
@@ -139,7 +143,7 @@ fn archive_history_fresh_cache_hit_avoids_network() {
     );
     assert!(matches!(
         second.ensure_history(),
-        Ok(HistorySource::Available(_))
+        Ok(HistorySource::Available { .. })
     ));
     assert!(second_requests.borrow().is_empty());
     assert!(
@@ -218,6 +222,81 @@ fn archive_history_stale_cache_revalidates_once_and_reuses_body() {
 }
 
 #[test]
+fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
+    let (_directory, store) = store();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = FixtureTransport {
+        responses: [(
+            history_url(),
+            history_response_with_body(
+                FOREIGN_NESTED_HISTORY,
+                TransportResponseHeaders {
+                    etag: Some("\"foreign-etag\"".into()),
+                    cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+                    ..TransportResponseHeaders::default()
+                },
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let first_source = first.ensure_history().expect("fresh history");
+    let HistorySource::Available { rejections, .. } = first_source else {
+        panic!("expected available history")
+    };
+    assert_eq!(rejections.len(), 1);
+    assert!(first.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic.status_detail(),
+        CranFastPathStatus::Invalid { diagnostic, .. }
+            if diagnostic.contains("calibFit/Ancestry/calib_0.1.02.tar.gz")
+    )));
+
+    let second_transport = FixtureTransport {
+        responses: [(
+            history_url(),
+            TransportResponse {
+                status: 304,
+                body: Vec::new(),
+                headers: TransportResponseHeaders {
+                    cache_control: CacheControlHeader::Valid("max-age=120".into()),
+                    ..TransportResponseHeaders::default()
+                },
+            },
+        )]
+        .into_iter()
+        .collect(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let second_source = second.ensure_history().expect("304 history");
+    let HistorySource::Available { rejections, .. } = second_source else {
+        panic!("expected available history")
+    };
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(
+        rejections[0].raw_path(),
+        "calibFit/Ancestry/calib_0.1.02.tar.gz"
+    );
+    assert!(second.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic.status_detail(),
+        CranFastPathStatus::Invalid { diagnostic, .. }
+            if diagnostic.contains("calibFit/Ancestry/calib_0.1.02.tar.gz")
+    )));
+}
+
+#[test]
 fn package_archive_fresh_cache_hit_avoids_network() {
     let (_directory, store) = store();
     let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
@@ -287,7 +366,7 @@ fn empty_package_archive_network_response_is_available_without_fallback() {
     let releases = session
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .expect("empty archive fast path");
-    assert_eq!(releases.len(), 1);
+    assert_eq!(releases.candidates().len(), 1);
     assert!(
         requests
             .borrow()
@@ -462,6 +541,7 @@ fn mixed_archive_semantic_rejection_stays_on_fast_path_without_history_or_tarbal
         .unwrap();
     assert_eq!(
         releases
+            .candidates()
             .iter()
             .filter(|release| release.version().as_str() == "1.6-5"
                 || release.version().as_str() == "1.7-0")
@@ -591,7 +671,7 @@ fn mixed_archive_fresh_raw_cache_replay_is_network_free_and_deterministic() {
     let first_releases = first
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
-    let expected_releases = release_signature(&first_releases);
+    let expected_releases = release_signature(first_releases.candidates());
     let expected_detail = partial_fast_path_detail(&first);
 
     let second_transport = empty_transport();
@@ -606,7 +686,10 @@ fn mixed_archive_fresh_raw_cache_replay_is_network_free_and_deterministic() {
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
     assert!(requests.borrow().is_empty());
-    assert_eq!(release_signature(&second_releases), expected_releases);
+    assert_eq!(
+        release_signature(second_releases.candidates()),
+        expected_releases
+    );
     assert_eq!(partial_fast_path_detail(&second), expected_detail);
     assert!(!requests.borrow().iter().any(|request| {
         request.url == history_url() || request.url == old_url() || request.url == new_url()
@@ -651,7 +734,7 @@ fn mixed_archive_stale_304_replay_is_deterministic_without_fallback() {
     let first_releases = first
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
-    let expected_releases = release_signature(&first_releases);
+    let expected_releases = release_signature(first_releases.candidates());
     let expected_detail = partial_fast_path_detail(&first);
 
     let mut second_transport = empty_transport();
@@ -676,7 +759,10 @@ fn mixed_archive_stale_304_replay_is_deterministic_without_fallback() {
     let second_releases = second
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
-    assert_eq!(release_signature(&second_releases), expected_releases);
+    assert_eq!(
+        release_signature(second_releases.candidates()),
+        expected_releases
+    );
     assert_eq!(partial_fast_path_detail(&second), expected_detail);
     assert_eq!(
         second

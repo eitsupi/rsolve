@@ -512,6 +512,16 @@ fn history_rejects_non_canonical_archive_paths() {
 }
 
 #[test]
+fn provider_keeps_unsafe_percent_paths_as_hard_failures() {
+    for fixture in INVALID_HISTORY_PATHS.iter().take(11) {
+        assert!(
+            crate::cran::history::enumerate_archive_rds_for_provider(fixture).is_err(),
+            "unsafe history path unexpectedly became a package-local rejection"
+        );
+    }
+}
+
+#[test]
 fn history_accepts_safe_nested_archive_paths() {
     let entries = enumerate_archive_rds(NESTED_HISTORY).expect("nested history fixture");
     assert_eq!(entries.len(), 1);
@@ -528,7 +538,49 @@ fn provider_quarantines_foreign_nested_archive_rows() {
         enumerate_archive_rds(FOREIGN_NESTED_HISTORY),
         Err(CranHistoryError::InvalidArchivePath { .. })
     ));
-    let entries = crate::cran::history::enumerate_archive_rds_for_provider(FOREIGN_NESTED_HISTORY)
-        .expect("foreign nested row is release-local");
-    assert!(entries.is_empty());
+    let projection =
+        crate::cran::history::enumerate_archive_rds_for_provider(FOREIGN_NESTED_HISTORY)
+            .expect("foreign nested row is release-local");
+    assert!(projection.entries.is_empty());
+    assert_eq!(projection.rejections.len(), 1);
+    assert_eq!(projection.rejections[0].package_hint().as_str(), "calibFit");
+    assert_eq!(
+        projection.rejections[0].raw_path(),
+        "calibFit/Ancestry/calib_0.1.02.tar.gz"
+    );
+}
+
+#[test]
+fn provider_projects_legacy_version_as_a_package_local_rejection() {
+    let projection =
+        crate::cran::history::enumerate_archive_rds_for_provider(LEGACY_VERSION_HISTORY)
+            .expect("legacy version is package-local");
+    assert!(projection.entries.is_empty());
+    assert_eq!(projection.rejections.len(), 1);
+    let rejection = &projection.rejections[0];
+    assert_eq!(rejection.package_hint().as_str(), "dse");
+    assert_eq!(rejection.row(), 0);
+    assert_eq!(rejection.raw_path(), "dse/dse_R2000.4-1.tar.gz");
+    assert!(rejection.reason().contains("invalid archive path"));
+
+    let package = PackageName::new("dse").unwrap();
+    let provider = CranProvider::from_source(
+        FixtureTransport::fallback(Vec::new(), 404),
+        "https://cran.invalid",
+        package.clone(),
+        CandidateSource::Fallback {
+            entries: Rc::from(Vec::<ArchiveEntry>::new().into_boxed_slice()),
+            rejections: Rc::from(projection.rejections.into_boxed_slice()),
+        },
+        Vec::new(),
+        None,
+    );
+    let error = provider
+        .releases(&SolverKey::InstalledName(package))
+        .expect_err("all rejected history must be metadata-invalid");
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::MetadataInvalid
+    );
+    assert!(error.diagnostic().contains("dse_R2000.4-1.tar.gz"));
 }

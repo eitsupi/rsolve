@@ -23,6 +23,59 @@ pub struct ArchiveEntry {
     mtime: i64,
 }
 
+/// A package-local row that cannot contribute a candidate to the provider
+/// history projection. The raw path is retained so callers can report the
+/// exact upstream row without manufacturing a Package/Version identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchiveHistoryRejection {
+    package_hint: PackageName,
+    raw_path: Box<str>,
+    row: usize,
+    version: Option<RPackageVersion>,
+    reason: Box<str>,
+}
+
+impl ArchiveHistoryRejection {
+    pub(crate) fn package_hint(&self) -> &PackageName {
+        &self.package_hint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_path(&self) -> &str {
+        &self.raw_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row(&self) -> usize {
+        self.row
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub(crate) fn diagnostic(&self) -> String {
+        format!(
+            "archive history package {} row {} path {:?}: {}",
+            self.package_hint, self.row, self.raw_path, self.reason
+        )
+    }
+
+    pub(crate) fn version(&self) -> Option<&RPackageVersion> {
+        self.version.as_ref()
+    }
+}
+
+/// Provider-only result of decoding archive history. Structural failures are
+/// still returned as errors; only rows that can be attributed to a named
+/// package are isolated as release-local rejections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchiveHistoryProjection {
+    pub(crate) entries: Vec<ArchiveEntry>,
+    pub(crate) rejections: Vec<ArchiveHistoryRejection>,
+}
+
 impl ArchiveEntry {
     pub fn package(&self) -> &PackageName {
         &self.package
@@ -108,12 +161,12 @@ pub(crate) fn enumerate_archive_rds_with_options(
 ) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
     let object = rd_rds::file::from_bytes_with_options(input, options)
         .map_err(|error| CranHistoryError::Decode(error.to_string()))?;
-    enumerate_object(&object, false)
+    Ok(enumerate_object(&object, false)?.entries)
 }
 
 pub(crate) fn enumerate_archive_rds_for_provider(
     input: &[u8],
-) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
+) -> Result<ArchiveHistoryProjection, CranHistoryError> {
     let object = rd_rds::file::from_bytes_with_options(input, &provider_rds_read_options())
         .map_err(|error| CranHistoryError::Decode(error.to_string()))?;
     enumerate_object(&object, true)
@@ -122,7 +175,7 @@ pub(crate) fn enumerate_archive_rds_for_provider(
 fn enumerate_object(
     object: &RObject,
     quarantine_nested_foreign_releases: bool,
-) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
+) -> Result<ArchiveHistoryProjection, CranHistoryError> {
     let RValue::List(items) = object.value() else {
         return Err(CranHistoryError::RootType("a named list or data.frame"));
     };
@@ -137,7 +190,10 @@ fn enumerate_object(
         return enumerate_frame(object, None, quarantine_nested_foreign_releases);
     }
 
-    let mut entries = Vec::new();
+    let mut projection = ArchiveHistoryProjection {
+        entries: Vec::new(),
+        rejections: Vec::new(),
+    };
     for (index, item) in items.iter().enumerate() {
         let package_name =
             names
@@ -151,20 +207,18 @@ fn enumerate_object(
             PackageName::new(&package_name).map_err(|_| CranHistoryError::InvalidPackage {
                 value: package_name.to_string(),
             })?;
-        entries.extend(enumerate_frame(
-            item,
-            Some(&package),
-            quarantine_nested_foreign_releases,
-        )?);
+        let frame = enumerate_frame(item, Some(&package), quarantine_nested_foreign_releases)?;
+        projection.entries.extend(frame.entries);
+        projection.rejections.extend(frame.rejections);
     }
-    Ok(entries)
+    Ok(projection)
 }
 
 fn enumerate_frame(
     object: &RObject,
     package_hint: Option<&PackageName>,
     quarantine_nested_foreign_releases: bool,
-) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
+) -> Result<ArchiveHistoryProjection, CranHistoryError> {
     if !is_data_frame(object) {
         return Err(CranHistoryError::NotDataFrame);
     }
@@ -201,50 +255,62 @@ fn enumerate_frame(
         return Err(CranHistoryError::RowNameLength);
     }
 
-    files
-        .into_iter()
-        .enumerate()
-        .filter_map(|(row, path)| {
-            let parsed = parse_archive_path(&path);
-            if quarantine_nested_foreign_releases
-                && parsed.is_err()
-                && is_nested_foreign_release_path(&path)
-            {
-                // CRAN has historically retained a small number of files in a
-                // package archive directory whose DESCRIPTION belongs to a
-                // different package (for example, a nested legacy upload).
-                // Do not manufacture a Package/Version identity for such a
-                // row.  The provider can safely quarantine this release-local
-                // anomaly while retaining the rest of archive history.
-                return None;
+    let mut projection = ArchiveHistoryProjection {
+        entries: Vec::new(),
+        rejections: Vec::new(),
+    };
+    for (row, path) in files.into_iter().enumerate() {
+        let parsed = match parse_archive_path(&path) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                if let Some(rejection) = package_local_rejection(
+                    quarantine_nested_foreign_releases,
+                    package_hint,
+                    &path,
+                    row,
+                    &error,
+                ) {
+                    projection.rejections.push(rejection);
+                    continue;
+                }
+                return Err(error);
             }
-            Some((row, path, parsed))
-        })
-        .map(|(row, path, parsed)| {
-            let (path_package, version, source_archive_relative_path) = parsed?;
-            if package_hint.is_some_and(|package| package != &path_package) {
-                return Err(CranHistoryError::InvalidPackage {
-                    value: path.clone(),
-                });
+        };
+        let (path_package, version, source_archive_relative_path) = parsed;
+        if package_hint.is_some_and(|package| package != &path_package) {
+            let error = CranHistoryError::InvalidPackage {
+                value: path.clone(),
+            };
+            if let Some(rejection) = package_local_rejection(
+                quarantine_nested_foreign_releases,
+                package_hint,
+                &path,
+                row,
+                &error,
+            ) {
+                projection.rejections.push(rejection);
+                continue;
             }
-            let package = package_hint.cloned().unwrap_or(path_package);
-            let size = sizes[row].ok_or(CranHistoryError::InvalidSize { row })?;
-            if !size.is_finite() || size < 0.0 || size.fract() != 0.0 {
-                return Err(CranHistoryError::InvalidSize { row });
-            }
-            let mtime = mtimes[row].ok_or(CranHistoryError::InvalidMtime { row })?;
-            if !mtime.is_finite() || mtime < 0.0 {
-                return Err(CranHistoryError::InvalidMtime { row });
-            }
-            Ok(ArchiveEntry {
-                package,
-                version,
-                source_archive_relative_path,
-                size: size as u64,
-                mtime: mtime as i64,
-            })
-        })
-        .collect()
+            return Err(error);
+        }
+        let package = package_hint.cloned().unwrap_or(path_package);
+        let size = sizes[row].ok_or(CranHistoryError::InvalidSize { row })?;
+        if !size.is_finite() || size < 0.0 || size.fract() != 0.0 {
+            return Err(CranHistoryError::InvalidSize { row });
+        }
+        let mtime = mtimes[row].ok_or(CranHistoryError::InvalidMtime { row })?;
+        if !mtime.is_finite() || mtime < 0.0 {
+            return Err(CranHistoryError::InvalidMtime { row });
+        }
+        projection.entries.push(ArchiveEntry {
+            package,
+            version,
+            source_archive_relative_path,
+            size: size as u64,
+            mtime: mtime as i64,
+        });
+    }
+    Ok(projection)
 }
 
 fn is_data_frame(object: &RObject) -> bool {
@@ -295,8 +361,7 @@ fn parse_archive_path(
             || segment.contains('\\')
             || segment.contains('?')
             || segment.contains('#')
-            || segment.contains("%2e")
-            || segment.contains("%2E")
+            || segment.contains('%')
     }) {
         return Err(CranHistoryError::InvalidArchivePath {
             value: path.to_owned(),
@@ -347,39 +412,61 @@ fn parse_archive_path(
     Ok((package, version, normalized_path))
 }
 
-/// Returns whether a path is a safe, nested archive row whose filename names a
-/// different package than its containing archive directory. Such rows are
-/// release-local anomalies, rather than a reason to discard every package in
-/// the history index. All other malformed paths remain hard failures.
-fn is_nested_foreign_release_path(path: &str) -> bool {
+fn package_local_rejection(
+    provider_mode: bool,
+    package_hint: Option<&PackageName>,
+    path: &str,
+    row: usize,
+    error: &CranHistoryError,
+) -> Option<ArchiveHistoryRejection> {
+    if !provider_mode {
+        return None;
+    }
+    let package_hint = package_hint?;
     let segments = path.split('/').collect::<Vec<_>>();
-    let (package, filename) = match segments.as_slice() {
-        ["src", "contrib", "Archive", package, nested @ .., filename] if !nested.is_empty() => {
-            (*package, *filename)
-        }
-        [package, nested @ .., filename] if !nested.is_empty() => (*package, *filename),
-        _ => return false,
-    };
-    if segments[..segments.len() - 1].iter().any(|segment| {
+    if segments.iter().any(|segment| {
         segment.is_empty()
             || *segment == "."
             || *segment == ".."
             || segment.contains('\\')
             || segment.contains('?')
             || segment.contains('#')
-            || segment.contains("%2e")
-            || segment.contains("%2E")
+            || segment.contains('%')
     }) {
-        return false;
+        return None;
     }
-    let Some(stem) = filename.strip_suffix(".tar.gz") else {
-        return false;
+    let (path_package, filename, nested) = match segments.as_slice() {
+        ["src", "contrib", "Archive", package, filename] => (*package, *filename, false),
+        ["src", "contrib", "Archive", package, nested @ .., filename] if !nested.is_empty() => {
+            (*package, *filename, true)
+        }
+        [package, filename] => (*package, *filename, false),
+        [package, nested @ .., filename] if !nested.is_empty() => (*package, *filename, true),
+        _ => return None,
     };
-    let Some((filename_package, version)) = stem.split_once('_') else {
-        return false;
-    };
-    PackageName::new(package).is_ok()
-        && PackageName::new(filename_package).is_ok()
-        && package != filename_package
-        && RPackageVersion::parse(version).is_ok()
+    let stem = filename.strip_suffix(".tar.gz")?;
+    let (filename_package, version) = stem.split_once('_')?;
+    if PackageName::new(path_package).is_err() || PackageName::new(filename_package).is_err() {
+        return None;
+    }
+    let is_foreign_nested =
+        nested && path_package != filename_package && path_package == package_hint.as_str();
+    let is_invalid_version = path_package == package_hint.as_str()
+        && filename_package == package_hint.as_str()
+        && RPackageVersion::parse(version).is_err();
+    if (!is_foreign_nested && !is_invalid_version)
+        || !matches!(
+            error,
+            CranHistoryError::InvalidArchivePath { .. } | CranHistoryError::InvalidPackage { .. }
+        )
+    {
+        return None;
+    }
+    Some(ArchiveHistoryRejection {
+        package_hint: package_hint.clone(),
+        raw_path: path.to_owned().into_boxed_str(),
+        row,
+        version: RPackageVersion::parse(version).ok(),
+        reason: error.to_string().into_boxed_str(),
+    })
 }

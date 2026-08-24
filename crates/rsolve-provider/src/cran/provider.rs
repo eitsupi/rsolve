@@ -18,13 +18,13 @@ use super::catalog::{CranCatalog, CranCatalogObservation};
 use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
 use super::history::CranHistoryError;
-use super::history::{ArchiveEntry, enumerate_archive_rds_for_provider};
+use super::history::{ArchiveEntry, ArchiveHistoryRejection, enumerate_archive_rds_for_provider};
 use crate::SnapshotStore;
 use crate::snapshot::FreshnessStateV1;
 use crate::snapshot::ReadOnlySnapshotCandidateLoader;
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageName, PackageRelease,
-    ReleaseAggregation, SolverKey,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
+    PackageName, PackageRelease, QuarantinedCandidate, ReleaseAggregation, SolverKey,
 };
 
 // Raw-response/cache integration consumes this provider-private policy seam
@@ -483,7 +483,10 @@ impl CranRefreshDiagnostic {
 
 enum CandidateSource {
     Fast(CranCatalog),
-    Fallback(Rc<[ArchiveEntry]>),
+    Fallback {
+        entries: Rc<[ArchiveEntry]>,
+        rejections: Rc<[ArchiveHistoryRejection]>,
+    },
 }
 
 /// A refreshed CRAN candidate source.
@@ -493,7 +496,7 @@ pub(crate) struct CranProvider<T> {
     base_url: Box<str>,
     source: CandidateSource,
     diagnostics: Vec<CranRefreshDiagnostic>,
-    loaded: RefCell<Option<Result<Vec<PackageRelease>, CandidateLoadError>>>,
+    loaded: RefCell<Option<Result<CandidateLoadResult, CandidateLoadError>>>,
     evidence: Option<Rc<RefCell<Vec<CranEvidenceObservation>>>>,
 }
 
@@ -619,17 +622,23 @@ impl<T: Transport> CranProvider<T> {
                 )),
             });
         }
-        let entries = enumerate_archive_rds_for_provider(&response.body)
+        let projection = enumerate_archive_rds_for_provider(&response.body)
             .map_err(CranProviderError::History)?;
-        Ok(CandidateSource::Fallback(Rc::from(
-            entries.into_boxed_slice(),
-        )))
+        Ok(CandidateSource::Fallback {
+            entries: Rc::from(projection.entries.into_boxed_slice()),
+            rejections: Rc::from(projection.rejections.into_boxed_slice()),
+        })
     }
 
     fn load_fallback(
         &self,
         entries: &[ArchiveEntry],
-    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        rejections: &[ArchiveHistoryRejection],
+    ) -> Result<CandidateLoadResult, CandidateLoadError> {
+        let package_rejections = rejections
+            .iter()
+            .filter(|rejection| rejection.package_hint() == &self.package)
+            .collect::<Vec<_>>();
         let mut releases = Vec::new();
         for entry in entries
             .iter()
@@ -711,12 +720,45 @@ impl<T: Transport> CranProvider<T> {
             }
             releases.extend(catalog.candidates(entry.package()).iter().cloned());
         }
-        Ok(releases)
+        let quarantined = package_rejections
+            .iter()
+            .filter_map(|rejection| {
+                rejection.version().map(|version| {
+                    QuarantinedCandidate::new(version.clone(), rejection.diagnostic())
+                })
+            })
+            .collect::<Vec<_>>();
+        if releases.is_empty() && !package_rejections.is_empty() && quarantined.is_empty() {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                format!(
+                    "CRAN archive history has no usable releases for {} after quarantining: {}",
+                    self.package,
+                    package_rejections
+                        .iter()
+                        .map(|rejection| rejection.diagnostic())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            ));
+        }
+        Ok(CandidateLoadResult::new(releases, quarantined))
     }
 }
 
 impl<T: Transport> CandidateLoader for CranProvider<T> {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let result = self.load(package)?;
+        if result.candidates().is_empty() && !result.quarantined().is_empty() {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                format!("CRAN archive history has no eligible releases for {package:?}"),
+            ));
+        }
+        Ok(result.into_parts().0)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
@@ -724,14 +766,20 @@ impl<T: Transport> CandidateLoader for CranProvider<T> {
             ));
         };
         if name != &self.package {
-            return Ok(Vec::new());
+            return Ok(CandidateLoadResult::new(Vec::new(), Vec::new()));
         }
         if let Some(result) = self.loaded.borrow().as_ref() {
             return result.clone();
         }
         let result = match &self.source {
-            CandidateSource::Fast(catalog) => Ok(catalog.candidates(&self.package).to_vec()),
-            CandidateSource::Fallback(entries) => self.load_fallback(entries),
+            CandidateSource::Fast(catalog) => Ok(CandidateLoadResult::new(
+                catalog.candidates(&self.package).to_vec(),
+                Vec::new(),
+            )),
+            CandidateSource::Fallback {
+                entries,
+                rejections,
+            } => self.load_fallback(entries, rejections),
         };
         *self.loaded.borrow_mut() = Some(result.clone());
         result
@@ -816,28 +864,71 @@ impl<T: Transport> CandidateLoader for CranRuntimeLoader<T> {
             CachedProvider::Failed(error) => Err(error.clone()),
         }
     }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        let SolverKey::InstalledName(name) = package else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("CRAN provider has no candidates for {package:?}"),
+            ));
+        };
+        if !self.providers.borrow().contains_key(name) {
+            let state = self.refresh_provider(name);
+            self.providers
+                .borrow_mut()
+                .entry(name.clone())
+                .or_insert(state);
+        }
+        let mut providers = self.providers.borrow_mut();
+        let Some(provider) = providers.get_mut(name) else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                "CRAN provider cache insertion failed",
+            ));
+        };
+        match provider {
+            CachedProvider::Ready(provider) => provider.load(package),
+            CachedProvider::Failed(error) => Err(error.clone()),
+        }
+    }
 }
 
 /// A transport-free, process-local view handed to the resolver after refresh.
 #[derive(Clone, Debug, Default)]
 pub struct CranCandidateSnapshot {
     candidates: HashMap<PackageName, Vec<PackageRelease>>,
+    quarantined: HashMap<PackageName, Vec<QuarantinedCandidate>>,
 }
 
 impl CandidateLoader for CranCandidateSnapshot {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let result = self.load(package)?;
+        if result.candidates().is_empty() && !result.quarantined().is_empty() {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                format!("CRAN snapshot has no eligible releases for {package:?}"),
+            ));
+        }
+        Ok(result.into_parts().0)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
                 format!("CRAN snapshot has no candidates for {package:?}"),
             ));
         };
-        self.candidates.get(name).cloned().ok_or_else(|| {
+        let candidates = self.candidates.get(name).cloned().ok_or_else(|| {
             CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
                 format!("CRAN snapshot has not refreshed package {name}"),
             )
-        })
+        })?;
+        Ok(CandidateLoadResult::new(
+            candidates,
+            self.quarantined.get(name).cloned().unwrap_or_default(),
+        ))
     }
 }
 
@@ -850,6 +941,7 @@ impl CranCandidateSnapshot {
     {
         Self {
             candidates: candidates.into_iter().collect(),
+            quarantined: HashMap::new(),
         }
     }
 
@@ -873,14 +965,17 @@ struct CranRefreshSession<T> {
     test_now: Option<jiff::Timestamp>,
     current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
     history: Option<Result<HistorySource, CandidateLoadError>>,
-    packages: HashMap<PackageName, Result<Vec<PackageRelease>, CandidateLoadError>>,
+    packages: HashMap<PackageName, Result<CandidateLoadResult, CandidateLoadError>>,
     diagnostics: Vec<CranRefreshDiagnostic>,
     evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
 }
 
 #[derive(Clone)]
 enum HistorySource {
-    Available(Rc<[ArchiveEntry]>),
+    Available {
+        entries: Rc<[ArchiveEntry]>,
+        rejections: Rc<[ArchiveHistoryRejection]>,
+    },
     Absent,
 }
 
@@ -1625,9 +1720,28 @@ impl<T: Transport> CranRefreshSession<T> {
                     .map_err(|error| MetadataParseFailure::Invalid(error.to_string().into()))
             },
         ) {
-            Ok((entries, _source, _outcome)) => Ok(HistorySource::Available(Rc::from(
-                entries.into_boxed_slice(),
-            ))),
+            Ok((projection, _source, _outcome)) => {
+                if !projection.rejections.is_empty() {
+                    let first = projection
+                        .rejections
+                        .first()
+                        .map(ArchiveHistoryRejection::diagnostic)
+                        .unwrap_or_else(|| "no rejection detail".to_owned());
+                    let additional = projection.rejections.len().saturating_sub(1);
+                    self.push_history_diagnostic(
+                        endpoint.clone(),
+                        Some(200),
+                        format!(
+                            "archive history quarantined {} package-local release(s); first: {first}; {additional} additional rejection(s)",
+                            projection.rejections.len()
+                        ),
+                    );
+                }
+                Ok(HistorySource::Available {
+                    entries: Rc::from(projection.entries.into_boxed_slice()),
+                    rejections: Rc::from(projection.rejections.into_boxed_slice()),
+                })
+            }
             Err(error) if matches!(error.status, Some(404 | 410)) => {
                 let status = error.status.expect("matched status");
                 self.diagnostics.push(CranRefreshDiagnostic {
@@ -1682,7 +1796,7 @@ impl<T: Transport> CranRefreshSession<T> {
     fn refresh_package(
         &mut self,
         package: &PackageName,
-    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    ) -> Result<CandidateLoadResult, CandidateLoadError> {
         if let Some(result) = self.packages.get(package) {
             return result.clone();
         }
@@ -1694,7 +1808,7 @@ impl<T: Transport> CranRefreshSession<T> {
     fn refresh_package_uncached(
         &mut self,
         package: &PackageName,
-    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    ) -> Result<CandidateLoadResult, CandidateLoadError> {
         let current = self.ensure_current()?.candidates(package).to_vec();
         let endpoint = format!(
             "{}/src/contrib/Archive/{}/PACKAGES.rds",
@@ -1830,7 +1944,7 @@ impl<T: Transport> CranRefreshSession<T> {
             }
             Err(failure) => match self.resolve_fast_path_failure(package_diagnostics, failure)? {
                 Some(source) => source,
-                None => return Ok(current),
+                None => return Ok(CandidateLoadResult::new(current, Vec::new())),
             },
         };
         let provider = CranProvider::from_source(
@@ -1843,9 +1957,12 @@ impl<T: Transport> CranRefreshSession<T> {
         );
         self.diagnostics
             .extend(provider.diagnostics().iter().cloned());
-        let archived = provider.releases(&SolverKey::InstalledName(package.clone()))?;
+        let archived = provider.load(&SolverKey::InstalledName(package.clone()))?;
         let mut aggregation = ReleaseAggregation::new();
-        for release in current.into_iter().chain(archived) {
+        for release in current
+            .into_iter()
+            .chain(archived.candidates().iter().cloned())
+        {
             aggregation.observe_release(release).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
@@ -1855,7 +1972,10 @@ impl<T: Transport> CranRefreshSession<T> {
         }
         let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
-        Ok(candidates)
+        Ok(CandidateLoadResult::new(
+            candidates,
+            archived.quarantined().to_vec(),
+        ))
     }
 
     fn refresh_packages(
@@ -1873,7 +1993,17 @@ impl<T: Transport> CranRefreshSession<T> {
                     result
                         .as_ref()
                         .ok()
-                        .map(|candidates| (package.clone(), candidates.clone()))
+                        .map(|result| (package.clone(), result.candidates().to_vec()))
+                })
+                .collect(),
+            quarantined: self
+                .packages
+                .iter()
+                .filter_map(|(package, result)| {
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(|result| (package.clone(), result.quarantined().to_vec()))
                 })
                 .collect(),
         })

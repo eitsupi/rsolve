@@ -60,6 +60,36 @@ fn runtime_loader_invalid_fast_path_falls_back_to_history() {
 }
 
 #[test]
+fn runtime_loader_preserves_quarantined_archive_history_versions() {
+    let mut transport = FixtureTransport::fallback(Vec::new(), 404);
+    transport.responses.insert(
+        history_url(),
+        TransportResponse {
+            status: 200,
+            body: FOREIGN_NESTED_HISTORY.to_vec(),
+            ..TransportResponse::default()
+        },
+    );
+    transport.responses.insert(
+        "https://cran.invalid/src/contrib/Archive/calibFit/PACKAGES.rds".to_owned(),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let loader = CranRuntimeLoader::new(transport, "https://cran.invalid");
+    let package = PackageName::new("calibFit").unwrap();
+    let result = loader
+        .load(&SolverKey::InstalledName(package))
+        .expect("quarantined history remains loadable");
+    assert!(result.candidates().is_empty());
+    assert_eq!(result.quarantined().len(), 1);
+    assert_eq!(result.quarantined()[0].version().as_str(), "0.1.02");
+    assert!(
+        result.quarantined()[0]
+            .diagnostic()
+            .contains("calibFit/Ancestry")
+    );
+}
+
+#[test]
 fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
     let current = b"Package: Matrix\nVersion: 1.8-0\nLicense: RSOLVE Fictional Current\n";
     let transport = session_transport(

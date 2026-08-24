@@ -31,12 +31,30 @@ const NESTED_HISTORY: &[u8] =
 const FOREIGN_NESTED_HISTORY: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-foreign-nested-archive.rds"
 );
+const LEGACY_VERSION_HISTORY: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-legacy-version.rds"
+);
 const INVALID_HISTORY_PATHS: &[&[u8]] = &[
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-traversal.rds"),
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-query.rds"),
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-fragment.rds"),
     include_bytes!(
         "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-traversal.rds"
+    ),
+    include_bytes!(
+        "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-slash.rds"
+    ),
+    include_bytes!(
+        "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-backslash.rds"
+    ),
+    include_bytes!(
+        "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-dot.rds"
+    ),
+    include_bytes!(
+        "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-query.rds"
+    ),
+    include_bytes!(
+        "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-percent-fragment.rds"
     ),
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-backslash.rds"),
     include_bytes!(

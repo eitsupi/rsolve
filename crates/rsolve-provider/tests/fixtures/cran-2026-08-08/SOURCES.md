@@ -42,6 +42,12 @@ fictional phrase.
 | `synthetic-meta-invalid-query.rds` | 1 | Invalid history query fixture; SHA-256 `2019b78dacf04763634ab6c4c4a7232c583b00edf7598205cc11497f802586d4` |
 | `synthetic-meta-invalid-fragment.rds` | 1 | Invalid history fragment fixture; SHA-256 `7f5cf493a324a85c5f3a89987e7035ad8969c53d08abeaf6953bb5d0c30d7c47` |
 | `synthetic-meta-invalid-percent-traversal.rds` | 1 | Invalid history percent-encoded traversal fixture; SHA-256 `43701bb0e53ba8214dcb736f2ec0b81ee6b7ce79a5457570332010ed2b3ad0b1` |
+| `synthetic-meta-invalid-percent-slash.rds` | 1 | Invalid history percent-encoded slash fixture; SHA-256 `585d25e934de08b01352cad64d5dc3c142f50d5e4a3209cd82cc5324003ab9ce` |
+| `synthetic-meta-invalid-percent-backslash.rds` | 1 | Invalid history percent-encoded backslash fixture; SHA-256 `9f78277d20bf7e951d928d155e90f821d1b06d892b0a12de2cef4fa7451ee078` |
+| `synthetic-meta-invalid-percent-dot.rds` | 1 | Invalid history percent-encoded dot fixture; SHA-256 `d00572b8f8520c17b729959525b190e2251ec5a54e91871196fc90283763aa44` |
+| `synthetic-meta-invalid-percent-query.rds` | 1 | Invalid history percent-encoded query fixture; SHA-256 `04b1a39fec1632b621edfe09e2fdf78db32b394aa15742f0ebb12c619b88737b` |
+| `synthetic-meta-invalid-percent-fragment.rds` | 1 | Invalid history percent-encoded fragment fixture; SHA-256 `edbaeb6a4f9575574f182fa0b1ae7b9b7da8bc957ea76f105de1aea8d3d66908` |
+| `synthetic-meta-invalid-legacy-version.rds` | 1 | Invalid legacy `dse_R2000.4-1` version fixture; SHA-256 `728e3f6d1fdc3353fc5d84da545dcf4515898c9d210d9aacc7a849d281b8bbc5` |
 | `synthetic-meta-invalid-backslash.rds` | 1 | Invalid history backslash fixture; SHA-256 `3e2a882f230793e495072e123c9def34e2963ca9b67388413e7ced6802080fc0` |
 | `synthetic-meta-invalid-package-mismatch.rds` | 1 | Invalid history package mismatch fixture; SHA-256 `22166d709fbc1df80d6de5b2682a519353a54f11bb1d2369aa9acde87e36b7d4` |
 | `synthetic-meta-invalid-version.rds` | 1 | Invalid history version fixture; SHA-256 `c87a2717a1ffeaa2f14f5958c984875de79443f189e4884996b11c6fd2ec66ea` |
