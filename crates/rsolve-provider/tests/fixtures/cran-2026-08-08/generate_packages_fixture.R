@@ -409,6 +409,19 @@ write_binary_fixture(
     "synthetic-nlme-invalid-archive-PACKAGES.rds",
     nlme_archive[3L, , drop = FALSE]
 )
+nlme_invalid_identity <- nlme_archive[1L, , drop = FALSE]
+nlme_invalid_identity[1L, "Version"] <- "3.1.x"
+write_binary_fixture(
+    "synthetic-nlme-invalid-identity-archive-PACKAGES.rds",
+    nlme_invalid_identity
+)
+
+matrix_invalid_path <- matrix_overlay_archive
+matrix_invalid_path[2L, "Path"] <- "4.7.0/NotRecommended"
+write_binary_fixture(
+    "synthetic-matrix-archive-invalid-path-PACKAGES.rds",
+    matrix_invalid_path
+)
 
 tar_field <- function(value, width) {
     bytes <- charToRaw(enc2utf8(value))

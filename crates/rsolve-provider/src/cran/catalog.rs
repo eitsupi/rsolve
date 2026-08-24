@@ -389,11 +389,13 @@ pub(crate) fn provider_observations_from_fields(
             field(&field_refs, "Package").and_then(|value| PackageName::new(value.trim()).ok());
         let version_hint = field(&field_refs, "Version")
             .and_then(|value| RPackageVersion::parse(value.trim()).ok());
-        let scope_hint = field(&field_refs, "Path")
-            .map(classify_path)
-            .transpose()
-            .ok()
-            .flatten();
+        let scope_hint = match context {
+            CranCatalogRecordContext::PackagesIndex => match field(&field_refs, "Path") {
+                Some(path) => classify_path(path).ok(),
+                None => Some(CranCatalogRecordScope::Root),
+            },
+            CranCatalogRecordContext::Description => Some(CranCatalogRecordScope::Root),
+        };
         let identity = match provider_identity_from_fields(&field_refs, context) {
             Ok(identity) => identity,
             Err(error) => {

@@ -324,7 +324,7 @@ impl CranCatalog {
 #[cfg(test)]
 mod tests {
     use super::{CranArchiveIndexProviderError, provider_archive_index_rds};
-    use crate::cran::catalog::CranRecordError;
+    use crate::cran::catalog::{CranCatalogRecordScope, CranRecordError};
     use rsolve_core::PackageName;
 
     const MATRIX_ARCHIVE: &[u8] = include_bytes!(
@@ -337,6 +337,12 @@ mod tests {
         include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-nlme-archive-PACKAGES.rds");
     const NLME_INVALID_ARCHIVE: &[u8] = include_bytes!(
         "../../tests/fixtures/cran-2026-08-08/synthetic-nlme-invalid-archive-PACKAGES.rds"
+    );
+    const NLME_INVALID_IDENTITY_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-nlme-invalid-identity-archive-PACKAGES.rds"
+    );
+    const INVALID_PATH_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-invalid-path-PACKAGES.rds"
     );
 
     #[test]
@@ -370,6 +376,10 @@ mod tests {
         assert_eq!(rejection.record_index(), 2);
         assert_eq!(rejection.package().unwrap().as_str(), "nlme");
         assert_eq!(rejection.version().unwrap().as_str(), "3.1-166");
+        assert!(matches!(
+            rejection.scope(),
+            Some(CranCatalogRecordScope::Root)
+        ));
         assert!(matches!(
             rejection.error(),
             CranRecordError::Dependency {
@@ -410,5 +420,33 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].to_string().contains("nlme"));
         assert!(diagnostics[0].to_string().contains("3.6.x"));
+    }
+
+    #[test]
+    fn provider_archive_projection_keeps_pathless_identity_failures_hard() {
+        let package = PackageName::new("nlme").unwrap();
+        let error = match provider_archive_index_rds(NLME_INVALID_IDENTITY_ARCHIVE, &package) {
+            Ok(_) => panic!("invalid package identity must fail closed"),
+            Err(error) => error,
+        };
+        let CranArchiveIndexProviderError::Identity(diagnostics) = error else {
+            panic!("expected identity rejection");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].to_string().contains("not numeric"));
+    }
+
+    #[test]
+    fn provider_archive_projection_keeps_invalid_recommended_path_hard() {
+        let package = PackageName::new("Matrix").unwrap();
+        let error = match provider_archive_index_rds(INVALID_PATH_ARCHIVE, &package) {
+            Ok(_) => panic!("invalid Recommended Path must fail closed"),
+            Err(error) => error,
+        };
+        let CranArchiveIndexProviderError::Identity(diagnostics) = error else {
+            panic!("expected invalid Path identity rejection");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].to_string().contains("NotRecommended"));
     }
 }

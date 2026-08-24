@@ -37,6 +37,8 @@ fictional phrase.
 | `synthetic-matrix-archive-missing-version.rds` | 2 | Invalid fast-path missing required column fixture; SHA-256 `fabb389fc6fc1cf4951a76121c644df269150184aa7e1860a547b2f064ec2a4c` |
 | `synthetic-nlme-archive-PACKAGES.rds` | 3 | Archive index with two valid `nlme` siblings and one invalid R dependency constraint; SHA-256 `fd345c83e2e2cb9b3559485aac68f7ccffe46f992b7e031b38ca804b2de17f6f` |
 | `synthetic-nlme-invalid-archive-PACKAGES.rds` | 1 | Archive index whose only `nlme` row has an invalid R dependency constraint; SHA-256 `fd710e0bd16b3042d7c0f2fff27ac3a3ec00db77c6b030e7932d4250855574a6` |
+| `synthetic-nlme-invalid-identity-archive-PACKAGES.rds` | 1 | Archive index with a pathless `nlme` row whose package version identity is invalid; SHA-256 `a32c01f0ee9020006bc7bd4438d4b24ea2443b2a550519e3e00f615294eae76f` |
+| `synthetic-matrix-archive-invalid-path-PACKAGES.rds` | 2 | Archive index with a valid root sibling and an invalid Recommended `Path`; SHA-256 `b08d49cc9528b24037a61aeffc3ec1b54f52ac7f64ef154e57ef639e0c85a04f` |
 | `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration, including canonical prefixed source path; SHA-256 `86fb29d89f3718f8128818243c4880cb6fabd67a77470bfab5b8eb2d1be2a5d9` |
 | `synthetic-meta-nested-archive.rds` | 1 | Named-list history with a safe nested archive path for one package; SHA-256 `cf20a3f85fa2248acddb1da6c9c8d008b6847eda7494a9d21ae2a669a94a779b` |
 | `synthetic-meta-foreign-nested-archive.rds` | 1 | Named-list history with a release-local nested path whose filename package differs from the containing archive directory; SHA-256 `45bd82d546e5bbdf9e9328bfaa319c5cf5199f3f89795337e056195b7a732fd7` |
