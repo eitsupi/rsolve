@@ -146,7 +146,10 @@ pub(crate) fn provider_archive_index_rds(
             hard.into_boxed_slice(),
         ));
     }
-    if observations.is_empty() {
+    // A structurally valid archive matrix may legitimately contain no
+    // releases (for example, while a package has no archived versions).
+    // Only an archive made entirely of rejected rows is semantically invalid.
+    if observations.is_empty() && !rejections.is_empty() {
         return Err(CranArchiveIndexProviderError::AllSemantic(
             rejections
                 .iter()
@@ -325,6 +328,9 @@ mod tests {
     const MATRIX_ARCHIVE: &[u8] = include_bytes!(
         "../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-PACKAGES.rds"
     );
+    const EMPTY_MATRIX_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-empty-matrix-archive-PACKAGES.rds"
+    );
 
     #[test]
     fn provider_archive_projection_enforces_expected_package() {
@@ -332,6 +338,16 @@ mod tests {
         let projection = provider_archive_index_rds(MATRIX_ARCHIVE, &package)
             .expect("Matrix archive projection");
         assert_eq!(projection.catalog.candidate_count(), 2);
+        assert!(projection.rejections.is_empty());
+    }
+
+    #[test]
+    fn provider_archive_projection_accepts_empty_matrix() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_archive_index_rds(EMPTY_MATRIX_ARCHIVE, &package)
+            .expect("empty Matrix archive projection");
+        assert_eq!(projection.catalog.candidate_count(), 0);
+        assert!(projection.observations.is_empty());
         assert!(projection.rejections.is_empty());
     }
 }

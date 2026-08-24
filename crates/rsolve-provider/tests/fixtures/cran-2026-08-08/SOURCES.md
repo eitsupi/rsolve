@@ -24,6 +24,7 @@ fictional phrase.
 | `synthetic-archive-PACKAGES.rds` | 4 | Gzip, format-3 archive package matrix; SHA-256 `29666ee379d1f6db074abed4e25795dff251d9506bf1baf5bbd057fe8ce15c85` |
 | `synthetic-valid-archive-PACKAGES.rds` | 3 | Gzip, format-3 valid archive matrix in non-semantic source order; SHA-256 `031591d19106f0a6788a57a7725f6ae32a193b69475ecfcea9ea77a4b00228c0` |
 | `synthetic-matrix-archive-PACKAGES.rds` | 2 | Fast-path Matrix history matrix; SHA-256 `996457bb49b94effe5740b0d1ea135ad2988126097ee3e7b693c68228ecd66e3` |
+| `synthetic-empty-matrix-archive-PACKAGES.rds` | 0 | Structurally valid empty Matrix history matrix; SHA-256 `d71ff77108a5060ec9e3190e78ccec9e43f548c93c612e3b225f6f25933d654e` |
 | `synthetic-matrix-archive-xz-PACKAGES.rds` | 2 | XZ-compressed format-3 Matrix history matrix; SHA-256 `13b61110746dc807800bd0e2e19bdbec104c2e85f8b0f2d0e1d1ea49e5580707` |
 | `synthetic-matrix-archive-bzip2-PACKAGES.rds` | 2 | Bzip2-compressed format-3 Matrix history matrix; SHA-256 `1a6751edf254191282d42e76dfcca33ecaa74b83a44f0476ee314c91965a4d97` |
 | `synthetic-native-utf8-archive-PACKAGES.rds` | 1 | Uncompressed format-2 archive matrix with valid native/unknown UTF-8; SHA-256 `b84f460daf88744203ee0c83e1c25e003cc427ec568969ae4bee85d34dd9355c` |

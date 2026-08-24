@@ -7,6 +7,9 @@ use std::rc::Rc;
 
 const FAST: &[u8] =
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-PACKAGES.rds");
+const EMPTY_FAST: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-empty-matrix-archive-PACKAGES.rds"
+);
 const SEMANTIC_INVALID_FAST: &[u8] =
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-archive-PACKAGES.rds");
 const WRONG_ROOT: &[u8] = include_bytes!(

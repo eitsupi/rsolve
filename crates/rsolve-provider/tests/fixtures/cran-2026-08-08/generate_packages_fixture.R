@@ -247,6 +247,17 @@ set_matrix_archive_row(2L, c(
     NeedsCompilation = "yes"
 ))
 write_binary_fixture("synthetic-matrix-archive-PACKAGES.rds", matrix_archive)
+
+empty_matrix_archive <- matrix(
+    character(),
+    nrow = 0L,
+    ncol = length(archive_columns),
+    dimnames = list(NULL, archive_columns)
+)
+write_binary_fixture(
+    "synthetic-empty-matrix-archive-PACKAGES.rds",
+    empty_matrix_archive
+)
 write_binary_fixture(
     "synthetic-matrix-archive-xz-PACKAGES.rds",
     matrix_archive,

@@ -17,6 +17,8 @@ const MATRIX_ARCHIVE_XZ: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-xz-PACKAGES.rds");
 const MATRIX_ARCHIVE_BZIP2: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-matrix-archive-bzip2-PACKAGES.rds");
+const EMPTY_MATRIX_ARCHIVE: &[u8] =
+    include_bytes!("fixtures/cran-2026-08-08/synthetic-empty-matrix-archive-PACKAGES.rds");
 const NATIVE_UTF8_ARCHIVE: &[u8] =
     include_bytes!("fixtures/cran-2026-08-08/synthetic-native-utf8-archive-PACKAGES.rds");
 const INVALID_UTF8_ARCHIVE: &[u8] =
@@ -142,6 +144,14 @@ fn archive_semantic_invalid_rows_fail_without_partial_catalog() {
         diagnostic.error(),
         CranRecordError::InvalidVersion(_)
     ));
+}
+
+#[test]
+fn empty_archive_matrix_is_a_valid_empty_catalog() {
+    let catalog =
+        CranCatalog::from_archive_index_rds(EMPTY_MATRIX_ARCHIVE).expect("empty archive matrix");
+    assert_eq!(catalog.package_count(), 0);
+    assert_eq!(catalog.candidate_count(), 0);
 }
 
 #[test]

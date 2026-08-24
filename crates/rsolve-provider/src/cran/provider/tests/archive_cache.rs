@@ -269,6 +269,178 @@ fn package_archive_fresh_cache_hit_avoids_network() {
 }
 
 #[test]
+fn empty_package_archive_network_response_is_available_without_fallback() {
+    let mut transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    transport
+        .responses
+        .insert(fast_url(), TransportResponse::new(200, EMPTY_FAST.to_vec()));
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let releases = session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .expect("empty archive fast path");
+    assert_eq!(releases.len(), 1);
+    assert!(
+        requests
+            .borrow()
+            .iter()
+            .any(|request| request.url == fast_url())
+    );
+    assert!(!requests.borrow().iter().any(|request| {
+        request.url == history_url() || request.url == old_url() || request.url == new_url()
+    }));
+    let diagnostic = session
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.endpoint() == fast_url())
+        .expect("empty archive fast-path diagnostic");
+    assert_eq!(diagnostic.status_detail(), &CranFastPathStatus::Available);
+}
+
+#[test]
+fn empty_package_archive_fresh_cache_hit_avoids_network() {
+    let (_directory, store) = store();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let mut first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: TransportResponseHeaders {
+                cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    first_transport.responses.insert(
+        fast_url(),
+        TransportResponse {
+            status: 200,
+            body: EMPTY_FAST.to_vec(),
+            headers: TransportResponseHeaders {
+                cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+                ..TransportResponseHeaders::default()
+            },
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+
+    let second_transport = empty_transport();
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .expect("fresh empty archive cache");
+    assert!(requests.borrow().is_empty());
+    assert_eq!(
+        second
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.endpoint() == fast_url())
+            .map(|diagnostic| diagnostic.status_detail()),
+        Some(&CranFastPathStatus::Available)
+    );
+}
+
+#[test]
+fn empty_package_archive_stale_cache_reuses_body_after_304() {
+    let (_directory, store) = store();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let etag = "\"empty-archive-etag\"";
+    let mut first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: TransportResponseHeaders {
+                cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    first_transport.responses.insert(
+        fast_url(),
+        TransportResponse {
+            status: 200,
+            body: EMPTY_FAST.to_vec(),
+            headers: TransportResponseHeaders {
+                etag: Some(etag.into()),
+                cache_control: CacheControlHeader::Valid("no-cache".into()),
+                ..TransportResponseHeaders::default()
+            },
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+
+    let mut second_transport = empty_transport();
+    second_transport.responses.insert(
+        fast_url(),
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: TransportResponseHeaders {
+                cache_control: CacheControlHeader::Valid("max-age=120".into()),
+                ..TransportResponseHeaders::default()
+            },
+        },
+    );
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .expect("304 empty archive cache");
+    assert_eq!(requests.borrow().len(), 1);
+    assert_eq!(requests.borrow()[0].url, fast_url());
+    assert_eq!(
+        requests.borrow()[0].validators.if_none_match.as_deref(),
+        Some(etag)
+    );
+    let diagnostic = second
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.endpoint() == fast_url())
+        .expect("empty archive 304 diagnostic");
+    assert_eq!(diagnostic.status(), Some(304));
+    assert_eq!(diagnostic.status_detail(), &CranFastPathStatus::Available);
+}
+
+#[test]
 fn mixed_archive_semantic_rejection_stays_on_fast_path_without_history_or_tarballs() {
     let mut transport = session_transport(
         TransportResponse {
