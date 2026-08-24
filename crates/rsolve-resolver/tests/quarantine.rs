@@ -7,7 +7,9 @@ use rsolve_core::{
     ReleaseMetadata, ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey,
     VersionConstraint,
 };
-use rsolve_resolver::{DefaultCandidatePreference, ResolutionFailure, Resolver, Unlocked};
+use rsolve_resolver::{
+    DefaultCandidatePreference, RequireLocked, ResolutionFailure, Resolver, Unlocked,
+};
 
 #[derive(Default)]
 struct FixtureLoader {
@@ -205,4 +207,29 @@ fn transitive_requirement_reports_quarantine_only_intersection() {
             if subject == SolverKey::InstalledName(package("child"))
                 && source.category() == CandidateLoadErrorCategory::MetadataInvalid
     ));
+}
+
+#[test]
+fn required_lock_keeps_lock_semantics_when_only_quarantine_intersects() {
+    let mut loader = FixtureLoader::default();
+    let candidate = release("foo", "1.0", Vec::new());
+    let identity = candidate.identity().clone();
+    loader.candidates.insert(package("foo"), vec![candidate]);
+    loader
+        .quarantined
+        .insert(package("foo"), vec![RPackageVersion::parse("2.0").unwrap()]);
+    let mut request = request(vec![any_dependency(
+        "foo",
+        VersionConstraint::from_clause(
+            rsolve_core::RelationOp::Ge,
+            RPackageVersion::parse("2.0").unwrap(),
+        ),
+    )]);
+    request
+        .locked
+        .insert(SolverKey::InstalledName(package("foo")), identity);
+    let error = Resolver::new(&loader, &DefaultCandidatePreference, &RequireLocked)
+        .resolve(request)
+        .unwrap_err();
+    assert!(matches!(error, ResolutionFailure::NoSolution { .. }));
 }

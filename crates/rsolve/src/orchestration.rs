@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoader, PackageRelease, PublicationCutoff, PublicationDate,
-    Resolution, SolverKey,
+    CandidateLoadError, CandidateLoadResult, CandidateLoader, PackageRelease, PublicationCutoff,
+    PublicationDate, Resolution, SolverKey,
 };
 use rsolve_provider::cran::{
     CranRefreshDiagnostic, CranSnapshotCacheDiagnostic, CranSnapshotPublishError,
@@ -32,6 +32,10 @@ pub(super) struct CandidateLoaderRef<'a>(pub(super) &'a dyn CandidateLoader);
 impl CandidateLoader for CandidateLoaderRef<'_> {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
         self.0.releases(package)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        self.0.load(package)
     }
 }
 

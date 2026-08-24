@@ -247,7 +247,8 @@ impl<'a> Provider<'a> {
                 }
             }
         }
-        if eligible.is_empty()
+        if required.is_none()
+            && eligible.is_empty()
             && range.is_some_and(|range| {
                 loaded
                     .quarantined()

@@ -14,6 +14,11 @@ struct FixtureLoader {
     package: PackageRelease,
 }
 
+struct QuarantinedFixtureLoader {
+    package: PackageRelease,
+    quarantined_version: RPackageVersion,
+}
+
 struct ChoiceLoader {
     packages: Vec<PackageRelease>,
 }
@@ -56,6 +61,25 @@ impl CandidateLoader for FixtureLoader {
                 "fixture has no candidates for this solver key",
             )),
         }
+    }
+}
+
+impl CandidateLoader for QuarantinedFixtureLoader {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        FixtureLoader {
+            package: self.package.clone(),
+        }
+        .releases(package)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        Ok(CandidateLoadResult::new(
+            self.releases(package)?,
+            vec![rsolve_core::QuarantinedCandidate::new(
+                self.quarantined_version.clone(),
+                "fixture quarantine",
+            )],
+        ))
     }
 }
 
@@ -709,6 +733,36 @@ fn injected_loader_exercises_manifest_to_resolution_orchestration() {
             .version(),
         &RPackageVersion::parse("1.0.0").unwrap()
     );
+}
+
+#[test]
+fn injected_loader_preserves_quarantine_metadata_through_orchestration() {
+    let root = PackageName::new("fixture").unwrap();
+    let manifest = Manifest::new(
+        VersionConstraint::from_clause(
+            rsolve_core::RelationOp::Ge,
+            RPackageVersion::parse("4.0").unwrap(),
+        ),
+        crate::manifest::ManifestTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        vec![crate::manifest::ManifestDependency::new(
+            root.clone(),
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Ge,
+                RPackageVersion::parse("2.0").unwrap(),
+            ),
+        )],
+    )
+    .unwrap();
+    let loader = QuarantinedFixtureLoader {
+        package: fixture_loader().package,
+        quarantined_version: RPackageVersion::parse("2.0").unwrap(),
+    };
+    let error = resolve_with_loader(manifest, &loader).unwrap_err();
+    assert!(matches!(
+        error,
+        CranResolutionError::Resolution(ResolutionFailure::CandidateLoad { source, .. })
+            if source.category() == CandidateLoadErrorCategory::MetadataInvalid
+    ));
 }
 
 #[test]
