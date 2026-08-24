@@ -1,5 +1,7 @@
 //! Read-only conversion of an archive package index RDS matrix.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 
@@ -8,9 +10,23 @@ use rd_rds::{NativeEncodingPolicy, file::ReadOptions, package::PackagesMatrix};
 use super::catalog::{
     CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation, CranCatalogRecordContext,
     CranCatalogRecordScope, CranDiagnostic, CranProviderObservationProjection, CranRecordError,
-    catalog_from_observations, observation_from_fields, provider_observations_from_fields,
-    validated_observations_from_fields,
+    provider_observations_from_fields, validated_observations_from_fields,
 };
+
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_IMPORT_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_archive_import_count() {
+    ARCHIVE_IMPORT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn archive_import_count() -> usize {
+    ARCHIVE_IMPORT_COUNT.with(Cell::get)
+}
 
 /// A structural or semantic failure while reading and validating an archive
 /// package index.
@@ -268,6 +284,15 @@ impl CranCatalog {
         input: &[u8],
         options: &ReadOptions,
     ) -> Result<Self, CranArchiveIndexError> {
+        Self::from_archive_index_rds_with_observations(input, options).map(|(catalog, _)| catalog)
+    }
+
+    pub(crate) fn from_archive_index_rds_with_observations(
+        input: &[u8],
+        options: &ReadOptions,
+    ) -> Result<(Self, Vec<CranCatalogObservation>), CranArchiveIndexError> {
+        #[cfg(test)]
+        ARCHIVE_IMPORT_COUNT.with(|count| count.set(count.get() + 1));
         let object = rd_rds::file::from_bytes_with_options(input, options)
             .map_err(CranArchiveIndexError::Decode)?;
         let matrix = PackagesMatrix::from_object(&object).map_err(CranArchiveIndexError::Matrix)?;
@@ -277,37 +302,6 @@ impl CranCatalog {
             }
         }
 
-        let observations = matrix.rows().map(|row| {
-            let package = row.get("Package").flatten().map(str::to_owned);
-            let fields = matrix
-                .column_names()
-                .filter_map(|column| {
-                    row.get(column)
-                        .flatten()
-                        .map(|value| (column.to_owned(), value.to_owned()))
-                })
-                .collect::<Vec<_>>();
-            let field_refs = fields
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str()))
-                .collect::<Vec<_>>();
-            (row.index(), package, observation_from_fields(&field_refs))
-        });
-
-        catalog_from_observations(observations).map_err(CranArchiveIndexError::Semantic)
-    }
-
-    pub(crate) fn observations_from_archive_index_rds(
-        input: &[u8],
-    ) -> Result<Vec<CranCatalogObservation>, CranArchiveIndexError> {
-        let object = rd_rds::file::from_bytes_with_options(input, &provider_rds_read_options())
-            .map_err(CranArchiveIndexError::Decode)?;
-        let matrix = PackagesMatrix::from_object(&object).map_err(CranArchiveIndexError::Matrix)?;
-        for column in ["Package", "Version"] {
-            if matrix.column(column).is_none() {
-                return Err(CranArchiveIndexError::MissingColumn(column));
-            }
-        }
         let records = matrix
             .rows()
             .map(|row| {
@@ -323,14 +317,26 @@ impl CranCatalog {
                 (row.index(), package, fields)
             })
             .collect();
-        validated_observations_from_fields(records).map_err(|error| match error {
-            super::catalog::CranCatalogError::Dcf(_) => {
-                CranArchiveIndexError::Semantic(Box::new([]))
-            }
-            super::catalog::CranCatalogError::Semantic(diagnostics) => {
-                CranArchiveIndexError::Semantic(diagnostics)
-            }
-        })
+
+        let observations =
+            validated_observations_from_fields(records).map_err(|error| match error {
+                super::catalog::CranCatalogError::Dcf(_) => {
+                    CranArchiveIndexError::Semantic(Box::new([]))
+                }
+                super::catalog::CranCatalogError::Semantic(diagnostics) => {
+                    CranArchiveIndexError::Semantic(diagnostics)
+                }
+            })?;
+        let catalog = CranCatalog::from_provider_observations(&observations);
+        Ok((catalog, observations))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observations_from_archive_index_rds(
+        input: &[u8],
+    ) -> Result<Vec<CranCatalogObservation>, CranArchiveIndexError> {
+        Self::from_archive_index_rds_with_observations(input, &provider_rds_read_options())
+            .map(|(_, observations)| observations)
     }
 }
 

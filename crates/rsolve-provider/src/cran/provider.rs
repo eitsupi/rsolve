@@ -11,9 +11,9 @@ use std::time::Duration;
 use self::raw_cache::{
     RawCache, RawCacheEntry, RawCacheLookup, RawCacheRepresentation, RawCacheWrite,
 };
-use super::archive_index::{
-    CranArchiveIndexProviderError, provider_archive_index_rds, provider_rds_read_options,
-};
+#[cfg(test)]
+use super::archive_index::provider_rds_read_options;
+use super::archive_index::{CranArchiveIndexProviderError, provider_archive_index_rds};
 use super::catalog::{CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation};
 use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
@@ -42,12 +42,12 @@ use self::cache_policy::{cache_control_policy, permits_reuse};
 use negative::FastPathFailure;
 #[cfg(test)]
 use refresher::canonical_base_url;
+use refresher::extract_description;
 pub use refresher::{CranSnapshotRefresher, CranSnapshotRefresherError};
-use refresher::{decode_gzip, extract_description};
 #[cfg(test)]
 pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
-    archive_rejection_to_evidence, current_records, index_record_to_evidence, source_input,
+    archive_rejection_to_evidence, import_current_index, index_record_to_evidence, source_input,
     tarball_record_to_evidence,
 };
 #[cfg(test)]
@@ -1207,21 +1207,7 @@ impl<T: Transport> CranRefreshSession<T> {
         representation: CranCurrentIndexRepresentation,
         body: &[u8],
     ) -> Result<(CranCatalog, Vec<CranCatalogObservation>), String> {
-        let catalog = match representation {
-            CranCurrentIndexRepresentation::Rds => {
-                CranCatalog::from_archive_index_rds_with_options(body, &provider_rds_read_options())
-                    .map_err(|error| error.to_string())?
-            }
-            CranCurrentIndexRepresentation::Gzip => {
-                let decoded = decode_gzip(body)?;
-                CranCatalog::from_packages(&decoded).map_err(|error| error.to_string())?
-            }
-            CranCurrentIndexRepresentation::PlainDcf => {
-                CranCatalog::from_packages(body).map_err(|error| error.to_string())?
-            }
-        };
-        let records = current_records(representation, body)?;
-        Ok((catalog, records))
+        import_current_index(representation, body)
     }
 
     fn acquire_metadata<V, P>(

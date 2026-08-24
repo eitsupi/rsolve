@@ -53,22 +53,26 @@ pub(super) fn source_input_with_metadata(
     }
 }
 
-pub(super) fn current_records(
+pub(super) fn import_current_index(
     representation: CranCurrentIndexRepresentation,
     body: &[u8],
-) -> Result<Vec<CranCatalogObservation>, String> {
+) -> Result<(CranCatalog, Vec<CranCatalogObservation>), String> {
     match representation {
         CranCurrentIndexRepresentation::Rds => {
-            CranCatalog::observations_from_archive_index_rds(body)
-                .map_err(|error| error.to_string())
+            CranCatalog::from_archive_index_rds_with_observations(
+                body,
+                &super::super::archive_index::provider_rds_read_options(),
+            )
+            .map_err(|error| error.to_string())
         }
         CranCurrentIndexRepresentation::Gzip => decode_gzip(body)
             .map_err(|error| error.to_string())
             .and_then(|decoded| {
-                CranCatalog::observations_from_packages(&decoded).map_err(|error| error.to_string())
+                CranCatalog::from_packages_with_observations(&decoded)
+                    .map_err(|error| error.to_string())
             }),
         CranCurrentIndexRepresentation::PlainDcf => {
-            CranCatalog::observations_from_packages(body).map_err(|error| error.to_string())
+            CranCatalog::from_packages_with_observations(body).map_err(|error| error.to_string())
         }
     }
 }

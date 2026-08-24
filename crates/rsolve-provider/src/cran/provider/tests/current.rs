@@ -1,5 +1,43 @@
 use super::*;
 use crate::cran::provider::raw_cache::{RawCacheLookup, RawCacheRepresentation, RawCacheWrite};
+use flate2::{Compression, write::GzEncoder};
+use std::io::Write;
+
+#[test]
+fn current_index_import_projects_catalog_and_evidence_from_one_parse() {
+    crate::cran::archive_index::reset_archive_import_count();
+    let (catalog, observations) = CranRefreshSession::<FixtureTransport>::parse_current_body(
+        CranCurrentIndexRepresentation::Rds,
+        NATIVE_UTF8_CURRENT,
+    )
+    .unwrap();
+    assert!(!catalog.is_empty());
+    assert!(!observations.is_empty());
+    assert_eq!(crate::cran::archive_index::archive_import_count(), 1);
+
+    let plain = b"Package: Matrix\nVersion: 1.7-0\nLicense: BSD\n";
+    crate::cran::catalog::reset_packages_import_count();
+    let (catalog, observations) = CranRefreshSession::<FixtureTransport>::parse_current_body(
+        CranCurrentIndexRepresentation::PlainDcf,
+        plain,
+    )
+    .unwrap();
+    assert_eq!(catalog.candidate_count(), 1);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(crate::cran::catalog::packages_import_count(), 1);
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(plain).unwrap();
+    let gzip = encoder.finish().unwrap();
+    crate::cran::catalog::reset_packages_import_count();
+    let (_, observations) = CranRefreshSession::<FixtureTransport>::parse_current_body(
+        CranCurrentIndexRepresentation::Gzip,
+        &gzip,
+    )
+    .unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(crate::cran::catalog::packages_import_count(), 1);
+}
 
 #[test]
 fn current_rds_provider_path_assumes_utf8_for_native_format_two_strings() {

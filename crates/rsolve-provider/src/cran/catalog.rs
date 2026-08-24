@@ -1,5 +1,7 @@
 //! Conversion of a current CRAN `PACKAGES` DCF index into domain candidates.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -16,6 +18,21 @@ use super::{DcfDocument, DcfError};
 
 const CRAN_NAMESPACE: &str = "cran";
 const SOURCE_CHANNEL: &str = "source";
+
+#[cfg(test)]
+thread_local! {
+    static PACKAGES_IMPORT_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_packages_import_count() {
+    PACKAGES_IMPORT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn packages_import_count() -> usize {
+    PACKAGES_IMPORT_COUNT.with(Cell::get)
+}
 
 /// A candidate catalog produced from one pinned current CRAN index.
 #[derive(Clone, Debug, Default)]
@@ -165,17 +182,18 @@ impl CranCatalog {
     /// be trusted. A semantically malformed record rejects the catalog, with
     /// all record diagnostics retained in source order.
     pub fn from_packages(input: &[u8]) -> Result<Self, CranCatalogError> {
+        Self::from_packages_with_observations(input).map(|(catalog, _)| catalog)
+    }
+
+    /// Parses and validates a plain PACKAGES index once, returning both the
+    /// candidate catalog and the lossless observations projected from it.
+    pub(crate) fn from_packages_with_observations(
+        input: &[u8],
+    ) -> Result<(Self, Vec<CranCatalogObservation>), CranCatalogError> {
+        #[cfg(test)]
+        PACKAGES_IMPORT_COUNT.with(|count| count.set(count.get() + 1));
         let document = DcfDocument::parse(input).map_err(CranCatalogError::Dcf)?;
-        Self::from_document(document)
-    }
-
-    /// Alias for [`Self::from_packages`].
-    pub fn parse(input: &[u8]) -> Result<Self, CranCatalogError> {
-        Self::from_packages(input)
-    }
-
-    fn from_document(document: DcfDocument) -> Result<Self, CranCatalogError> {
-        let observations = document
+        let records = document
             .records()
             .iter()
             .enumerate()
@@ -186,22 +204,22 @@ impl CranCatalog {
                 let fields = record
                     .fields()
                     .iter()
-                    .map(|field| (field.name(), field.value()))
-                    .collect::<Vec<_>>();
-                (
-                    record_index,
-                    package,
-                    observation_from_fields_with_context(
-                        &fields,
-                        CranCatalogRecordContext::PackagesIndex,
-                    ),
-                )
-            });
-        catalog_from_observations_with_context(
-            observations,
+                    .map(|field| (field.name().to_owned(), field.value().to_owned()))
+                    .collect();
+                (record_index, package, fields)
+            })
+            .collect();
+        let observations = validated_observations_from_fields_with_context(
+            records,
             CranCatalogRecordContext::PackagesIndex,
-        )
-        .map_err(CranCatalogError::Semantic)
+        )?;
+        let catalog = Self::from_provider_observations(&observations);
+        Ok((catalog, observations))
+    }
+
+    /// Alias for [`Self::from_packages`].
+    pub fn parse(input: &[u8]) -> Result<Self, CranCatalogError> {
+        Self::from_packages(input)
     }
 
     /// Parses a package archive's `DESCRIPTION` DCF record.
@@ -237,6 +255,7 @@ impl CranCatalog {
             .map_err(CranCatalogError::Semantic)
     }
 
+    #[cfg(test)]
     pub(crate) fn observations_from_packages(
         input: &[u8],
     ) -> Result<Vec<CranCatalogObservation>, CranCatalogError> {
@@ -741,21 +760,6 @@ impl fmt::Display for DependencyParseError {
 
 impl Error for DependencyParseError {}
 
-pub(super) fn catalog_from_observations<I>(
-    observations: I,
-) -> Result<CranCatalog, Box<[CranDiagnostic]>>
-where
-    I: IntoIterator<
-        Item = (
-            usize,
-            Option<String>,
-            Result<ReleaseObservation, CranRecordError>,
-        ),
-    >,
-{
-    catalog_from_observations_with_context(observations, CranCatalogRecordContext::PackagesIndex)
-}
-
 pub(super) fn catalog_from_observations_with_context<I>(
     observations: I,
     context: CranCatalogRecordContext,
@@ -857,6 +861,7 @@ fn observation_scope(
     }
 }
 
+#[cfg(test)]
 pub(super) fn observation_from_fields(
     fields: &[(&str, &str)],
 ) -> Result<ReleaseObservation, CranRecordError> {
