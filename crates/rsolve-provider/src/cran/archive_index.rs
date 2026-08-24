@@ -183,6 +183,7 @@ fn provider_rejection_is_hard(rejection: &CranArchiveReleaseRejection) -> bool {
         CranRecordError::Domain(rsolve_core::PackageReleaseError::InvalidDependency { .. }) => {
             false
         }
+        CranRecordError::Dependency { .. } => false,
         CranRecordError::InvalidPath { .. } => true,
         CranRecordError::Domain(_) => true,
         _ => false,
@@ -322,7 +323,8 @@ impl CranCatalog {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_archive_index_rds;
+    use super::{CranArchiveIndexProviderError, provider_archive_index_rds};
+    use crate::cran::catalog::CranRecordError;
     use rsolve_core::PackageName;
 
     const MATRIX_ARCHIVE: &[u8] = include_bytes!(
@@ -330,6 +332,11 @@ mod tests {
     );
     const EMPTY_MATRIX_ARCHIVE: &[u8] = include_bytes!(
         "../../tests/fixtures/cran-2026-08-08/synthetic-empty-matrix-archive-PACKAGES.rds"
+    );
+    const NLME_ARCHIVE: &[u8] =
+        include_bytes!("../../tests/fixtures/cran-2026-08-08/synthetic-nlme-archive-PACKAGES.rds");
+    const NLME_INVALID_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-nlme-invalid-archive-PACKAGES.rds"
     );
 
     #[test]
@@ -349,5 +356,59 @@ mod tests {
         assert_eq!(projection.catalog.candidate_count(), 0);
         assert!(projection.observations.is_empty());
         assert!(projection.rejections.is_empty());
+    }
+
+    #[test]
+    fn provider_archive_projection_quarantines_invalid_dependency_versions() {
+        let package = PackageName::new("nlme").unwrap();
+        let projection = provider_archive_index_rds(NLME_ARCHIVE, &package)
+            .expect("valid nlme siblings must survive a semantic rejection");
+        assert_eq!(projection.catalog.candidate_count(), 2);
+        assert_eq!(projection.observations.len(), 2);
+        assert_eq!(projection.rejections.len(), 1);
+        let rejection = &projection.rejections[0];
+        assert_eq!(rejection.record_index(), 2);
+        assert_eq!(rejection.package().unwrap().as_str(), "nlme");
+        assert_eq!(rejection.version().unwrap().as_str(), "3.1-166");
+        assert!(matches!(
+            rejection.error(),
+            CranRecordError::Dependency {
+                field: "Depends",
+                ..
+            }
+        ));
+        assert!(
+            rejection
+                .fields()
+                .iter()
+                .any(|(name, value)| { name == "Package" && value == "nlme" })
+        );
+        assert!(
+            rejection
+                .fields()
+                .iter()
+                .any(|(name, value)| { name == "Version" && value == "3.1-166" })
+        );
+        assert!(
+            rejection
+                .fields()
+                .iter()
+                .any(|(name, value)| { name == "Depends" && value == "R (>= 3.6.x)" })
+        );
+    }
+
+    #[test]
+    fn provider_archive_projection_rejects_all_semantically_invalid_rows() {
+        let package = PackageName::new("nlme").unwrap();
+        let error = match provider_archive_index_rds(NLME_INVALID_ARCHIVE, &package) {
+            Ok(_) => panic!("an archive with no valid releases must fail closed"),
+            Err(error) => error,
+        };
+        let CranArchiveIndexProviderError::AllSemantic(diagnostics) = error else {
+            panic!("expected all-semantic rejection");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].to_string().contains("nlme"));
+        assert!(diagnostics[0].to_string().contains("3.6.x"));
     }
 }

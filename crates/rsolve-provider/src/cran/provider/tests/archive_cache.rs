@@ -582,6 +582,104 @@ fn mixed_archive_semantic_rejection_stays_on_fast_path_without_history_or_tarbal
 }
 
 #[test]
+fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
+    let (_directory, store) = store();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let cache_headers = TransportResponseHeaders {
+        etag: Some("\"nlme-archive\"".into()),
+        cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+        ..TransportResponseHeaders::default()
+    };
+    let mut first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: cache_headers.clone(),
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    first_transport.responses.insert(
+        fast_url_for("nlme"),
+        TransportResponse {
+            status: 200,
+            body: NLME_ARCHIVE.to_vec(),
+            headers: cache_headers.clone(),
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let package = PackageName::new("nlme").unwrap();
+    let first_result = first.refresh_package(&package).expect("network archive");
+    assert_eq!(
+        release_signature(first_result.candidates()),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert_eq!(first_result.quarantined().len(), 1);
+    assert_eq!(first_result.quarantined()[0].version().as_str(), "3.1-166");
+
+    let fresh_transport = empty_transport();
+    let fresh_requests = fresh_transport.requests.clone();
+    let mut fresh = CranRefreshSession::new_with_clock(
+        Rc::new(fresh_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let fresh_result = fresh
+        .refresh_package(&package)
+        .expect("fresh archive cache");
+    assert!(fresh_requests.borrow().is_empty());
+    assert_eq!(
+        release_signature(fresh_result.candidates()),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert_eq!(fresh_result.quarantined().len(), 1);
+
+    let mut stale_transport = empty_transport();
+    stale_transport.responses.insert(
+        current_rds_url(),
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: cache_headers.clone(),
+        },
+    );
+    stale_transport.responses.insert(
+        fast_url_for("nlme"),
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: cache_headers,
+        },
+    );
+    let stale_requests = stale_transport.requests.clone();
+    let mut stale = CranRefreshSession::new_with_clock(
+        Rc::new(stale_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T01:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let stale_result = stale.refresh_package(&package).expect("304 archive cache");
+    assert_eq!(
+        release_signature(stale_result.candidates()),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert_eq!(stale_result.quarantined().len(), 1);
+    assert_eq!(stale_requests.borrow().len(), 2);
+    assert!(
+        stale_requests
+            .borrow()
+            .iter()
+            .all(|request| request.validators.if_none_match.as_deref() == Some("\"nlme-archive\""))
+    );
+}
+
+#[test]
 fn archive_rejection_survives_snapshot_roundtrip_and_keeps_valid_sibling_visible() {
     let (_directory, store) = store();
     let mut transport = session_transport(

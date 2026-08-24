@@ -36,6 +36,8 @@ const ROOT_NESTED_MIXED_HISTORY: &[u8] =
 const ROOT_UNSAFE_PERCENT_HISTORY: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-root-unsafe-percent.rds"
 );
+const NLME_ARCHIVE: &[u8] =
+    include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-nlme-archive-PACKAGES.rds");
 const LEGACY_VERSION_HISTORY: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-legacy-version.rds"
 );

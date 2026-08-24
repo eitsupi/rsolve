@@ -367,6 +367,49 @@ write_binary_fixture(
     matrix_archive[, setdiff(colnames(matrix_archive), "Version"), drop = FALSE]
 )
 
+nlme_archive_columns <- archive_columns
+nlme_archive <- matrix(
+    NA_character_,
+    nrow = 3L,
+    ncol = length(nlme_archive_columns),
+    dimnames = list(NULL, nlme_archive_columns)
+)
+set_nlme_archive_row <- function(row, values) {
+    nlme_archive[row, names(values)] <<- unname(values)
+}
+set_nlme_archive_row(1L, c(
+    Package = "nlme",
+    Version = "3.1-168",
+    Depends = "R (>= 3.6.0)",
+    Imports = "graphics, stats, utils, lattice",
+    License = "RSOLVE Fictional Terms nlme",
+    MD5sum = "00000000000000000000000000000041",
+    NeedsCompilation = "yes"
+))
+set_nlme_archive_row(2L, c(
+    Package = "nlme",
+    Version = "3.1-167",
+    Depends = "R (>= 3.5.0)",
+    Imports = "graphics, stats, utils, lattice",
+    License = "RSOLVE Fictional Terms nlme",
+    MD5sum = "00000000000000000000000000000042",
+    NeedsCompilation = "yes"
+))
+set_nlme_archive_row(3L, c(
+    Package = "nlme",
+    Version = "3.1-166",
+    Depends = "R (>= 3.6.x)",
+    Imports = "graphics, stats, utils, lattice",
+    License = "RSOLVE Fictional Terms nlme",
+    MD5sum = "00000000000000000000000000000043",
+    NeedsCompilation = "yes"
+))
+write_binary_fixture("synthetic-nlme-archive-PACKAGES.rds", nlme_archive)
+write_binary_fixture(
+    "synthetic-nlme-invalid-archive-PACKAGES.rds",
+    nlme_archive[3L, , drop = FALSE]
+)
+
 tar_field <- function(value, width) {
     bytes <- charToRaw(enc2utf8(value))
     if (length(bytes) >= width) {

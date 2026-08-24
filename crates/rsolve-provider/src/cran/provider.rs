@@ -14,7 +14,7 @@ use self::raw_cache::{
 use super::archive_index::{
     CranArchiveIndexProviderError, provider_archive_index_rds, provider_rds_read_options,
 };
-use super::catalog::{CranCatalog, CranCatalogObservation};
+use super::catalog::{CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation};
 use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
 use super::history::CranHistoryError;
@@ -482,7 +482,10 @@ impl CranRefreshDiagnostic {
 }
 
 enum CandidateSource {
-    Fast(CranCatalog),
+    Fast {
+        catalog: CranCatalog,
+        rejections: Rc<[CranArchiveReleaseRejection]>,
+    },
     Fallback {
         entries: Rc<[ArchiveEntry]>,
         rejections: Rc<[ArchiveHistoryRejection]>,
@@ -533,7 +536,10 @@ impl<T: Transport> CranProvider<T> {
                         status_detail: CranFastPathStatus::Available,
                         source: CranRefreshSource::ArchiveFastPath,
                     });
-                    CandidateSource::Fast(catalog)
+                    CandidateSource::Fast {
+                        catalog,
+                        rejections: Rc::from(Vec::new().into_boxed_slice()),
+                    }
                 }
                 Err(error) => {
                     diagnostics.push(CranRefreshDiagnostic {
@@ -772,10 +778,39 @@ impl<T: Transport> CandidateLoader for CranProvider<T> {
             return result.clone();
         }
         let result = match &self.source {
-            CandidateSource::Fast(catalog) => Ok(CandidateLoadResult::new(
-                catalog.candidates(&self.package).to_vec(),
-                Vec::new(),
-            )),
+            CandidateSource::Fast {
+                catalog,
+                rejections,
+            } => {
+                let candidates = catalog.candidates(&self.package).to_vec();
+                let quarantined = rejections
+                    .iter()
+                    .filter_map(|rejection| {
+                        rejection.version().map(|version| {
+                            QuarantinedCandidate::new(
+                                version.clone(),
+                                rejection.diagnostic().to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() && !rejections.is_empty() && quarantined.is_empty() {
+                    Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        format!(
+                            "CRAN archive index has no usable releases for {} after quarantining: {}",
+                            self.package,
+                            rejections
+                                .iter()
+                                .map(|rejection| rejection.diagnostic().to_string())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    ))
+                } else {
+                    Ok(CandidateLoadResult::new(candidates, quarantined))
+                }
+            }
             CandidateSource::Fallback {
                 entries,
                 rejections,
@@ -1889,7 +1924,10 @@ impl<T: Transport> CranRefreshSession<T> {
                     },
                     source: CranRefreshSource::ArchiveFastPath,
                 });
-                Ok(CandidateSource::Fast(catalog))
+                Ok(CandidateSource::Fast {
+                    catalog,
+                    rejections: Rc::from(rejections.into_boxed_slice()),
+                })
             }
             Err(error) if matches!(error.status, Some(404 | 410)) => {
                 let status = error.status.expect("matched status");
