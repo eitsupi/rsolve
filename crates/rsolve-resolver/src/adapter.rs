@@ -11,10 +11,10 @@ use pubgrub::{
     PackageResolutionStatistics, PubGrubError, Ranges, resolve,
 };
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, PackageRelease, PublicationCutoff,
-    PublicationDate, RPackageVersion, RelationOp, ReleaseIdentity, Resolution, ResolutionRequest,
-    SolverKey, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
+    DependencyKind, DependencyRequirement, DependencySourceConstraint, PackageRelease,
+    PublicationCutoff, PublicationDate, RPackageVersion, RelationOp, ReleaseIdentity, Resolution,
+    ResolutionRequest, SolverKey, VersionConstraint,
 };
 
 use crate::{CandidatePreference, LockDecision, LockUpdatePolicy, PreferenceContext};
@@ -87,21 +87,25 @@ struct Provider<'a> {
     preference: &'a dyn CandidatePreference,
     lock_policy: &'a dyn LockUpdatePolicy,
     request: &'a ResolutionRequest,
-    cache: RefCell<HashMap<SolverKey, Result<Vec<PackageRelease>, CandidateLoadError>>>,
+    cache: RefCell<HashMap<SolverKey, Result<CandidateLoadResult, CandidateLoadError>>>,
 }
 
 impl<'a> Provider<'a> {
-    fn candidates(&self, subject: &SolverKey) -> Result<Vec<PackageRelease>, Box<AdapterError>> {
+    fn loaded(&self, subject: &SolverKey) -> Result<CandidateLoadResult, Box<AdapterError>> {
         if let Some(cached) = self.cache.borrow().get(subject) {
             return cached
                 .clone()
                 .map_err(|source| candidate_load_error(subject.clone(), source));
         }
-        let result = self.loader.releases(subject);
+        let result = self.loader.load(subject);
         self.cache
             .borrow_mut()
             .insert(subject.clone(), result.clone());
         result.map_err(|source| candidate_load_error(subject.clone(), source))
+    }
+
+    fn candidates(&self, subject: &SolverKey) -> Result<Vec<PackageRelease>, Box<AdapterError>> {
+        Ok(self.loaded(subject)?.into_parts().0)
     }
 
     fn r_version(&self) -> &RPackageVersion {
@@ -192,7 +196,8 @@ impl<'a> Provider<'a> {
         range: Option<&Ranges<RPackageVersion>>,
         use_candidates: impl FnOnce(&mut Vec<PackageRelease>, &PreferenceContext<'_>) -> T,
     ) -> Result<T, Box<AdapterError>> {
-        let candidates = self.candidates(subject)?;
+        let loaded = self.loaded(subject)?;
+        let candidates = loaded.candidates().to_vec();
         let decision = self.lock_decision(subject);
         let required = match &decision {
             LockDecision::Require(identity) => Some(identity),
@@ -241,6 +246,31 @@ impl<'a> Provider<'a> {
                     eligible = candidates_before_policy;
                 }
             }
+        }
+        if eligible.is_empty()
+            && range.is_some_and(|range| {
+                loaded
+                    .quarantined()
+                    .iter()
+                    .any(|candidate| range.contains(candidate.version()))
+            })
+        {
+            let versions = loaded
+                .quarantined()
+                .iter()
+                .filter(|candidate| range.is_none_or(|range| range.contains(candidate.version())))
+                .map(|candidate| candidate.version().to_string())
+                .collect::<Vec<_>>();
+            return Err(candidate_load_error(
+                subject.clone(),
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!(
+                        "all candidates matching the requested range were quarantined: {}",
+                        versions.join(", ")
+                    ),
+                ),
+            ));
         }
         Ok(use_candidates(&mut eligible, &context))
     }
@@ -297,7 +327,7 @@ impl<'a> Provider<'a> {
             }
             LockDecision::Unlocked => None,
         };
-        let candidates = self.candidates(subject)?;
+        let candidates = self.loaded(subject)?.candidates().to_vec();
         let matching = candidates
             .iter()
             .filter(|candidate| {

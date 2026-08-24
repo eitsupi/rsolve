@@ -39,6 +39,7 @@ pub use publication::{
 pub use r_versions::{RPackageVersion, RPackageVersionError};
 pub use request::{LockedIdentities, ResolutionRequest, SolverKey};
 pub use resolution::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, Resolution, ResolvedPackage,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
+    QuarantinedCandidate, Resolution, ResolvedPackage,
 };
 pub use target::ResolutionTarget;

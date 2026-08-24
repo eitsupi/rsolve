@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::{PackageName, PackageRelease, ResolutionTarget, SolverKey};
+use crate::{PackageName, PackageRelease, RPackageVersion, ResolutionTarget, SolverKey};
 
 /// The stable categories a candidate source may report to the resolver.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -46,11 +46,77 @@ impl fmt::Display for CandidateLoadError {
 
 impl Error for CandidateLoadError {}
 
+/// A release coordinate that was observed but quarantined before it could be
+/// projected into an installable candidate.
+///
+/// Quarantined coordinates are intentionally provider-neutral.  Providers may
+/// retain richer raw evidence in their snapshots, while the resolver only
+/// needs to know which versions must not be treated as an ordinary
+/// no-solution result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuarantinedCandidate {
+    version: RPackageVersion,
+    diagnostic: Box<str>,
+}
+
+impl QuarantinedCandidate {
+    pub fn new(version: RPackageVersion, diagnostic: impl Into<Box<str>>) -> Self {
+        Self {
+            version,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    pub fn version(&self) -> &RPackageVersion {
+        &self.version
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+/// The provider-neutral result of loading one solver subject's candidates.
+#[derive(Clone, Debug)]
+pub struct CandidateLoadResult {
+    candidates: Vec<PackageRelease>,
+    quarantined: Vec<QuarantinedCandidate>,
+}
+
+impl CandidateLoadResult {
+    pub fn new(candidates: Vec<PackageRelease>, quarantined: Vec<QuarantinedCandidate>) -> Self {
+        Self {
+            candidates,
+            quarantined,
+        }
+    }
+
+    pub fn candidates(&self) -> &[PackageRelease] {
+        &self.candidates
+    }
+
+    pub fn quarantined(&self) -> &[QuarantinedCandidate] {
+        &self.quarantined
+    }
+
+    pub fn into_parts(self) -> (Vec<PackageRelease>, Vec<QuarantinedCandidate>) {
+        (self.candidates, self.quarantined)
+    }
+}
+
 /// The resolver's candidate-loading port.  Implementations own their catalog
 /// and any provider-specific conversion; the solver only sees validated
 /// domain releases.
 pub trait CandidateLoader {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError>;
+
+    /// Loads validated candidates together with coordinates that were
+    /// deliberately quarantined by the provider.  Existing loaders that have
+    /// no quarantine information get the ordinary candidate-only projection.
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        self.releases(package)
+            .map(|candidates| CandidateLoadResult::new(candidates, Vec::new()))
+    }
 }
 
 /// One selected installable logical release.

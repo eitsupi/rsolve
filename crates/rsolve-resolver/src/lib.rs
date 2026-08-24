@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencySourceConstraint, PackageName, PackageRelease, Provenance, PublicationDate,
-    RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, Resolution,
-    ResolutionRequest, SolverKey, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
+    DependencyKind, DependencySourceConstraint, PackageName, PackageRelease, Provenance,
+    PublicationDate, RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+    Resolution, ResolutionRequest, SolverKey, VersionConstraint,
 };
 
 pub use adapter::{
@@ -135,6 +135,15 @@ impl<L: CandidateLoader> CandidateLoader for RBasePackageOverlay<L> {
             return Ok(vec![release.clone()]);
         }
         self.loader.releases(package)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        if let SolverKey::InstalledName(name) = package
+            && let Some(release) = self.base.get(name)
+        {
+            return Ok(CandidateLoadResult::new(vec![release.clone()], Vec::new()));
+        }
+        self.loader.load(package)
     }
 }
 

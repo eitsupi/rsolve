@@ -23,6 +23,54 @@ fn read_only_loader_maps_present_and_missing_states_without_io() {
 }
 
 #[test]
+fn read_only_loader_projects_quarantined_versions_alongside_valid_siblings() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("quarantined-sibling.redb");
+    let mut input = present_input();
+    input.histories[0].observations.push(RawObservationV1 {
+        id: 1,
+        source_index: 0,
+        record_index: 1,
+        fields: vec![
+            FieldV1 {
+                name: "Package".into(),
+                value: "foo".into(),
+            },
+            FieldV1 {
+                name: "Version".into(),
+                value: "2.0".into(),
+            },
+        ],
+        artifact: None,
+        axes: EvidenceAxesV1 {
+            parse: ParseStateV1::Valid,
+            namespace: NamespaceStateV1::Established,
+            occurrence: OccurrenceStateV1::ObservationOnly,
+            semantics: SemanticsStateV1::Invalid,
+            publication: PublicationStateV1::Unknown,
+            freshness: FreshnessStateV1::CurrentGeneration,
+        },
+    });
+    input.histories[0].decisions = vec![DecisionV1 {
+        code: DecisionCodeV1::QuarantinedRelease,
+        observation_ids: vec![1],
+        detail: "release was quarantined after semantic validation".into(),
+    }];
+    SnapshotGenerationBuilder::new(input, &path)
+        .build()
+        .unwrap();
+    let loader =
+        ReadOnlySnapshotCandidateLoader::open(&path, RegistryId::new("cran").unwrap()).unwrap();
+    let loaded = loader
+        .load(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+        .unwrap();
+    assert_eq!(loaded.candidates().len(), 1);
+    assert_eq!(loaded.candidates()[0].version().as_str(), "1.0");
+    assert_eq!(loaded.quarantined().len(), 1);
+    assert_eq!(loaded.quarantined()[0].version().as_str(), "2.0");
+}
+
+#[test]
 fn read_only_loader_maps_partial_and_incomplete_missing_states() {
     let dir = tempdir().unwrap();
     let mut partial = input();

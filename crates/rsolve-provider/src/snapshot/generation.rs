@@ -72,7 +72,7 @@ impl ReadOnlySnapshotCandidateLoader {
     fn releases_for_name(
         &self,
         name: &PackageName,
-    ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    ) -> Result<CandidateLoadResult, CandidateLoadError> {
         let read = self.database.begin_read().map_err(snapshot_invalid)?;
         let table = read
             .open_table(PACKAGE_HISTORIES)
@@ -101,17 +101,29 @@ impl ReadOnlySnapshotCandidateLoader {
                 "package history is incomplete and cannot provide candidates",
             ));
         }
-        history
+        let candidates = history
             .eligible_releases
             .iter()
             .map(release_to_domain)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(package_metadata_invalid)
+            .map_err(package_metadata_invalid)?;
+        let quarantined = quarantined_candidates(&history);
+        Ok(CandidateLoadResult::new(candidates, quarantined))
     }
 }
 
 impl CandidateLoader for ReadOnlySnapshotCandidateLoader {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let result = self.load(package)?;
+        if result.candidates().is_empty() && !result.quarantined().is_empty() {
+            return Err(package_metadata_invalid(
+                "package history has no eligible release",
+            ));
+        }
+        Ok(result.into_parts().0)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
@@ -120,6 +132,31 @@ impl CandidateLoader for ReadOnlySnapshotCandidateLoader {
         };
         self.releases_for_name(name)
     }
+}
+
+fn quarantined_candidates(history: &PackageHistoryV1) -> Vec<QuarantinedCandidate> {
+    let mut result = history
+        .decisions
+        .iter()
+        .filter(|decision| matches!(decision.code, DecisionCodeV1::QuarantinedRelease))
+        .flat_map(|decision| {
+            decision.observation_ids.iter().filter_map(|id| {
+                let observation = history
+                    .observations
+                    .iter()
+                    .find(|candidate| candidate.id == *id)?;
+                let version = observation
+                    .fields
+                    .iter()
+                    .find(|field| field.name.eq_ignore_ascii_case("Version"))
+                    .and_then(|field| RPackageVersion::parse(&field.value).ok())?;
+                Some(QuarantinedCandidate::new(version, decision.detail.clone()))
+            })
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| left.version().cmp(right.version()));
+    result.dedup_by(|left, right| left.version() == right.version());
+    result
 }
 
 fn snapshot_invalid(error: impl fmt::Display) -> CandidateLoadError {
