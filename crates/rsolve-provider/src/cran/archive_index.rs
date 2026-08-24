@@ -7,8 +7,9 @@ use rd_rds::{NativeEncodingPolicy, file::ReadOptions, package::PackagesMatrix};
 
 use super::catalog::{
     CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation, CranCatalogRecordContext,
-    CranDiagnostic, CranProviderObservationProjection, CranRecordError, catalog_from_observations,
-    observation_from_fields, provider_observations_from_fields, validated_observations_from_fields,
+    CranCatalogRecordScope, CranDiagnostic, CranProviderObservationProjection, CranRecordError,
+    catalog_from_observations, observation_from_fields, provider_observations_from_fields,
+    validated_observations_from_fields,
 };
 
 /// A structural or semantic failure while reading and validating an archive
@@ -138,7 +139,7 @@ pub(crate) fn provider_archive_index_rds(
     );
     let hard = rejections
         .iter()
-        .filter(|diagnostic| provider_rejection_is_hard(diagnostic))
+        .filter(|diagnostic| provider_rejection_is_hard(diagnostic, expected_package))
         .map(CranArchiveReleaseRejection::diagnostic)
         .collect::<Vec<_>>();
     if !hard.is_empty() {
@@ -165,10 +166,22 @@ pub(crate) fn provider_archive_index_rds(
     })
 }
 
-fn provider_rejection_is_hard(rejection: &CranArchiveReleaseRejection) -> bool {
-    if rejection.package().is_none() || rejection.version().is_none() || rejection.scope().is_none()
-    {
+fn provider_rejection_is_hard(
+    rejection: &CranArchiveReleaseRejection,
+    expected_package: &rsolve_core::PackageName,
+) -> bool {
+    if rejection.package().is_none() || rejection.scope().is_none() {
         return true;
+    }
+    if rejection.version().is_none() {
+        return !matches!(
+            (rejection.error(), rejection.package(), rejection.scope()),
+            (
+                CranRecordError::InvalidVersion(_),
+                Some(package),
+                Some(CranCatalogRecordScope::Root),
+            ) if package == expected_package
+        );
     }
     match rejection.error() {
         CranRecordError::MissingField("Package")
@@ -341,6 +354,12 @@ mod tests {
     const NLME_INVALID_IDENTITY_ARCHIVE: &[u8] = include_bytes!(
         "../../tests/fixtures/cran-2026-08-08/synthetic-nlme-invalid-identity-archive-PACKAGES.rds"
     );
+    const NLME_INVALID_VERSION_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-nlme-invalid-version-archive-PACKAGES.rds"
+    );
+    const NLME_ALL_INVALID_VERSION_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-nlme-all-invalid-version-archive-PACKAGES.rds"
+    );
     const INVALID_PATH_ARCHIVE: &[u8] = include_bytes!(
         "../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-invalid-path-PACKAGES.rds"
     );
@@ -433,7 +452,50 @@ mod tests {
             panic!("expected identity rejection");
         };
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].to_string().contains("not numeric"));
+        assert!(
+            diagnostics[0]
+                .to_string()
+                .contains("package name has an invalid character")
+        );
+    }
+
+    #[test]
+    fn provider_archive_projection_quarantines_pathless_invalid_version() {
+        let package = PackageName::new("nlme").unwrap();
+        let projection = provider_archive_index_rds(NLME_INVALID_VERSION_ARCHIVE, &package)
+            .expect("valid siblings must survive an invalid raw Version");
+        assert_eq!(projection.catalog.candidate_count(), 2);
+        assert_eq!(projection.rejections.len(), 1);
+        let rejection = &projection.rejections[0];
+        assert_eq!(rejection.package().unwrap().as_str(), "nlme");
+        assert!(rejection.version().is_none());
+        assert!(matches!(
+            rejection.scope(),
+            Some(CranCatalogRecordScope::Root)
+        ));
+        assert!(matches!(
+            rejection.error(),
+            CranRecordError::InvalidVersion(_)
+        ));
+        assert!(
+            rejection
+                .fields()
+                .iter()
+                .any(|(name, value)| { name == "Version" && value == "3.1-2 (1999/12/23)" })
+        );
+    }
+
+    #[test]
+    fn provider_archive_projection_rejects_all_pathless_invalid_versions() {
+        let package = PackageName::new("nlme").unwrap();
+        let error = match provider_archive_index_rds(NLME_ALL_INVALID_VERSION_ARCHIVE, &package) {
+            Ok(_) => panic!("all invalid Version rows must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CranArchiveIndexProviderError::AllSemantic(_)
+        ));
     }
 
     #[test]

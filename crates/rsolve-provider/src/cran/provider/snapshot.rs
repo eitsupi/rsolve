@@ -131,9 +131,9 @@ pub(super) fn tarball_record_to_evidence(
     )
 }
 
-/// Retains a release-local archive rejection as raw evidence. The provider
-/// projection rejects rows without an attributable package/version/scope as
-/// package-global failures before this bridge is reached.
+/// Retains a release-local archive rejection as raw evidence. Rows with an
+/// attributable version retain an archive locator; rows whose raw Version
+/// field is malformed remain observation-only so no coordinate is fabricated.
 pub(super) fn archive_rejection_to_evidence(
     rejection: &CranArchiveReleaseRejection,
     source: SourceInput,
@@ -143,13 +143,10 @@ pub(super) fn archive_rejection_to_evidence(
     let package = rejection
         .package()
         .expect("release-local archive rejection must identify a package");
-    let version = rejection
-        .version()
-        .expect("release-local archive rejection must identify a version");
     let scope = rejection
         .scope()
         .expect("release-local archive rejection must identify a scope");
-    let locator = match scope {
+    let locator = rejection.version().map(|version| match scope {
         CranCatalogRecordScope::Root => {
             format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
         }
@@ -162,6 +159,11 @@ pub(super) fn archive_rejection_to_evidence(
                 .expect("validated Recommended overlay must retain Path");
             format!("{base_url}/src/contrib/{path}/{package}_{version}.tar.gz")
         }
+    });
+    let occurrence = if locator.is_some() {
+        OccurrenceStateV1::ArtifactBound
+    } else {
+        OccurrenceStateV1::ObservationOnly
     };
     CranEvidenceObservation {
         source,
@@ -175,7 +177,7 @@ pub(super) fn archive_rejection_to_evidence(
                 value: value.clone(),
             })
             .collect(),
-        artifact: Some(OccurrenceArtifactV1 {
+        artifact: locator.map(|locator| OccurrenceArtifactV1 {
             locator,
             // Archive rejections are retained even when an index field is
             // malformed. Keep those fields lossless above, but only promote
@@ -188,7 +190,7 @@ pub(super) fn archive_rejection_to_evidence(
         axes: EvidenceAxesV1 {
             parse: ParseStateV1::Valid,
             namespace: NamespaceStateV1::Established,
-            occurrence: OccurrenceStateV1::ArtifactBound,
+            occurrence,
             semantics: SemanticsStateV1::Invalid,
             publication: PublicationStateV1::Unknown,
             freshness,
@@ -406,5 +408,56 @@ mod tests {
         SnapshotGenerationBuilder::new(input, directory.path().join("generation.redb"))
             .build()
             .expect("quarantined invalid checksum must not block snapshot publish");
+    }
+
+    #[test]
+    fn invalid_archive_version_is_observation_only_without_fabricated_locator() {
+        let package = PackageName::new("nlme").unwrap();
+        let projection = provider_observations_from_fields(
+            vec![(
+                0,
+                Some(package.to_string()),
+                vec![
+                    ("Package".into(), "nlme".into()),
+                    ("Version".into(), "3.1-2 (1999/12/23)".into()),
+                    ("License".into(), "GPL-2".into()),
+                ],
+            )],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&package),
+        );
+        let rejection = projection.rejections.first().expect("invalid Version");
+        assert!(rejection.version().is_none());
+        let evidence = archive_rejection_to_evidence(
+            rejection,
+            source_input(
+                "cran-archive-index",
+                "rds",
+                "https://cran.invalid/src/contrib/Archive/nlme/PACKAGES.rds",
+                b"archive",
+            ),
+            "https://cran.invalid",
+            FreshnessStateV1::BulkGeneration,
+        );
+        assert!(evidence.artifact.is_none());
+        assert_eq!(evidence.axes.occurrence, OccurrenceStateV1::ObservationOnly);
+        assert_eq!(evidence.axes.semantics, SemanticsStateV1::Invalid);
+        assert!(evidence.release.is_none());
+        assert!(
+            evidence
+                .fields
+                .iter()
+                .any(|field| field.name == "Version" && field.value == "3.1-2 (1999/12/23)")
+        );
+
+        let input = compose_snapshot(
+            default_context(RegistryId::new("cran").unwrap()),
+            vec![evidence],
+        )
+        .expect("observation-only invalid Version must compose");
+        let directory = tempfile::tempdir().unwrap();
+        SnapshotGenerationBuilder::new(input, directory.path().join("generation.redb"))
+            .build()
+            .expect("observation-only invalid Version must publish");
     }
 }

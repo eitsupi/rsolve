@@ -410,10 +410,21 @@ write_binary_fixture(
     nlme_archive[3L, , drop = FALSE]
 )
 nlme_invalid_identity <- nlme_archive[1L, , drop = FALSE]
-nlme_invalid_identity[1L, "Version"] <- "3.1.x"
+nlme_invalid_identity[1L, "Package"] <- "nlme!"
 write_binary_fixture(
     "synthetic-nlme-invalid-identity-archive-PACKAGES.rds",
     nlme_invalid_identity
+)
+nlme_invalid_version <- nlme_archive[c(1L, 2L, 1L), , drop = FALSE]
+nlme_invalid_version[3L, "Version"] <- "3.1-2 (1999/12/23)"
+nlme_invalid_version[3L, "MD5sum"] <- "00000000000000000000000000000044"
+write_binary_fixture(
+    "synthetic-nlme-invalid-version-archive-PACKAGES.rds",
+    nlme_invalid_version
+)
+write_binary_fixture(
+    "synthetic-nlme-all-invalid-version-archive-PACKAGES.rds",
+    nlme_invalid_version[3L, , drop = FALSE]
 )
 
 matrix_invalid_path <- matrix_overlay_archive

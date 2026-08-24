@@ -680,6 +680,120 @@ fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
 }
 
 #[test]
+fn nlme_invalid_version_survives_fresh_and_304_archive_cache_replay() {
+    let (_directory, store) = store();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let cache_headers = TransportResponseHeaders {
+        etag: Some("\"nlme-invalid-version-archive\"".into()),
+        cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+        ..TransportResponseHeaders::default()
+    };
+    let mut first_transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: cache_headers.clone(),
+        },
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    first_transport.responses.insert(
+        fast_url_for("nlme"),
+        TransportResponse {
+            status: 200,
+            body: NLME_INVALID_VERSION_ARCHIVE.to_vec(),
+            headers: cache_headers.clone(),
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        "https://cran.invalid",
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let package = PackageName::new("nlme").unwrap();
+    let first_result = first.refresh_package(&package).expect("network archive");
+    assert_eq!(
+        release_signature(first_result.candidates()),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert!(first_result.quarantined().is_empty());
+    let evidence = first.evidence.borrow();
+    let observation = evidence
+        .iter()
+        .find(|observation| {
+            observation.package.as_str() == "nlme"
+                && matches!(
+                    observation.axes.semantics,
+                    crate::snapshot::SemanticsStateV1::Invalid
+                )
+        })
+        .expect("nlme archive evidence");
+    assert!(observation.artifact.is_none());
+    assert!(matches!(
+        observation.axes.occurrence,
+        crate::snapshot::OccurrenceStateV1::ObservationOnly
+    ));
+    assert!(matches!(
+        observation.axes.semantics,
+        crate::snapshot::SemanticsStateV1::Invalid
+    ));
+
+    let fresh_transport = empty_transport();
+    let fresh_requests = fresh_transport.requests.clone();
+    let mut fresh = CranRefreshSession::new_with_clock(
+        Rc::new(fresh_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let fresh_result = fresh
+        .refresh_package(&package)
+        .expect("fresh archive cache");
+    assert!(fresh_requests.borrow().is_empty());
+    assert_eq!(
+        release_signature(fresh_result.candidates()),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert!(fresh_result.quarantined().is_empty());
+
+    let mut stale_transport = empty_transport();
+    stale_transport.responses.insert(
+        current_rds_url(),
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: cache_headers.clone(),
+        },
+    );
+    stale_transport.responses.insert(
+        fast_url_for("nlme"),
+        TransportResponse {
+            status: 304,
+            body: Vec::new(),
+            headers: cache_headers,
+        },
+    );
+    let stale_requests = stale_transport.requests.clone();
+    let mut stale = CranRefreshSession::new_with_clock(
+        Rc::new(stale_transport),
+        "https://cran.invalid",
+        Some("2026-08-23T01:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let stale_result = stale.refresh_package(&package).expect("304 archive cache");
+    assert_eq!(
+        release_signature(stale_result.candidates()),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert!(stale_result.quarantined().is_empty());
+    assert_eq!(stale_requests.borrow().len(), 2);
+    assert!(stale_requests.borrow().iter().all(|request| {
+        request.validators.if_none_match.as_deref() == Some("\"nlme-invalid-version-archive\"")
+    }));
+}
+
+#[test]
 fn archive_rejection_survives_snapshot_roundtrip_and_keeps_valid_sibling_visible() {
     let (_directory, store) = store();
     let mut transport = session_transport(
@@ -730,6 +844,50 @@ fn archive_rejection_survives_snapshot_roundtrip_and_keeps_valid_sibling_visible
             .iter()
             .map(|release| release.version().as_str())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn invalid_version_archive_survives_snapshot_roundtrip_and_keeps_valid_siblings_visible() {
+    let (_directory, store) = store();
+    let mut transport = session_transport(
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    transport.responses.insert(
+        fast_url_for("nlme"),
+        TransportResponse::new(200, NLME_INVALID_VERSION_ARCHIVE.to_vec()),
+    );
+    let loader = refresh_and_publish_with_transport(
+        &store,
+        transport,
+        "https://cran.invalid",
+        &[PackageName::new("nlme").unwrap()],
+    )
+    .expect("invalid-version archive snapshot should publish");
+    let releases = loader
+        .releases(&SolverKey::InstalledName(PackageName::new("nlme").unwrap()))
+        .unwrap();
+    assert_eq!(
+        releases
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        vec!["3.1-167", "3.1-168"]
+    );
+    assert_eq!(loader.header().observation_count, 3);
+
+    let offline = store.read_current().unwrap();
+    let offline_releases = offline
+        .releases(&SolverKey::InstalledName(PackageName::new("nlme").unwrap()))
+        .unwrap();
+    assert_eq!(
+        offline_releases
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        vec!["3.1-167", "3.1-168"]
     );
 }
 
