@@ -90,6 +90,85 @@ fn runtime_loader_preserves_quarantined_archive_history_versions() {
 }
 
 #[test]
+fn persisted_snapshot_replays_quarantined_xml_candidates_offline() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let package = PackageName::new("XML").unwrap();
+    let mut transport = session_transport(
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(
+            200,
+            b"Package: XML\nVersion: 3.99-0.19\nDepends: R (>= 3.6.0)\nLicense: RSOLVE Fictional Terms XML\nMD5sum: 00000000000000000000000000000043\nNeedsCompilation: yes\n".to_vec(),
+        ),
+    );
+    transport.responses.insert(
+        fast_url_for("XML"),
+        TransportResponse::new(200, XML_QUARANTINED_ARCHIVE.to_vec()),
+    );
+    let online = crate::cran::provider::refresh_and_publish_with_transport(
+        &store,
+        transport,
+        "https://cran.invalid",
+        std::slice::from_ref(&package),
+    )
+    .expect("online fixture refresh must publish");
+    let online_result = online
+        .load(&SolverKey::InstalledName(package.clone()))
+        .expect("online snapshot must load XML");
+    let offline = store
+        .read_current()
+        .expect("published snapshot must be readable offline");
+    let offline_result = offline
+        .load(&SolverKey::InstalledName(package))
+        .expect("offline snapshot must load XML");
+    assert_eq!(
+        online_result
+            .candidates()
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        vec!["3.99-0.19"]
+    );
+    assert_eq!(
+        online_result
+            .quarantined()
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        vec!["0.2", "0.3-3"]
+    );
+    assert_eq!(
+        offline_result
+            .candidates()
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        online_result
+            .candidates()
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        offline_result
+            .quarantined()
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>(),
+        online_result
+            .quarantined()
+            .iter()
+            .map(|release| release.version().as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
     let current = b"Package: Matrix\nVersion: 1.8-0\nLicense: RSOLVE Fictional Current\n";
     let transport = session_transport(

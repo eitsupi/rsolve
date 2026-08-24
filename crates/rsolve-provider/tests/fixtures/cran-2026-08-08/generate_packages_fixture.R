@@ -405,6 +405,52 @@ set_nlme_archive_row(3L, c(
     NeedsCompilation = "yes"
 ))
 write_binary_fixture("synthetic-nlme-archive-PACKAGES.rds", nlme_archive)
+
+xml_archive <- matrix(
+    NA_character_,
+    nrow = 3L,
+    ncol = length(archive_columns),
+    dimnames = list(NULL, archive_columns)
+)
+set_xml_archive_row <- function(row, values) {
+    xml_archive[row, names(values)] <<- unname(values)
+}
+for (row in seq_len(2L)) {
+    set_xml_archive_row(row, c(
+        Package = "XML",
+        Version = c("0.2", "0.3-3")[[row]],
+        Depends = if (row == 1L) {
+            paste0(
+                "Daniel Veillard's libxml\n",
+                "(ftp://ftp.gnome.org/pub/GNOME/sources/libxml/)\n",
+                "and/or\n",
+                "Jim Clark's expat (http://www.jclark.com/xml)"
+            )
+        } else {
+            paste0(
+                "Daniel Veillard's libxml\n",
+                "(ftp://ftp.gnome.org/pub/GNOME/stable/sources/libxml/)\n",
+                "and/or\n",
+                "Jim Clark's expat (http://www.jclark.com/xml)"
+            )
+        },
+        License = "GPL. http://www.gnu.org/copyleft/gpl.html",
+        MD5sum = c(
+            "a07976f82228395c263187c98f1032ef",
+            "be0f72b9c37333319bb8ebdcc90244b8"
+        )[[row]],
+        NeedsCompilation = "yes"
+    ))
+}
+set_xml_archive_row(3L, c(
+    Package = "XML",
+    Version = "3.99-0.19",
+    Depends = "R (>= 3.6.0)",
+    License = "RSOLVE Fictional Terms XML",
+    MD5sum = "00000000000000000000000000000043",
+    NeedsCompilation = "yes"
+))
+write_binary_fixture("synthetic-xml-quarantined-archive-PACKAGES.rds", xml_archive)
 write_binary_fixture(
     "synthetic-nlme-invalid-archive-PACKAGES.rds",
     nlme_archive[3L, , drop = FALSE]

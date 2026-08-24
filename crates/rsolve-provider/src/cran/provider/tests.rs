@@ -41,6 +41,9 @@ const NLME_ARCHIVE: &[u8] =
 const NLME_INVALID_VERSION_ARCHIVE: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-nlme-invalid-version-archive-PACKAGES.rds"
 );
+const XML_QUARANTINED_ARCHIVE: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-xml-quarantined-archive-PACKAGES.rds"
+);
 const LEGACY_VERSION_HISTORY: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-legacy-version.rds"
 );

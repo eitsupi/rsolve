@@ -1,14 +1,182 @@
 use super::*;
 use crate::{LockedPackage, LockedResolution};
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, DependencyKind, DependencyRequirement,
-    DependencySourceConstraint, GitCommitId, NormalizedGitUrl, PackageName, PackageNamespace,
-    PackageRelease, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionTarget, Sha256Digest, SolverKey, SourceScheme, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
+    DependencyKind, DependencyRequirement, DependencySourceConstraint, GitCommitId,
+    NormalizedGitUrl, PackageName, PackageNamespace, PackageRelease, Provenance, RPackageVersion,
+    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ResolutionTarget, Sha256Digest,
+    SolverKey, SourceScheme, VersionConstraint,
 };
 use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_resolver::R_BASE_PACKAGE_NAMES;
 use std::collections::BTreeMap;
+
+/// A compact CRAN-shaped fixture for the historical R 3.6 tidyverse closure.
+///
+/// The real archive contains malformed XML releases (0.2 and 0.3-3) next to
+/// usable releases. Keeping those versions in the fixture's quarantine side
+/// makes this test exercise the same resolver boundary as a provider snapshot,
+/// without making the test depend on a live CRAN mirror.
+#[derive(Clone, Default)]
+struct TidyverseFixtureLoader {
+    candidates: BTreeMap<PackageName, Vec<PackageRelease>>,
+    quarantined: BTreeMap<PackageName, Vec<RPackageVersion>>,
+}
+
+impl CandidateLoader for TidyverseFixtureLoader {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        let result = self.load(package)?;
+        if result.candidates().is_empty() && !result.quarantined().is_empty() {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                format!("tidyverse fixture has no eligible releases for {package:?}"),
+            ));
+        }
+        Ok(result.into_parts().0)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        let SolverKey::InstalledName(name) = package else {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("tidyverse fixture has no candidates for {package:?}"),
+            ));
+        };
+        let candidates = self.candidates.get(name).cloned().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("tidyverse fixture has not refreshed package {name}"),
+            )
+        })?;
+        let quarantined = self
+            .quarantined
+            .get(name)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .map(|version| {
+                rsolve_core::QuarantinedCandidate::new(version, "invalid CRAN archive release")
+            })
+            .collect();
+        Ok(CandidateLoadResult::new(candidates, quarantined))
+    }
+}
+
+fn tidyverse_fixture(
+    xml_candidates: &[&str],
+    xml_constraint: VersionConstraint,
+) -> TidyverseFixtureLoader {
+    let tidyverse = PackageName::new("tidyverse").unwrap();
+    let rvest = PackageName::new("rvest").unwrap();
+    let xml = PackageName::new("XML").unwrap();
+    let r = PackageName::new("R").unwrap();
+    let mut candidates = BTreeMap::new();
+    candidates.insert(
+        tidyverse.clone(),
+        vec![release_at_version_with_dependencies(
+            &tidyverse,
+            "1.3.2",
+            vec![
+                dependency(DependencyKind::Depends, &r, ge_version("3.6.0")),
+                dependency(
+                    DependencyKind::Imports,
+                    &rvest,
+                    VersionConstraint::unconstrained(),
+                ),
+            ],
+        )],
+    );
+    candidates.insert(
+        rvest.clone(),
+        vec![release_at_version_with_dependencies(
+            &rvest,
+            "0.3.6",
+            vec![dependency(DependencyKind::Imports, &xml, xml_constraint)],
+        )],
+    );
+    candidates.insert(
+        xml.clone(),
+        xml_candidates
+            .iter()
+            .map(|version| release_at_version_with_dependencies(&xml, version, Vec::new()))
+            .collect(),
+    );
+
+    TidyverseFixtureLoader {
+        candidates,
+        quarantined: BTreeMap::from([(
+            xml,
+            ["0.2", "0.3-3"]
+                .into_iter()
+                .map(|version| RPackageVersion::parse(version).unwrap())
+                .collect(),
+        )]),
+    }
+}
+
+fn dependency(
+    kind: DependencyKind,
+    name: &PackageName,
+    constraint: VersionConstraint,
+) -> DependencyRequirement {
+    DependencyRequirement::new(
+        kind,
+        name.clone(),
+        DependencySourceConstraint::Any,
+        constraint,
+    )
+}
+
+fn ge_version(version: &str) -> VersionConstraint {
+    VersionConstraint::from_clause(
+        rsolve_core::RelationOp::Ge,
+        RPackageVersion::parse(version).unwrap(),
+    )
+}
+
+fn release_at_version_with_dependencies(
+    name: &PackageName,
+    version: &str,
+    dependencies: Vec<DependencyRequirement>,
+) -> PackageRelease {
+    let version = RPackageVersion::parse(version).unwrap();
+    PackageRelease::try_from(ReleaseObservation {
+        identity: ReleaseIdentity::new(
+            name.clone(),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version.clone(),
+            },
+        ),
+        observed_package: name.clone(),
+        observed_version: version,
+        metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        publication: None,
+        dependencies,
+        distributions: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn tidyverse_manifest() -> Manifest {
+    let tidyverse = PackageName::new("tidyverse").unwrap();
+    Manifest::new(
+        ge_version("3.6.0"),
+        crate::manifest::ManifestTarget::new(RPackageVersion::parse("3.6").unwrap()),
+        vec![crate::manifest::ManifestDependency::new(
+            tidyverse,
+            VersionConstraint::unconstrained(),
+        )],
+    )
+    .unwrap()
+}
+
+fn tidyverse_lock(loader: &TidyverseFixtureLoader) -> Lockfile {
+    let resolution =
+        resolve_with_loader(tidyverse_manifest(), loader).expect("tidyverse fixture must resolve");
+    Lockfile::from_resolution(&resolution, EnvironmentId::new("default").unwrap())
+        .expect("tidyverse resolution must project into a lock")
+}
 
 struct FixtureLoader {
     package: PackageRelease,
@@ -733,6 +901,52 @@ fn injected_loader_exercises_manifest_to_resolution_orchestration() {
             .version(),
         &RPackageVersion::parse("1.0.0").unwrap()
     );
+}
+
+#[test]
+fn hermetic_tidyverse_r36_lock_reaches_xml_without_quarantined_releases() {
+    let loader = tidyverse_fixture(&["3.99-0.19"], VersionConstraint::unconstrained());
+    let lock = tidyverse_lock(&loader);
+    let encoded = crate::to_toml(&lock).expect("tidyverse lock must encode");
+    let decoded = crate::from_toml(&encoded).expect("tidyverse lock must decode");
+    assert_eq!(decoded, lock);
+
+    let packages = &lock.resolutions[0].packages;
+    let xml = packages
+        .iter()
+        .find(|package| package.identity.name().as_str() == "XML")
+        .expect("tidyverse dependency closure must reach XML");
+    assert_eq!(xml.version, RPackageVersion::parse("3.99-0.19").unwrap());
+    assert!(packages.iter().all(|package| {
+        package.identity.name().as_str() != "XML"
+            || !matches!(package.version.as_str(), "0.2" | "0.3-3")
+    }));
+}
+
+#[test]
+fn hermetic_tidyverse_r36_all_quarantined_xml_releases_is_metadata_invalid() {
+    let loader = tidyverse_fixture(&[], VersionConstraint::unconstrained());
+    let error = resolve_with_loader(tidyverse_manifest(), &loader).unwrap_err();
+    assert!(matches!(
+        error,
+        CranResolutionError::Resolution(ResolutionFailure::CandidateLoad { source, .. })
+            if source.category() == CandidateLoadErrorCategory::MetadataInvalid
+    ));
+}
+
+#[test]
+fn hermetic_tidyverse_r36_quarantine_only_xml_constraint_is_metadata_invalid() {
+    let xml_constraint = VersionConstraint::from_clause(
+        rsolve_core::RelationOp::Lt,
+        RPackageVersion::parse("1.0.0").unwrap(),
+    );
+    let loader = tidyverse_fixture(&["3.99-0.19"], xml_constraint);
+    let error = resolve_with_loader(tidyverse_manifest(), &loader).unwrap_err();
+    assert!(matches!(
+        error,
+        CranResolutionError::Resolution(ResolutionFailure::CandidateLoad { source, .. })
+            if source.category() == CandidateLoadErrorCategory::MetadataInvalid
+    ));
 }
 
 #[test]

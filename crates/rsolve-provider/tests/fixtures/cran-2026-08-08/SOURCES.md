@@ -40,6 +40,7 @@ fictional phrase.
 | `synthetic-nlme-invalid-identity-archive-PACKAGES.rds` | 1 | Archive index with a pathless row whose package identity is invalid; SHA-256 `91fa7346c23855b93280718e254f334c81abaf28ee60a4cd81f54ce816073d70` |
 | `synthetic-nlme-invalid-version-archive-PACKAGES.rds` | 3 | Archive index with valid `nlme` siblings and raw Version `3.1-2 (1999/12/23)` quarantined without repair; SHA-256 `98509e75a76e5d801fb6f49dbbc174086db8f3a229bcc3e09bd7839c8492de1e` |
 | `synthetic-nlme-all-invalid-version-archive-PACKAGES.rds` | 1 | Archive index whose only `nlme` row has raw Version `3.1-2 (1999/12/23)`; SHA-256 `8acf897f503a710686b908c37624da03e5da5712246a8021b3853de0db7944a3` |
+| `synthetic-xml-quarantined-archive-PACKAGES.rds` | 3 | Archive index that quarantines the real XML 0.2/0.3-3 malformed `Depends` rows while retaining a valid synthetic sibling; SHA-256 `7f9d99c15feb29b6206629c055e9b102212cf6128defd7bd905c7c06e404193f` |
 | `synthetic-matrix-archive-invalid-path-PACKAGES.rds` | 2 | Archive index with a valid root sibling and an invalid Recommended `Path`; SHA-256 `b08d49cc9528b24037a61aeffc3ec1b54f52ac7f64ef154e57ef639e0c85a04f` |
 | `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration, including canonical prefixed source path; SHA-256 `86fb29d89f3718f8128818243c4880cb6fabd67a77470bfab5b8eb2d1be2a5d9` |
 | `synthetic-meta-nested-archive.rds` | 1 | Named-list history with a safe nested archive path for one package; SHA-256 `cf20a3f85fa2248acddb1da6c9c8d008b6847eda7494a9d21ae2a669a94a779b` |
