@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_cross_mirror_refresh_does_not_extend_header_provenance() {
+    fn identical_cross_mirror_validation_reuses_generation_without_extending_header_provenance() {
         let directory = tempdir().unwrap();
         let store =
             SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
@@ -492,16 +492,11 @@ mod tests {
         else {
             panic!("identical cross-mirror refresh should retain a compatible generation");
         };
-        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Stale);
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Fresh);
         assert!(
             diagnostic
                 .endpoints()
-                .all(|endpoint| endpoint.contains("mirror-a.example"))
-        );
-        assert!(
-            diagnostic
-                .endpoints()
-                .all(|endpoint| !endpoint.contains("mirror-b.example"))
+                .all(|endpoint| endpoint.contains("mirror-b.example"))
         );
         assert!(
             loader

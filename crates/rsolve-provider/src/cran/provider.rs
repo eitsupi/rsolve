@@ -326,21 +326,26 @@ pub fn inspect_cran_snapshot_cache(
                 .map(|source| (source.id.as_str(), source.content_sha256.as_str()))
                 .collect::<Vec<_>>()
                 == header_source_identities
-            && canonical_validation_source_endpoints(record) == canonical_endpoints(header)
     });
     let validation_timestamp = validation
         .clone()
         .filter(|_| validation_matches)
         .and_then(|record| record.validated_at.parse::<jiff::Timestamp>().ok());
     let endpoint_provenance_matches = policy.expected_endpoint.as_deref().is_none_or(|expected| {
-        let header_has_expected_endpoint = header
-            .sources
-            .iter()
-            .all(|source| endpoint_belongs_to(&source.endpoint, expected));
-        header_has_expected_endpoint
-            && validation
-                .as_ref()
-                .is_none_or(|record| !validation_matches || record.effective_endpoint == expected)
+        if validation_matches {
+            validation.as_ref().is_some_and(|record| {
+                record.effective_endpoint == expected
+                    && record
+                        .sources
+                        .iter()
+                        .all(|source| endpoint_belongs_to(&source.endpoint, expected))
+            })
+        } else {
+            header
+                .sources
+                .iter()
+                .all(|source| endpoint_belongs_to(&source.endpoint, expected))
+        }
     });
     let diagnostic_endpoints = validation
         .as_ref()
@@ -431,21 +436,6 @@ fn canonical_validation_endpoints(record: &crate::snapshot::CurrentValidationV1)
         .iter()
         .flat_map(|source| source.endpoint.split('\n'))
         .chain(record.effective_endpoint.split('\n'))
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    endpoints.sort();
-    endpoints.dedup();
-    endpoints.into_iter().map(String::into_boxed_str).collect()
-}
-
-fn canonical_validation_source_endpoints(
-    record: &crate::snapshot::CurrentValidationV1,
-) -> Vec<Box<str>> {
-    let mut endpoints = record
-        .sources
-        .iter()
-        .flat_map(|source| source.endpoint.split('\n'))
         .filter(|endpoint| !endpoint.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
