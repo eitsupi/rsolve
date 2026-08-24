@@ -422,7 +422,6 @@ fn package_local_rejection(
     if !provider_mode {
         return None;
     }
-    let package_hint = package_hint?;
     let segments = path.split('/').collect::<Vec<_>>();
     if segments.iter().any(|segment| {
         segment.is_empty()
@@ -449,6 +448,9 @@ fn package_local_rejection(
     if PackageName::new(path_package).is_err() || PackageName::new(filename_package).is_err() {
         return None;
     }
+    let package_hint = package_hint
+        .cloned()
+        .or_else(|| PackageName::new(path_package).ok())?;
     let is_foreign_nested =
         nested && path_package != filename_package && path_package == package_hint.as_str();
     let is_invalid_version = path_package == package_hint.as_str()

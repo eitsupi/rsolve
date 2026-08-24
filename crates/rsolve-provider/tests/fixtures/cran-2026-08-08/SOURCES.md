@@ -38,6 +38,8 @@ fictional phrase.
 | `synthetic-meta-archive.rds` | 2 | Named-list `file.info`-shaped fallback enumeration, including canonical prefixed source path; SHA-256 `86fb29d89f3718f8128818243c4880cb6fabd67a77470bfab5b8eb2d1be2a5d9` |
 | `synthetic-meta-nested-archive.rds` | 1 | Named-list history with a safe nested archive path for one package; SHA-256 `cf20a3f85fa2248acddb1da6c9c8d008b6847eda7494a9d21ae2a669a94a779b` |
 | `synthetic-meta-foreign-nested-archive.rds` | 1 | Named-list history with a release-local nested path whose filename package differs from the containing archive directory; SHA-256 `45bd82d546e5bbdf9e9328bfaa319c5cf5199f3f89795337e056195b7a732fd7` |
+| `synthetic-meta-root-nested-mixed.rds` | 3 | Root data.frame history with one valid nested entry, one foreign nested filename, and one invalid legacy version; SHA-256 `966300b971d39d9d2c46adc54488c95c5ad63aab371447ee69acb23305e90058` |
+| `synthetic-meta-root-unsafe-percent.rds` | 1 | Root data.frame history with a percent-encoded path segment that must remain a hard failure; SHA-256 `0ca68a1562835f804685acaf62f7f01543763e944fd535e7ac0bc246ae5b5669` |
 | `synthetic-meta-invalid-traversal.rds` | 1 | Invalid history path traversal fixture; SHA-256 `fea5fd7e683eb913986ba89ad1058ec0d22bc625e78ff44082af791ee31a6c12` |
 | `synthetic-meta-invalid-query.rds` | 1 | Invalid history query fixture; SHA-256 `2019b78dacf04763634ab6c4c4a7232c583b00edf7598205cc11497f802586d4` |
 | `synthetic-meta-invalid-fragment.rds` | 1 | Invalid history fragment fixture; SHA-256 `7f5cf493a324a85c5f3a89987e7035ad8969c53d08abeaf6953bb5d0c30d7c47` |

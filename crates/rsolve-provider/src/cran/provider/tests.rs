@@ -31,6 +31,11 @@ const NESTED_HISTORY: &[u8] =
 const FOREIGN_NESTED_HISTORY: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-foreign-nested-archive.rds"
 );
+const ROOT_NESTED_MIXED_HISTORY: &[u8] =
+    include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-root-nested-mixed.rds");
+const ROOT_UNSAFE_PERCENT_HISTORY: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-root-unsafe-percent.rds"
+);
 const LEGACY_VERSION_HISTORY: &[u8] = include_bytes!(
     "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-legacy-version.rds"
 );

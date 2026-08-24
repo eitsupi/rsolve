@@ -551,6 +551,46 @@ fn provider_quarantines_foreign_nested_archive_rows() {
 }
 
 #[test]
+fn provider_projects_root_data_frame_package_local_rejections() {
+    let projection =
+        crate::cran::history::enumerate_archive_rds_for_provider(ROOT_NESTED_MIXED_HISTORY)
+            .expect("root data.frame package-local rows are isolatable");
+    assert_eq!(projection.entries.len(), 1);
+    assert_eq!(projection.entries[0].package().as_str(), "Matrix");
+    assert_eq!(
+        projection.entries[0].source_archive_relative_path(),
+        "Matrix/legacy/Matrix_1.6-5.tar.gz"
+    );
+    assert_eq!(projection.rejections.len(), 2);
+
+    let foreign = projection
+        .rejections
+        .iter()
+        .find(|rejection| rejection.package_hint().as_str() == "calibFit")
+        .expect("foreign nested filename should be attributed to its container");
+    assert_eq!(foreign.row(), 1);
+    assert_eq!(foreign.raw_path(), "calibFit/Ancestry/calib_0.1.02.tar.gz");
+    assert!(foreign.reason().contains("invalid archive path"));
+
+    let legacy = projection
+        .rejections
+        .iter()
+        .find(|rejection| rejection.package_hint().as_str() == "dse")
+        .expect("invalid legacy version should be attributed to its container");
+    assert_eq!(legacy.row(), 2);
+    assert_eq!(legacy.raw_path(), "dse/dse_R2000.4-1.tar.gz");
+    assert!(legacy.reason().contains("invalid archive path"));
+}
+
+#[test]
+fn provider_keeps_root_data_frame_unsafe_paths_as_hard_failures() {
+    assert!(matches!(
+        crate::cran::history::enumerate_archive_rds_for_provider(ROOT_UNSAFE_PERCENT_HISTORY),
+        Err(CranHistoryError::InvalidArchivePath { .. })
+    ));
+}
+
+#[test]
 fn provider_projects_legacy_version_as_a_package_local_rejection() {
     let projection =
         crate::cran::history::enumerate_archive_rds_for_provider(LEGACY_VERSION_HISTORY)

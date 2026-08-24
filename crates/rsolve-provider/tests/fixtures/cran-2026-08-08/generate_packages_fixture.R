@@ -479,6 +479,36 @@ write_binary_fixture(
     foreign_nested_archive_history
 )
 
+root_history_frame <- function(paths) {
+    count <- length(paths)
+    data.frame(
+        size = rep(1234, count),
+        isdir = rep(FALSE, count),
+        mode = rep(420L, count),
+        mtime = rep(1790000000, count),
+        ctime = rep(1790000000, count),
+        atime = rep(1790000000, count),
+        uid = rep(1000L, count),
+        gid = rep(1000L, count),
+        uname = rep("fixture", count),
+        grname = rep("fixture", count),
+        row.names = paths
+    )
+}
+
+write_binary_fixture(
+    "synthetic-meta-root-nested-mixed.rds",
+    root_history_frame(c(
+        "Matrix/legacy/Matrix_1.6-5.tar.gz",
+        "calibFit/Ancestry/calib_0.1.02.tar.gz",
+        "dse/dse_R2000.4-1.tar.gz"
+    ))
+)
+write_binary_fixture(
+    "synthetic-meta-root-unsafe-percent.rds",
+    root_history_frame("Matrix/%2e/Matrix_1.6-5.tar.gz")
+)
+
 invalid_history <- function(path, package = "Matrix") {
     setNames(list(data.frame(
         size = 1,
