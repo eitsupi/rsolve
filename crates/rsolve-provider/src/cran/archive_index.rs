@@ -6,8 +6,9 @@ use std::fmt;
 use rd_rds::{NativeEncodingPolicy, file::ReadOptions, package::PackagesMatrix};
 
 use super::catalog::{
-    CranCatalog, CranCatalogObservation, CranDiagnostic, catalog_from_observations,
-    observation_from_fields, validated_observations_from_fields,
+    CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation, CranCatalogRecordContext,
+    CranDiagnostic, CranProviderObservationProjection, CranRecordError, catalog_from_observations,
+    observation_from_fields, provider_observations_from_fields, validated_observations_from_fields,
 };
 
 /// A structural or semantic failure while reading and validating an archive
@@ -38,6 +39,151 @@ impl CranArchiveIndexError {
 /// helper is only for the provider's repository boundary.
 pub(crate) fn provider_rds_read_options() -> ReadOptions {
     ReadOptions::default().native_encoding_policy(NativeEncodingPolicy::AssumeUtf8)
+}
+
+pub(crate) struct CranArchiveIndexProviderProjection {
+    pub(crate) catalog: CranCatalog,
+    pub(crate) observations: Vec<CranCatalogObservation>,
+    pub(crate) rejections: Vec<CranArchiveReleaseRejection>,
+}
+
+#[derive(Debug)]
+pub(crate) enum CranArchiveIndexProviderError {
+    Structural(CranArchiveIndexError),
+    Identity(Box<[CranDiagnostic]>),
+    AllSemantic(Box<[CranDiagnostic]>),
+}
+
+impl fmt::Display for CranArchiveIndexProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Structural(error) => error.fmt(formatter),
+            Self::Identity(diagnostics) => write_provider_diagnostics(
+                formatter,
+                "archive index identity records are invalid",
+                diagnostics,
+            ),
+            Self::AllSemantic(diagnostics) => write_provider_diagnostics(
+                formatter,
+                "all archive index releases have invalid semantics",
+                diagnostics,
+            ),
+        }
+    }
+}
+
+fn write_provider_diagnostics(
+    formatter: &mut fmt::Formatter<'_>,
+    prefix: &str,
+    diagnostics: &[CranDiagnostic],
+) -> fmt::Result {
+    write!(formatter, "{prefix}: ")?;
+    if let Some(first) = diagnostics.first() {
+        write!(formatter, "{first}")?;
+        if diagnostics.len() > 1 {
+            write!(
+                formatter,
+                ", and {} additional diagnostic(s)",
+                diagnostics.len() - 1
+            )?;
+        }
+    } else {
+        formatter.write_str("no diagnostics")?;
+    }
+    Ok(())
+}
+
+/// Reads an archive index for the provider boundary. Release-local semantic
+/// failures are quarantined, while structural and identity failures reject
+/// the whole response so they cannot be misattributed to a sibling release.
+pub(crate) fn provider_archive_index_rds(
+    input: &[u8],
+    expected_package: &rsolve_core::PackageName,
+) -> Result<CranArchiveIndexProviderProjection, CranArchiveIndexProviderError> {
+    let object = rd_rds::file::from_bytes_with_options(input, &provider_rds_read_options())
+        .map_err(CranArchiveIndexError::Decode)
+        .map_err(CranArchiveIndexProviderError::Structural)?;
+    let matrix = PackagesMatrix::from_object(&object)
+        .map_err(CranArchiveIndexError::Matrix)
+        .map_err(CranArchiveIndexProviderError::Structural)?;
+    for column in ["Package", "Version"] {
+        if matrix.column(column).is_none() {
+            return Err(CranArchiveIndexProviderError::Structural(
+                CranArchiveIndexError::MissingColumn(column),
+            ));
+        }
+    }
+    let records = matrix
+        .rows()
+        .map(|row| {
+            let package = row.get("Package").flatten().map(str::to_owned);
+            let fields = matrix
+                .column_names()
+                .filter_map(|column| {
+                    row.get(column)
+                        .flatten()
+                        .map(|value| (column.to_owned(), value.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            (row.index(), package, fields)
+        })
+        .collect();
+    let CranProviderObservationProjection {
+        observations,
+        rejections,
+    } = provider_observations_from_fields(
+        records,
+        CranCatalogRecordContext::PackagesIndex,
+        Some(expected_package),
+    );
+    let hard = rejections
+        .iter()
+        .filter(|diagnostic| provider_rejection_is_hard(diagnostic))
+        .map(CranArchiveReleaseRejection::diagnostic)
+        .collect::<Vec<_>>();
+    if !hard.is_empty() {
+        return Err(CranArchiveIndexProviderError::Identity(
+            hard.into_boxed_slice(),
+        ));
+    }
+    if observations.is_empty() {
+        return Err(CranArchiveIndexProviderError::AllSemantic(
+            rejections
+                .iter()
+                .map(CranArchiveReleaseRejection::diagnostic)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ));
+    }
+    Ok(CranArchiveIndexProviderProjection {
+        catalog: CranCatalog::from_provider_observations(&observations),
+        observations,
+        rejections,
+    })
+}
+
+fn provider_rejection_is_hard(rejection: &CranArchiveReleaseRejection) -> bool {
+    if rejection.package().is_none() || rejection.version().is_none() || rejection.scope().is_none()
+    {
+        return true;
+    }
+    match rejection.error() {
+        CranRecordError::MissingField("Package")
+        | CranRecordError::MissingField("Version")
+        | CranRecordError::InvalidPackageName(_)
+        | CranRecordError::InvalidVersion(_)
+        | CranRecordError::UnexpectedPackage { .. } => true,
+        CranRecordError::DuplicateField(field) => matches!(
+            field.to_ascii_lowercase().as_str(),
+            "package" | "version" | "path"
+        ),
+        CranRecordError::Domain(rsolve_core::PackageReleaseError::InvalidDependency { .. }) => {
+            false
+        }
+        CranRecordError::InvalidPath { .. } => true,
+        CranRecordError::Domain(_) => true,
+        _ => false,
+    }
 }
 
 impl fmt::Display for CranArchiveIndexError {
@@ -168,5 +314,24 @@ impl CranCatalog {
                 CranArchiveIndexError::Semantic(diagnostics)
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_archive_index_rds;
+    use rsolve_core::PackageName;
+
+    const MATRIX_ARCHIVE: &[u8] = include_bytes!(
+        "../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-PACKAGES.rds"
+    );
+
+    #[test]
+    fn provider_archive_projection_enforces_expected_package() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_archive_index_rds(MATRIX_ARCHIVE, &package)
+            .expect("Matrix archive projection");
+        assert_eq!(projection.catalog.candidate_count(), 2);
+        assert!(projection.rejections.is_empty());
     }
 }

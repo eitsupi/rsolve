@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::error::Error;
-#[cfg(test)]
 use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
@@ -12,7 +11,9 @@ use std::time::Duration;
 use self::raw_cache::{
     RawCache, RawCacheEntry, RawCacheLookup, RawCacheRepresentation, RawCacheWrite,
 };
-use super::archive_index::provider_rds_read_options;
+use super::archive_index::{
+    CranArchiveIndexProviderError, provider_archive_index_rds, provider_rds_read_options,
+};
 use super::catalog::{CranCatalog, CranCatalogObservation};
 use super::evidence::CranEvidenceObservation;
 #[cfg(test)]
@@ -94,6 +95,12 @@ impl Error for CranProviderError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CranFastPathStatus {
     Available,
+    /// The archive index was usable after quarantining release-local semantic
+    /// errors; the admitted sibling releases remain available.
+    AvailableWithRejections {
+        count: usize,
+        diagnostic: Box<str>,
+    },
     /// The archive index capability is not exposed by this repository.
     Unsupported {
         status: u16,
@@ -889,6 +896,28 @@ struct MetadataAcquisitionFailure {
     status: Option<u16>,
     category: CandidateLoadErrorCategory,
     diagnostic: Box<str>,
+    fallback_allowed: bool,
+}
+
+enum MetadataParseFailure {
+    Invalid(Box<str>),
+    NoFallback(Box<str>),
+}
+
+impl MetadataParseFailure {
+    fn allows_fallback(&self) -> bool {
+        matches!(self, Self::Invalid(_))
+    }
+}
+
+impl fmt::Display for MetadataParseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(diagnostic) | Self::NoFallback(diagnostic) => {
+                formatter.write_str(diagnostic)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -904,6 +933,7 @@ impl MetadataAcquisitionFailure {
             status: None,
             category: CandidateLoadErrorCategory::SnapshotInvalid,
             diagnostic: format!("CRAN metadata raw cache is invalid: {error}").into(),
+            fallback_allowed: false,
         }
     }
 
@@ -912,6 +942,7 @@ impl MetadataAcquisitionFailure {
             status: Some(status),
             category: CandidateLoadErrorCategory::TransportFailure,
             diagnostic: diagnostic.into(),
+            fallback_allowed: true,
         }
     }
 
@@ -920,6 +951,7 @@ impl MetadataAcquisitionFailure {
             status: None,
             category: CandidateLoadErrorCategory::TransportFailure,
             diagnostic: format!("transport failure: {error}").into(),
+            fallback_allowed: true,
         }
     }
 
@@ -928,7 +960,14 @@ impl MetadataAcquisitionFailure {
             status,
             category: CandidateLoadErrorCategory::MetadataInvalid,
             diagnostic: diagnostic.into(),
+            fallback_allowed: true,
         }
+    }
+
+    fn parse(status: Option<u16>, diagnostic: impl Into<Box<str>>, allows_fallback: bool) -> Self {
+        let mut failure = Self::invalid(status, diagnostic);
+        failure.fallback_allowed = allows_fallback;
+        failure
     }
 
     fn into_candidate(self) -> CandidateLoadError {
@@ -1066,7 +1105,7 @@ impl<T: Transport> CranRefreshSession<T> {
         MetadataAcquisitionFailure,
     >
     where
-        P: Fn(&[u8]) -> Result<V, String>,
+        P: Fn(&[u8]) -> Result<V, MetadataParseFailure>,
     {
         let cache_key = self
             .raw_cache
@@ -1219,32 +1258,40 @@ impl<T: Transport> CranRefreshSession<T> {
                     ) && !retried_unconditionally =>
                 {
                     retried_unconditionally = true;
+                    let allows_fallback = error.allows_fallback();
                     match self.transport.get(endpoint) {
                         Ok(response) if response.status == 200 => {
                             candidate = Some(CurrentBody::from_response(response, self.now()));
                             origin = Some(CurrentBodyOrigin::Network200);
                         }
                         Ok(response) => {
-                            return Err(MetadataAcquisitionFailure::invalid(
+                            return Err(MetadataAcquisitionFailure::parse(
                                 Some(response.status),
                                 format!(
                                     "cached metadata was invalid ({error}) and unconditional recovery returned HTTP {}",
                                     response.status
                                 ),
+                                allows_fallback,
                             ));
                         }
                         Err(fetch_error) => {
-                            return Err(MetadataAcquisitionFailure::invalid(
+                            return Err(MetadataAcquisitionFailure::parse(
                                 None,
                                 format!(
                                     "cached metadata was invalid ({error}) and unconditional recovery failed: {fetch_error}"
                                 ),
+                                allows_fallback,
                             ));
                         }
                     }
                 }
                 Err(error) => {
-                    return Err(MetadataAcquisitionFailure::invalid(Some(200), error));
+                    let allows_fallback = error.allows_fallback();
+                    return Err(MetadataAcquisitionFailure::parse(
+                        Some(200),
+                        error.to_string(),
+                        allows_fallback,
+                    ));
                 }
             }
         }
@@ -1572,7 +1619,10 @@ impl<T: Transport> CranRefreshSession<T> {
             RawCacheRepresentation::ArchiveHistoryRds,
             "cran-archive-history",
             "rds",
-            |body| enumerate_archive_rds_for_provider(body).map_err(|error| error.to_string()),
+            |body| {
+                enumerate_archive_rds_for_provider(body)
+                    .map_err(|error| MetadataParseFailure::Invalid(error.to_string().into()))
+            },
         ) {
             Ok((entries, _source, _outcome)) => Ok(HistorySource::Available(Rc::from(
                 entries.into_boxed_slice(),
@@ -1657,21 +1707,24 @@ impl<T: Transport> CranRefreshSession<T> {
             "cran-archive-index",
             "rds",
             |body| {
-                let catalog = CranCatalog::from_archive_index_rds_with_options(
-                    body,
-                    &provider_rds_read_options(),
-                )
-                .map_err(|error| error.to_string())?;
-                let records =
-                    CranCatalog::observations_from_archive_index_rds(body).map_err(|error| {
-                        format!(
-                            "validated archive index could not be projected losslessly: {error}"
-                        )
-                    })?;
-                Ok((catalog, records))
+                let projection = provider_archive_index_rds(body, package).map_err(|error| {
+                    let diagnostic = error.to_string().into_boxed_str();
+                    match error {
+                        CranArchiveIndexProviderError::AllSemantic(_)
+                        | CranArchiveIndexProviderError::Identity(_) => {
+                            MetadataParseFailure::NoFallback(diagnostic)
+                        }
+                        _ => MetadataParseFailure::Invalid(diagnostic),
+                    }
+                })?;
+                Ok((
+                    projection.catalog,
+                    projection.observations,
+                    projection.rejections,
+                ))
             },
         ) {
-            Ok(((catalog, records), source, outcome)) => {
+            Ok(((catalog, records, rejections), source, outcome)) => {
                 self.evidence
                     .borrow_mut()
                     .extend(records.iter().map(|record| {
@@ -1690,7 +1743,25 @@ impl<T: Transport> CranRefreshSession<T> {
                         MetadataAcquisitionOutcome::Cached
                         | MetadataAcquisitionOutcome::Network200 => 200,
                     }),
-                    status_detail: CranFastPathStatus::Available,
+                    status_detail: if rejections.is_empty() {
+                        CranFastPathStatus::Available
+                    } else {
+                        CranFastPathStatus::AvailableWithRejections {
+                            count: rejections.len(),
+                            diagnostic: {
+                                let first = rejections
+                                    .first()
+                                    .map(|rejection| rejection.diagnostic().to_string())
+                                    .unwrap_or_else(|| "no rejection detail".to_owned());
+                                let additional = rejections.len().saturating_sub(1);
+                                format!(
+                                    "{} archive release(s) quarantined after semantic validation; first: {first}; {additional} additional rejection(s)",
+                                    rejections.len()
+                                )
+                                .into()
+                            },
+                        }
+                    },
                     source: CranRefreshSource::ArchiveFastPath,
                 });
                 Ok(CandidateSource::Fast(catalog))
@@ -1728,7 +1799,9 @@ impl<T: Transport> CranRefreshSession<T> {
                     },
                     source: CranRefreshSource::ArchiveFastPath,
                 });
-                if error.category == CandidateLoadErrorCategory::SnapshotInvalid {
+                if !error.fallback_allowed
+                    || error.category == CandidateLoadErrorCategory::SnapshotInvalid
+                {
                     self.diagnostics.extend(package_diagnostics);
                     return Err(error.into_candidate());
                 }

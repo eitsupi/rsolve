@@ -33,12 +33,66 @@ pub(crate) struct CranCatalogObservation {
     scope: CranCatalogRecordScope,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CranArchiveReleaseRejection {
+    record_index: usize,
+    package: Option<PackageName>,
+    version: Option<RPackageVersion>,
+    scope: Option<CranCatalogRecordScope>,
+    fields: Vec<(String, String)>,
+    error: CranRecordError,
+}
+
+impl CranArchiveReleaseRejection {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn record_index(&self) -> usize {
+        self.record_index
+    }
+
+    pub(crate) fn package(&self) -> Option<&PackageName> {
+        self.package.as_ref()
+    }
+
+    pub(crate) fn version(&self) -> Option<&RPackageVersion> {
+        self.version.as_ref()
+    }
+
+    pub(crate) fn scope(&self) -> Option<&CranCatalogRecordScope> {
+        self.scope.as_ref()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn fields(&self) -> &[(String, String)] {
+        &self.fields
+    }
+
+    pub(crate) fn error(&self) -> &CranRecordError {
+        &self.error
+    }
+
+    pub(crate) fn diagnostic(&self) -> CranDiagnostic {
+        CranDiagnostic {
+            record_index: self.record_index,
+            package: self.package.as_ref().map(ToString::to_string),
+            error: self.error.clone(),
+        }
+    }
+}
+
+/// Provider-facing archive projection that keeps valid releases separate from
+/// release-local semantic rejections. Structural and identity failures remain
+/// diagnostics for the caller to reject as a whole.
+pub(crate) struct CranProviderObservationProjection {
+    pub(crate) observations: Vec<CranCatalogObservation>,
+    pub(crate) rejections: Vec<CranArchiveReleaseRejection>,
+}
+
 /// The semantic scope of a CRAN package-index record.
 ///
 /// A record under `R/Recommended` describes an R-runtime-specific occurrence,
 /// not the registry release in the CRAN root index.  Keeping this distinction
 /// here makes catalog and evidence selection use the same classification.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CranCatalogRecordScope {
     Root,
     RecommendedOverlay { runtime: RPackageVersion },
@@ -81,6 +135,32 @@ impl CranCatalogObservation {
 }
 
 impl CranCatalog {
+    pub(crate) fn from_provider_observations(observations: &[CranCatalogObservation]) -> Self {
+        let mut aggregation = ReleaseAggregation::new();
+        for observation in observations {
+            if matches!(
+                observation.scope,
+                CranCatalogRecordScope::RecommendedOverlay { .. }
+            ) {
+                continue;
+            }
+            aggregation
+                .observe_release(observation.release.clone())
+                .expect("provider projection validated release aggregation");
+        }
+        let mut candidates: BTreeMap<PackageName, Vec<PackageRelease>> = BTreeMap::new();
+        for release in aggregation.releases() {
+            candidates
+                .entry(release.identity().name().clone())
+                .or_default()
+                .push(release.clone());
+        }
+        for releases in candidates.values_mut() {
+            releases.sort_by(|left, right| left.version().cmp(right.version()));
+        }
+        Self { candidates }
+    }
+
     /// Parses and converts a plain `src/contrib/PACKAGES` snapshot.
     ///
     /// DCF syntax errors fail the operation because record boundaries cannot
@@ -288,6 +368,206 @@ pub(crate) fn validated_observations_from_fields_with_context(
         .collect::<Vec<_>>())
 }
 
+pub(crate) fn provider_observations_from_fields(
+    records: Vec<CatalogRecord>,
+    context: CranCatalogRecordContext,
+    expected_package: Option<&PackageName>,
+) -> CranProviderObservationProjection {
+    let fields_by_index = records
+        .iter()
+        .map(|(record_index, _, fields)| (*record_index, fields.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut observations = Vec::new();
+    let mut rejections = Vec::new();
+    let mut aggregation = ReleaseAggregation::new();
+    let mut seen_identities = HashMap::<ProviderIdentityKey, bool>::new();
+
+    for (record_index, _package, fields) in records {
+        let field_refs = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let package_hint =
+            field(&field_refs, "Package").and_then(|value| PackageName::new(value.trim()).ok());
+        let version_hint = field(&field_refs, "Version")
+            .and_then(|value| RPackageVersion::parse(value.trim()).ok());
+        let scope_hint = field(&field_refs, "Path")
+            .map(classify_path)
+            .transpose()
+            .ok()
+            .flatten();
+        let identity = match provider_identity_from_fields(&field_refs, context) {
+            Ok(identity) => identity,
+            Err(error) => {
+                rejections.push(CranArchiveReleaseRejection {
+                    record_index,
+                    package: package_hint.clone(),
+                    version: version_hint,
+                    scope: scope_hint,
+                    fields,
+                    error,
+                });
+                continue;
+            }
+        };
+        if let Some(expected) = expected_package
+            && identity.0 != *expected
+        {
+            rejections.push(CranArchiveReleaseRejection {
+                record_index,
+                package: Some(identity.0.clone()),
+                version: Some(identity.1.clone()),
+                scope: Some(identity.2.clone()),
+                fields,
+                error: CranRecordError::UnexpectedPackage {
+                    expected: expected.to_string(),
+                    actual: identity.0.to_string(),
+                },
+            });
+            continue;
+        }
+        let identity_key = provider_identity_key(&identity.0, &identity.1, &identity.2);
+        let parsed = observation_from_fields_with_context(&field_refs, context);
+        let observation = match parsed {
+            Ok(observation) => observation,
+            Err(error) => {
+                let was_rejected = seen_identities.insert(identity_key, true);
+                if was_rejected.is_some() {
+                    rejections.push(CranArchiveReleaseRejection {
+                        record_index,
+                        package: Some(identity.0),
+                        version: Some(identity.1),
+                        scope: Some(identity.2),
+                        fields,
+                        error: CranRecordError::Domain(PackageReleaseError::ConflictingMetadata {
+                            field: "duplicate identity",
+                        }),
+                    });
+                } else {
+                    rejections.push(CranArchiveReleaseRejection {
+                        record_index,
+                        package: Some(identity.0),
+                        version: Some(identity.1),
+                        scope: Some(identity.2),
+                        fields,
+                        error,
+                    });
+                }
+                continue;
+            }
+        };
+        let scope = observation_scope(&observation, context);
+        let package_name = observation.identity.name().clone();
+        let release = match PackageRelease::try_from(observation.clone()) {
+            Ok(release) => release,
+            Err(error) => {
+                let was_rejected = seen_identities.insert(identity_key, true);
+                let rejection_error = if was_rejected.is_some() {
+                    CranRecordError::Domain(PackageReleaseError::ConflictingMetadata {
+                        field: "duplicate identity",
+                    })
+                } else {
+                    CranRecordError::Domain(error)
+                };
+                rejections.push(CranArchiveReleaseRejection {
+                    record_index,
+                    package: Some(package_name),
+                    version: Some(identity.1),
+                    scope: Some(identity.2),
+                    fields,
+                    error: rejection_error,
+                });
+                continue;
+            }
+        };
+        let was_rejected = seen_identities.insert(identity_key, false);
+        if was_rejected == Some(true) {
+            rejections.push(CranArchiveReleaseRejection {
+                record_index,
+                package: Some(package_name),
+                version: Some(identity.1),
+                scope: Some(identity.2),
+                fields,
+                error: CranRecordError::Domain(PackageReleaseError::ConflictingMetadata {
+                    field: "duplicate identity",
+                }),
+            });
+            continue;
+        }
+        if matches!(scope, CranCatalogRecordScope::Root)
+            && let Err(error) = aggregation.observe_release(release.clone())
+        {
+            rejections.push(CranArchiveReleaseRejection {
+                record_index,
+                package: Some(package_name),
+                version: Some(identity.1),
+                scope: Some(identity.2),
+                fields,
+                error: CranRecordError::Domain(error),
+            });
+            continue;
+        }
+        observations.push(CranCatalogObservation {
+            record_index,
+            package: package_name,
+            fields: fields_by_index
+                .get(&record_index)
+                .cloned()
+                .expect("provider record fields must be retained"),
+            release,
+            scope,
+        });
+    }
+
+    CranProviderObservationProjection {
+        observations,
+        rejections,
+    }
+}
+
+fn provider_identity_from_fields(
+    fields: &[(&str, &str)],
+    context: CranCatalogRecordContext,
+) -> Result<(PackageName, RPackageVersion, CranCatalogRecordScope), CranRecordError> {
+    reject_identity_duplicates(fields)?;
+    let package = PackageName::new(required_field(fields, "Package")?.trim())
+        .map_err(CranRecordError::InvalidPackageName)?;
+    let version = RPackageVersion::parse(required_field(fields, "Version")?.trim())
+        .map_err(CranRecordError::InvalidVersion)?;
+    let scope = match context {
+        CranCatalogRecordContext::PackagesIndex => field(fields, "Path")
+            .map(classify_path)
+            .transpose()?
+            .unwrap_or(CranCatalogRecordScope::Root),
+        CranCatalogRecordContext::Description => CranCatalogRecordScope::Root,
+    };
+    Ok((package, version, scope))
+}
+
+fn reject_identity_duplicates(fields: &[(&str, &str)]) -> Result<(), CranRecordError> {
+    let mut names = BTreeSet::new();
+    for (name, _) in fields {
+        let normalized = name.to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "package" | "version" | "path") {
+            continue;
+        }
+        if !names.insert(normalized) {
+            return Err(CranRecordError::DuplicateField((*name).to_owned()));
+        }
+    }
+    Ok(())
+}
+
+type ProviderIdentityKey = (PackageName, RPackageVersion, CranCatalogRecordScope);
+
+fn provider_identity_key(
+    package: &PackageName,
+    version: &RPackageVersion,
+    scope: &CranCatalogRecordScope,
+) -> ProviderIdentityKey {
+    (package.clone(), version.clone(), scope.clone())
+}
+
 /// A failure while parsing the index as DCF syntax or converting parsed
 /// records into validated catalog entries.
 #[derive(Debug)]
@@ -384,6 +664,10 @@ pub enum CranRecordError {
     DuplicateField(String),
     InvalidPackageName(PackageNameError),
     InvalidVersion(RPackageVersionError),
+    UnexpectedPackage {
+        expected: String,
+        actual: String,
+    },
     InvalidPath {
         value: String,
         diagnostic: String,
@@ -408,6 +692,12 @@ impl fmt::Display for CranRecordError {
             Self::DuplicateField(field) => write!(f, "duplicate field {field}"),
             Self::InvalidPackageName(error) => error.fmt(f),
             Self::InvalidVersion(error) => error.fmt(f),
+            Self::UnexpectedPackage { expected, actual } => {
+                write!(
+                    f,
+                    "archive row belongs to package {actual}, expected {expected}"
+                )
+            }
             Self::InvalidPath { value, diagnostic } => {
                 write!(f, "invalid Path value {value:?}: {diagnostic}")
             }
@@ -815,7 +1105,8 @@ fn parse_constraint(input: &str) -> Result<VersionConstraint, DependencyParseErr
 
 #[cfg(test)]
 mod tests {
-    use super::CranCatalog;
+    use super::{CranCatalog, CranCatalogRecordContext, CranRecordError};
+    use rsolve_core::PackageName;
 
     const MATCHING_ARCHIVE: &[u8] = include_bytes!(
         "../../tests/fixtures/cran-2026-08-08/synthetic-matrix-archive-overlay-PACKAGES.rds"
@@ -958,5 +1249,169 @@ Package: Matrix\nVersion: 1.0\nLicense: conflicting\n";
             diagnostics[1].error(),
             super::CranRecordError::Domain(_)
         ));
+    }
+
+    #[test]
+    fn provider_archive_projection_quarantines_release_local_dependency_errors() {
+        let records = vec![
+            (
+                0,
+                Some("rsolvefixture.history".to_owned()),
+                vec![
+                    ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                    ("Version".to_owned(), "1.0".to_owned()),
+                    ("License".to_owned(), "fixture".to_owned()),
+                ],
+            ),
+            (
+                1,
+                Some("rsolvefixture.history".to_owned()),
+                vec![
+                    ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                    ("Version".to_owned(), "1.1".to_owned()),
+                    ("License".to_owned(), "fixture".to_owned()),
+                ],
+            ),
+            (
+                2,
+                Some("rsolvefixture.history".to_owned()),
+                vec![
+                    ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                    ("Version".to_owned(), "1.2".to_owned()),
+                    ("Depends".to_owned(), "libxml (>= )".to_owned()),
+                ],
+            ),
+        ];
+        let projection = super::provider_observations_from_fields(
+            records,
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&PackageName::new("rsolvefixture.history").unwrap()),
+        );
+        assert_eq!(projection.observations.len(), 2);
+        assert_eq!(projection.rejections.len(), 1);
+        assert_eq!(projection.rejections[0].record_index(), 2);
+        assert_eq!(
+            projection.rejections[0].package().unwrap().as_str(),
+            "rsolvefixture.history"
+        );
+        assert_eq!(projection.rejections[0].version().unwrap().as_str(), "1.2");
+        assert!(matches!(
+            projection.rejections[0].error(),
+            CranRecordError::Dependency { .. }
+        ));
+        let catalog = CranCatalog::from_provider_observations(&projection.observations);
+        assert_eq!(catalog.candidate_count(), 2);
+        assert!(
+            catalog
+                .candidates_named("rsolvefixture.history")
+                .unwrap()
+                .iter()
+                .all(|release| release.version().as_str() != "1.2")
+        );
+    }
+
+    #[test]
+    fn provider_projection_checks_path_before_release_semantics() {
+        let records = vec![(
+            0,
+            Some("rsolvefixture.history".to_owned()),
+            vec![
+                ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                ("Version".to_owned(), "1.0".to_owned()),
+                ("Path".to_owned(), "broken-path".to_owned()),
+                ("Depends".to_owned(), "libxml (>= )".to_owned()),
+            ],
+        )];
+        let projection = super::provider_observations_from_fields(
+            records,
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&PackageName::new("rsolvefixture.history").unwrap()),
+        );
+        assert!(projection.observations.is_empty());
+        assert!(matches!(
+            projection.rejections[0].error(),
+            CranRecordError::InvalidPath { .. }
+        ));
+        assert_eq!(projection.rejections[0].version().unwrap().as_str(), "1.0");
+    }
+
+    #[test]
+    fn provider_projection_rejects_unexpected_package_and_preserves_raw_fields() {
+        let records = vec![(
+            0,
+            Some("other".to_owned()),
+            vec![
+                ("Package".to_owned(), "other".to_owned()),
+                ("Version".to_owned(), "1.0".to_owned()),
+                ("Depends".to_owned(), "R".to_owned()),
+            ],
+        )];
+        let projection = super::provider_observations_from_fields(
+            records,
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&PackageName::new("rsolvefixture.history").unwrap()),
+        );
+        assert!(projection.observations.is_empty());
+        let rejection = &projection.rejections[0];
+        assert!(matches!(
+            rejection.error(),
+            CranRecordError::UnexpectedPackage { .. }
+        ));
+        assert_eq!(rejection.fields().len(), 3);
+    }
+
+    #[test]
+    fn provider_projection_aggregates_equivalent_valid_duplicates() {
+        let fields = |version: &str| {
+            vec![
+                ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                ("Version".to_owned(), version.to_owned()),
+                ("License".to_owned(), "fixture".to_owned()),
+            ]
+        };
+        let projection = super::provider_observations_from_fields(
+            vec![(0, None, fields("1.0")), (1, None, fields("1.0.0"))],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&PackageName::new("rsolvefixture.history").unwrap()),
+        );
+        assert_eq!(projection.observations.len(), 2);
+        assert!(projection.rejections.is_empty());
+        let catalog = CranCatalog::from_provider_observations(&projection.observations);
+        assert_eq!(catalog.candidate_count(), 1);
+    }
+
+    #[test]
+    fn provider_projection_makes_valid_and_rejected_duplicate_identity_hard() {
+        let records = vec![
+            (
+                0,
+                None,
+                vec![
+                    ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                    ("Version".to_owned(), "1.0".to_owned()),
+                    ("Depends".to_owned(), "libxml (>= )".to_owned()),
+                ],
+            ),
+            (
+                1,
+                None,
+                vec![
+                    ("Package".to_owned(), "rsolvefixture.history".to_owned()),
+                    ("Version".to_owned(), "1.0.0".to_owned()),
+                ],
+            ),
+        ];
+        let projection = super::provider_observations_from_fields(
+            records,
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&PackageName::new("rsolvefixture.history").unwrap()),
+        );
+        assert!(projection.observations.len() <= 1);
+        assert!(projection.rejections.iter().any(|rejection| matches!(
+            rejection.error(),
+            CranRecordError::Domain(rsolve_core::PackageReleaseError::ConflictingMetadata {
+                field: "duplicate identity"
+            })
+        )));
     }
 }
