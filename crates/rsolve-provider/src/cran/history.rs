@@ -108,16 +108,21 @@ pub(crate) fn enumerate_archive_rds_with_options(
 ) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
     let object = rd_rds::file::from_bytes_with_options(input, options)
         .map_err(|error| CranHistoryError::Decode(error.to_string()))?;
-    enumerate_object(&object)
+    enumerate_object(&object, false)
 }
 
 pub(crate) fn enumerate_archive_rds_for_provider(
     input: &[u8],
 ) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
-    enumerate_archive_rds_with_options(input, &provider_rds_read_options())
+    let object = rd_rds::file::from_bytes_with_options(input, &provider_rds_read_options())
+        .map_err(|error| CranHistoryError::Decode(error.to_string()))?;
+    enumerate_object(&object, true)
 }
 
-fn enumerate_object(object: &RObject) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
+fn enumerate_object(
+    object: &RObject,
+    quarantine_nested_foreign_releases: bool,
+) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
     let RValue::List(items) = object.value() else {
         return Err(CranHistoryError::RootType("a named list or data.frame"));
     };
@@ -129,7 +134,7 @@ fn enumerate_object(object: &RObject) -> Result<Vec<ArchiveEntry>, CranHistoryEr
     }
 
     if is_data_frame(object) {
-        return enumerate_frame(object, None);
+        return enumerate_frame(object, None, quarantine_nested_foreign_releases);
     }
 
     let mut entries = Vec::new();
@@ -146,7 +151,11 @@ fn enumerate_object(object: &RObject) -> Result<Vec<ArchiveEntry>, CranHistoryEr
             PackageName::new(&package_name).map_err(|_| CranHistoryError::InvalidPackage {
                 value: package_name.to_string(),
             })?;
-        entries.extend(enumerate_frame(item, Some(&package))?);
+        entries.extend(enumerate_frame(
+            item,
+            Some(&package),
+            quarantine_nested_foreign_releases,
+        )?);
     }
     Ok(entries)
 }
@@ -154,6 +163,7 @@ fn enumerate_object(object: &RObject) -> Result<Vec<ArchiveEntry>, CranHistoryEr
 fn enumerate_frame(
     object: &RObject,
     package_hint: Option<&PackageName>,
+    quarantine_nested_foreign_releases: bool,
 ) -> Result<Vec<ArchiveEntry>, CranHistoryError> {
     if !is_data_frame(object) {
         return Err(CranHistoryError::NotDataFrame);
@@ -194,8 +204,24 @@ fn enumerate_frame(
     files
         .into_iter()
         .enumerate()
-        .map(|(row, path)| {
-            let (path_package, version, source_archive_relative_path) = parse_archive_path(&path)?;
+        .filter_map(|(row, path)| {
+            let parsed = parse_archive_path(&path);
+            if quarantine_nested_foreign_releases
+                && parsed.is_err()
+                && is_nested_foreign_release_path(&path)
+            {
+                // CRAN has historically retained a small number of files in a
+                // package archive directory whose DESCRIPTION belongs to a
+                // different package (for example, a nested legacy upload).
+                // Do not manufacture a Package/Version identity for such a
+                // row.  The provider can safely quarantine this release-local
+                // anomaly while retaining the rest of archive history.
+                return None;
+            }
+            Some((row, path, parsed))
+        })
+        .map(|(row, path, parsed)| {
+            let (path_package, version, source_archive_relative_path) = parsed?;
             if package_hint.is_some_and(|package| package != &path_package) {
                 return Err(CranHistoryError::InvalidPackage {
                     value: path.clone(),
@@ -262,7 +288,16 @@ fn parse_archive_path(
     path: &str,
 ) -> Result<(PackageName, RPackageVersion, Box<str>), CranHistoryError> {
     let segments = path.split('/').collect::<Vec<_>>();
-    if segments.iter().any(|segment| segment.is_empty()) {
+    if segments.iter().any(|segment| {
+        segment.is_empty()
+            || *segment == "."
+            || *segment == ".."
+            || segment.contains('\\')
+            || segment.contains('?')
+            || segment.contains('#')
+            || segment.contains("%2e")
+            || segment.contains("%2E")
+    }) {
         return Err(CranHistoryError::InvalidArchivePath {
             value: path.to_owned(),
         });
@@ -270,6 +305,10 @@ fn parse_archive_path(
     let (package_segment, filename) = match segments.as_slice() {
         [package, filename] => (*package, *filename),
         ["src", "contrib", "Archive", package, filename] => (*package, *filename),
+        ["src", "contrib", "Archive", package, nested @ .., filename] if !nested.is_empty() => {
+            (*package, *filename)
+        }
+        [package, nested @ .., filename] if !nested.is_empty() => (*package, *filename),
         _ => {
             return Err(CranHistoryError::InvalidArchivePath {
                 value: path.to_owned(),
@@ -300,6 +339,47 @@ fn parse_archive_path(
         RPackageVersion::parse(version).map_err(|_| CranHistoryError::InvalidArchivePath {
             value: path.to_owned(),
         })?;
-    let normalized_path = format!("{package}/{filename}").into_boxed_str();
+    let normalized_path = if segments.starts_with(&["src", "contrib", "Archive"]) {
+        segments[3..].join("/").into_boxed_str()
+    } else {
+        segments.join("/").into_boxed_str()
+    };
     Ok((package, version, normalized_path))
+}
+
+/// Returns whether a path is a safe, nested archive row whose filename names a
+/// different package than its containing archive directory. Such rows are
+/// release-local anomalies, rather than a reason to discard every package in
+/// the history index. All other malformed paths remain hard failures.
+fn is_nested_foreign_release_path(path: &str) -> bool {
+    let segments = path.split('/').collect::<Vec<_>>();
+    let (package, filename) = match segments.as_slice() {
+        ["src", "contrib", "Archive", package, nested @ .., filename] if !nested.is_empty() => {
+            (*package, *filename)
+        }
+        [package, nested @ .., filename] if !nested.is_empty() => (*package, *filename),
+        _ => return false,
+    };
+    if segments[..segments.len() - 1].iter().any(|segment| {
+        segment.is_empty()
+            || *segment == "."
+            || *segment == ".."
+            || segment.contains('\\')
+            || segment.contains('?')
+            || segment.contains('#')
+            || segment.contains("%2e")
+            || segment.contains("%2E")
+    }) {
+        return false;
+    }
+    let Some(stem) = filename.strip_suffix(".tar.gz") else {
+        return false;
+    };
+    let Some((filename_package, version)) = stem.split_once('_') else {
+        return false;
+    };
+    PackageName::new(package).is_ok()
+        && PackageName::new(filename_package).is_ok()
+        && package != filename_package
+        && RPackageVersion::parse(version).is_ok()
 }

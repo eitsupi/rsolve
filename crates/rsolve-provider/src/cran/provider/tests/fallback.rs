@@ -510,3 +510,25 @@ fn history_rejects_non_canonical_archive_paths() {
         ));
     }
 }
+
+#[test]
+fn history_accepts_safe_nested_archive_paths() {
+    let entries = enumerate_archive_rds(NESTED_HISTORY).expect("nested history fixture");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].package().as_str(), "Matrix");
+    assert_eq!(
+        entries[0].source_archive_relative_path(),
+        "Matrix/legacy/Matrix_1.6-5.tar.gz"
+    );
+}
+
+#[test]
+fn provider_quarantines_foreign_nested_archive_rows() {
+    assert!(matches!(
+        enumerate_archive_rds(FOREIGN_NESTED_HISTORY),
+        Err(CranHistoryError::InvalidArchivePath { .. })
+    ));
+    let entries = crate::cran::history::enumerate_archive_rds_for_provider(FOREIGN_NESTED_HISTORY)
+        .expect("foreign nested row is release-local");
+    assert!(entries.is_empty());
+}

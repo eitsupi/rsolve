@@ -26,6 +26,11 @@ const INVALID_UTF8_CURRENT: &[u8] = include_bytes!(
 );
 const HISTORY: &[u8] =
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-archive.rds");
+const NESTED_HISTORY: &[u8] =
+    include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-nested-archive.rds");
+const FOREIGN_NESTED_HISTORY: &[u8] = include_bytes!(
+    "../../../tests/fixtures/cran-2026-08-08/synthetic-meta-foreign-nested-archive.rds"
+);
 const INVALID_HISTORY_PATHS: &[&[u8]] = &[
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-traversal.rds"),
     include_bytes!("../../../tests/fixtures/cran-2026-08-08/synthetic-meta-invalid-query.rds"),

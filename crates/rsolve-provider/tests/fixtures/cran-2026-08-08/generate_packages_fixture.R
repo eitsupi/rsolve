@@ -442,6 +442,43 @@ archive_history <- list(
 )
 write_binary_fixture("synthetic-meta-archive.rds", archive_history)
 
+nested_archive_history <- list(
+    Matrix = data.frame(
+        size = 1234,
+        isdir = FALSE,
+        mode = 420L,
+        mtime = 1790000000,
+        ctime = 1790000000,
+        atime = 1790000000,
+        uid = 1000L,
+        gid = 1000L,
+        uname = "fixture",
+        grname = "fixture",
+        row.names = "Matrix/legacy/Matrix_1.6-5.tar.gz"
+    )
+)
+write_binary_fixture("synthetic-meta-nested-archive.rds", nested_archive_history)
+
+foreign_nested_archive_history <- list(
+    calibFit = data.frame(
+        size = 1234,
+        isdir = FALSE,
+        mode = 420L,
+        mtime = 1790000000,
+        ctime = 1790000000,
+        atime = 1790000000,
+        uid = 1000L,
+        gid = 1000L,
+        uname = "fixture",
+        grname = "fixture",
+        row.names = "calibFit/Ancestry/calib_0.1.02.tar.gz"
+    )
+)
+write_binary_fixture(
+    "synthetic-meta-foreign-nested-archive.rds",
+    foreign_nested_archive_history
+)
+
 invalid_history <- function(path) {
     list(Matrix = data.frame(
         size = 1,
