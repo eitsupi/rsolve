@@ -18,7 +18,7 @@ use crate::Manifest;
 use crate::orchestration::{
     CandidateLoaderRef, CranResolutionError, CranResolutionOutcome, resolve_request,
 };
-use rsolve_resolver::{RBasePackageOverlay, is_r_base_package_name};
+use rsolve_resolver::{RBasePackageOverlay, ResolutionFailure, is_r_base_package_name};
 
 /// Derive the private CRAN registry identity from the canonical endpoint.
 /// The provider kind and endpoint are length-delimited to avoid ambiguous
@@ -80,6 +80,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn collect_cran_dependency_closure_from_loader(
     roots: &[PackageName],
     loader: &dyn CandidateLoader,
@@ -129,10 +130,11 @@ enum CacheProbe<L> {
 
 /// Shared cache decision boundary used by both production resolution and
 /// deterministic orchestration tests. Refresh is invoked only when the
-/// compatible generation is stale or cannot prove the requested closure.
+/// compatible generation is stale or cannot prove the requested resolution.
 fn cache_or_refresh<L, F>(
     probe: CacheProbe<L>,
     roots: &[PackageName],
+    request: &rsolve_core::ResolutionRequest,
     mut refresh: F,
 ) -> Result<(L, Vec<CranSnapshotCacheDiagnostic>), CranResolutionError>
 where
@@ -144,10 +146,11 @@ where
         CacheProbe::Compatible { loader, diagnostic }
             if diagnostic.status() == CranSnapshotCacheStatus::Fresh =>
         {
-            match collect_cran_dependency_closure_from_loader(roots, &loader) {
+            match resolve_prepared_snapshot_without_transport(request.clone(), &loader) {
                 Ok(_) => return Ok((loader, vec![diagnostic])),
                 Err(error) => {
-                    diagnostics.push(CranSnapshotCacheDiagnostic::closure_incomplete(&error))
+                    let error = cache_resolution_error(error);
+                    diagnostics.push(CranSnapshotCacheDiagnostic::closure_incomplete(&error));
                 }
             }
         }
@@ -159,23 +162,42 @@ where
     Ok((loader, diagnostics))
 }
 
+fn cache_resolution_error(error: CranResolutionError) -> CandidateLoadError {
+    match error {
+        CranResolutionError::Resolution(ResolutionFailure::CandidateLoad { source, .. }) => *source,
+        error => CandidateLoadError::new(
+            CandidateLoadErrorCategory::MetadataInvalid,
+            format!(
+                "cached CRAN generation cannot satisfy the requested dependency closure: {error}"
+            ),
+        ),
+    }
+}
+
 fn resolve_offline_from_cache<L: CandidateLoader>(
     request: rsolve_core::ResolutionRequest,
-    roots: &[PackageName],
     probe: CacheProbe<L>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
     let (loader, diagnostic) = match probe {
         CacheProbe::Compatible { loader, diagnostic } => (loader, diagnostic),
         CacheProbe::Rejected(diagnostic) => return Err(CranResolutionError::Cache(diagnostic)),
     };
-    collect_cran_dependency_closure_from_loader(roots, &loader)
-        .map_err(CranResolutionError::Offline)?;
-    let resolution = resolve_prepared_snapshot_without_transport(request, &loader)?;
+    let resolution = resolve_prepared_snapshot_without_transport(request, &loader)
+        .map_err(map_offline_resolution_error)?;
     Ok(CranResolutionOutcome {
         resolution,
         diagnostics: Vec::new(),
         cache_diagnostics: vec![diagnostic],
     })
+}
+
+fn map_offline_resolution_error(error: CranResolutionError) -> CranResolutionError {
+    match error {
+        CranResolutionError::Resolution(ResolutionFailure::CandidateLoad { source, .. }) => {
+            CranResolutionError::Offline(*source)
+        }
+        error => error,
+    }
 }
 
 /// Resolve a CRAN manifest against one persistent, immutable snapshot.
@@ -234,7 +256,7 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
         },
         CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
     };
-    let (loader, cache_diagnostics) = cache_or_refresh(probe, &roots, |batch| {
+    let (loader, cache_diagnostics) = cache_or_refresh(probe, &roots, &request, |batch| {
         let closure =
             collect_cran_dependency_closure(batch, |batch| refresher.refresh_packages(batch))
                 .map_err(CranResolutionError::Refresh)?;
@@ -309,7 +331,7 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy(
         },
         CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
     };
-    resolve_offline_from_cache(request, &roots, probe)
+    resolve_offline_from_cache(request, probe)
 }
 
 /// Solve only through the already prepared loader; no refresh callback is
@@ -340,6 +362,30 @@ mod tests {
         dependencies: Vec<DependencyRequirement>,
     ) -> PackageRelease {
         let version = RPackageVersion::parse("1.0.0").unwrap();
+        PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: name.clone(),
+            observed_version: version,
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
+            dependencies,
+            distributions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn release_at_version_with_dependencies(
+        name: &PackageName,
+        version: &str,
+        dependencies: Vec<DependencyRequirement>,
+    ) -> PackageRelease {
+        let version = RPackageVersion::parse(version).unwrap();
         PackageRelease::try_from(ReleaseObservation {
             identity: ReleaseIdentity::new(
                 name.clone(),
@@ -481,6 +527,8 @@ mod tests {
                 vec![release_with_dependencies(&dependency, Vec::new())],
             ),
         ]);
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
         let mut refreshes = 0;
         let (reused, diagnostics) = cache_or_refresh(
             CacheProbe::Compatible {
@@ -488,6 +536,7 @@ mod tests {
                 diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(30)),
             },
             std::slice::from_ref(&root),
+            &request,
             |_| {
                 refreshes += 1;
                 unreachable!("fresh complete cache must not refresh")
@@ -500,12 +549,119 @@ mod tests {
     }
 
     #[test]
+    fn fresh_cache_reuse_ignores_missing_dependency_of_unselected_legacy_candidate() {
+        let root = PackageName::new("root").unwrap();
+        let legacy_dependency = PackageName::new("legacydep").unwrap();
+        let current = release_at_version_with_dependencies(&root, "2.0.0", Vec::new());
+        let legacy = release_at_version_with_dependencies(
+            &root,
+            "1.0.0",
+            vec![required_dependency(
+                DependencyKind::Imports,
+                &legacy_dependency,
+            )],
+        );
+        let loader =
+            CranCandidateSnapshot::from_candidates([(root.clone(), vec![legacy, current])]);
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
+        let mut refreshes = 0;
+        let (reused, diagnostics) = cache_or_refresh(
+            CacheProbe::Compatible {
+                loader,
+                diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(30)),
+            },
+            std::slice::from_ref(&root),
+            &request,
+            |_| {
+                refreshes += 1;
+                unreachable!("fresh selectable cache must not refresh");
+            },
+        )
+        .unwrap();
+        assert_eq!(refreshes, 0);
+        assert_eq!(diagnostics[0].status(), CranSnapshotCacheStatus::Fresh);
+        let resolution = resolve_prepared_snapshot_without_transport(request, &reused).unwrap();
+        assert_eq!(
+            resolution.selected(&root).unwrap().version().as_str(),
+            "2.0.0"
+        );
+    }
+
+    #[test]
+    fn offline_cache_with_only_missing_dependency_returns_typed_failure() {
+        let root = PackageName::new("root").unwrap();
+        let missing = PackageName::new("missing").unwrap();
+        let root_release = release_at_version_with_dependencies(
+            &root,
+            "1.0.0",
+            vec![required_dependency(DependencyKind::Imports, &missing)],
+        );
+        let loader = CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]);
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
+        let error = resolve_offline_from_cache(
+            request,
+            CacheProbe::Compatible {
+                loader,
+                diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(30)),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CranResolutionError::Offline(source)
+                if source.category() == CandidateLoadErrorCategory::NotFound
+        ));
+    }
+
+    #[test]
+    fn offline_missing_root_and_corrupt_snapshot_keep_typed_failures() {
+        let root = PackageName::new("root").unwrap();
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
+        let missing = resolve_offline_from_cache(
+            request.clone(),
+            CacheProbe::Compatible {
+                loader: CranCandidateSnapshot::default(),
+                diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(30)),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing,
+            CranResolutionError::Offline(source)
+                if source.category() == CandidateLoadErrorCategory::NotFound
+        ));
+
+        let corrupt = FailingLoader(CandidateLoadError::new(
+            CandidateLoadErrorCategory::SnapshotInvalid,
+            "corrupt current snapshot",
+        ));
+        let error = resolve_offline_from_cache(
+            request,
+            CacheProbe::Compatible {
+                loader: corrupt,
+                diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(30)),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CranResolutionError::Offline(source)
+                if source.category() == CandidateLoadErrorCategory::SnapshotInvalid
+        ));
+    }
+
+    #[test]
     fn stale_or_incomplete_cache_refreshes_once() {
         let root = PackageName::new("root").unwrap();
         let complete = CranCandidateSnapshot::from_candidates([(
             root.clone(),
             vec![release_with_dependencies(&root, Vec::new())],
         )]);
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
         for (probe, expected_status) in [
             (
                 CacheProbe::Compatible {
@@ -523,11 +679,12 @@ mod tests {
             ),
         ] {
             let mut refreshes = 0;
-            let (_, diagnostics) = cache_or_refresh(probe, std::slice::from_ref(&root), |_| {
-                refreshes += 1;
-                Ok(complete.clone())
-            })
-            .unwrap();
+            let (_, diagnostics) =
+                cache_or_refresh(probe, std::slice::from_ref(&root), &request, |_| {
+                    refreshes += 1;
+                    Ok(complete.clone())
+                })
+                .unwrap();
             assert_eq!(refreshes, 1);
             assert_eq!(diagnostics[0].status(), expected_status);
         }
@@ -544,7 +701,6 @@ mod tests {
         )]);
         let outcome = resolve_offline_from_cache(
             request,
-            std::slice::from_ref(&root),
             CacheProbe::Compatible {
                 loader,
                 diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Stale, Some(7200)),
@@ -561,7 +717,6 @@ mod tests {
         let request = crate::manifest::compose_resolution_request(manifest_for(root)).unwrap();
         let error = resolve_offline_from_cache(
             request,
-            &[],
             CacheProbe::<CranCandidateSnapshot>::Rejected(cache_diagnostic(
                 CranSnapshotCacheStatus::RevisionIncompatible,
                 None,
