@@ -177,7 +177,12 @@ pub(super) fn archive_rejection_to_evidence(
             .collect(),
         artifact: Some(OccurrenceArtifactV1 {
             locator,
-            checksums: checksums_from_fields(rejection.fields()),
+            // Archive rejections are retained even when an index field is
+            // malformed. Keep those fields lossless above, but only promote
+            // values that satisfy the snapshot checksum contract into the
+            // typed artifact projection. Valid observations continue to use
+            // the fail-closed path in `checksums_from_index_fields`.
+            checksums: checksums_from_rejection_fields(rejection.fields()),
             size: None,
         }),
         axes: EvidenceAxesV1 {
@@ -242,6 +247,22 @@ fn evidence_axes(
 
 fn checksums_from_index_fields(record: &CranCatalogObservation) -> Vec<ChecksumV1> {
     checksums_from_fields(record.fields())
+}
+
+fn checksums_from_rejection_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
+    checksums_from_fields(fields)
+        .into_iter()
+        .filter(|checksum| match checksum.algorithm.as_str() {
+            // The wire validator treats MD5 as an opaque non-empty value,
+            // while SHA-256 values must be exactly 32 bytes of hex.
+            "md5" => true,
+            "sha256" => {
+                checksum.value.len() == 64
+                    && checksum.value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }
+            _ => false,
+        })
+        .collect()
 }
 
 fn checksums_from_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
@@ -318,5 +339,72 @@ impl<T: Transport> CranRefreshSession<T> {
             ));
         }
         Ok(observations)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cran::catalog::{CranCatalogRecordContext, provider_observations_from_fields};
+    use crate::cran::evidence::compose_snapshot;
+    use crate::cran::publish::default_context;
+    use crate::snapshot::SnapshotGenerationBuilder;
+    use rsolve_core::RegistryId;
+
+    #[test]
+    fn quarantined_checksum_fields_stay_raw_without_blocking_snapshot_publish() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_observations_from_fields(
+            vec![(
+                0,
+                Some(package.to_string()),
+                vec![
+                    ("Package".into(), "Matrix".into()),
+                    ("Version".into(), "1.7-0".into()),
+                    ("License".into(), "RSOLVE Fictional Terms Matrix".into()),
+                    ("Depends".into(), "libxml (>= )".into()),
+                    ("MD5sum".into(), "00000000000000000000000000000021".into()),
+                    ("SHA256".into(), "not-a-digest".into()),
+                ],
+            )],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&package),
+        );
+        let rejection = projection.rejections.first().expect("semantic rejection");
+        let evidence = archive_rejection_to_evidence(
+            rejection,
+            source_input(
+                "cran-archive-index",
+                "rds",
+                "https://cran.invalid/src/contrib/Archive/Matrix/PACKAGES.rds",
+                b"archive",
+            ),
+            "https://cran.invalid",
+            FreshnessStateV1::BulkGeneration,
+        );
+
+        assert!(
+            evidence
+                .fields
+                .iter()
+                .any(|field| { field.name == "SHA256" && field.value == "not-a-digest" })
+        );
+        assert_eq!(
+            evidence.artifact.as_ref().unwrap().checksums,
+            vec![ChecksumV1 {
+                algorithm: "md5".into(),
+                value: "00000000000000000000000000000021".into(),
+            }]
+        );
+
+        let input = compose_snapshot(
+            default_context(RegistryId::new("cran").unwrap()),
+            vec![evidence],
+        )
+        .expect("quarantined invalid checksum must not block composition");
+        let directory = tempfile::tempdir().unwrap();
+        SnapshotGenerationBuilder::new(input, directory.path().join("generation.redb"))
+            .build()
+            .expect("quarantined invalid checksum must not block snapshot publish");
     }
 }
