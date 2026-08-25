@@ -65,3 +65,8 @@ pub use cache::{SnapshotStore, SnapshotStoreError};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn test_present_input() -> SnapshotBuildInput {
+    tests::present_input()
+}

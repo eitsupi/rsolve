@@ -12,7 +12,10 @@ use super::super::publish::{
     CranSnapshotPublishError, default_context, publish_snapshot_with_endpoint_and_refresh_guard,
 };
 use super::transport::UreqTransport;
-use super::{CranCandidateSnapshot, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshSession};
+use super::{
+    CranCandidateSnapshot, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshSession,
+    CranSnapshotCachePolicy, CranSnapshotCacheResult,
+};
 use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotRefreshGuard, SnapshotStore};
 
 /// A transport-neutral failure constructing the CRAN snapshot refresher.
@@ -49,6 +52,21 @@ pub struct CranPersistentRefresh<'a> {
     guard: SnapshotRefreshGuard<'a>,
     previous_projection: Option<std::path::PathBuf>,
     pre_wait: PersistentRefreshProbe,
+}
+
+/// Provider-owned state captured before a refresh caller waits for the
+/// persistent transaction. The cache result is only for the warm fast path;
+/// the opaque validation observation is consumed by the transaction.
+pub struct CranPersistentRefreshPreflight<'a> {
+    store: &'a SnapshotStore,
+    probe: PersistentRefreshProbe,
+    initial_cache: Option<CranSnapshotCacheResult>,
+}
+
+impl CranPersistentRefreshPreflight<'_> {
+    pub fn cache_result(&self) -> Option<&CranSnapshotCacheResult> {
+        self.initial_cache.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,15 +126,47 @@ impl CranSnapshotRefresher {
         diagnostics
     }
 
+    pub fn preflight_refresh<'a>(
+        &self,
+        store: &'a SnapshotStore,
+        policy: &CranSnapshotCachePolicy,
+    ) -> CranPersistentRefreshPreflight<'a> {
+        self.preflight_refresh_with_after_observation(store, policy, || {})
+    }
+
+    fn preflight_refresh_with_after_observation<'a, F>(
+        &self,
+        store: &'a SnapshotStore,
+        policy: &CranSnapshotCachePolicy,
+        after_observation: F,
+    ) -> CranPersistentRefreshPreflight<'a>
+    where
+        F: FnOnce(),
+    {
+        // Capture the lock-free observation before attempting even the warm
+        // probe. This ordering is the forced-waiter coalescing boundary.
+        let probe = observe_persistent_refresh_probe(store);
+        after_observation();
+        let initial_cache = super::inspect_cran_snapshot_cache_without_wait(store, policy);
+        CranPersistentRefreshPreflight {
+            store,
+            probe,
+            initial_cache,
+        }
+    }
+
     pub fn begin_persistent_refresh<'a>(
         &'a self,
-        store: &'a SnapshotStore,
+        preflight: CranPersistentRefreshPreflight<'a>,
     ) -> Result<CranPersistentRefresh<'a>, CranSnapshotPublishError> {
-        // This read intentionally happens immediately before the blocking
-        // lock acquisition. The validation file is atomically replaced, so a
-        // lock-free read observes either a complete old/new canonical record
-        // or a fail-closed invalid result.
-        let pre_wait = observe_persistent_refresh_probe(store);
+        self.begin_persistent_refresh_with_probe(preflight.store, preflight.probe)
+    }
+
+    fn begin_persistent_refresh_with_probe<'a>(
+        &'a self,
+        store: &'a SnapshotStore,
+        pre_wait: PersistentRefreshProbe,
+    ) -> Result<CranPersistentRefresh<'a>, CranSnapshotPublishError> {
         let guard = store.begin_refresh().map_err(|error| {
             CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
                 CandidateLoadErrorCategory::SnapshotInvalid,
@@ -367,7 +417,10 @@ pub(super) fn extract_description(input: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_persistent_refresh_probe, refresh_completed_after_wait};
+    use super::{
+        CranSnapshotCachePolicy, CranSnapshotCacheResult, CranSnapshotRefresher,
+        observe_persistent_refresh_probe, refresh_completed_after_wait,
+    };
     use crate::snapshot::{CurrentValidationSourceV2, CurrentValidationV2, SnapshotStore};
     use rsolve_core::RegistryId;
 
@@ -432,5 +485,47 @@ mod tests {
             &unreadable,
             second.revision.as_deref()
         ));
+    }
+
+    #[test]
+    fn preflight_carries_the_old_revision_past_a_cache_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let input = crate::snapshot::test_present_input();
+        store
+            .build_and_publish_with_endpoint(input, "https://cloud.r-project.org")
+            .unwrap();
+        let validation_path = store.root().join("current-validation");
+        let current = store.read_current_validation().unwrap().unwrap();
+        let refresher = CranSnapshotRefresher::new(crate::cran::CranMetadataConfig::new(
+            "https://cloud.r-project.org",
+            "https://cloud.r-project.org/src/contrib/ALLPACKAGES.rds",
+        ))
+        .unwrap();
+        let policy = CranSnapshotCachePolicy::at("2026-08-25T00:00:00Z".parse().unwrap())
+            .with_expected_endpoint("https://cloud.r-project.org")
+            .with_allowed_auxiliary_endpoint(
+                "https://cloud.r-project.org/src/contrib/ALLPACKAGES.rds",
+            );
+
+        // `preflight_refresh` captures sequence 1 before its nonblocking
+        // cache probe. Simulate an owner publishing sequence 2 immediately
+        // after observation and before that probe.
+        let preflight = refresher.preflight_refresh_with_after_observation(&store, &policy, || {
+            let mut next = current.clone();
+            next.refresh_sequence = 2;
+            std::fs::write(&validation_path, serde_json::to_vec(&next).unwrap()).unwrap();
+        });
+        let locked_revision = store.read_current_validation_revision_unlocked().unwrap();
+        let probed_revision = match preflight.cache_result().unwrap() {
+            CranSnapshotCacheResult::Compatible { diagnostic, .. }
+            | CranSnapshotCacheResult::Rejected(diagnostic) => {
+                diagnostic.revision_token().map(str::to_owned)
+            }
+        };
+        assert_eq!(probed_revision.as_deref(), locked_revision.as_deref());
+        let transaction = refresher.begin_persistent_refresh(preflight).unwrap();
+        assert!(transaction.refresh_completed_while_waiting(locked_revision.as_deref()));
     }
 }

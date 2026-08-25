@@ -10,7 +10,7 @@ use rsolve_provider::SnapshotStore;
 use rsolve_provider::cran::{CranCandidateSnapshot, CranMetadataConfig, CranSnapshotRefresher};
 use rsolve_provider::cran::{
     CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,
-    CranSnapshotCacheStatus, inspect_cran_snapshot_cache, inspect_cran_snapshot_cache_without_wait,
+    CranSnapshotCacheStatus, inspect_cran_snapshot_cache,
 };
 use sha2::{Digest, Sha256};
 
@@ -285,16 +285,16 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
     let cache_policy = cache_policy
         .with_expected_endpoint(refresher.canonical_endpoint())
         .with_allowed_auxiliary_endpoint(refresher.allpackages_feed_endpoint());
-    // A non-blocking probe is used only for the warm, complete-cache fast
-    // path. Forced-refresh coalescing is decided later from the provider
-    // transaction's lock-free pre-wait validation observation and its
-    // authoritative locked snapshot.
-    let initial_cache = inspect_cran_snapshot_cache_without_wait(store, &cache_policy);
+    // Capture the provider-owned validation observation before attempting the
+    // non-blocking cache probe. The same observation is consumed by the
+    // transaction if this request has to wait for another refresh.
+    let preflight = refresher.preflight_refresh(store, &cache_policy);
     // Keep the warm, complete-cache path entirely loader-only. Acquiring the
     // persistent refresh transaction here would add lock/raw-cache work to
     // every online invocation even when no metadata refresh is necessary.
     if !cache_policy.refresh_metadata
-        && let Some(CranSnapshotCacheResult::Compatible { loader, diagnostic }) = initial_cache
+        && let Some(CranSnapshotCacheResult::Compatible { loader, diagnostic }) =
+            preflight.cache_result()
         && diagnostic.status() == CranSnapshotCacheStatus::Fresh
         && let Ok(resolution) =
             resolve_prepared_snapshot_without_transport(request.clone(), loader.as_ref())
@@ -302,13 +302,13 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
         return Ok(CranResolutionOutcome {
             resolution,
             diagnostics: Vec::new(),
-            cache_diagnostics: vec![diagnostic],
+            cache_diagnostics: vec![diagnostic.clone()],
         });
     }
     // Hold the refresh lock through closure discovery, metadata acquisition,
     // composition and publication. Waiters re-read after lock handoff.
     let transaction = refresher
-        .begin_persistent_refresh(store)
+        .begin_persistent_refresh(preflight)
         .map_err(CranResolutionError::Publish)?;
     let mut locked_policy = cache_policy.clone();
     locked_policy.refresh_metadata = false;

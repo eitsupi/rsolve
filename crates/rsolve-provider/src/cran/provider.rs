@@ -47,7 +47,10 @@ use negative::FastPathFailure;
 #[cfg(test)]
 use refresher::canonical_base_url;
 use refresher::extract_description;
-pub use refresher::{CranPersistentRefresh, CranSnapshotRefresher, CranSnapshotRefresherError};
+pub use refresher::{
+    CranPersistentRefresh, CranPersistentRefreshPreflight, CranSnapshotRefresher,
+    CranSnapshotRefresherError,
+};
 #[cfg(test)]
 pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
@@ -372,7 +375,7 @@ pub fn inspect_cran_snapshot_cache(
 /// refresh transaction. `None` means the transaction lock was busy; callers
 /// must not interpret that as a missing or fresh generation and should
 /// re-check after acquiring their own transaction.
-pub fn inspect_cran_snapshot_cache_without_wait(
+pub(crate) fn inspect_cran_snapshot_cache_without_wait(
     store: &SnapshotStore,
     policy: &CranSnapshotCachePolicy,
 ) -> Option<CranSnapshotCacheResult> {

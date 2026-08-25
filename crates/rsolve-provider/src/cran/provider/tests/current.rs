@@ -136,8 +136,17 @@ fn persistent_refresh_child_probe() {
         crate::snapshot::SnapshotStore::open(&root, rsolve_core::RegistryId::new("cran").unwrap())
             .unwrap();
     let feed = "https://feed.invalid/ALLPACKAGES.zst";
-    let now = "2026-08-25T00:00:00Z".parse().unwrap();
+    let now: jiff::Timestamp = "2026-08-25T00:00:00Z".parse().unwrap();
     let pre_wait = crate::cran::provider::refresher::observe_persistent_refresh_probe(&store);
+    // Keep the child fixture's ordering identical to the production
+    // preflight: the opaque observation precedes the non-blocking cache probe.
+    // In the waiter process this probe runs while the owner holds the lock and
+    // therefore returns `None` without turning the test into a busy wait.
+    let initial_policy = CranSnapshotCachePolicy::at(now)
+        .with_expected_endpoint("https://cloud.r-project.org")
+        .with_allowed_auxiliary_endpoint(feed);
+    let _initial_cache =
+        crate::cran::provider::inspect_cran_snapshot_cache_without_wait(&store, &initial_policy);
     std::fs::write(
         root.join(if forced {
             if owner {
@@ -411,10 +420,17 @@ fn persistent_refresh_drop_releases_lock_for_a_following_transaction() {
         "https://feed.invalid/allpackages.zst",
     ))
     .unwrap();
+    let policy = CranSnapshotCachePolicy::at(jiff::Timestamp::now())
+        .with_expected_endpoint("https://cran.invalid")
+        .with_allowed_auxiliary_endpoint("https://feed.invalid/allpackages.zst");
 
-    let transaction = refresher.begin_persistent_refresh(&store).unwrap();
+    let transaction = refresher
+        .begin_persistent_refresh(refresher.preflight_refresh(&store, &policy))
+        .unwrap();
     drop(transaction);
-    refresher.begin_persistent_refresh(&store).unwrap();
+    refresher
+        .begin_persistent_refresh(refresher.preflight_refresh(&store, &policy))
+        .unwrap();
 }
 
 #[test]
