@@ -151,6 +151,61 @@ impl<T: Transport> CranRefreshSession<T> {
         ) {
             Ok((projection, source, outcome)) => {
                 let feed_digest = hex_digest(source.content_sha256).to_string();
+                let projection_path = self.raw_cache.as_ref().and_then(|cache| {
+                    cache
+                        .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
+                        .ok()
+                        .map(|key| cache.projection_path_for_digest(&key, &source.content_sha256))
+                });
+                let Some(projection_path) = projection_path else {
+                    return Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        "ALLPACKAGES projection cache path is unavailable",
+                    ));
+                };
+
+                // A positive qualification is the durable result of the
+                // complete mirror decision. Once the feed bytes have been
+                // acquired and all binding inputs still match, reuse that
+                // decision directly instead of rescanning the projection or
+                // fetching canonical evidence again. Forced refreshes and
+                // stale or mismatched records deliberately fall through to
+                // the full validation path below.
+                let reusable_positive = persisted_qualification.as_ref().filter(|record| {
+                    !self.refresh_metadata
+                        && record.status == qualification::Status::Positive
+                        && qualification::matches(
+                            record,
+                            &self.base_url,
+                            &endpoint,
+                            &current_digest,
+                            &archive_digest,
+                            Some(&feed_digest),
+                        )
+                        && qualification::positive_reusable(record, self.now())
+                });
+                if reusable_positive.is_some() {
+                    let status = match outcome {
+                        MetadataAcquisitionOutcome::Revalidated304 => 304,
+                        MetadataAcquisitionOutcome::Cached
+                        | MetadataAcquisitionOutcome::Network200 => 200,
+                    };
+                    self.diagnostics.push(CranRefreshDiagnostic {
+                        endpoint: endpoint.clone().into_boxed_str(),
+                        status: Some(status),
+                        status_detail: CranFastPathStatus::Available,
+                        source: CranRefreshSource::AllPackages,
+                    });
+                    let result = Rc::new(AllPackagesSource {
+                        projection: Rc::new(projection),
+                        source,
+                        projection_path,
+                    });
+                    let result = Ok(result);
+                    self.allpackages = Some(result.clone());
+                    return result;
+                }
+
                 let coverage = projection
                     .classify_current(&current_catalog)
                     .map_err(|error| {
@@ -312,18 +367,6 @@ impl<T: Transport> CranRefreshSession<T> {
                     status_detail: detail,
                     source: CranRefreshSource::AllPackages,
                 });
-                let projection_path = self.raw_cache.as_ref().and_then(|cache| {
-                    cache
-                        .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
-                        .ok()
-                        .map(|key| cache.projection_path_for_digest(&key, &source.content_sha256))
-                });
-                let Some(projection_path) = projection_path else {
-                    return Err(CandidateLoadError::new(
-                        CandidateLoadErrorCategory::SnapshotInvalid,
-                        "ALLPACKAGES projection cache path is unavailable",
-                    ));
-                };
                 Ok(Rc::new(AllPackagesSource {
                     projection: Rc::new(projection),
                     source,

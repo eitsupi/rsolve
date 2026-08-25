@@ -84,7 +84,7 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
     let signature = release_signature(first_result.candidates());
 
     crate::cran::provider::allpackages::reset_test_counters();
-    let second_transport = allpackages_transport(feed, false);
+    let second_transport = allpackages_transport(feed.clone(), false);
     let second_requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
@@ -98,6 +98,33 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
     assert_eq!(release_signature(second_result.candidates()), signature);
     assert!(second_requests.borrow().is_empty());
     assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+    assert_eq!(
+        crate::cran::provider::allpackages::classify_current_count(),
+        0
+    );
+
+    // A changed qualification binding is not a reusable decision even when
+    // every raw artifact remains fresh. The normal path must reclassify it.
+    let qualification_path = RawCache::open(&store).unwrap().qualification_path();
+    let mut mismatched = crate::cran::provider::qualification::load_result(&qualification_path)
+        .unwrap()
+        .unwrap();
+    mismatched.current_digest = "changed-current-surface".into();
+    crate::cran::provider::qualification::publish(&qualification_path, &mismatched).unwrap();
+    crate::cran::provider::allpackages::reset_test_counters();
+    let third_transport = allpackages_transport(feed, false);
+    let third_requests = third_transport.requests.clone();
+    let mut third = CranRefreshSession::new_with_clock(
+        Rc::new(third_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:02Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    third
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(third_requests.borrow().is_empty());
+    assert!(crate::cran::provider::allpackages::classify_current_count() > 0);
 }
 
 #[test]
@@ -186,6 +213,7 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
     assert_eq!(release_signature(second_result.candidates()), signature);
     assert_eq!(requests.borrow().len(), 3);
     assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+    assert!(crate::cran::provider::allpackages::classify_current_count() > 0);
     assert!(requests.borrow().iter().all(|request| {
         request.validators.if_none_match.as_deref() == Some("\"allpackages-e2e\"")
     }));
@@ -239,6 +267,7 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
         .unwrap();
     assert_eq!(release_signature(third_result.candidates()), signature);
     assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+    assert!(crate::cran::provider::allpackages::classify_current_count() > 0);
 }
 
 #[test]
@@ -367,6 +396,10 @@ fn custom_mirror_positive_reuses_actual_canonical_qualification_until_ttl() {
     assert_eq!(release_signature(second_result.candidates()), signature);
     assert!(second_requests.borrow().is_empty());
     assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+    assert_eq!(
+        crate::cran::provider::allpackages::classify_current_count(),
+        0
+    );
 
     let third_transport = custom_mirror_transport(feed.clone(), HISTORY, false);
     let third_requests = third_transport.requests.clone();

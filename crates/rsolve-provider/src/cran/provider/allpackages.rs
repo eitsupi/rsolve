@@ -35,12 +35,14 @@ const PACKAGE_OBSERVATIONS: TableDefinition<&str, &[u8]> =
 thread_local! {
     static PROJECTION_BUILD_COUNT: Cell<usize> = const { Cell::new(0) };
     static PROJECTION_DECODE_COUNT: Cell<usize> = const { Cell::new(0) };
+    static CLASSIFY_CURRENT_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(super) fn reset_test_counters() {
     PROJECTION_BUILD_COUNT.with(|counter| counter.set(0));
     PROJECTION_DECODE_COUNT.with(|counter| counter.set(0));
+    CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(0));
 }
 
 #[cfg(test)]
@@ -49,6 +51,11 @@ pub(super) fn test_counters() -> (usize, usize) {
         PROJECTION_BUILD_COUNT.with(Cell::get),
         PROJECTION_DECODE_COUNT.with(Cell::get),
     )
+}
+
+#[cfg(test)]
+pub(super) fn classify_current_count() -> usize {
+    CLASSIFY_CURRENT_COUNT.with(Cell::get)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -104,6 +111,8 @@ impl IndexedProjection {
         &self,
         current: &CranCatalog,
     ) -> Result<CoverageSummary, String> {
+        #[cfg(test)]
+        CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(counter.get() + 1));
         let read = self
             .database
             .begin_read()
