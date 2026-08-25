@@ -155,7 +155,9 @@ pub(super) fn failure_probe_at(
     let local_window = LOCAL_BACKOFF_BASE_SECS
         .saturating_mul(1_i64 << exponent)
         .min(LOCAL_BACKOFF_CAP_SECS);
-    let jitter_secs = ((local_window as u128 * sample as u128) / u64::MAX as u128) as i64;
+    let jitter_secs = ((local_window as u128 * sample as u128) / u64::MAX as u128)
+        .max(1)
+        .min(LOCAL_BACKOFF_CAP_SECS as u128) as i64;
     let local_deadline = now + jiff::SignedDuration::from_secs(jitter_secs);
     let server_deadline = retry_after
         .and_then(|value| parse_retry_after(value, now))
@@ -183,10 +185,12 @@ pub(super) fn failure_probe_at(
 fn parse_retry_after(value: &str, now: jiff::Timestamp) -> Option<i64> {
     let value = value.trim();
     let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        value
-            .parse::<u64>()
-            .ok()
-            .map(|seconds| seconds.min(SERVER_BACKOFF_CAP_SECS as u64) as i64)
+        let seconds = value.bytes().fold(0_u64, |seconds, byte| {
+            seconds
+                .saturating_mul(10)
+                .saturating_add(u64::from(byte - b'0'))
+        });
+        Some(seconds.min(SERVER_BACKOFF_CAP_SECS as u64) as i64)
     } else {
         parse_http_date(value).and_then(|deadline| {
             if deadline <= now {
@@ -325,12 +329,12 @@ mod tests {
             failure_probe_at(now, 1, Some("Tue Aug 25 18:00:00 2026"), 0),
             "2026-08-25T18:00:00Z"
         );
-        for value in [
-            "999999999999999999999",
-            "yesterday",
-            "-1",
-            "Wed, 24 Aug 2026 00:00:00 GMT",
-        ] {
+        assert_eq!(
+            failure_probe_at(now, 1, Some("18446744073709551616"), 0),
+            "2026-08-26T00:00:00Z",
+            "oversized delay-seconds saturates before the 24-hour cap"
+        );
+        for value in ["yesterday", "-1", "Wed, 24 Aug 2026 00:00:00 GMT"] {
             assert_eq!(
                 failure_probe_at(now, 1, Some(value), u64::MAX),
                 "2026-08-25T00:01:00Z",
@@ -346,7 +350,7 @@ mod tests {
     #[test]
     fn local_backoff_is_full_jitter_and_capped() {
         let now = "2026-08-25T00:00:00Z".parse().unwrap();
-        assert_eq!(failure_probe_at(now, 1, None, 0), "2026-08-25T00:00:00Z");
+        assert_eq!(failure_probe_at(now, 1, None, 0), "2026-08-25T00:00:01Z");
         assert_eq!(
             failure_probe_at(now, 2, None, u64::MAX),
             "2026-08-25T00:02:00Z"
