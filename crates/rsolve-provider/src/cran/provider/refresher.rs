@@ -76,6 +76,10 @@ impl CranSnapshotRefresher {
         self.session.borrow().base_url.clone()
     }
 
+    pub fn allpackages_feed_endpoint(&self) -> Box<str> {
+        self.session.borrow().allpackages_feed_endpoint.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn refresh_metadata_enabled(&self) -> bool {
         self.session.borrow().refresh_metadata

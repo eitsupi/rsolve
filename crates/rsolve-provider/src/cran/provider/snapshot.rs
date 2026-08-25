@@ -298,11 +298,9 @@ fn checksums_from_rejection_fields(fields: &[(String, String)]) -> Vec<ChecksumV
         .into_iter()
         .filter(|checksum| match checksum.algorithm.as_str() {
             // The wire validator treats MD5 as an opaque non-empty value,
-            // while the original upstream SHA-256 must be exactly 32 bytes
-            // of hex. P3M's SHA256 is for its rewritten tarball and is not
-            // attached to the canonical CRAN archive locator.
+            // while SHA-256 values must be exactly 32 bytes of hex.
             "md5" => true,
-            "sha256-original" => {
+            "sha256" | "sha256-original" => {
                 checksum.value.len() == 64
                     && checksum.value.bytes().all(|byte| byte.is_ascii_hexdigit())
             }
@@ -317,6 +315,8 @@ fn checksums_from_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
         .filter_map(|(name, value)| {
             let algorithm = if name.eq_ignore_ascii_case("MD5sum") {
                 "md5"
+            } else if name.eq_ignore_ascii_case("SHA256") {
+                "sha256"
             } else if name.eq_ignore_ascii_case("SHA256Original") {
                 "sha256-original"
             } else {
@@ -525,6 +525,41 @@ mod tests {
             7,
         );
         assert!(evidence.artifact.unwrap().checksums.is_empty());
+    }
+
+    #[test]
+    fn configured_cran_index_keeps_sha256_artifact_evidence() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_observations_from_fields(
+            vec![(
+                0,
+                Some(package.to_string()),
+                vec![
+                    ("Package".into(), "Matrix".into()),
+                    ("Version".into(), "1.7-0".into()),
+                    ("License".into(), "BSD-3-Clause".into()),
+                    ("MD5sum".into(), "0123456789abcdef0123456789abcdef".into()),
+                    ("SHA256".into(), "a".repeat(64)),
+                ],
+            )],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&package),
+        );
+        let evidence = index_record_to_evidence(
+            projection.observations.first().expect("valid observation"),
+            source_input(
+                "cran-current",
+                "rds",
+                "https://cran.invalid/src/contrib/PACKAGES.rds",
+                b"current",
+            ),
+            "https://cran.invalid",
+            true,
+            FreshnessStateV1::CurrentGeneration,
+        );
+        assert!(evidence.artifact.unwrap().checksums.iter().any(|checksum| {
+            checksum.algorithm == "sha256" && checksum.value == "a".repeat(64)
+        }));
     }
 
     #[test]

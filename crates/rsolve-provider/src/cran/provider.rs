@@ -198,6 +198,10 @@ pub struct CranSnapshotCachePolicy {
     pub parser_schema: u32,
     pub normalization_policy: u32,
     pub expected_endpoint: Option<Box<str>>,
+    /// The exact provider-private auxiliary feed permitted alongside the
+    /// configured repository endpoint. This is deliberately opt-in rather
+    /// than a generic second provenance root.
+    pub allowed_auxiliary_endpoint: Option<Box<str>>,
     pub refresh_metadata: bool,
 }
 
@@ -209,12 +213,23 @@ impl CranSnapshotCachePolicy {
             parser_schema: CRAN_PARSER_SCHEMA,
             normalization_policy: CRAN_NORMALIZATION_POLICY,
             expected_endpoint: None,
+            allowed_auxiliary_endpoint: None,
             refresh_metadata: false,
         }
     }
 
     pub fn with_expected_endpoint(mut self, endpoint: impl AsRef<str>) -> Self {
         self.expected_endpoint = Some(endpoint.as_ref().trim_end_matches('/').to_owned().into());
+        self
+    }
+
+    pub fn with_allowed_auxiliary_endpoint(mut self, endpoint: impl AsRef<str>) -> Self {
+        let endpoint = endpoint
+            .as_ref()
+            .trim_end_matches('/')
+            .to_owned()
+            .into_boxed_str();
+        self.allowed_auxiliary_endpoint = Some(endpoint);
         self
     }
 
@@ -387,19 +402,26 @@ pub fn inspect_cran_snapshot_cache(
         .filter(|_| validation_matches)
         .and_then(|record| record.validated_at.parse::<jiff::Timestamp>().ok());
     let endpoint_provenance_matches = policy.expected_endpoint.as_deref().is_none_or(|expected| {
+        let source_allowed = |endpoint: &str| {
+            endpoint_belongs_to(endpoint, expected)
+                || policy
+                    .allowed_auxiliary_endpoint
+                    .as_deref()
+                    .is_some_and(|allowed| endpoint == allowed)
+        };
         if validation_matches {
             validation.as_ref().is_some_and(|record| {
                 record.effective_endpoint == expected
                     && record
                         .sources
                         .iter()
-                        .all(|source| endpoint_belongs_to(&source.endpoint, expected))
+                        .all(|source| source_allowed(&source.endpoint))
             })
         } else {
             header
                 .sources
                 .iter()
-                .all(|source| endpoint_belongs_to(&source.endpoint, expected))
+                .all(|source| source_allowed(&source.endpoint))
         }
     });
     let diagnostic_endpoints = validation

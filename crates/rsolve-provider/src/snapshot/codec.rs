@@ -208,12 +208,12 @@ pub(super) fn sync_directory(_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(super) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
 #[cfg(windows)]
-pub(super) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,

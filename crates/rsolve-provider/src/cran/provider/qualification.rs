@@ -144,7 +144,7 @@ pub(super) fn publish(path: &Path, record: &Record) -> Result<(), String> {
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     drop(file);
-    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    crate::snapshot::replace_file(&temporary, path).map_err(|error| error.to_string())?;
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())?;

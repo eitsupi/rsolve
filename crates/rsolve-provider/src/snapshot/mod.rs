@@ -39,10 +39,11 @@ use validation::*;
 
 mod codec;
 pub(crate) use codec::encode_history;
+pub(crate) use codec::replace_file;
 pub use codec::{decode_header, decode_history, encode_header};
 use codec::{
-    history_manifest, read_generation_header, replace_file, sync_directory, sync_file,
-    validate_generation, write_generation,
+    history_manifest, read_generation_header, sync_directory, sync_file, validate_generation,
+    write_generation,
 };
 
 mod generation;

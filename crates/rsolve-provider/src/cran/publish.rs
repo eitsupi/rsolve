@@ -463,6 +463,41 @@ mod tests {
     }
 
     #[test]
+    fn configured_repository_allows_only_bound_allpackages_auxiliary_feed() {
+        let custom_feed = "https://feed.example/custom-ALLPACKAGES.zst";
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let mut observations = fixture_observations();
+        for (index, observation) in observations.iter_mut().enumerate() {
+            observation.source.endpoint = if index == 0 {
+                "https://mirror.example/PACKAGES.rds".into()
+            } else {
+                custom_feed.into()
+            };
+        }
+        publish_snapshot_with_endpoint(&store, context(), observations, "https://mirror.example")
+            .unwrap();
+        let with_feed_binding =
+            CranSnapshotCachePolicy::at("2026-08-23T00:00:30Z".parse().unwrap())
+                .with_expected_endpoint("https://mirror.example")
+                .with_allowed_auxiliary_endpoint(custom_feed);
+        assert!(matches!(
+            inspect_cran_snapshot_cache(&store, &with_feed_binding),
+            CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == CranSnapshotCacheStatus::Fresh
+        ));
+        let without_feed_binding =
+            CranSnapshotCachePolicy::at("2026-08-23T00:00:30Z".parse().unwrap())
+                .with_expected_endpoint("https://mirror.example");
+        assert!(matches!(
+            inspect_cran_snapshot_cache(&store, &without_feed_binding),
+            CranSnapshotCacheResult::Compatible { diagnostic, .. }
+                if diagnostic.status() == CranSnapshotCacheStatus::Stale
+        ));
+    }
+
+    #[test]
     fn identical_cross_mirror_validation_reuses_generation_without_extending_header_provenance() {
         let directory = tempdir().unwrap();
         let store =

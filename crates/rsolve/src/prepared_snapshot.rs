@@ -271,7 +271,9 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
     };
     let refresher =
         CranSnapshotRefresher::new(metadata_config).map_err(CranResolutionError::Provider)?;
-    let cache_policy = cache_policy.with_expected_endpoint(refresher.canonical_endpoint());
+    let cache_policy = cache_policy
+        .with_expected_endpoint(refresher.canonical_endpoint())
+        .with_allowed_auxiliary_endpoint(refresher.allpackages_feed_endpoint());
     let cache = inspect_cran_snapshot_cache(store, &cache_policy);
     let probe = match cache {
         CranSnapshotCacheResult::Compatible { loader, diagnostic } => CacheProbe::Compatible {

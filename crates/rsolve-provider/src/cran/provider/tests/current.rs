@@ -143,6 +143,19 @@ fn refresher_preserves_refresh_metadata_configuration() {
 }
 
 #[test]
+fn refresher_preserves_custom_allpackages_feed_endpoint() {
+    let refresher = CranSnapshotRefresher::new(CranMetadataConfig::new(
+        "https://cran.invalid",
+        "https://feed.invalid/custom-ALLPACKAGES.zst",
+    ))
+    .unwrap();
+    assert_eq!(
+        refresher.allpackages_feed_endpoint().as_ref(),
+        "https://feed.invalid/custom-ALLPACKAGES.zst"
+    );
+}
+
+#[test]
 fn refresher_preserves_publication_cutoff_history_policy() {
     let refresher = CranSnapshotRefresher::new(
         CranMetadataConfig::for_repository("https://cran.invalid").without_allpackages_history(),
