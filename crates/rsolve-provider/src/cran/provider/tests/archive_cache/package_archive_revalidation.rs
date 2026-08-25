@@ -17,7 +17,7 @@ fn package_archive_stale_cache_revalidates_once_with_304() {
     };
     let mut first_transport = session_transport(
         current,
-        TransportResponse::new(404, vec![]),
+        current_gzip_response(),
         TransportResponse::new(404, vec![]),
     );
     first_transport.responses.insert(

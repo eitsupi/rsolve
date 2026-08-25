@@ -71,7 +71,7 @@ pub(in crate::cran::provider::tests) fn allpackages_transport(
     );
     responses.insert(
         "https://cloud.r-project.org/src/contrib/PACKAGES.gz".into(),
-        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(200, current_gzip_body()),
     );
     responses.insert(
         "https://cloud.r-project.org/src/contrib/PACKAGES".into(),
@@ -106,6 +106,10 @@ pub(in crate::cran::provider::tests) fn custom_mirror_transport(
     transport.responses.insert(
         "https://mirror.invalid/src/contrib/PACKAGES.rds".into(),
         TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+    );
+    transport.responses.insert(
+        "https://mirror.invalid/src/contrib/PACKAGES.gz".into(),
+        TransportResponse::new(200, current_gzip_body()),
     );
     transport.responses.insert(
         "https://mirror.invalid/src/contrib/Meta/archive.rds".into(),

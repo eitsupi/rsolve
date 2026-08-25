@@ -204,8 +204,8 @@ fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
         .unwrap();
     assert_eq!(releases.len(), 3);
     assert_eq!(requests.borrow().len(), before);
-    assert_eq!(requests.borrow()[0], current_rds_url());
-    assert_eq!(requests.borrow()[1], current_gzip_url());
+    assert_eq!(requests.borrow()[0], current_gzip_url());
+    assert_eq!(requests.borrow()[1], current_rds_url());
     assert_eq!(requests.borrow()[2], current_plain_url());
     assert_eq!(
         requests

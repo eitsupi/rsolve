@@ -222,6 +222,18 @@ fn current_plain_url() -> String {
     "https://cran.invalid/src/contrib/PACKAGES".to_owned()
 }
 
+fn current_gzip_body() -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(b"Package: Matrix\nVersion: 1.7-6\nLicense: RSOLVE Fictional Terms Matrix\n")
+        .unwrap();
+    encoder.finish().unwrap()
+}
+
+fn current_gzip_response() -> TransportResponse {
+    TransportResponse::new(200, current_gzip_body())
+}
+
 fn fast_url_for(package: &str) -> String {
     format!("https://cran.invalid/src/contrib/Archive/{package}/PACKAGES.rds")
 }

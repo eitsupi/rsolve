@@ -196,6 +196,14 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
     };
     let mut first_transport = allpackages_transport(feed.clone(), false);
     first_transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.gz".into(),
+        TransportResponse {
+            status: 200,
+            body: current_gzip_body(),
+            headers: headers.clone(),
+        },
+    );
+    first_transport.responses.insert(
         "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
         TransportResponse {
             status: 200,
@@ -242,6 +250,7 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
 
     let mut not_modified = allpackages_transport(Vec::new(), false);
     for url in [
+        "https://cloud.r-project.org/src/contrib/PACKAGES.gz".to_owned(),
         "https://cloud.r-project.org/src/contrib/PACKAGES.rds".to_owned(),
         "https://cloud.r-project.org/src/contrib/Meta/archive.rds".to_owned(),
         ALLPACKAGES_FIXTURE_URL.to_owned(),
@@ -287,6 +296,14 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
     assert_eq!(qualification.next_probe_at, None);
 
     let mut same_body = allpackages_transport(Vec::new(), false);
+    same_body.responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.gz".into(),
+        TransportResponse {
+            status: 200,
+            body: current_gzip_body(),
+            headers: headers.clone(),
+        },
+    );
     same_body.responses.insert(
         "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
         TransportResponse {

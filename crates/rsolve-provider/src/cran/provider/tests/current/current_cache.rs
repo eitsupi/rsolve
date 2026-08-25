@@ -245,7 +245,7 @@ fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
 }
 
 #[test]
-fn persistent_current_rds_cache_reuse_avoids_a_second_request() {
+fn persistent_current_index_cache_reuse_avoids_a_second_request() {
     let directory = tempfile::tempdir().unwrap();
     let store = crate::snapshot::SnapshotStore::open(
         directory.path(),
@@ -264,7 +264,16 @@ fn persistent_current_rds_cache_reuse_avoids_a_second_request() {
                 ..TransportResponseHeaders::default()
             },
         },
-        TransportResponse::new(404, Vec::new()),
+        TransportResponse {
+            status: 200,
+            body: current_gzip_body(),
+            headers: TransportResponseHeaders {
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=3600".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
         TransportResponse::new(404, Vec::new()),
     );
     let first_requests = first_transport.requests.clone();
@@ -280,7 +289,7 @@ fn persistent_current_rds_cache_reuse_avoids_a_second_request() {
         first_requests
             .borrow()
             .iter()
-            .filter(|request| request.url == current_rds_url())
+            .filter(|request| request.url == current_gzip_url())
             .count(),
         1
     );

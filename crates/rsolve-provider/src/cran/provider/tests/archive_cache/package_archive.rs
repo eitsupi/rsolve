@@ -12,7 +12,7 @@ fn empty_package_archive_stale_cache_reuses_body_after_304() {
                 ..TransportResponseHeaders::default()
             },
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     first_transport.responses.insert(
@@ -82,7 +82,7 @@ fn mixed_archive_semantic_rejection_stays_on_fast_path_without_history_or_tarbal
             body: NATIVE_UTF8_CURRENT.to_vec(),
             ..TransportResponse::default()
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     transport.responses.insert(
@@ -154,7 +154,7 @@ fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
             body: NATIVE_UTF8_CURRENT.to_vec(),
             headers: cache_headers.clone(),
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     first_transport.responses.insert(
@@ -228,7 +228,7 @@ fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
         vec!["3.1-167", "3.1-168"]
     );
     assert_eq!(stale_result.quarantined().len(), 1);
-    assert_eq!(stale_requests.borrow().len(), 2);
+    assert_eq!(stale_requests.borrow().len(), 1);
     assert!(
         stale_requests
             .borrow()
@@ -252,7 +252,7 @@ fn nlme_invalid_version_survives_fresh_and_304_archive_cache_replay() {
             body: NATIVE_UTF8_CURRENT.to_vec(),
             headers: cache_headers.clone(),
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     first_transport.responses.insert(
@@ -345,7 +345,7 @@ fn nlme_invalid_version_survives_fresh_and_304_archive_cache_replay() {
         vec!["3.1-167", "3.1-168"]
     );
     assert!(stale_result.quarantined().is_empty());
-    assert_eq!(stale_requests.borrow().len(), 2);
+    assert_eq!(stale_requests.borrow().len(), 1);
     assert!(stale_requests.borrow().iter().all(|request| {
         request.validators.if_none_match.as_deref() == Some("\"nlme-invalid-version-archive\"")
     }));
@@ -356,7 +356,7 @@ fn archive_rejection_survives_snapshot_roundtrip_and_keeps_valid_sibling_visible
     let (_directory, store) = store();
     let mut transport = session_transport(
         TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     transport.responses.insert(
@@ -462,7 +462,7 @@ fn mixed_archive_fresh_raw_cache_replay_is_network_free_and_deterministic() {
                 ..TransportResponseHeaders::default()
             },
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     first_transport.responses.insert(
@@ -524,7 +524,7 @@ fn mixed_archive_stale_304_replay_is_deterministic_without_fallback() {
                 ..TransportResponseHeaders::default()
             },
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     first_transport.responses.insert(
@@ -692,7 +692,7 @@ fn tarball_fallback_does_not_receive_metadata_validators_or_enter_raw_cache() {
     };
     let mut first_transport = session_transport(
         current,
-        TransportResponse::new(404, vec![]),
+        current_gzip_response(),
         TransportResponse::new(404, vec![]),
     );
     first_transport.responses.insert(
@@ -869,7 +869,7 @@ fn package_archive_fresh_cache_hit_avoids_network() {
     };
     let first_transport = session_transport(
         current.clone(),
-        TransportResponse::new(404, vec![]),
+        current_gzip_response(),
         TransportResponse::new(404, vec![]),
     );
     let mut first_transport = first_transport;
@@ -951,7 +951,7 @@ fn empty_package_archive_fresh_cache_hit_avoids_network() {
                 ..TransportResponseHeaders::default()
             },
         },
-        TransportResponse::new(404, Vec::new()),
+        current_gzip_response(),
         TransportResponse::new(404, Vec::new()),
     );
     first_transport.responses.insert(

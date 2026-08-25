@@ -56,8 +56,8 @@ fn invalid_gzip_current_index_falls_back_to_plain_once() {
             .len(),
         1
     );
-    assert_eq!(requests.borrow()[0], current_rds_url());
-    assert_eq!(requests.borrow()[1], current_gzip_url());
+    assert_eq!(requests.borrow()[0], current_gzip_url());
+    assert_eq!(requests.borrow()[1], current_rds_url());
     assert_eq!(requests.borrow()[2], current_plain_url());
     assert!(session.diagnostics.iter().any(|diagnostic| {
         diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Gzip)
@@ -69,11 +69,49 @@ fn invalid_gzip_current_index_falls_back_to_plain_once() {
 }
 
 #[test]
-fn invalid_rds_current_index_falls_back_to_gzip() {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder
-        .write_all(b"Package: rsolvefixture.plain\nVersion: 3.0.0\n")
+fn invalid_gzip_current_index_falls_back_to_rds() {
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse {
+            status: 200,
+            body: b"not gzip".to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse {
+            status: 500,
+            body: Vec::new(),
+            ..TransportResponse::default()
+        },
+    );
+    let requests = Rc::clone(&transport.requests);
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
+    session
+        .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap();
+    assert_eq!(requests.borrow()[0], current_gzip_url());
+    assert_eq!(requests.borrow()[1], current_rds_url());
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Gzip)
+            && matches!(
+                diagnostic.status_detail(),
+                CranFastPathStatus::Invalid { .. }
+            )
+    }));
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Rds)
+            && matches!(diagnostic.status_detail(), CranFastPathStatus::Available)
+    }));
+}
+
+#[test]
+fn invalid_rds_current_index_falls_back_to_plain() {
     let transport = session_transport(
         TransportResponse {
             status: 200,
@@ -81,13 +119,13 @@ fn invalid_rds_current_index_falls_back_to_gzip() {
             ..TransportResponse::default()
         },
         TransportResponse {
-            status: 200,
-            body: encoder.finish().unwrap(),
+            status: 404,
+            body: Vec::new(),
             ..TransportResponse::default()
         },
         TransportResponse {
-            status: 500,
-            body: Vec::new(),
+            status: 200,
+            body: b"Package: rsolvefixture.plain\nVersion: 3.0.0\n".to_vec(),
             ..TransportResponse::default()
         },
     );
@@ -99,48 +137,9 @@ fn invalid_rds_current_index_falls_back_to_gzip() {
     session
         .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
         .unwrap();
-    assert_eq!(requests.borrow()[0], current_rds_url());
-    assert_eq!(requests.borrow()[1], current_gzip_url());
-    assert_eq!(requests.borrow()[2], fast_url_for("rsolvefixture.plain"));
-    assert!(session.diagnostics.iter().any(|diagnostic| {
-        diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Gzip)
-            && matches!(diagnostic.status_detail(), CranFastPathStatus::Available)
-    }));
-}
-
-#[test]
-fn semantic_invalid_current_index_falls_back_to_gzip() {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder
-        .write_all(b"Package: rsolvefixture.plain\nVersion: 3.0.0\n")
-        .unwrap();
-    let transport = session_transport(
-        TransportResponse {
-            status: 200,
-            body: SEMANTIC_INVALID_FAST.to_vec(),
-            ..TransportResponse::default()
-        },
-        TransportResponse {
-            status: 200,
-            body: encoder.finish().unwrap(),
-            ..TransportResponse::default()
-        },
-        TransportResponse {
-            status: 500,
-            body: Vec::new(),
-            ..TransportResponse::default()
-        },
-    );
-    let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(
-        Rc::new(transport),
-        CranMetadataConfig::new("https://cran.invalid", ""),
-    );
-    session
-        .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
-        .unwrap();
-    assert_eq!(requests.borrow()[0], current_rds_url());
-    assert_eq!(requests.borrow()[1], current_gzip_url());
+    assert_eq!(requests.borrow()[0], current_gzip_url());
+    assert_eq!(requests.borrow()[1], current_rds_url());
+    assert_eq!(requests.borrow()[2], current_plain_url());
     assert!(session.diagnostics.iter().any(|diagnostic| {
         diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Rds)
             && matches!(
@@ -148,6 +147,66 @@ fn semantic_invalid_current_index_falls_back_to_gzip() {
                 CranFastPathStatus::Invalid { .. }
             )
     }));
+}
+
+#[test]
+fn valid_gzip_current_index_wins_without_rds_and_reports_progress_once() {
+    let current = b"Package: rsolvefixture.plain\nVersion: 3.0.0\n";
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(current).unwrap();
+    let transport = session_transport(
+        TransportResponse {
+            status: 200,
+            body: b"invalid RDS".to_vec(),
+            ..TransportResponse::default()
+        },
+        TransportResponse {
+            status: 200,
+            body: encoder.finish().unwrap(),
+            ..TransportResponse::default()
+        },
+        TransportResponse::new(500, Vec::new()),
+    );
+    let requests = Rc::clone(&transport.requests);
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let capture = Rc::clone(&events);
+    let callback = Rc::new(move |event| capture.borrow_mut().push(event));
+    let mut session = CranRefreshSession::new_with_progress(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        None,
+        None,
+        Some(callback),
+    );
+    session
+        .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
+        .unwrap();
+    assert_eq!(requests.borrow()[0], current_gzip_url());
+    assert!(
+        !requests
+            .borrow()
+            .iter()
+            .any(|request| request.url == current_rds_url())
+    );
+    assert!(session.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::CurrentIndex(CranCurrentIndexRepresentation::Gzip)
+            && matches!(diagnostic.status_detail(), CranFastPathStatus::Available)
+    }));
+    let events = events.borrow();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CranRefreshProgress::CurrentIndexStarted))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CranRefreshProgress::CurrentIndexCompleted { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]

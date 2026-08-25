@@ -33,8 +33,8 @@ impl<T: Transport> CranRefreshSession<T> {
         }
         self.emit_progress(CranRefreshProgress::CurrentIndexStarted);
         let representations = [
-            (CranCurrentIndexRepresentation::Rds, "PACKAGES.rds"),
             (CranCurrentIndexRepresentation::Gzip, "PACKAGES.gz"),
+            (CranCurrentIndexRepresentation::Rds, "PACKAGES.rds"),
             (CranCurrentIndexRepresentation::PlainDcf, "PACKAGES"),
         ];
         let mut failures = Vec::new();
