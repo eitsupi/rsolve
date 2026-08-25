@@ -621,14 +621,18 @@ fn retain_projection_files(
     }
     let projection_entries = directory_fd
         .entries()?
-        .filter_map(Result::ok)
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
         .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(".redb"))
+            Path::new(&entry.file_name()).extension() == Some(std::ffi::OsStr::new("redb"))
         })
-        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
+        .map(|entry| {
+            let is_file = entry.file_type()?.is_file();
+            Ok(is_file.then_some(entry))
+        })
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
     // The capability directory pins the original directory object. Even if

@@ -488,6 +488,29 @@ fn projection_retention_rejects_previous_outside_parent_before_matching_basename
 
 #[cfg(unix)]
 #[test]
+fn projection_retention_removes_non_utf8_redb_orphans() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let namespace = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let key_directory = namespace.join("7".repeat(64));
+    fs::create_dir_all(&key_directory).unwrap();
+    let active = key_directory.join("active.redb");
+    let orphan = key_directory.join(std::ffi::OsStr::from_bytes(b"orphan-\xff.redb"));
+    fs::write(&active, b"active").unwrap();
+    fs::write(&orphan, b"orphan").unwrap();
+
+    cache
+        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
+        .unwrap();
+
+    assert!(active.exists());
+    assert!(!orphan.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn projection_retention_rejects_symlinked_raw_key_directory() {
     let store = store();
     let cache = RawCache::open(&store).unwrap();
