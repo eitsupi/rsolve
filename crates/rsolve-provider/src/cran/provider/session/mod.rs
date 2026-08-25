@@ -75,7 +75,7 @@ pub(super) struct CranRefreshSession<T> {
 
 #[derive(Clone)]
 pub(super) struct ArchiveHistorySource {
-    projection: Option<Rc<RefCell<PackageProjection>>>,
+    projection: Option<Rc<RefCell<Option<PackageProjection>>>>,
     rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
     rebuild_attempted: Rc<Cell<bool>>,
     eager: Option<Rc<BTreeMap<String, ArchivePackagePayload>>>,
@@ -124,7 +124,7 @@ impl ArchiveHistorySource {
             .map_err(|error| format!("invalid archive history projection summary: {error}"))?;
         Ok(Self {
             surface_digest: projection.surface_digest().into(),
-            projection: Some(Rc::new(RefCell::new(projection))),
+            projection: Some(Rc::new(RefCell::new(Some(projection)))),
             rebuild,
             rebuild_attempted: Rc::new(Cell::new(false)),
             eager: None,
@@ -179,8 +179,16 @@ impl ArchiveHistorySource {
         &self,
         package: &PackageName,
     ) -> Result<ArchivePackagePayload, CandidateLoadError> {
-        let payload = if let Some(projection) = &self.projection {
-            let result = Self::decode_projection_package(&projection.borrow(), package);
+        let payload = if let Some(projection_cell) = &self.projection {
+            let projection_ref = projection_cell.borrow();
+            let Some(projection) = projection_ref.as_ref() else {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::SnapshotInvalid,
+                    "archive package projection is unavailable after a failed rebuild",
+                ));
+            };
+            let result = Self::decode_projection_package(projection, package);
+            drop(projection_ref);
             match result {
                 Ok(result) => result,
                 Err(ArchiveProjectionFailure::Storage(error)) => {
@@ -202,6 +210,8 @@ impl ArchiveHistorySource {
                             format!("invalid archive package projection: {error}"),
                         ));
                     }
+                    let old_projection = projection_cell.borrow_mut().take();
+                    drop(old_projection);
                     let rebuilt = rebuild().map_err(|rebuild_error| {
                         CandidateLoadError::new(
                             CandidateLoadErrorCategory::SnapshotInvalid,
@@ -216,17 +226,20 @@ impl ArchiveHistorySource {
                             validation_error,
                         )
                     })?;
-                    *projection.borrow_mut() = rebuilt;
-                    Self::decode_projection_package(&projection.borrow(), package).map_err(
-                        |error| {
-                            CandidateLoadError::new(
-                                CandidateLoadErrorCategory::SnapshotInvalid,
-                                format!(
-                                    "invalid archive package projection after rebuild: {error:?}"
-                                ),
-                            )
-                        },
-                    )?
+                    *projection_cell.borrow_mut() = Some(rebuilt);
+                    let projection_ref = projection_cell.borrow();
+                    let Some(projection) = projection_ref.as_ref() else {
+                        return Err(CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            "archive package projection is unavailable after rebuild",
+                        ));
+                    };
+                    Self::decode_projection_package(projection, package).map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("invalid archive package projection after rebuild: {error:?}"),
+                        )
+                    })?
                 }
             }
         } else {
