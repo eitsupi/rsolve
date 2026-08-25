@@ -1,0 +1,401 @@
+use super::super::MAX_RESPONSE_BYTES;
+use super::*;
+use crate::cran::provider::transport::TransportResponseHeaders;
+use crate::snapshot::SnapshotStore;
+use rsolve_core::RegistryId;
+use std::fs;
+use std::ops::Deref;
+use tempfile::{TempDir, tempdir};
+
+struct StoreFixture {
+    _directory: TempDir,
+    store: SnapshotStore,
+}
+
+impl Deref for StoreFixture {
+    type Target = SnapshotStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+fn store() -> StoreFixture {
+    let directory = tempdir().unwrap();
+    let store = SnapshotStore::open(
+        directory.path().to_path_buf(),
+        RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    StoreFixture {
+        _directory: directory,
+        store,
+    }
+}
+
+fn key(store: &SnapshotStore) -> RawCacheKey {
+    RawCacheKey::new(
+        store.registry_id(),
+        "https://cran.invalid/src/contrib/PACKAGES.rds",
+        RawCacheRepresentation::CurrentRds,
+    )
+    .unwrap()
+}
+
+fn write(body: &[u8]) -> RawCacheWrite {
+    let timestamp = "2026-08-23T00:00:00Z".parse().unwrap();
+    RawCacheWrite {
+        status: 200,
+        body: body.to_vec(),
+        observed_at: timestamp,
+        validated_at: timestamp,
+        etag: Some("\"tag\"".into()),
+        last_modified: None,
+        cache_control: CacheControlHeader::Valid("max-age=120".into()),
+    }
+}
+
+#[test]
+fn raw_cache_round_trip_and_304_timestamp_update() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Missing));
+    assert!(matches!(
+        cache.publish(&key, write(b"body")).unwrap(),
+        RawCachePublishOutcome::Stored
+    ));
+    cache.publish(&key, write(b"replacement")).unwrap();
+    assert_eq!(fs::read_dir(&cache.directory).unwrap().count(), 2);
+    let RawCacheLookup::Hit(entry) = cache.lookup(&key) else {
+        panic!("expected hit")
+    };
+    assert_eq!(entry.body, b"replacement");
+    let later = "2026-08-23T00:00:10Z".parse().unwrap();
+    cache.update_validated_at(&key, later).unwrap();
+    let RawCacheLookup::Hit(entry) = cache.lookup(&key) else {
+        panic!("expected updated hit")
+    };
+    assert_eq!(entry.observed_at, "2026-08-23T00:00:00Z".parse().unwrap());
+    assert_eq!(entry.validated_at, later);
+}
+
+#[test]
+fn raw_cache_preserves_validated_response_headers() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    let mut response = write(b"body");
+    response.last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".into());
+    cache.publish(&key, response).unwrap();
+    let RawCacheLookup::Hit(entry) = cache.lookup(&key) else {
+        panic!("expected hit")
+    };
+    assert_eq!(entry.etag.as_deref(), Some("\"tag\""));
+    assert_eq!(
+        entry.last_modified.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+    assert_eq!(
+        entry.cache_control,
+        CacheControlHeader::Valid("max-age=120".into())
+    );
+}
+
+#[test]
+fn raw_cache_304_no_store_evicts_without_republishing() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    cache
+        .update_validated_at_with_headers(
+            &key,
+            "2026-08-23T00:00:10Z".parse().unwrap(),
+            &TransportResponseHeaders {
+                cache_control: CacheControlHeader::Valid("no-store".into()),
+                ..TransportResponseHeaders::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Missing));
+}
+
+#[test]
+fn raw_cache_key_separates_endpoint_and_representation_and_rejects_unsafe_urls() {
+    let store = store();
+    let first = key(&store);
+    let second = RawCacheKey::new(
+        store.registry_id(),
+        "https://cran.invalid/src/contrib/PACKAGES.gz",
+        RawCacheRepresentation::CurrentGzip,
+    )
+    .unwrap();
+    assert_ne!(first.digest(), second.digest());
+    for endpoint in [
+        "https://user:pass@cran.invalid/PACKAGES",
+        "https://cran.invalid/PACKAGES?x=1",
+        "https://cran.invalid/PACKAGES#fragment",
+        "file:///tmp/PACKAGES",
+    ] {
+        assert!(
+            RawCacheKey::new(
+                store.registry_id(),
+                endpoint,
+                RawCacheRepresentation::CurrentRds,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn raw_cache_no_store_evicts_existing_entry() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"old")).unwrap();
+    let mut response = write(b"body");
+    response.cache_control = CacheControlHeader::Valid("no-store".into());
+    assert!(matches!(
+        cache.publish(&key, response).unwrap(),
+        RawCachePublishOutcome::NoStore
+    ));
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Missing));
+}
+
+#[test]
+fn raw_cache_rejects_invalid_cache_control_without_replacing_entry() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"old")).unwrap();
+    let oversized = "x".repeat(8 * 1024 + 1);
+    for value in [
+        " max-age=120".to_owned(),
+        "max-age=120 ".to_owned(),
+        "max-age=120\n".to_owned(),
+        oversized,
+    ] {
+        let mut response = write(b"new");
+        response.cache_control = CacheControlHeader::Valid(value.into_boxed_str());
+        assert!(cache.publish(&key, response).is_err());
+        let RawCacheLookup::Hit(entry) = cache.lookup(&key) else {
+            panic!("invalid cache-control replaced the existing entry")
+        };
+        assert_eq!(entry.body, b"old");
+    }
+}
+
+fn rewrite_header<F>(cache: &RawCache, key: &RawCacheKey, mutate: F)
+where
+    F: FnOnce(&mut RawCacheHeaderV1),
+{
+    let path = cache.entry_path(key);
+    let bytes = fs::read(&path).unwrap();
+    let header_length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let mut header: RawCacheHeaderV1 =
+        serde_json::from_slice(&bytes[4..4 + header_length]).unwrap();
+    mutate(&mut header);
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    let mut rewritten = (header_bytes.len() as u32).to_le_bytes().to_vec();
+    rewritten.extend_from_slice(&header_bytes);
+    rewritten.extend_from_slice(&bytes[4 + header_length..]);
+    fs::write(path, rewritten).unwrap();
+}
+
+#[test]
+fn raw_cache_rejects_wrong_registry_key_and_header_identity() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let wrong_key = RawCacheKey::new(
+        &RegistryId::new("other").unwrap(),
+        "https://cran.invalid/src/contrib/PACKAGES.rds",
+        RawCacheRepresentation::CurrentRds,
+    )
+    .unwrap();
+    assert!(cache.publish(&wrong_key, write(b"body")).is_err());
+
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| header.registry_id = "other".into());
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| header.key_sha256 = "0".repeat(64));
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[test]
+fn raw_cache_rejects_wrong_length_or_digest_without_returning_body() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| header.body_length += 1);
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| header.body_sha256 = "0".repeat(64));
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[test]
+fn raw_cache_rejects_oversized_headers_and_bodies() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    let path = cache.entry_path(&key);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[..HEADER_LENGTH_BYTES].copy_from_slice(&((MAX_HEADER_BYTES as u32) + 1).to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| {
+        header.body_length = MAX_RESPONSE_BYTES + 1;
+    });
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[test]
+fn raw_cache_rejects_noncanonical_validators() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| {
+        header.etag = Some("unquoted".into());
+    });
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| {
+        header.etag = Some("\"é\"".into());
+    });
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+
+    cache.publish(&key, write(b"body")).unwrap();
+    rewrite_header(&cache, &key, |header| {
+        header.last_modified = Some("Wed, 21 Oct 2015 07:28:00 UTC".into());
+    });
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_cache_rejects_entry_symlinks() {
+    use std::os::unix::fs::symlink;
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    let target = cache.directory.join("outside");
+    fs::write(&target, b"not-an-entry").unwrap();
+    symlink(&target, cache.entry_path(&key)).unwrap();
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_cache_rejects_symlink_namespaces() {
+    use std::os::unix::fs::symlink;
+
+    let first_store = store();
+    let namespace = first_store.root().join(RAW_CACHE_DIRECTORY);
+    fs::create_dir(&namespace).unwrap();
+    fs::remove_dir(&namespace).unwrap();
+    symlink(first_store.root().join("generations"), &namespace).unwrap();
+    assert!(RawCache::open(&first_store).is_err());
+
+    let second_store = store();
+    let cache = RawCache::open(&second_store).unwrap();
+    let version = cache.directory;
+    fs::remove_dir_all(&version).unwrap();
+    symlink(second_store.root().join("generations"), &version).unwrap();
+    assert!(RawCache::open(&second_store).is_err());
+}
+
+#[test]
+fn raw_cache_corruption_never_returns_body() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    let path = cache.entry_path(&key);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.pop();
+    fs::write(path, bytes).unwrap();
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[test]
+fn raw_cache_rejects_noncanonical_header_json() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let key = key(&store);
+    cache.publish(&key, write(b"body")).unwrap();
+    let path = cache.entry_path(&key);
+    let bytes = fs::read(&path).unwrap();
+    let header_length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let header = &bytes[4..4 + header_length];
+    let mut rewritten = ((header_length + 1) as u32).to_le_bytes().to_vec();
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(header);
+    rewritten.extend_from_slice(&bytes[4 + header_length..]);
+    fs::write(path, rewritten).unwrap();
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Corrupt(_)));
+}
+
+#[test]
+fn semantic_snapshot_namespace_is_untouched() {
+    let store = store();
+    let before = fs::read_dir(store.root().join("generations"))
+        .unwrap()
+        .count();
+    let cache = RawCache::open(&store).unwrap();
+    cache.publish(&key(&store), write(b"body")).unwrap();
+    assert_eq!(
+        fs::read_dir(store.root().join("generations"))
+            .unwrap()
+            .count(),
+        before
+    );
+    assert!(!store.root().join("current").exists());
+}
+
+#[test]
+fn projection_retention_keeps_only_a_bounded_recent_set() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    for index in 0..4 {
+        fs::write(
+            cache
+                .directory
+                .join(PROJECTION_DIRECTORY)
+                .join(format!("projection-{index}.redb")),
+            [index as u8],
+        )
+        .unwrap();
+    }
+    let active = cache
+        .directory
+        .join(PROJECTION_DIRECTORY)
+        .join("projection-0.redb");
+    let previous = cache
+        .directory
+        .join(PROJECTION_DIRECTORY)
+        .join("projection-1.redb");
+    cache.retain_projections(&active, Some(&previous)).unwrap();
+    let retained = fs::read_dir(cache.directory.join(PROJECTION_DIRECTORY))
+        .unwrap()
+        .count();
+    assert_eq!(retained, 2);
+    assert!(active.exists());
+    assert!(previous.exists());
+    assert!(
+        !cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join("projection-2.redb")
+            .exists()
+    );
+}
