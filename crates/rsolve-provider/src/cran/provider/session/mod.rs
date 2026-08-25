@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::rc::Rc;
 
@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::catalog::{CranCatalog, CranCatalogObservation, CranCatalogRecordContext};
 use super::super::evidence::CranEvidenceObservation;
-use super::super::history::{ArchiveEntry, ArchiveHistoryRejection};
+use super::super::history::{ArchiveEntry, ArchivePackagePayload};
 use super::allpackages::IndexedProjection;
 use super::cache_policy::CacheControlHeader;
 use super::cache_policy::{cache_control_policy, permits_reuse};
@@ -39,11 +39,17 @@ mod package;
 #[cfg(test)]
 thread_local! {
     static CURRENT_PROJECTION_BUILD_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ARCHIVE_PROJECTION_BUILD_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 fn note_current_projection_build() {
     CURRENT_PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
+}
+
+#[cfg(test)]
+fn note_archive_projection_build() {
+    ARCHIVE_PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
 }
 
 /// A single refresh session. All network and parsing state is discarded from
@@ -67,6 +73,128 @@ pub(super) struct CranRefreshSession<T> {
     package_local_fallback_reported: bool,
     pub(in crate::cran::provider) diagnostics: Vec<CranRefreshDiagnostic>,
     pub(in crate::cran::provider) evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
+}
+
+#[derive(Clone)]
+pub(super) struct ArchiveHistorySource {
+    projection: Option<Rc<PackageProjection>>,
+    eager: Option<Rc<BTreeMap<String, ArchivePackagePayload>>>,
+    entry_count: usize,
+    rejection_count: usize,
+    first_rejection: Option<Box<str>>,
+    surface_digest: Box<str>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(super) struct ArchiveHistorySummary {
+    pub(super) entry_count: usize,
+    pub(super) rejection_count: usize,
+    pub(super) first_rejection: Option<String>,
+}
+
+impl ArchiveHistorySource {
+    pub(super) fn from_projection(projection: PackageProjection) -> Result<Self, String> {
+        let summary: ArchiveHistorySummary = postcard::from_bytes(projection.summary())
+            .map_err(|error| format!("invalid archive history projection summary: {error}"))?;
+        let record_count = summary
+            .entry_count
+            .checked_add(summary.rejection_count)
+            .ok_or_else(|| "archive history projection record count overflow".to_owned())?;
+        if record_count != projection.record_count() {
+            return Err(format!(
+                "archive history projection record count mismatch: expected {record_count}, stored {}",
+                projection.record_count()
+            ));
+        }
+        Ok(Self {
+            surface_digest: projection.surface_digest().into(),
+            projection: Some(Rc::new(projection)),
+            eager: None,
+            entry_count: summary.entry_count,
+            rejection_count: summary.rejection_count,
+            first_rejection: summary.first_rejection.map(Into::into),
+        })
+    }
+
+    pub(super) fn package(
+        &self,
+        package: &PackageName,
+    ) -> Result<ArchivePackagePayload, CandidateLoadError> {
+        let payload = if let Some(projection) = &self.projection {
+            projection
+                .lookup_package(package.as_str())
+                .map_err(|error| {
+                    CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+                })?
+                .map(|payload| {
+                    let record_count = payload.record_count;
+                    postcard::from_bytes::<ArchivePackagePayload>(&payload.bytes)
+                        .map(|payload| (payload, record_count))
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        format!("invalid archive package projection: {error}"),
+                    )
+                })?
+        } else {
+            self.eager
+                .as_ref()
+                .and_then(|packages| packages.get(package.as_str()).cloned())
+                .map(|payload| {
+                    let record_count = payload.entries.len() + payload.rejections.len();
+                    (payload, record_count)
+                })
+        };
+        let (payload, record_count) = payload.unwrap_or_else(|| {
+            (
+                ArchivePackagePayload {
+                    entries: Vec::new(),
+                    rejections: Vec::new(),
+                },
+                0,
+            )
+        });
+        let expected = payload
+            .entries
+            .len()
+            .checked_add(payload.rejections.len())
+            .ok_or_else(|| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::SnapshotInvalid,
+                    "archive package projection record count overflow",
+                )
+            })?;
+        if expected != record_count {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                format!(
+                    "archive package projection record count mismatch: expected {expected}, stored {record_count}"
+                ),
+            ));
+        }
+        payload.validate_for_package(package).map_err(|error| {
+            CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+        })
+    }
+
+    pub(super) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(super) fn rejections(&self) -> usize {
+        self.rejection_count
+    }
+
+    pub(super) fn first_rejection(&self) -> Option<&str> {
+        self.first_rejection.as_deref()
+    }
+
+    pub(super) fn surface_digest(&self) -> &str {
+        &self.surface_digest
+    }
 }
 
 #[derive(Clone)]
@@ -169,15 +297,39 @@ impl CurrentProjection {
         package: &PackageName,
     ) -> Result<super::super::catalog::CranProviderObservationProjection, CandidateLoadError> {
         if let Some(projection) = &self.projection {
-            let records = projection
+            let Some(payload) = projection
                 .lookup_package(package.as_str())
                 .map_err(|error| {
                     CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+                })?
+            else {
+                return Ok(super::super::catalog::provider_observations_from_fields(
+                    Vec::new(),
+                    CranCatalogRecordContext::PackagesIndex,
+                    Some(package),
+                ));
+            };
+            let record_count = payload.record_count;
+            let records =
+                current::decode_current_records(&payload.bytes, package).map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        format!("invalid current package projection: {error}"),
+                    )
                 })?;
+            if records.len() != record_count {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::SnapshotInvalid,
+                    format!(
+                        "current package projection record count mismatch: expected {}, stored {record_count}",
+                        records.len()
+                    ),
+                ));
+            }
             return Ok(super::super::catalog::provider_observations_from_fields(
                 records
                     .into_iter()
-                    .map(|record| (record.record_index, record.package, record.fields))
+                    .map(|record| (record.record_index, Some(record.package), record.fields))
                     .collect(),
                 CranCatalogRecordContext::PackagesIndex,
                 Some(package),
@@ -199,12 +351,21 @@ impl CurrentProjection {
         if let Some(catalog) = &self.projection {
             let mut observations = Vec::new();
             catalog
-                .visit_package_records(|package, records| {
+                .visit_packages(|package, payload, record_count| {
                     let package = PackageName::new(package).map_err(|error| error.to_string())?;
+                    let records = current::decode_current_records(payload, &package)?;
+                    if records.len() != record_count {
+                        return Err(format!(
+                            "current package projection record count mismatch: expected {}, stored {record_count}",
+                            records.len()
+                        ));
+                    }
                     let projection = super::super::catalog::provider_observations_from_fields(
                         records
                             .into_iter()
-                            .map(|record| (record.record_index, record.package, record.fields))
+                            .map(|record| {
+                                (record.record_index, Some(record.package), record.fields)
+                            })
                             .collect(),
                         CranCatalogRecordContext::PackagesIndex,
                         Some(&package),
@@ -272,10 +433,7 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> Box<str> {
 
 #[derive(Clone)]
 pub(super) enum HistorySource {
-    Available {
-        entries: Rc<[ArchiveEntry]>,
-        rejections: Rc<[ArchiveHistoryRejection]>,
-    },
+    Available { source: Rc<ArchiveHistorySource> },
     Absent,
 }
 
@@ -299,20 +457,32 @@ struct MetadataAcquisitionFailure {
 enum MetadataParseFailure {
     Invalid(Box<str>),
     NoFallback(Box<str>),
+    SnapshotInvalid(Box<str>),
 }
 
 impl MetadataParseFailure {
     fn allows_fallback(&self) -> bool {
         matches!(self, Self::Invalid(_))
     }
+
+    fn allows_cached_retry(&self) -> bool {
+        !matches!(self, Self::SnapshotInvalid(_))
+    }
+
+    fn category(&self) -> CandidateLoadErrorCategory {
+        match self {
+            Self::SnapshotInvalid(_) => CandidateLoadErrorCategory::SnapshotInvalid,
+            Self::Invalid(_) | Self::NoFallback(_) => CandidateLoadErrorCategory::MetadataInvalid,
+        }
+    }
 }
 
 impl fmt::Display for MetadataParseFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invalid(diagnostic) | Self::NoFallback(diagnostic) => {
-                formatter.write_str(diagnostic)
-            }
+            Self::Invalid(diagnostic)
+            | Self::NoFallback(diagnostic)
+            | Self::SnapshotInvalid(diagnostic) => formatter.write_str(diagnostic),
         }
     }
 }
@@ -450,6 +620,16 @@ impl<T: Transport> CranRefreshSession<T> {
     #[cfg(test)]
     pub(in crate::cran::provider) fn current_projection_build_count() -> usize {
         CURRENT_PROJECTION_BUILD_COUNT.with(Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(in crate::cran::provider) fn reset_archive_projection_build_count() {
+        ARCHIVE_PROJECTION_BUILD_COUNT.with(|counter| counter.set(0));
+    }
+
+    #[cfg(test)]
+    pub(in crate::cran::provider) fn archive_projection_build_count() -> usize {
+        ARCHIVE_PROJECTION_BUILD_COUNT.with(Cell::get)
     }
 
     #[cfg(test)]

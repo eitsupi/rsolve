@@ -5,7 +5,7 @@
 //! surface summary; this container only binds the resulting rows to the raw
 //! body and parser contract.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -16,9 +16,10 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 
 const FORMAT: &str = "rsolve-cran-package-projection";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER: TableDefinition<&str, &[u8]> = TableDefinition::new("header");
 const PACKAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("packages");
+const PACKAGE_COUNTS: TableDefinition<&str, u64> = TableDefinition::new("package_counts");
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -61,17 +62,23 @@ pub(crate) struct ProjectionContract {
     pub(crate) normalization_policy: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ProjectionRecord {
-    pub(crate) record_index: usize,
-    pub(crate) package: Option<String>,
-    pub(crate) fields: Vec<(String, String)>,
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionBuild {
+    pub(crate) packages: Vec<ProjectionPackage>,
+    pub(crate) summary: Vec<u8>,
+    pub(crate) surface_digest: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProjectionBuild {
-    pub(crate) records: Vec<ProjectionRecord>,
-    pub(crate) surface_digest: String,
+pub(crate) struct ProjectionPackage {
+    pub(crate) package: String,
+    pub(crate) record_count: usize,
+    pub(crate) payload: Vec<u8>,
+}
+
+pub(crate) struct ProjectionPayload {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) record_count: usize,
 }
 
 #[derive(Debug)]
@@ -92,6 +99,7 @@ struct Header {
     normalization_policy: u32,
     package_count: usize,
     record_count: usize,
+    summary: Vec<u8>,
     surface_digest: String,
 }
 
@@ -116,7 +124,8 @@ impl PackageProjection {
             return Ok(projection);
         }
         let build = build().map_err(ProjectionError::Build)?;
-        Self::write(path, raw_digest, source_kind, contract, build)
+        let counts = build.validate().map_err(ProjectionError::Build)?;
+        Self::write(path, raw_digest, source_kind, contract, build, counts)
             .map_err(ProjectionError::Storage)?;
         Self::open(
             path,
@@ -143,10 +152,10 @@ impl PackageProjection {
         let read = database
             .begin_read()
             .map_err(|error| format!("invalid package projection transaction: {error}"))?;
-        let table = read
+        let header_table = read
             .open_table(HEADER)
             .map_err(|error| format!("invalid package projection header: {error}"))?;
-        let value = table
+        let value = header_table
             .get("header")
             .map_err(|error| format!("invalid package projection header: {error}"))?
             .ok_or_else(|| "package projection header is missing".to_owned())?;
@@ -162,30 +171,60 @@ impl PackageProjection {
         {
             return Err("package projection contract does not match raw source".into());
         }
-        drop(table);
+        let _packages = read
+            .open_table(PACKAGES)
+            .map_err(|error| format!("invalid package projection records: {error}"))?;
+        let _counts = read
+            .open_table(PACKAGE_COUNTS)
+            .map_err(|error| format!("invalid package projection counts: {error}"))?;
+        drop(header_table);
+        drop(_packages);
+        drop(_counts);
         drop(read);
         Ok(Self { database, header })
     }
 
-    pub(crate) fn lookup_package(&self, package: &str) -> Result<Vec<ProjectionRecord>, String> {
+    pub(crate) fn lookup_package(
+        &self,
+        package: &str,
+    ) -> Result<Option<ProjectionPayload>, String> {
         let read = self
             .database
             .begin_read()
             .map_err(|error| error.to_string())?;
-        let table = read
+        let packages = read
             .open_table(PACKAGES)
             .map_err(|error| error.to_string())?;
-        table
+        let counts = read
+            .open_table(PACKAGE_COUNTS)
+            .map_err(|error| error.to_string())?;
+        let payload = packages
             .get(package)
             .map_err(|error| error.to_string())?
-            .map(|value| postcard::from_bytes(value.value()).map_err(|error| error.to_string()))
-            .transpose()
-            .map(|records| records.unwrap_or_default())
+            .map(|value| value.value().to_vec());
+        let count = counts.get(package).map_err(|error| error.to_string())?;
+        match (payload, count) {
+            (None, None) => Ok(None),
+            (Some(_), None) | (None, Some(_)) => {
+                Err("package projection payload/count entry mismatch".into())
+            }
+            (Some(bytes), Some(count)) => {
+                if bytes.is_empty() || count.value() == 0 {
+                    return Err("invalid package projection payload/count entry".into());
+                }
+                let record_count = usize::try_from(count.value())
+                    .map_err(|_| "package projection record count exceeds usize".to_owned())?;
+                Ok(Some(ProjectionPayload {
+                    bytes,
+                    record_count,
+                }))
+            }
+        }
     }
 
-    pub(crate) fn visit_package_records<F>(&self, mut visitor: F) -> Result<(), String>
+    pub(crate) fn visit_packages<F>(&self, mut visitor: F) -> Result<(), String>
     where
-        F: FnMut(&str, Vec<ProjectionRecord>) -> Result<(), String>,
+        F: FnMut(&str, &[u8], usize) -> Result<(), String>,
     {
         #[cfg(test)]
         VISIT_PACKAGE_RECORDS_COUNT.with(|counter| counter.set(counter.get() + 1));
@@ -193,16 +232,50 @@ impl PackageProjection {
             .database
             .begin_read()
             .map_err(|error| error.to_string())?;
-        let table = read
+        let packages = read
             .open_table(PACKAGES)
             .map_err(|error| error.to_string())?;
-        for item in table.iter().map_err(|error| error.to_string())? {
+        let counts = read
+            .open_table(PACKAGE_COUNTS)
+            .map_err(|error| error.to_string())?;
+        let mut package_count = 0usize;
+        let mut record_count = 0usize;
+        for item in packages.iter().map_err(|error| error.to_string())? {
             let (key, value) = item.map_err(|error| error.to_string())?;
-            if !key.value().is_empty() {
-                let records =
-                    postcard::from_bytes(value.value()).map_err(|error| error.to_string())?;
-                visitor(key.value(), records)?;
+            if key.value().is_empty() || value.value().is_empty() {
+                return Err("invalid package projection payload entry".into());
             }
+            let Some(count) = counts.get(key.value()).map_err(|error| error.to_string())? else {
+                return Err("package projection payload has no count entry".into());
+            };
+            if count.value() == 0 {
+                return Err("invalid package projection count entry".into());
+            }
+            let count = usize::try_from(count.value())
+                .map_err(|_| "package projection record count exceeds usize".to_owned())?;
+            package_count = package_count
+                .checked_add(1)
+                .ok_or_else(|| "package projection package count overflow".to_owned())?;
+            record_count = record_count
+                .checked_add(count)
+                .ok_or_else(|| "package projection record count overflow".to_owned())?;
+            visitor(key.value(), value.value(), count)?;
+        }
+        for item in counts.iter().map_err(|error| error.to_string())? {
+            let (key, count) = item.map_err(|error| error.to_string())?;
+            if key.value().is_empty() || count.value() == 0 {
+                return Err("invalid package projection count entry".into());
+            }
+            if packages
+                .get(key.value())
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                return Err("package projection count has no payload".into());
+            }
+        }
+        if package_count != self.header.package_count || record_count != self.header.record_count {
+            return Err("package projection counts do not match its header".into());
         }
         Ok(())
     }
@@ -211,8 +284,16 @@ impl PackageProjection {
         self.header.package_count
     }
 
+    pub(crate) fn record_count(&self) -> usize {
+        self.header.record_count
+    }
+
     pub(crate) fn surface_digest(&self) -> &str {
         &self.header.surface_digest
+    }
+
+    pub(crate) fn summary(&self) -> &[u8] {
+        &self.header.summary
     }
 
     fn write(
@@ -221,6 +302,7 @@ impl PackageProjection {
         source_kind: ProjectionSourceKind,
         contract: ProjectionContract,
         build: ProjectionBuild,
+        (package_count, record_count): (usize, usize),
     ) -> Result<(), String> {
         let parent = path
             .parent()
@@ -230,7 +312,6 @@ impl PackageProjection {
         drop(_temporary_file);
         let _cleanup = TemporaryPath(temporary.clone());
         let mut database = Database::create(&temporary).map_err(|error| error.to_string())?;
-        let record_count = build.records.len();
         let header = Header {
             format: FORMAT.into(),
             version: VERSION,
@@ -239,20 +320,11 @@ impl PackageProjection {
             parser_schema: contract.parser_schema,
             compatibility_profile: contract.compatibility_profile,
             normalization_policy: contract.normalization_policy,
-            package_count: 0,
+            package_count,
             record_count,
+            summary: build.summary,
             surface_digest: build.surface_digest,
         };
-        let mut grouped = BTreeMap::<String, Vec<ProjectionRecord>>::new();
-        for record in build.records {
-            grouped
-                .entry(record.package.clone().unwrap_or_default())
-                .or_default()
-                .push(record);
-        }
-        let package_count = grouped.keys().filter(|package| !package.is_empty()).count();
-        let mut header = header;
-        header.package_count = package_count;
         {
             let tx = database.begin_write().map_err(|error| error.to_string())?;
             {
@@ -264,11 +336,21 @@ impl PackageProjection {
             }
             {
                 let mut table = tx.open_table(PACKAGES).map_err(|error| error.to_string())?;
-                for (package, records) in grouped {
-                    let encoded =
-                        postcard::to_stdvec(&records).map_err(|error| error.to_string())?;
+                for package in &build.packages {
                     table
-                        .insert(package.as_str(), encoded.as_slice())
+                        .insert(package.package.as_str(), package.payload.as_slice())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            {
+                let mut table = tx
+                    .open_table(PACKAGE_COUNTS)
+                    .map_err(|error| error.to_string())?;
+                for package in &build.packages {
+                    let record_count = u64::try_from(package.record_count)
+                        .map_err(|_| "package projection record count exceeds u64".to_owned())?;
+                    table
+                        .insert(package.package.as_str(), record_count)
                         .map_err(|error| error.to_string())?;
                 }
             }
@@ -281,6 +363,40 @@ impl PackageProjection {
             .map_err(|error| error.to_string())?;
         crate::snapshot::replace_file(&temporary, path).map_err(|error| error.to_string())?;
         sync_parent(parent)
+    }
+}
+
+impl ProjectionBuild {
+    fn validate(&self) -> Result<(usize, usize), String> {
+        let mut package_keys = BTreeSet::new();
+        let mut record_count = 0usize;
+        for package in &self.packages {
+            if package.package.is_empty() {
+                return Err("package projection contains an empty package key".into());
+            }
+            if !package_keys.insert(package.package.as_str()) {
+                return Err(format!(
+                    "package projection contains duplicate package key {}",
+                    package.package
+                ));
+            }
+            if package.record_count == 0 {
+                return Err(format!(
+                    "package projection contains an empty payload for {}",
+                    package.package
+                ));
+            }
+            if package.payload.is_empty() {
+                return Err(format!(
+                    "package projection contains an empty payload for {}",
+                    package.package
+                ));
+            }
+            record_count = record_count
+                .checked_add(package.record_count)
+                .ok_or_else(|| "package projection record count overflow".to_owned())?;
+        }
+        Ok((package_keys.len(), record_count))
     }
 }
 
@@ -370,11 +486,12 @@ mod tests {
 
     fn build(raw: &str) -> ProjectionBuild {
         ProjectionBuild {
-            records: vec![ProjectionRecord {
-                record_index: 0,
-                package: Some("pkg".into()),
-                fields: vec![("Version".into(), raw.into())],
+            packages: vec![ProjectionPackage {
+                package: "pkg".into(),
+                record_count: 1,
+                payload: postcard::to_stdvec(&raw).unwrap(),
             }],
+            summary: raw.as_bytes().to_vec(),
             surface_digest: format!("surface-{raw}"),
         }
     }
@@ -397,7 +514,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            projection.lookup_package("pkg").unwrap()[0].fields[0].1,
+            postcard::from_bytes::<String>(
+                &projection.lookup_package("pkg").unwrap().unwrap().bytes
+            )
+            .unwrap(),
             "1.0"
         );
         drop(projection);
@@ -417,24 +537,13 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(projection.package_count(), 1);
         assert_eq!(projection.surface_digest(), "surface-1.0");
+        assert_eq!(projection.summary(), b"1.0");
     }
 
     #[test]
     fn package_record_visitor_reads_all_keys_in_one_ordered_pass() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("current.redb");
-        let records = vec![
-            ProjectionRecord {
-                record_index: 1,
-                package: Some("b".into()),
-                fields: vec![],
-            },
-            ProjectionRecord {
-                record_index: 0,
-                package: Some("a".into()),
-                fields: vec![],
-            },
-        ];
         let projection = PackageProjection::open_or_build(
             &path,
             b"raw",
@@ -442,7 +551,19 @@ mod tests {
             contract(),
             || {
                 Ok(ProjectionBuild {
-                    records,
+                    packages: vec![
+                        ProjectionPackage {
+                            package: "b".into(),
+                            record_count: 1,
+                            payload: vec![1],
+                        },
+                        ProjectionPackage {
+                            package: "a".into(),
+                            record_count: 1,
+                            payload: vec![0],
+                        },
+                    ],
+                    summary: vec![9],
                     surface_digest: "surface".into(),
                 })
             },
@@ -451,13 +572,48 @@ mod tests {
         reset_visit_package_records_count();
         let mut keys = Vec::new();
         projection
-            .visit_package_records(|package, records| {
-                keys.push((package.to_owned(), records[0].record_index));
+            .visit_packages(|package, payload, record_count| {
+                keys.push((package.to_owned(), payload[0]));
+                assert_eq!(record_count, 1);
                 Ok(())
             })
             .unwrap();
         assert_eq!(visit_package_records_count(), 1);
         assert_eq!(keys, [("a".into(), 0), ("b".into(), 1)]);
+    }
+
+    #[test]
+    fn warm_open_defers_extra_count_validation_until_full_visit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("current.redb");
+        let projection = PackageProjection::open_or_build(
+            &path,
+            b"raw",
+            ProjectionSourceKind::Current,
+            contract(),
+            || Ok(build("1.0")),
+        )
+        .unwrap();
+        drop(projection);
+        let database = Database::open(&path).unwrap();
+        {
+            let tx = database.begin_write().unwrap();
+            {
+                let mut counts = tx.open_table(PACKAGE_COUNTS).unwrap();
+                counts.insert("orphan", 1).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        drop(database);
+        let projection = PackageProjection::open(
+            &path,
+            &hex_digest(Sha256::digest(b"raw")),
+            ProjectionSourceKind::Current,
+            &contract(),
+        )
+        .unwrap();
+        let error = projection.visit_packages(|_, _, _| Ok(())).unwrap_err();
+        assert!(error.contains("no payload"));
     }
 
     #[test]
@@ -490,7 +646,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            projection.lookup_package("pkg").unwrap()[0].fields[0].1,
+            postcard::from_bytes::<String>(
+                &projection.lookup_package("pkg").unwrap().unwrap().bytes
+            )
+            .unwrap(),
             "1.1"
         );
         assert_eq!(calls.get(), 2);
@@ -507,7 +666,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            projection.lookup_package("pkg").unwrap()[0].fields[0].1,
+            postcard::from_bytes::<String>(
+                &projection.lookup_package("pkg").unwrap().unwrap().bytes
+            )
+            .unwrap(),
             "1.2"
         );
         assert_eq!(calls.get(), 3);
@@ -534,9 +696,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            projection.lookup_package("pkg").unwrap()[0].fields[0].1,
+            postcard::from_bytes::<String>(
+                &projection.lookup_package("pkg").unwrap().unwrap().bytes
+            )
+            .unwrap(),
             "2.0"
         );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_and_empty_package_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let duplicate_path = directory.path().join("duplicate.redb");
+        let duplicate = PackageProjection::open_or_build(
+            &duplicate_path,
+            b"raw",
+            ProjectionSourceKind::Current,
+            contract(),
+            || {
+                Ok(ProjectionBuild {
+                    packages: vec![
+                        ProjectionPackage {
+                            package: "pkg".into(),
+                            record_count: 1,
+                            payload: vec![1],
+                        },
+                        ProjectionPackage {
+                            package: "pkg".into(),
+                            record_count: 1,
+                            payload: vec![2],
+                        },
+                    ],
+                    summary: Vec::new(),
+                    surface_digest: "surface".into(),
+                })
+            },
+        );
+        assert!(
+            matches!(duplicate, Err(ProjectionError::Build(message)) if message.contains("duplicate"))
+        );
+
+        let empty_path = directory.path().join("empty.redb");
+        let empty = PackageProjection::open_or_build(
+            &empty_path,
+            b"raw",
+            ProjectionSourceKind::Current,
+            contract(),
+            || {
+                Ok(ProjectionBuild {
+                    packages: vec![ProjectionPackage {
+                        package: String::new(),
+                        record_count: 1,
+                        payload: vec![1],
+                    }],
+                    summary: Vec::new(),
+                    surface_digest: "surface".into(),
+                })
+            },
+        );
+        assert!(
+            matches!(empty, Err(ProjectionError::Build(message)) if message.contains("empty package"))
+        );
+
+        let empty_payload_path = directory.path().join("empty-payload.redb");
+        let empty_payload = PackageProjection::open_or_build(
+            &empty_payload_path,
+            b"raw",
+            ProjectionSourceKind::Current,
+            contract(),
+            || {
+                Ok(ProjectionBuild {
+                    packages: vec![ProjectionPackage {
+                        package: "pkg".into(),
+                        record_count: 1,
+                        payload: Vec::new(),
+                    }],
+                    summary: Vec::new(),
+                    surface_digest: "surface".into(),
+                })
+            },
+        );
+        assert!(matches!(
+            empty_payload,
+            Err(ProjectionError::Build(message)) if message.contains("empty payload")
+        ));
     }
 
     #[cfg(unix)]

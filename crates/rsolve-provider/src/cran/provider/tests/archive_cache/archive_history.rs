@@ -1,6 +1,8 @@
 #[test]
 fn archive_history_fresh_cache_hit_avoids_network() {
     let (_directory, store) = store();
+    CranRefreshSession::<FixtureTransport>::reset_archive_projection_build_count();
+    crate::cran::provider::raw_cache::projection::reset_visit_package_records_count();
     let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
     let first_transport = FixtureTransport {
         responses: [(
@@ -25,6 +27,14 @@ fn archive_history_fresh_cache_hit_avoids_network() {
         first.ensure_history(),
         Ok(HistorySource::Available { .. })
     ));
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::archive_projection_build_count(),
+        1
+    );
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_package_records_count(),
+        0
+    );
     assert_eq!(first_requests.borrow().len(), 1);
     assert!(
         !first_requests
@@ -45,12 +55,123 @@ fn archive_history_fresh_cache_hit_avoids_network() {
         second.ensure_history(),
         Ok(HistorySource::Available { .. })
     ));
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::archive_projection_build_count(),
+        1
+    );
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_package_records_count(),
+        0
+    );
     assert!(second_requests.borrow().is_empty());
     assert!(
         !second_requests
             .borrow()
             .iter()
             .any(|request| request.url == legacy_history_url())
+    );
+}
+
+#[test]
+fn archive_projection_storage_failure_does_not_retry_transport() {
+    let (_directory, store) = store();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = FixtureTransport {
+        responses: [(history_url(), history_response(Default::default()))]
+            .into_iter()
+            .collect(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first.ensure_history().unwrap();
+    drop(first);
+
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&history_url(), RawCacheRepresentation::ArchiveHistoryRds)
+        .unwrap();
+    let digest = Sha256::digest(HISTORY);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection =
+        cache.projection_path_in_namespace(ProjectionNamespace::ArchiveHistory, &key, &digest);
+    std::fs::remove_file(&projection).unwrap();
+    std::fs::create_dir(&projection).unwrap();
+
+    let second_transport = empty_transport();
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let error = second
+        .ensure_history()
+        .err()
+        .expect("projection storage failure");
+    assert_eq!(
+        error.category(),
+        CandidateLoadErrorCategory::SnapshotInvalid
+    );
+    assert!(requests.borrow().is_empty());
+}
+
+#[test]
+fn corrupt_archive_projection_rebuilds_from_cached_raw_without_transport() {
+    let (_directory, store) = store();
+    CranRefreshSession::<FixtureTransport>::reset_archive_projection_build_count();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = FixtureTransport {
+        responses: [(history_url(), history_response(Default::default()))]
+            .into_iter()
+            .collect(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first.ensure_history().unwrap();
+    drop(first);
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&history_url(), RawCacheRepresentation::ArchiveHistoryRds)
+        .unwrap();
+    let digest = Sha256::digest(HISTORY);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection =
+        cache.projection_path_in_namespace(ProjectionNamespace::ArchiveHistory, &key, &digest);
+    std::fs::write(&projection, b"corrupt projection").unwrap();
+
+    let second_transport = empty_transport();
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    assert!(matches!(
+        second.ensure_history(),
+        Ok(HistorySource::Available { .. })
+    ));
+    assert!(requests.borrow().is_empty());
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::archive_projection_build_count(),
+        2
     );
 }
 
@@ -148,10 +269,12 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
         Some(RawCache::open(&store).unwrap()),
     );
     let first_source = first.ensure_history().expect("fresh history");
-    let HistorySource::Available { rejections, .. } = first_source else {
+    let HistorySource::Available { source } = first_source else {
         panic!("expected available history")
     };
-    assert_eq!(rejections.len(), 1);
+    let package = PackageName::new("calibFit").unwrap();
+    let first_payload = source.package(&package).expect("package payload");
+    assert_eq!(first_payload.rejections.len(), 1);
     assert!(first.diagnostics.iter().any(|diagnostic| matches!(
         diagnostic.status_detail(),
         CranFastPathStatus::Invalid { diagnostic, .. }
@@ -181,12 +304,13 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
         Some(RawCache::open(&store).unwrap()),
     );
     let second_source = second.ensure_history().expect("304 history");
-    let HistorySource::Available { rejections, .. } = second_source else {
+    let HistorySource::Available { source } = second_source else {
         panic!("expected available history")
     };
-    assert_eq!(rejections.len(), 1);
+    let second_payload = source.package(&package).expect("package payload");
+    assert_eq!(second_payload.rejections.len(), 1);
     assert_eq!(
-        rejections[0].raw_path(),
+        second_payload.rejections[0].raw_path(),
         "calibFit/Ancestry/calib_0.1.02.tar.gz"
     );
     assert!(second.diagnostics.iter().any(|diagnostic| matches!(
@@ -197,4 +321,6 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
 }
 use super::*;
 use crate::cran::provider::cache_policy::CacheControlHeader;
+use crate::cran::provider::raw_cache::ProjectionNamespace;
 use crate::cran::provider::raw_cache::{RawCache, RawCacheLookup, RawCacheRepresentation};
+use sha2::{Digest, Sha256};

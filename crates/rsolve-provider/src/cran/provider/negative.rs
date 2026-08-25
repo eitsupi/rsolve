@@ -1,8 +1,10 @@
 //! Session-local negative-cache fallback decisions.
 
+use std::rc::Rc;
+
 use super::CranRefreshDiagnostic;
 use super::{CandidateSource, CranRefreshSession, HistorySource, Transport};
-use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory};
+use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageName};
 
 pub(super) enum FastPathFailure {
     Unsupported,
@@ -15,6 +17,7 @@ pub(super) enum FastPathFailure {
 impl<T: Transport> CranRefreshSession<T> {
     pub(super) fn resolve_fast_path_failure(
         &mut self,
+        package: &PackageName,
         mut package_diagnostics: Vec<CranRefreshDiagnostic>,
         failure: FastPathFailure,
     ) -> Result<Option<CandidateSource>, CandidateLoadError> {
@@ -23,13 +26,13 @@ impl<T: Transport> CranRefreshSession<T> {
         // session and contributes at most one diagnostic.
         self.diagnostics.append(&mut package_diagnostics);
         match self.ensure_history()? {
-            HistorySource::Available {
-                entries,
-                rejections,
-            } => Ok(Some(CandidateSource::Fallback {
-                entries,
-                rejections,
-            })),
+            HistorySource::Available { source } => {
+                let payload = source.package(package)?;
+                Ok(Some(CandidateSource::Fallback {
+                    entries: Rc::from(payload.entries.into_boxed_slice()),
+                    rejections: Rc::from(payload.rejections.into_boxed_slice()),
+                }))
+            }
             HistorySource::Absent => match failure {
                 FastPathFailure::Unsupported => Ok(None),
                 FastPathFailure::Invalid {

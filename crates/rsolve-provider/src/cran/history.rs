@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use rd_rds::{RObject, RStr, RValue, file::ReadOptions};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::archive_index::provider_rds_read_options;
 use rsolve_core::{PackageName, RPackageVersion};
@@ -33,6 +34,152 @@ pub(crate) struct ArchiveHistoryRejection {
     row: usize,
     version: Option<RPackageVersion>,
     reason: Box<str>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ArchivePackagePayload {
+    pub(crate) entries: Vec<ArchiveEntry>,
+    pub(crate) rejections: Vec<ArchiveHistoryRejection>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ArchiveEntryWire {
+    package: String,
+    version: String,
+    source_archive_relative_path: String,
+    size: u64,
+    mtime: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ArchiveHistoryRejectionWire {
+    package_hint: String,
+    raw_path: String,
+    row: usize,
+    version: Option<String>,
+    reason: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ArchivePackagePayloadWire {
+    entries: Vec<ArchiveEntryWire>,
+    rejections: Vec<ArchiveHistoryRejectionWire>,
+}
+
+impl Serialize for ArchivePackagePayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ArchivePackagePayloadWire {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| ArchiveEntryWire {
+                    package: entry.package.to_string(),
+                    version: entry.version.to_string(),
+                    source_archive_relative_path: entry.source_archive_relative_path.to_string(),
+                    size: entry.size,
+                    mtime: entry.mtime,
+                })
+                .collect(),
+            rejections: self
+                .rejections
+                .iter()
+                .map(|rejection| ArchiveHistoryRejectionWire {
+                    package_hint: rejection.package_hint.to_string(),
+                    raw_path: rejection.raw_path.to_string(),
+                    row: rejection.row,
+                    version: rejection.version.as_ref().map(ToString::to_string),
+                    reason: rejection.reason.to_string(),
+                })
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ArchivePackagePayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ArchivePackagePayloadWire::deserialize(deserializer)?;
+        let entries = wire
+            .entries
+            .into_iter()
+            .map(|entry| {
+                Ok(ArchiveEntry {
+                    package: PackageName::new(&entry.package).map_err(serde::de::Error::custom)?,
+                    version: RPackageVersion::parse(&entry.version)
+                        .map_err(serde::de::Error::custom)?,
+                    source_archive_relative_path: entry.source_archive_relative_path.into(),
+                    size: entry.size,
+                    mtime: entry.mtime,
+                })
+            })
+            .collect::<Result<_, D::Error>>()?;
+        let rejections = wire
+            .rejections
+            .into_iter()
+            .map(|rejection| {
+                Ok(ArchiveHistoryRejection {
+                    package_hint: PackageName::new(&rejection.package_hint)
+                        .map_err(serde::de::Error::custom)?,
+                    raw_path: rejection.raw_path.into(),
+                    row: rejection.row,
+                    version: rejection
+                        .version
+                        .as_deref()
+                        .map(RPackageVersion::parse)
+                        .transpose()
+                        .map_err(serde::de::Error::custom)?,
+                    reason: rejection.reason.into(),
+                })
+            })
+            .collect::<Result<_, D::Error>>()?;
+        Ok(Self {
+            entries,
+            rejections,
+        })
+    }
+}
+
+impl ArchivePackagePayload {
+    pub(crate) fn validate_for_package(self, package: &PackageName) -> Result<Self, String> {
+        for entry in &self.entries {
+            if entry.package() != package {
+                return Err(format!(
+                    "archive projection package binding mismatch for {package}"
+                ));
+            }
+            if entry.mtime < 0 {
+                return Err("archive projection entry has a negative mtime".into());
+            }
+            let (path_package, path_version, normalized_path) =
+                parse_archive_path(entry.source_archive_relative_path())
+                    .map_err(|error| format!("invalid archive projection entry: {error}"))?;
+            if &path_package != entry.package()
+                || &path_version != entry.version()
+                || normalized_path.as_ref() != entry.source_archive_relative_path()
+            {
+                return Err(format!(
+                    "archive projection entry does not match its package, version, or path: {}",
+                    entry.source_archive_relative_path()
+                ));
+            }
+        }
+        if self
+            .rejections
+            .iter()
+            .any(|rejection| rejection.package_hint() != package)
+        {
+            return Err(format!(
+                "archive projection package binding mismatch for {package}"
+            ));
+        }
+        Ok(self)
+    }
 }
 
 impl ArchiveHistoryRejection {

@@ -48,17 +48,12 @@ impl<T: Transport> CranRefreshSession<T> {
         bulk: &AllPackagesSource,
     ) -> Result<Option<BulkCandidateResult>, CandidateLoadError> {
         let history = match self.ensure_history()? {
-            HistorySource::Available {
-                entries,
-                rejections,
-            } => {
-                if rejections
-                    .iter()
-                    .any(|rejection| rejection.package_hint() == package)
-                {
+            HistorySource::Available { source } => {
+                let payload = source.package(package)?;
+                if !payload.rejections.is_empty() {
                     return Ok(None);
                 }
-                entries
+                payload.entries
             }
             HistorySource::Absent => return Ok(None),
         };
@@ -339,10 +334,12 @@ impl<T: Transport> CranRefreshSession<T> {
                 provider_diagnostics = package_diagnostics;
                 source
             }
-            Err(failure) => match self.resolve_fast_path_failure(package_diagnostics, failure)? {
-                Some(source) => source,
-                None => return Ok(CandidateLoadResult::new(current, Vec::new())),
-            },
+            Err(failure) => {
+                match self.resolve_fast_path_failure(package, package_diagnostics, failure)? {
+                    Some(source) => source,
+                    None => return Ok(CandidateLoadResult::new(current, Vec::new())),
+                }
+            }
         };
         let provider = CranProvider::from_source(
             Rc::clone(&self.transport),

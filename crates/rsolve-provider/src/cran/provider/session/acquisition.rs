@@ -174,7 +174,8 @@ impl<T: Transport> CranRefreshSession<T> {
                     if matches!(
                         origin,
                         Some(CurrentBodyOrigin::Cached | CurrentBodyOrigin::Revalidated304)
-                    ) && !retried_unconditionally =>
+                    ) && error.allows_cached_retry()
+                        && !retried_unconditionally =>
                 {
                     retried_unconditionally = true;
                     let allows_fallback = error.allows_fallback();
@@ -206,11 +207,13 @@ impl<T: Transport> CranRefreshSession<T> {
                 }
                 Err(error) => {
                     let allows_fallback = error.allows_fallback();
-                    return Err(MetadataAcquisitionFailure::parse(
-                        Some(200),
-                        error.to_string(),
-                        allows_fallback,
-                    ));
+                    return Err(MetadataAcquisitionFailure {
+                        status: Some(200),
+                        retry_after: None,
+                        category: error.category(),
+                        diagnostic: error.to_string().into(),
+                        fallback_allowed: allows_fallback,
+                    });
                 }
             }
         }

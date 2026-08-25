@@ -114,6 +114,7 @@ fn current_projection_storage_failure_does_not_retry_transport() {
         Some(cache),
     );
     first.ensure_current().unwrap();
+    drop(first);
 
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let key = cache

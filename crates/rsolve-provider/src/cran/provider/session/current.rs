@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
@@ -10,7 +11,7 @@ use super::super::model::{
 };
 use super::super::raw_cache::RawCacheRepresentation;
 use super::super::raw_cache::projection::{
-    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionRecord,
+    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionPackage,
     ProjectionSourceKind,
 };
 use super::super::raw_cache::{ProjectionNamespace, RawCacheLookup, RawCacheWrite};
@@ -19,7 +20,7 @@ use super::{
     CranRefreshSession, CurrentBody, CurrentBodyOrigin, CurrentProjection,
     DEFAULT_COMPATIBLE_GENERATION_TTL, cache_control_policy, permits_reuse,
 };
-use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory};
+use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageName};
 
 fn current_projection_contract() -> ProjectionContract {
     ProjectionContract {
@@ -27,6 +28,30 @@ fn current_projection_contract() -> ProjectionContract {
         compatibility_profile: super::CRAN_COMPATIBILITY_PROFILE,
         normalization_policy: super::CRAN_NORMALIZATION_POLICY,
     }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(super) struct CurrentProjectionRecord {
+    pub(super) record_index: usize,
+    pub(super) package: String,
+    pub(super) fields: Vec<(String, String)>,
+}
+
+pub(super) fn decode_current_records(
+    payload: &[u8],
+    package: &PackageName,
+) -> Result<Vec<CurrentProjectionRecord>, String> {
+    let records: Vec<CurrentProjectionRecord> =
+        postcard::from_bytes(payload).map_err(|error| error.to_string())?;
+    if records
+        .iter()
+        .any(|record| record.package != package.as_str())
+    {
+        return Err(format!(
+            "current package projection payload is not bound to {package}"
+        ));
+    }
+    Ok(records)
 }
 
 fn build_current_projection(
@@ -45,17 +70,33 @@ fn build_current_projection(
     let (catalog, observations) =
         super::super::snapshot::import_current_index(representation, body)
             .map_err(|error| error.to_string())?;
-    let records = observations
-        .iter()
-        .map(|observation| ProjectionRecord {
-            record_index: observation.record_index(),
-            package: Some(observation.package().to_string()),
-            fields: observation.fields().to_vec(),
+    let mut grouped = BTreeMap::<String, Vec<CurrentProjectionRecord>>::new();
+    for observation in &observations {
+        grouped
+            .entry(observation.package().to_string())
+            .or_default()
+            .push(CurrentProjectionRecord {
+                record_index: observation.record_index(),
+                package: observation.package().to_string(),
+                fields: observation.fields().to_vec(),
+            });
+    }
+    let packages = grouped
+        .into_iter()
+        .map(|(package, records)| {
+            let record_count = records.len();
+            Ok(ProjectionPackage {
+                package,
+                record_count,
+                payload: postcard::to_stdvec(&records).map_err(|error| error.to_string())?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
+    let surface_digest = super::catalog_surface_digest(&catalog);
     let build = ProjectionBuild {
-        records,
-        surface_digest: super::catalog_surface_digest(&catalog).into(),
+        packages,
+        summary: Vec::new(),
+        surface_digest: surface_digest.into(),
     };
     Ok((build, catalog, observations))
 }
@@ -246,7 +287,14 @@ impl<T: Transport> CranRefreshSession<T> {
                     .map(CurrentProjection::new),
                     None => build_current_projection(representation, &body.body)
                         .map(|(build, catalog, observations)| {
-                            debug_assert_eq!(build.records.len(), observations.len());
+                            debug_assert_eq!(
+                                build
+                                    .packages
+                                    .iter()
+                                    .map(|package| package.record_count)
+                                    .sum::<usize>(),
+                                observations.len()
+                            );
                             CurrentProjection::eager(catalog, observations)
                         })
                         .map_err(ProjectionError::Build),
