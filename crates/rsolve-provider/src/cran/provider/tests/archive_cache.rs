@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 
 const ALLPACKAGES_FIXTURE_URL: &str = "https://feed.invalid/ALLPACKAGES.zst";
 
-fn allpackages_fixture_body(
+pub(super) fn allpackages_fixture_body(
     entries: &[crate::cran::history::ArchiveEntry],
     include_current: bool,
     omit_entry: Option<usize>,
@@ -64,7 +64,10 @@ fn allpackages_fixture_body(
     raw_zstd(dcf.as_bytes())
 }
 
-fn allpackages_transport(feed_body: Vec<u8>, include_package_archive: bool) -> FixtureTransport {
+pub(super) fn allpackages_transport(
+    feed_body: Vec<u8>,
+    include_package_archive: bool,
+) -> FixtureTransport {
     let mut responses = std::collections::HashMap::new();
     responses.insert(
         "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
@@ -98,7 +101,7 @@ fn allpackages_transport(feed_body: Vec<u8>, include_package_archive: bool) -> F
     }
 }
 
-fn custom_mirror_transport(
+pub(super) fn custom_mirror_transport(
     feed_body: Vec<u8>,
     target_history: &[u8],
     include_package_archive: bool,
@@ -135,7 +138,7 @@ fn allpackages_duplicate_fixture_body(entries: &[crate::cran::history::ArchiveEn
     raw_zstd(dcf.as_bytes())
 }
 
-fn matrix_history_entries() -> Vec<crate::cran::history::ArchiveEntry> {
+pub(super) fn matrix_history_entries() -> Vec<crate::cran::history::ArchiveEntry> {
     enumerate_archive_rds_for_provider(HISTORY)
         .unwrap()
         .entries

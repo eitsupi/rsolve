@@ -263,6 +263,7 @@ pub struct CranSnapshotCacheDiagnostic {
     age_seconds: Option<u64>,
     endpoints: Vec<Box<str>>,
     diagnostic: Box<str>,
+    revision_token: Option<Box<str>>,
 }
 
 impl std::fmt::Display for CranSnapshotCacheDiagnostic {
@@ -288,6 +289,7 @@ impl CranSnapshotCacheDiagnostic {
             age_seconds,
             endpoints,
             diagnostic: diagnostic.into(),
+            revision_token: None,
         }
     }
     pub fn status(&self) -> CranSnapshotCacheStatus {
@@ -301,6 +303,10 @@ impl CranSnapshotCacheDiagnostic {
     }
     pub fn diagnostic(&self) -> &str {
         &self.diagnostic
+    }
+
+    pub fn revision_token(&self) -> Option<&str> {
+        self.revision_token.as_deref()
     }
 
     pub fn is_routine_online_fallback(&self) -> bool {
@@ -322,6 +328,7 @@ impl CranSnapshotCacheDiagnostic {
                 "cached CRAN generation cannot be used for the requested dependency closure: {error}"
             )
             .into(),
+            revision_token: None,
         }
     }
 }
@@ -334,13 +341,65 @@ pub enum CranSnapshotCacheResult {
     Rejected(CranSnapshotCacheDiagnostic),
 }
 
+fn cache_revision_token(
+    header: &crate::snapshot::SnapshotHeaderV1,
+    validation: Option<&crate::snapshot::CurrentValidationV2>,
+) -> Box<str> {
+    let mut digest = Sha256::new();
+    digest.update(b"rsolve-cran-cache-revision-v1");
+    if let Ok(bytes) = crate::snapshot::encode_header(header) {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    } else {
+        digest.update(0_u64.to_be_bytes());
+    }
+    match validation.and_then(|record| serde_json::to_vec(record).ok()) {
+        Some(bytes) => {
+            digest.update([1]);
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        None => digest.update([0]),
+    }
+    hex_digest(digest.finalize())
+}
+
 /// Inspect the current immutable generation without transport. This is the
 /// sole CRAN freshness boundary; resolver traversal remains loader-only.
 pub fn inspect_cran_snapshot_cache(
     store: &SnapshotStore,
     policy: &CranSnapshotCachePolicy,
 ) -> CranSnapshotCacheResult {
-    let loader = match store.read_current_optional() {
+    let guard = match store.begin_refresh() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
+                status: CranSnapshotCacheStatus::Corrupt,
+                age_seconds: None,
+                endpoints: Vec::new(),
+                diagnostic: format!("unable to acquire snapshot refresh lock: {error}").into(),
+                revision_token: None,
+            });
+        }
+    };
+    inspect_cran_snapshot_cache_with_refresh_guard(&guard, policy)
+}
+
+pub(crate) fn inspect_cran_snapshot_cache_with_refresh_guard(
+    guard: &crate::snapshot::SnapshotRefreshGuard<'_>,
+    policy: &CranSnapshotCachePolicy,
+) -> CranSnapshotCacheResult {
+    let loader = guard.read_current_optional();
+    let validation = guard.read_current_validation().ok().flatten();
+    inspect_cran_snapshot_cache_from_reads(policy, loader, validation)
+}
+
+fn inspect_cran_snapshot_cache_from_reads(
+    policy: &CranSnapshotCachePolicy,
+    loader_result: Result<Option<ReadOnlySnapshotCandidateLoader>, CandidateLoadError>,
+    validation: Option<crate::snapshot::CurrentValidationV2>,
+) -> CranSnapshotCacheResult {
+    let loader = match loader_result {
         Ok(Some(loader)) => loader,
         Ok(None) => {
             return CranSnapshotCacheResult::Rejected(CranSnapshotCacheDiagnostic {
@@ -348,6 +407,7 @@ pub fn inspect_cran_snapshot_cache(
                 age_seconds: None,
                 endpoints: Vec::new(),
                 diagnostic: "current CRAN snapshot pointer is missing".into(),
+                revision_token: None,
             });
         }
         Err(error) => {
@@ -356,6 +416,7 @@ pub fn inspect_cran_snapshot_cache(
                 age_seconds: None,
                 endpoints: Vec::new(),
                 diagnostic: error.diagnostic().into(),
+                revision_token: None,
             });
         }
     };
@@ -372,9 +433,9 @@ pub fn inspect_cran_snapshot_cache(
                 "CRAN snapshot compatibility revisions are incompatible (profile {}, parser {}, normalization {})",
                 header.compatibility_profile, header.parser_schema, header.normalization_policy
             ).into(),
+            revision_token: None,
         });
     }
-    let validation = store.read_current_validation().ok().flatten();
     let header_source_identities = header
         .sources
         .iter()
@@ -440,6 +501,7 @@ pub fn inspect_cran_snapshot_cache(
                     age_seconds: None,
                     endpoints: Vec::new(),
                     diagnostic: format!("invalid source observed_at: {error}").into(),
+                    revision_token: None,
                 });
             }
         };
@@ -458,6 +520,7 @@ pub fn inspect_cran_snapshot_cache(
             age_seconds: None,
             endpoints: Vec::new(),
             diagnostic: "CRAN snapshot has no source observations".into(),
+            revision_token: None,
         });
     }
     let age_seconds = u64::try_from(oldest_source_age).unwrap_or(u64::MAX);
@@ -484,6 +547,7 @@ pub fn inspect_cran_snapshot_cache(
         } else {
             "compatible CRAN snapshot generation is stale but remains usable offline".into()
         },
+        revision_token: Some(cache_revision_token(header, validation.as_ref())),
     };
     CranSnapshotCacheResult::Compatible {
         loader: Box::new(loader),
@@ -509,7 +573,7 @@ fn canonical_endpoints(header: &crate::snapshot::SnapshotHeaderV1) -> Vec<Box<st
     endpoints.into_iter().map(String::into_boxed_str).collect()
 }
 
-fn canonical_validation_endpoints(record: &crate::snapshot::CurrentValidationV1) -> Vec<Box<str>> {
+fn canonical_validation_endpoints(record: &crate::snapshot::CurrentValidationV2) -> Vec<Box<str>> {
     let mut endpoints = record
         .sources
         .iter()
@@ -1084,6 +1148,7 @@ struct CranRefreshSession<T> {
 struct AllPackagesSource {
     projection: Rc<allpackages::IndexedProjection>,
     source: crate::snapshot::SourceInput,
+    projection_path: std::path::PathBuf,
 }
 
 struct BulkCandidateResult {
@@ -1348,6 +1413,35 @@ impl<T: Transport> CranRefreshSession<T> {
 
     fn attach_raw_cache(&mut self, cache: RawCache) {
         self.raw_cache = Some(cache);
+    }
+
+    pub(super) fn previous_allpackages_projection_path(&self) -> Option<std::path::PathBuf> {
+        let cache = self.raw_cache.as_ref()?;
+        let record = qualification::load(&cache.qualification_path())?;
+        // Only a positive record bound to this exact provider/feed may be
+        // retained as the safe previous projection. Negative, unknown, or
+        // stale records from another endpoint must not influence cleanup.
+        if record.status != qualification::Status::Positive
+            || record.repository_endpoint != self.base_url.as_ref()
+            || record.feed_endpoint != self.allpackages_feed_endpoint.as_ref()
+        {
+            return None;
+        }
+        let key = cache
+            .key(
+                &self.allpackages_feed_endpoint,
+                RawCacheRepresentation::AllPackagesZstd,
+            )
+            .ok()?;
+        let path = cache.projection_path_for_hex_digest(&key, &record.feed_digest)?;
+        path.is_file().then_some(path)
+    }
+
+    pub(super) fn active_allpackages_projection_path(&self) -> Option<std::path::PathBuf> {
+        self.allpackages
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|source| source.projection_path.clone())
     }
 
     fn parse_current_body(
@@ -2076,14 +2170,13 @@ impl<T: Transport> CranRefreshSession<T> {
             self.allpackages = Some(Err(error.clone()));
             return Err(error);
         }
-        let projection_cache = self.raw_cache.as_ref();
         let result = match self.acquire_metadata(
             &endpoint,
             RawCacheRepresentation::AllPackagesZstd,
             "cran-allpackages",
             "zstd",
             |body| {
-                let projection_path = projection_cache.and_then(|cache| {
+                let projection_path = self.raw_cache.as_ref().and_then(|cache| {
                     cache
                         .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
                         .ok()
@@ -2269,9 +2362,22 @@ impl<T: Transport> CranRefreshSession<T> {
                     status_detail: detail,
                     source: CranRefreshSource::AllPackages,
                 });
+                let projection_path = self.raw_cache.as_ref().and_then(|cache| {
+                    cache
+                        .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
+                        .ok()
+                        .map(|key| cache.projection_path_for_digest(&key, &source.content_sha256))
+                });
+                let Some(projection_path) = projection_path else {
+                    return Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        "ALLPACKAGES projection cache path is unavailable",
+                    ));
+                };
                 Ok(Rc::new(AllPackagesSource {
                     projection: Rc::new(projection),
                     source,
+                    projection_path,
                 }))
             }
             Err(error) if matches!(error.status, Some(404 | 410)) => {

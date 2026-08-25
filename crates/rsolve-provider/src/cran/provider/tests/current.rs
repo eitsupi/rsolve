@@ -1,7 +1,482 @@
 use super::*;
 use crate::cran::provider::raw_cache::{RawCacheLookup, RawCacheRepresentation, RawCacheWrite};
 use flate2::{Compression, write::GzEncoder};
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::time::Duration;
+
+#[derive(Clone)]
+struct FileCountingTransport {
+    inner: FixtureTransport,
+    counter: PathBuf,
+}
+
+impl FileCountingTransport {
+    fn count(&self) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.counter)
+            .unwrap();
+        writeln!(file, "request").unwrap();
+    }
+}
+
+impl Transport for FileCountingTransport {
+    fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
+        self.get_with_validators(url, &TransportValidators::default())
+    }
+
+    fn get_with_validators(
+        &self,
+        url: &str,
+        validators: &TransportValidators,
+    ) -> Result<TransportResponse, TransportError> {
+        self.count();
+        self.inner.get_with_validators(url, validators)
+    }
+}
+
+fn wait_for_child_file(path: &Path) {
+    for _ in 0..500 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("child did not create {} within timeout", path.display());
+}
+
+fn wait_for_child(mut child: Child) -> std::process::ExitStatus {
+    for _ in 0..500 {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    panic!("child did not finish within timeout");
+}
+
+fn spawn_persistent_child(root: &Path, mode: &str) -> Child {
+    Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("cran::provider::tests::current::persistent_refresh_child_probe")
+        .arg("--nocapture")
+        .env("RSOLVE_PERSISTENT_CHILD_ROOT", root)
+        .env("RSOLVE_PERSISTENT_CHILD_MODE", mode)
+        .spawn()
+        .unwrap()
+}
+
+fn seed_previous_projection(root: &Path) -> PathBuf {
+    let store =
+        crate::snapshot::SnapshotStore::open(root, rsolve_core::RegistryId::new("cran").unwrap())
+            .unwrap();
+    let feed = "https://feed.invalid/ALLPACKAGES.zst";
+    let raw_cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = raw_cache
+        .key(feed, RawCacheRepresentation::AllPackagesZstd)
+        .unwrap();
+    let digest = "0".repeat(64);
+    let previous = raw_cache
+        .projection_path_for_hex_digest(&key, &digest)
+        .unwrap();
+    std::fs::write(&previous, b"previous").unwrap();
+    std::fs::write(
+        root.join("raw-cache/v1/projections/newer-orphan.redb"),
+        b"orphan",
+    )
+    .unwrap();
+    let record = crate::cran::provider::qualification::Record {
+        status: crate::cran::provider::qualification::Status::Positive,
+        repository_endpoint: "https://cloud.r-project.org".into(),
+        feed_endpoint: feed.into(),
+        feed_digest: digest,
+        ..Default::default()
+    };
+    crate::cran::provider::qualification::publish(&raw_cache.qualification_path(), &record)
+        .unwrap();
+    previous
+}
+
+fn append_counter(root: &Path, name: &str) {
+    let path = root.join(name);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "event").unwrap();
+}
+
+fn projection_files(root: &Path) -> Vec<PathBuf> {
+    let directory = root.join("raw-cache/v1/projections");
+    std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("redb"))
+        .collect()
+}
+
+#[test]
+fn persistent_refresh_child_probe() {
+    let Ok(root) = std::env::var("RSOLVE_PERSISTENT_CHILD_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let mode = std::env::var("RSOLVE_PERSISTENT_CHILD_MODE").unwrap();
+    let owner = mode.ends_with("owner");
+    let forced = mode.starts_with("forced");
+    let failure = mode == "failure-owner";
+    let store =
+        crate::snapshot::SnapshotStore::open(&root, rsolve_core::RegistryId::new("cran").unwrap())
+            .unwrap();
+    let feed = "https://feed.invalid/ALLPACKAGES.zst";
+    let now = "2026-08-25T00:00:00Z".parse().unwrap();
+    let initial_revision = if mode.starts_with("failure") {
+        None
+    } else {
+        let initial_policy = CranSnapshotCachePolicy::at(now)
+            .with_expected_endpoint("https://cloud.r-project.org")
+            .with_allowed_auxiliary_endpoint(feed)
+            .with_refresh_metadata();
+        let initial_result = inspect_cran_snapshot_cache(&store, &initial_policy);
+        match &initial_result {
+            CranSnapshotCacheResult::Compatible { diagnostic, .. }
+            | CranSnapshotCacheResult::Rejected(diagnostic) => {
+                diagnostic.revision_token().map(str::to_owned)
+            }
+        }
+    };
+    std::fs::write(
+        root.join(if forced {
+            if owner {
+                "forced-owner-probed"
+            } else {
+                "forced-waiter-probed"
+            }
+        } else if owner {
+            "normal-owner-probed"
+        } else {
+            "normal-waiter-probed"
+        }),
+        b"ready",
+    )
+    .unwrap();
+    if !mode.starts_with("failure") {
+        wait_for_child_file(&root.join(if forced {
+            if owner {
+                "forced-owner-start"
+            } else {
+                "forced-waiter-start"
+            }
+        } else if owner {
+            "normal-owner-start"
+        } else {
+            "normal-waiter-start"
+        }));
+    }
+
+    if !owner {
+        std::fs::write(
+            root.join(format!(
+                "{}-waiter-attempting-lock",
+                mode.split('-').next().unwrap()
+            )),
+            b"waiting",
+        )
+        .unwrap();
+    }
+    let guard = store.begin_refresh().unwrap();
+    if owner {
+        std::fs::write(
+            root.join(if failure {
+                "failure-owner-locked"
+            } else {
+                "persistent-owner-locked"
+            }),
+            b"ready",
+        )
+        .unwrap();
+        wait_for_child_file(&root.join(format!(
+            "{}-waiter-attempting-lock",
+            mode.split('-').next().unwrap()
+        )));
+        if failure {
+            panic!("intentional acquisition failure after lock ownership");
+        }
+    }
+
+    let capture_cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let capture_session = CranRefreshSession::new_with_clock(
+        Rc::new(FixtureTransport {
+            responses: HashMap::new(),
+            requests: Rc::new(RefCell::new(Vec::new())),
+        }),
+        CranMetadataConfig::new("https://cloud.r-project.org", feed),
+        Some(now),
+        Some(capture_cache),
+    );
+    let captured_previous = capture_session.previous_allpackages_projection_path();
+    drop(capture_session);
+
+    let mut locked_policy = CranSnapshotCachePolicy::at(now)
+        .with_expected_endpoint("https://cloud.r-project.org")
+        .with_allowed_auxiliary_endpoint(feed);
+    locked_policy.refresh_metadata = false;
+    let locked_result = crate::cran::provider::inspect_cran_snapshot_cache_with_refresh_guard(
+        &guard,
+        &locked_policy,
+    );
+    let locked_revision = match &locked_result {
+        CranSnapshotCacheResult::Compatible { diagnostic, .. }
+        | CranSnapshotCacheResult::Rejected(diagnostic) => {
+            diagnostic.revision_token().map(str::to_owned)
+        }
+    };
+    let locked_compatible = matches!(&locked_result, CranSnapshotCacheResult::Compatible { .. });
+    let satisfied = if forced {
+        initial_revision != locked_revision && locked_revision.is_some()
+    } else {
+        locked_compatible
+    };
+    if satisfied {
+        let CranSnapshotCacheResult::Compatible { loader, .. } = &locked_result else {
+            panic!("waiter must reopen the published current snapshot");
+        };
+        assert!(!loader.header().generation.is_empty());
+    }
+    if !satisfied {
+        let raw_cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+        let projection_directory = root.join("raw-cache/v1/projections");
+        let previous = captured_previous.expect("positive qualification must bind previous");
+        let orphan = projection_directory.join("newer-orphan.redb");
+        let generated_before = projection_files(&root)
+            .into_iter()
+            .filter(|path| path != &previous && path != &orphan)
+            .count();
+        let transport = FileCountingTransport {
+            inner: super::archive_cache::allpackages_transport(
+                super::archive_cache::allpackages_fixture_body(
+                    &super::archive_cache::matrix_history_entries(),
+                    true,
+                    None,
+                ),
+                false,
+            ),
+            counter: root.join("persistent-request-count"),
+        };
+        let mut config = CranMetadataConfig::new("https://cloud.r-project.org", feed);
+        config.refresh_metadata = forced;
+        let mut session = CranRefreshSession::new_with_clock(
+            Rc::new(transport),
+            config,
+            Some(now),
+            Some(raw_cache),
+        );
+        let observations = session
+            .refresh_snapshot_observations(&[PackageName::new("Matrix").unwrap()])
+            .unwrap();
+        drop(session);
+        let mut context = crate::cran::publish::default_context(store.registry_id().clone());
+        context.created_at = "2026-08-25T00:00:00Z".into();
+        crate::cran::publish::publish_snapshot_with_endpoint_and_refresh_guard(
+            &guard,
+            context,
+            observations,
+            "https://cloud.r-project.org",
+        )
+        .unwrap();
+        let generated_after = projection_files(&root)
+            .into_iter()
+            .filter(|path| path != &previous && path != &orphan)
+            .count();
+        if generated_before == 0 && generated_after > 0 {
+            append_counter(&root, "persistent-refresh-count");
+            append_counter(&root, "persistent-projection-build-count");
+        }
+        let active = projection_files(&root)
+            .into_iter()
+            .find(|path| path != &previous && path != &orphan)
+            .unwrap();
+        crate::cran::provider::raw_cache::RawCache::open(&store)
+            .unwrap()
+            .retain_projections(&active, Some(&previous))
+            .unwrap();
+    }
+}
+
+#[test]
+fn persistent_refresh_child_processes_coalesce_normal_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let previous = seed_previous_projection(root);
+    let owner = spawn_persistent_child(root, "normal-owner");
+    let waiter = spawn_persistent_child(root, "normal-waiter");
+    wait_for_child_file(&root.join("normal-owner-probed"));
+    wait_for_child_file(&root.join("normal-waiter-probed"));
+    std::fs::write(root.join("normal-owner-start"), b"go").unwrap();
+    wait_for_child_file(&root.join("persistent-owner-locked"));
+    std::fs::write(root.join("normal-waiter-start"), b"go").unwrap();
+    wait_for_child_file(&root.join("normal-waiter-attempting-lock"));
+    assert!(wait_for_child(owner).success());
+    assert!(previous.exists());
+    assert_eq!(projection_files(root).len(), 2);
+    assert!(wait_for_child(waiter).success());
+    assert_eq!(
+        std::fs::read_to_string(root.join("persistent-request-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("persistent-refresh-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("persistent-projection-build-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        !root
+            .join("raw-cache/v1/projections/newer-orphan.redb")
+            .exists()
+    );
+    let validation: crate::snapshot::CurrentValidationV2 =
+        serde_json::from_slice(&std::fs::read(root.join("current-validation")).unwrap()).unwrap();
+    assert_eq!(validation.refresh_sequence, 1);
+}
+
+#[test]
+fn persistent_refresh_child_processes_coalesce_forced_refresh_and_retry_after_panic() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let previous = seed_previous_projection(root);
+    let owner = spawn_persistent_child(root, "forced-owner");
+    let waiter = spawn_persistent_child(root, "forced-waiter");
+    wait_for_child_file(&root.join("forced-owner-probed"));
+    wait_for_child_file(&root.join("forced-waiter-probed"));
+    std::fs::write(root.join("forced-owner-start"), b"go").unwrap();
+    wait_for_child_file(&root.join("persistent-owner-locked"));
+    std::fs::write(root.join("forced-waiter-start"), b"go").unwrap();
+    wait_for_child_file(&root.join("forced-waiter-attempting-lock"));
+    assert!(wait_for_child(owner).success());
+    assert!(previous.exists());
+    assert_eq!(projection_files(root).len(), 2);
+    assert!(wait_for_child(waiter).success());
+    assert_eq!(
+        std::fs::read_to_string(root.join("persistent-refresh-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("persistent-request-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    let validation: crate::snapshot::CurrentValidationV2 =
+        serde_json::from_slice(&std::fs::read(root.join("current-validation")).unwrap()).unwrap();
+    assert_eq!(validation.refresh_sequence, 1);
+
+    let failure_directory = tempfile::tempdir().unwrap();
+    let failure_root = failure_directory.path();
+    seed_previous_projection(failure_root);
+    let failure_owner = spawn_persistent_child(failure_root, "failure-owner");
+    wait_for_child_file(&failure_root.join("failure-owner-locked"));
+    let retry = spawn_persistent_child(failure_root, "failure-waiter");
+    wait_for_child_file(&failure_root.join("failure-waiter-attempting-lock"));
+    assert!(!wait_for_child(failure_owner).success());
+    assert!(wait_for_child(retry).success());
+    let failure_validation: crate::snapshot::CurrentValidationV2 =
+        serde_json::from_slice(&std::fs::read(failure_root.join("current-validation")).unwrap())
+            .unwrap();
+    assert_eq!(failure_validation.refresh_sequence, 1);
+}
+
+#[test]
+fn persistent_refresh_drop_releases_lock_for_a_following_transaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let refresher = CranSnapshotRefresher::new(CranMetadataConfig::new(
+        "https://cran.invalid",
+        "https://feed.invalid/allpackages.zst",
+    ))
+    .unwrap();
+
+    let transaction = refresher.begin_persistent_refresh(&store).unwrap();
+    drop(transaction);
+    refresher.begin_persistent_refresh(&store).unwrap();
+}
+
+#[test]
+fn previous_projection_requires_positive_record_bound_to_current_endpoints() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let repository = "https://cran.invalid";
+    let feed = "https://feed.invalid/allpackages.zst";
+    let raw_cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = raw_cache
+        .key(feed, RawCacheRepresentation::AllPackagesZstd)
+        .unwrap();
+    let digest = "00".repeat(32);
+    let projection = raw_cache
+        .projection_path_for_hex_digest(&key, &digest)
+        .unwrap();
+    std::fs::File::create(&projection).unwrap();
+
+    let mut record = crate::cran::provider::qualification::Record {
+        status: crate::cran::provider::qualification::Status::Positive,
+        repository_endpoint: repository.into(),
+        feed_endpoint: feed.into(),
+        feed_digest: digest,
+        ..Default::default()
+    };
+    crate::cran::provider::qualification::publish(&raw_cache.qualification_path(), &record)
+        .unwrap();
+    let transport = FixtureTransport {
+        responses: HashMap::new(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new(repository, feed),
+        None,
+        Some(raw_cache),
+    );
+    assert_eq!(
+        session.previous_allpackages_projection_path(),
+        Some(projection)
+    );
+
+    let raw_cache = session.raw_cache.as_ref().unwrap();
+    record.repository_endpoint = "https://other.invalid".into();
+    crate::cran::provider::qualification::publish(&raw_cache.qualification_path(), &record)
+        .unwrap();
+    assert_eq!(session.previous_allpackages_projection_path(), None);
+}
 
 #[test]
 fn current_index_import_projects_catalog_and_evidence_from_one_parse() {

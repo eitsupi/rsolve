@@ -9,11 +9,11 @@ use flate2::read::GzDecoder;
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageName};
 
 use super::super::publish::{
-    CranSnapshotPublishError, default_context, publish_snapshot_with_endpoint,
+    CranSnapshotPublishError, default_context, publish_snapshot_with_endpoint_and_refresh_guard,
 };
 use super::transport::UreqTransport;
 use super::{CranCandidateSnapshot, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshSession};
-use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotStore};
+use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotRefreshGuard, SnapshotStore};
 
 /// A transport-neutral failure constructing the CRAN snapshot refresher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +38,16 @@ impl Error for CranSnapshotRefresherError {}
 /// returned snapshot itself performs no I/O.
 pub struct CranSnapshotRefresher {
     session: RefCell<CranRefreshSession<UreqTransport>>,
+}
+
+/// Provider-owned transaction spanning cache recheck, CRAN metadata
+/// acquisition, composition and publication. The generic snapshot lock is
+/// deliberately kept behind this boundary.
+pub struct CranPersistentRefresh<'a> {
+    refresher: &'a CranSnapshotRefresher,
+    store: &'a SnapshotStore,
+    guard: SnapshotRefreshGuard<'a>,
+    previous_projection: Option<std::path::PathBuf>,
 }
 
 impl CranSnapshotRefresher {
@@ -72,6 +82,30 @@ impl CranSnapshotRefresher {
         diagnostics
     }
 
+    pub fn begin_persistent_refresh<'a>(
+        &'a self,
+        store: &'a SnapshotStore,
+    ) -> Result<CranPersistentRefresh<'a>, CranSnapshotPublishError> {
+        let guard = store.begin_refresh().map_err(|error| {
+            CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                format!("unable to acquire CRAN snapshot refresh lock: {error}"),
+            ))
+        })?;
+        // Bind the raw cache and capture the last-known-good projection while
+        // the transaction is still at its initial, locked snapshot. Closure
+        // discovery may replace the qualification record, so doing this
+        // later would lose the safe previous projection.
+        self.attach_persistent_cache(store)?;
+        let previous_projection = self.session.borrow().previous_allpackages_projection_path();
+        Ok(CranPersistentRefresh {
+            refresher: self,
+            store,
+            guard,
+            previous_projection,
+        })
+    }
+
     pub fn canonical_endpoint(&self) -> Box<str> {
         self.session.borrow().base_url.clone()
     }
@@ -99,11 +133,7 @@ impl CranSnapshotRefresher {
         self.session.borrow_mut().refresh_packages(roots)
     }
 
-    /// Binds a persistent store to this refresher before any package refresh
-    /// begins. Callers that first discover a dependency closure with
-    /// [`refresh_packages`] and publish it later must use this seam so the
-    /// metadata responses acquired during discovery are also persisted.
-    pub fn prepare_persistent_refresh(
+    fn attach_persistent_cache(
         &self,
         store: &SnapshotStore,
     ) -> Result<(), CranSnapshotPublishError> {
@@ -125,18 +155,76 @@ impl CranSnapshotRefresher {
         store: &SnapshotStore,
         roots: &[PackageName],
     ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
-        self.prepare_persistent_refresh(store)?;
+        let guard = store.begin_refresh().map_err(|error| {
+            CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                format!("unable to acquire CRAN snapshot refresh lock: {error}"),
+            ))
+        })?;
+        self.attach_persistent_cache(store)?;
+        let previous_projection = self.session.borrow().previous_allpackages_projection_path();
+        self.refresh_and_publish_snapshot_with_refresh_guard(
+            &guard,
+            store,
+            roots,
+            previous_projection.as_deref(),
+        )
+    }
+
+    pub(crate) fn refresh_and_publish_snapshot_with_refresh_guard(
+        &self,
+        guard: &SnapshotRefreshGuard<'_>,
+        store: &SnapshotStore,
+        roots: &[PackageName],
+        previous_projection: Option<&std::path::Path>,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
         let mut session = self.session.borrow_mut();
         let observations = session
             .refresh_snapshot_observations(roots)
             .map_err(CranSnapshotPublishError::Acquisition)?;
         drop(session);
-        publish_snapshot_with_endpoint(
-            store,
+        let loader = publish_snapshot_with_endpoint_and_refresh_guard(
+            guard,
             default_context(store.registry_id().clone()),
             observations,
             &self.session.borrow().base_url,
-        )
+        )?;
+        if let Ok(raw_cache) = super::raw_cache::RawCache::open(store)
+            && let Some(active_projection) =
+                self.session.borrow().active_allpackages_projection_path()
+        {
+            let _ = raw_cache.retain_projections(&active_projection, previous_projection);
+        }
+        Ok(loader)
+    }
+}
+
+impl CranPersistentRefresh<'_> {
+    pub fn inspect_cache(
+        &self,
+        policy: &super::super::CranSnapshotCachePolicy,
+    ) -> super::super::CranSnapshotCacheResult {
+        super::super::provider::inspect_cran_snapshot_cache_with_refresh_guard(&self.guard, policy)
+    }
+
+    pub fn refresh_packages(
+        &self,
+        roots: &[PackageName],
+    ) -> Result<CranCandidateSnapshot, CandidateLoadError> {
+        self.refresher.session.borrow_mut().refresh_packages(roots)
+    }
+
+    pub fn refresh_and_publish_snapshot(
+        &self,
+        roots: &[PackageName],
+    ) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
+        self.refresher
+            .refresh_and_publish_snapshot_with_refresh_guard(
+                &self.guard,
+                self.store,
+                roots,
+                self.previous_projection.as_deref(),
+            )
     }
 }
 

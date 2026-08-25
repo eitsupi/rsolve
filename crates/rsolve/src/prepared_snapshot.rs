@@ -128,6 +128,16 @@ enum CacheProbe<L> {
     Rejected(CranSnapshotCacheDiagnostic),
 }
 
+fn cache_revision(cache: &CranSnapshotCacheResult) -> Option<Box<str>> {
+    match cache {
+        CranSnapshotCacheResult::Compatible { diagnostic, .. } => diagnostic
+            .revision_token()
+            .map(str::to_owned)
+            .map(Into::into),
+        CranSnapshotCacheResult::Rejected(_) => None,
+    }
+}
+
 /// Shared cache decision boundary used by both production resolution and
 /// deterministic orchestration tests. Refresh is invoked only when the
 /// compatible generation is stale or cannot prove the requested resolution.
@@ -162,6 +172,7 @@ where
     Ok((loader, diagnostics))
 }
 
+#[cfg(test)]
 fn prepare_then_refresh<L, P, F>(
     roots: &[PackageName],
     mut prepare: P,
@@ -274,42 +285,72 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
     let cache_policy = cache_policy
         .with_expected_endpoint(refresher.canonical_endpoint())
         .with_allowed_auxiliary_endpoint(refresher.allpackages_feed_endpoint());
-    let cache = inspect_cran_snapshot_cache(store, &cache_policy);
-    let probe = match cache {
-        CranSnapshotCacheResult::Compatible { loader, diagnostic } => CacheProbe::Compatible {
-            loader: *loader,
-            diagnostic,
-        },
-        CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
+    // Probe before waiting so a forced waiter can distinguish a refresh that
+    // completed after its probe from an unrelated later refresh. The second
+    // probe below is the authoritative lock snapshot.
+    let initial_cache = inspect_cran_snapshot_cache(store, &cache_policy);
+    let initial_revision = cache_revision(&initial_cache);
+    // Keep the warm, complete-cache path entirely loader-only. Acquiring the
+    // persistent refresh transaction here would add lock/raw-cache work to
+    // every online invocation even when no metadata refresh is necessary.
+    if !cache_policy.refresh_metadata
+        && let CranSnapshotCacheResult::Compatible { loader, diagnostic } = initial_cache
+        && diagnostic.status() == CranSnapshotCacheStatus::Fresh
+        && let Ok(resolution) =
+            resolve_prepared_snapshot_without_transport(request.clone(), loader.as_ref())
+    {
+        return Ok(CranResolutionOutcome {
+            resolution,
+            diagnostics: Vec::new(),
+            cache_diagnostics: vec![diagnostic],
+        });
+    }
+    // Hold the refresh lock through closure discovery, metadata acquisition,
+    // composition and publication. Waiters re-read after lock handoff.
+    let transaction = refresher
+        .begin_persistent_refresh(store)
+        .map_err(CranResolutionError::Publish)?;
+    let mut locked_policy = cache_policy.clone();
+    locked_policy.refresh_metadata = false;
+    let locked_cache = transaction.inspect_cache(&locked_policy);
+    let locked_revision = cache_revision(&locked_cache);
+    let forced_refresh_satisfied = cache_policy.refresh_metadata
+        && initial_revision != locked_revision
+        && locked_revision.is_some();
+    let probe = if cache_policy.refresh_metadata && !forced_refresh_satisfied {
+        match locked_cache {
+            CranSnapshotCacheResult::Compatible { diagnostic, .. } => {
+                CacheProbe::Rejected(diagnostic)
+            }
+            CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
+        }
+    } else {
+        match locked_cache {
+            CranSnapshotCacheResult::Compatible { loader, diagnostic } => CacheProbe::Compatible {
+                loader: *loader,
+                diagnostic,
+            },
+            CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
+        }
     };
     let (loader, cache_diagnostics) = cache_or_refresh(probe, &roots, &request, |batch| {
-        prepare_then_refresh(
-            batch,
-            || {
-                refresher
-                    .prepare_persistent_refresh(store)
-                    .map_err(CranResolutionError::Publish)
-            },
-            |batch| {
-                let closure = collect_cran_dependency_closure(batch, |batch| {
-                    refresher.refresh_packages(batch)
-                })
+        let closure =
+            collect_cran_dependency_closure(batch, |batch| transaction.refresh_packages(batch))
                 .map_err(CranResolutionError::Refresh)?;
-                if closure.is_empty() {
-                    return Err(CranResolutionError::Refresh(CandidateLoadError::new(
-                        CandidateLoadErrorCategory::MetadataInvalid,
-                        format!(
-                            "refresh returned no remote packages for batch of {}",
-                            batch.len()
-                        ),
-                    )));
-                }
-                refresher
-                    .refresh_and_publish_snapshot(store, &closure)
-                    .map_err(CranResolutionError::Publish)
-            },
-        )
+        if closure.is_empty() {
+            return Err(CranResolutionError::Refresh(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                format!(
+                    "refresh returned no remote packages for batch of {}",
+                    batch.len()
+                ),
+            )));
+        }
+        transaction
+            .refresh_and_publish_snapshot(&closure)
+            .map_err(CranResolutionError::Publish)
     })?;
+    drop(transaction);
     let resolution = resolve_prepared_snapshot_without_transport(request, &loader)?;
     Ok(CranResolutionOutcome {
         resolution,

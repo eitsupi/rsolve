@@ -34,7 +34,7 @@ struct CurrentPointerV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CurrentValidationSourceV1 {
+pub(crate) struct CurrentValidationSourceV2 {
     pub(crate) id: String,
     pub(crate) content_sha256: String,
     pub(crate) endpoint: String,
@@ -42,7 +42,7 @@ pub(crate) struct CurrentValidationSourceV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CurrentValidationV1 {
+pub(crate) struct CurrentValidationV2 {
     pub(crate) format: String,
     pub(crate) version: u32,
     pub(crate) registry_id: String,
@@ -51,8 +51,9 @@ pub(crate) struct CurrentValidationV1 {
     pub(crate) parser_schema: u32,
     pub(crate) normalization_policy: u32,
     pub(crate) validated_at: String,
+    pub(crate) refresh_sequence: u64,
     pub(crate) effective_endpoint: String,
-    pub(crate) sources: Vec<CurrentValidationSourceV1>,
+    pub(crate) sources: Vec<CurrentValidationSourceV2>,
 }
 
 struct CurrentValidationFacts {
@@ -62,7 +63,7 @@ struct CurrentValidationFacts {
     normalization_policy: u32,
     validated_at: String,
     effective_endpoint: String,
-    sources: Vec<CurrentValidationSourceV1>,
+    sources: Vec<CurrentValidationSourceV2>,
 }
 
 fn current_validation_facts(
@@ -73,7 +74,7 @@ fn current_validation_facts(
         .iter()
         .map(|source| {
             let observed = super::source_observation(source)?;
-            Ok(CurrentValidationSourceV1 {
+            Ok(CurrentValidationSourceV2 {
                 id: observed.id,
                 content_sha256: observed.content_sha256,
                 endpoint: observed.endpoint,
@@ -162,6 +163,14 @@ pub(crate) struct RefreshLock {
     path: PathBuf,
 }
 
+/// Owns the store refresh lock across the complete metadata transaction.
+/// Network acquisition, composition, publication and retention may all use
+/// this guard; callers must not acquire a second refresh lock while it lives.
+pub(crate) struct SnapshotRefreshGuard<'a> {
+    store: &'a SnapshotStore,
+    lock: RefreshLock,
+}
+
 pub struct SnapshotStore {
     root: PathBuf,
     registry_id: RegistryId,
@@ -237,6 +246,27 @@ impl SnapshotStore {
         let lock = self
             .acquire_refresh_lock(RefreshLockMode::Blocking)
             .map_err(SnapshotPublishError::Store)?;
+        let loader = self.build_and_publish_locked(&lock, input, effective_endpoint)?;
+        drop(lock);
+        after_unlock(self);
+        Ok(loader)
+    }
+
+    pub(crate) fn build_and_publish_with_refresh_guard(
+        &self,
+        guard: &SnapshotRefreshGuard<'_>,
+        input: SnapshotBuildInput,
+        effective_endpoint: impl Into<Box<str>>,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError> {
+        self.build_and_publish_locked(&guard.lock, input, Some(effective_endpoint.into()))
+    }
+
+    fn build_and_publish_locked(
+        &self,
+        lock: &RefreshLock,
+        input: SnapshotBuildInput,
+        effective_endpoint: Option<Box<str>>,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, SnapshotPublishError> {
         let staging_path = self
             .unique_staging_path()
             .map_err(SnapshotPublishError::Store)?;
@@ -250,7 +280,7 @@ impl SnapshotStore {
             .build()
             .map_err(SnapshotPublishError::Build)?;
         let generation_name = generation.generation().to_owned();
-        self.publish_generation(&lock, generation)
+        self.publish_generation(lock, generation)
             .map_err(SnapshotPublishError::Store)?;
         // Pin the generation that this operation published before releasing
         // the lock. A later publisher may replace `current` immediately after
@@ -262,16 +292,14 @@ impl SnapshotStore {
             (validation_facts, effective_endpoint)
         {
             self.write_current_validation(
-                &lock,
+                lock,
                 loader.header(),
                 validation_facts,
                 Some(effective_endpoint),
             )
             .map_err(SnapshotPublishError::Store)?;
         }
-        drop(lock);
         drop(staging_cleanup);
-        after_unlock(self);
         Ok(loader)
     }
 
@@ -315,6 +343,13 @@ impl SnapshotStore {
             .map_err(|error| {
                 store_candidate_error(format!("unable to acquire snapshot refresh lock: {error}"))
             })?;
+        self.read_current_optional_locked(&_refresh_lock)
+    }
+
+    fn read_current_optional_locked(
+        &self,
+        _refresh_lock: &RefreshLock,
+    ) -> Result<Option<ReadOnlySnapshotCandidateLoader>, CandidateLoadError> {
         let pointer_bytes = match read_at_most(&self.root.join(CURRENT_NAME), POINTER_LIMIT) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -340,14 +375,21 @@ impl SnapshotStore {
 
     pub(crate) fn read_current_validation(
         &self,
-    ) -> Result<Option<CurrentValidationV1>, SnapshotStoreError> {
+    ) -> Result<Option<CurrentValidationV2>, SnapshotStoreError> {
         let _refresh_lock = self.acquire_refresh_lock(RefreshLockMode::Blocking)?;
+        self.read_current_validation_locked(&_refresh_lock)
+    }
+
+    fn read_current_validation_locked(
+        &self,
+        _refresh_lock: &RefreshLock,
+    ) -> Result<Option<CurrentValidationV2>, SnapshotStoreError> {
         let bytes = match read_at_most(&self.root.join(CURRENT_VALIDATION_NAME), POINTER_LIMIT) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let record = serde_json::from_slice::<CurrentValidationV1>(&bytes).map_err(|error| {
+        let record = serde_json::from_slice::<CurrentValidationV2>(&bytes).map_err(|error| {
             store_invalid(format!("invalid current validation record: {error}"))
         })?;
         if serde_json::to_vec(&record)
@@ -358,7 +400,7 @@ impl SnapshotStore {
                 "current validation record is not canonical JSON",
             ));
         }
-        if record.format != "rsolve-metadata-current-validation" || record.version != 1 {
+        if record.format != "rsolve-metadata-current-validation" || record.version != 2 {
             return Err(store_invalid(
                 "unknown current validation record format or version",
             ));
@@ -369,6 +411,7 @@ impl SnapshotStore {
             || record.compatibility_profile == 0
             || record.parser_schema == 0
             || record.normalization_policy == 0
+            || record.refresh_sequence == 0
             || !super::is_rfc3339_seconds(&record.validated_at)
             || record.effective_endpoint.is_empty()
             || record.sources.is_empty()
@@ -410,15 +453,22 @@ impl SnapshotStore {
                 "current validation effective endpoint must not be empty",
             ));
         }
-        let record = CurrentValidationV1 {
+        let refresh_sequence = next_refresh_sequence(
+            self.read_current_validation_locked(lock)
+                .ok()
+                .flatten()
+                .map(|record| record.refresh_sequence),
+        )?;
+        let record = CurrentValidationV2 {
             format: "rsolve-metadata-current-validation".into(),
-            version: 1,
+            version: 2,
             registry_id: facts.registry_id,
             generation: header.generation.clone(),
             compatibility_profile: facts.compatibility_profile,
             parser_schema: facts.parser_schema,
             normalization_policy: facts.normalization_policy,
             validated_at: facts.validated_at,
+            refresh_sequence,
             effective_endpoint,
             sources: facts.sources,
         };
@@ -503,6 +553,11 @@ impl SnapshotStore {
             file,
             path: self.root.join(REFRESH_LOCK_NAME),
         })
+    }
+
+    pub(crate) fn begin_refresh(&self) -> Result<SnapshotRefreshGuard<'_>, SnapshotStoreError> {
+        let lock = self.acquire_refresh_lock(RefreshLockMode::Blocking)?;
+        Ok(SnapshotRefreshGuard { store: self, lock })
     }
 
     pub(crate) fn publish_generation(
@@ -647,6 +702,28 @@ impl SnapshotStore {
         };
         let pointer = decode_pointer_store(&bytes, &self.registry_id)?;
         Ok(Some(pointer.generation))
+    }
+}
+
+impl SnapshotRefreshGuard<'_> {
+    pub(crate) fn store(&self) -> &SnapshotStore {
+        self.store
+    }
+
+    pub(crate) fn read_current_optional(
+        &self,
+    ) -> Result<Option<ReadOnlySnapshotCandidateLoader>, CandidateLoadError> {
+        self.store.read_current_optional_locked(&self.lock)
+    }
+
+    pub(crate) fn read_current_validation(
+        &self,
+    ) -> Result<Option<CurrentValidationV2>, SnapshotStoreError> {
+        self.store.read_current_validation_locked(&self.lock)
+    }
+
+    pub(crate) fn cleanup(&self, retain_generations: &[&str]) -> Result<(), SnapshotStoreError> {
+        self.store.cleanup(&self.lock, retain_generations)
     }
 }
 
@@ -806,6 +883,12 @@ fn store_invalid(error: impl fmt::Display) -> SnapshotStoreError {
     SnapshotStoreError::Invalid(error.to_string().into_boxed_str())
 }
 
+fn next_refresh_sequence(previous: Option<u64>) -> Result<u64, SnapshotStoreError> {
+    previous
+        .map_or(Some(1), |sequence| sequence.checked_add(1))
+        .ok_or_else(|| store_invalid("current validation refresh sequence overflow"))
+}
+
 fn store_candidate_error(error: impl fmt::Display) -> CandidateLoadError {
     CandidateLoadError::new(
         CandidateLoadErrorCategory::SnapshotInvalid,
@@ -822,5 +905,18 @@ fn is_regular_file(path: &Path) -> bool {
 fn remove_regular_file(path: &Path) {
     if is_regular_file(path) {
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_refresh_sequence;
+
+    #[test]
+    fn refresh_sequence_has_deterministic_boundaries() {
+        assert_eq!(next_refresh_sequence(None).unwrap(), 1);
+        assert_eq!(next_refresh_sequence(Some(0)).unwrap(), 1);
+        assert_eq!(next_refresh_sequence(Some(u64::MAX - 1)).unwrap(), u64::MAX);
+        assert!(next_refresh_sequence(Some(u64::MAX)).is_err());
     }
 }

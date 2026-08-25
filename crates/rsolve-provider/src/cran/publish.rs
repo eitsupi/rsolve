@@ -8,7 +8,11 @@ use std::fmt;
 
 use super::provider::{CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA};
 use crate::snapshot::CoverageV1;
-use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotPublishError, SnapshotStore};
+#[cfg(test)]
+use crate::snapshot::SnapshotStore;
+use crate::snapshot::{
+    ReadOnlySnapshotCandidateLoader, SnapshotPublishError, SnapshotRefreshGuard,
+};
 use rsolve_core::{CandidateLoadError, RegistryId};
 
 use super::evidence::{
@@ -94,6 +98,7 @@ pub fn publish_snapshot(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn publish_snapshot_with_endpoint(
     store: &SnapshotStore,
     context: SnapshotCompositionContext,
@@ -106,6 +111,24 @@ pub(crate) fn publish_snapshot_with_endpoint(
         })?;
     store
         .build_and_publish_with_endpoint(input, effective_endpoint.as_ref())
+        .map_err(|error: SnapshotPublishError| {
+            CranSnapshotPublishError::Publication(error.to_string().into_boxed_str())
+        })
+}
+
+pub(crate) fn publish_snapshot_with_endpoint_and_refresh_guard(
+    guard: &SnapshotRefreshGuard<'_>,
+    context: SnapshotCompositionContext,
+    observations: Vec<CranEvidenceObservation>,
+    effective_endpoint: impl AsRef<str>,
+) -> Result<ReadOnlySnapshotCandidateLoader, CranSnapshotPublishError> {
+    let input =
+        compose_snapshot(context, observations).map_err(|error: EvidenceCompositionError| {
+            CranSnapshotPublishError::Composition(error.to_string().into_boxed_str())
+        })?;
+    guard
+        .store()
+        .build_and_publish_with_refresh_guard(guard, input, effective_endpoint.as_ref())
         .map_err(|error: SnapshotPublishError| {
             CranSnapshotPublishError::Publication(error.to_string().into_boxed_str())
         })
@@ -372,10 +395,10 @@ mod tests {
         ));
 
         let validation_path = directory.path().join("current-validation");
-        let read_validation = || -> crate::snapshot::CurrentValidationV1 {
+        let read_validation = || -> crate::snapshot::CurrentValidationV2 {
             serde_json::from_slice(&std::fs::read(&validation_path).unwrap()).unwrap()
         };
-        let write_validation = |validation: &crate::snapshot::CurrentValidationV1| {
+        let write_validation = |validation: &crate::snapshot::CurrentValidationV2| {
             std::fs::write(&validation_path, serde_json::to_vec(validation).unwrap()).unwrap();
         };
         let mut validation = read_validation();

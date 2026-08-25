@@ -231,8 +231,82 @@ impl RawCache {
             .join(format!("{}.redb", self.projection_key(key, body)))
     }
 
+    pub(crate) fn projection_path_for_digest(
+        &self,
+        key: &RawCacheKey,
+        content_sha256: &[u8; 32],
+    ) -> PathBuf {
+        self.directory.join(PROJECTION_DIRECTORY).join(format!(
+            "{}-{}.redb",
+            key.digest(),
+            hex(content_sha256)
+        ))
+    }
+
+    pub(crate) fn projection_path_for_hex_digest(
+        &self,
+        key: &RawCacheKey,
+        content_sha256: &str,
+    ) -> Option<PathBuf> {
+        if content_sha256.len() != 64
+            || !content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return None;
+        }
+        Some(
+            self.directory
+                .join(PROJECTION_DIRECTORY)
+                .join(format!("{}-{content_sha256}.redb", key.digest())),
+        )
+    }
+
     pub(crate) fn qualification_path(&self) -> PathBuf {
         self.directory.join("qualification.json")
+    }
+
+    /// Retain only a bounded set of content-addressed projections. The
+    /// currently usable projection and one previous projection are retained;
+    /// callers run this under the snapshot refresh transaction and treat
+    /// cleanup as best-effort so a failed refresh never removes last-known
+    /// good metadata.
+    pub(crate) fn retain_projections(
+        &self,
+        active: &Path,
+        previous: Option<&Path>,
+    ) -> Result<(), RawCacheError> {
+        if !is_regular_file(active) {
+            return Err(RawCacheError::Invalid(
+                "active ALLPACKAGES projection is missing".into(),
+            ));
+        }
+        let files = fs::read_dir(self.directory.join(PROJECTION_DIRECTORY))?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let is_projection = path.extension().and_then(|ext| ext.to_str()) == Some("redb")
+                    && fs::symlink_metadata(&path)
+                        .ok()
+                        .is_some_and(|metadata| metadata.file_type().is_file());
+                is_projection.then_some(path)
+            })
+            .collect::<Vec<_>>();
+        let previous = match previous {
+            Some(path) if !is_regular_file(path) => {
+                return Err(RawCacheError::Invalid(
+                    "previous ALLPACKAGES projection is missing".into(),
+                ));
+            }
+            other => other,
+        };
+        for path in files {
+            if path == active || previous.is_some_and(|candidate| candidate == path) {
+                continue;
+            }
+            let _ = fs::remove_file(path);
+        }
+        sync_directory(&self.directory.join(PROJECTION_DIRECTORY))
     }
 
     pub(crate) fn lookup(&self, key: &RawCacheKey) -> RawCacheLookup {
@@ -694,6 +768,12 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 fn ensure_directory(path: &Path) -> Result<(), RawCacheError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -1117,5 +1197,43 @@ mod tests {
             before
         );
         assert!(!store.root().join("current").exists());
+    }
+
+    #[test]
+    fn projection_retention_keeps_only_a_bounded_recent_set() {
+        let store = store();
+        let cache = RawCache::open(&store).unwrap();
+        for index in 0..4 {
+            fs::write(
+                cache
+                    .directory
+                    .join(PROJECTION_DIRECTORY)
+                    .join(format!("projection-{index}.redb")),
+                [index as u8],
+            )
+            .unwrap();
+        }
+        let active = cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join("projection-0.redb");
+        let previous = cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join("projection-1.redb");
+        cache.retain_projections(&active, Some(&previous)).unwrap();
+        let retained = fs::read_dir(cache.directory.join(PROJECTION_DIRECTORY))
+            .unwrap()
+            .count();
+        assert_eq!(retained, 2);
+        assert!(active.exists());
+        assert!(previous.exists());
+        assert!(
+            !cache
+                .directory
+                .join(PROJECTION_DIRECTORY)
+                .join("projection-2.redb")
+                .exists()
+        );
     }
 }
