@@ -58,7 +58,10 @@ fn current_rds_provider_path_assumes_utf8_for_native_format_two_strings() {
             ..TransportResponse::default()
         },
     );
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let catalog = session
         .ensure_current()
         .expect("provider CRAN UTF-8 contract should accept native format-2 strings");
@@ -91,7 +94,10 @@ fn current_rds_provider_path_rejects_invalid_native_utf8() {
             ..TransportResponse::default()
         },
     );
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let error = session
         .ensure_current()
         .expect_err("invalid native UTF-8 must fail closed");
@@ -107,7 +113,12 @@ fn concrete_loader_validates_and_canonicalizes_base_without_requests() {
         canonical_base_url(" https://cran.invalid/mirror/// ").unwrap(),
         "https://cran.invalid/mirror".into()
     );
-    assert!(CranSnapshotRefresher::new("https://cran.invalid/mirror///").is_ok());
+    assert!(
+        CranSnapshotRefresher::new(CranMetadataConfig::for_repository(
+            "https://cran.invalid/mirror///",
+        ))
+        .is_ok()
+    );
     for input in [
         "",
         "ftp://cran.invalid",
@@ -116,10 +127,28 @@ fn concrete_loader_validates_and_canonicalizes_base_without_requests() {
         "https://cran.invalid/#mirror",
     ] {
         assert!(matches!(
-            CranSnapshotRefresher::new(input),
+            CranSnapshotRefresher::new(CranMetadataConfig::for_repository(input)),
             Err(CranSnapshotRefresherError::InvalidBaseUrl { .. })
         ));
     }
+}
+
+#[test]
+fn refresher_preserves_refresh_metadata_configuration() {
+    let refresher = CranSnapshotRefresher::new(
+        CranMetadataConfig::for_repository("https://cran.invalid").with_refresh_metadata(),
+    )
+    .unwrap();
+    assert!(refresher.refresh_metadata_enabled());
+}
+
+#[test]
+fn refresher_preserves_publication_cutoff_history_policy() {
+    let refresher = CranSnapshotRefresher::new(
+        CranMetadataConfig::for_repository("https://cran.invalid").without_allpackages_history(),
+    )
+    .unwrap();
+    assert!(!refresher.allpackages_history_enabled());
 }
 
 #[test]
@@ -142,7 +171,10 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
             ..TransportResponse::default()
         },
     );
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let snapshot = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap();
@@ -174,7 +206,10 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
             ..TransportResponse::default()
         },
     );
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let error = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap_err();
@@ -211,7 +246,10 @@ Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\nMD5sum: overlay\nPath: 
             ..TransportResponse::default()
         },
     );
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let catalog = session
         .ensure_current()
         .expect("a Recommended overlay must not make the complete current index invalid");
@@ -295,7 +333,10 @@ fn current_index_transport_or_status_failures_remain_transport_failures() {
             responses,
             requests: Rc::new(RefCell::new(Vec::new())),
         };
-        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let mut session = CranRefreshSession::new(
+            Rc::new(transport),
+            CranMetadataConfig::new("https://cran.invalid", ""),
+        );
         let error = session.ensure_current().unwrap_err();
         assert_eq!(
             error.category(),
@@ -335,7 +376,10 @@ fn current_index_http_success_with_invalid_schema_is_metadata_invalid() {
         responses,
         requests: Rc::new(RefCell::new(Vec::new())),
     };
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let error = session.ensure_current().unwrap_err();
     assert_eq!(
         error.category(),
@@ -370,7 +414,7 @@ fn persistent_current_rds_cache_reuse_avoids_a_second_request() {
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(cache),
     );
@@ -392,12 +436,60 @@ fn persistent_current_rds_cache_reuse_avoids_a_second_request() {
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(cache),
     );
     second.ensure_current().unwrap();
     assert!(second_requests.borrow().is_empty());
+}
+
+#[test]
+fn refresh_metadata_revalidates_a_fresh_raw_cache_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = session_transport(
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some(t0),
+        Some(cache),
+    );
+    first.ensure_current().unwrap();
+
+    let second_transport = session_transport(
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let requests = second_transport.requests.clone();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", "").with_refresh_metadata(),
+        Some(t0),
+        Some(cache),
+    );
+    assert!(second.refresh_metadata);
+    second.ensure_current().unwrap();
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url == current_rds_url())
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -470,7 +562,7 @@ fn stale_current_cache_revalidates_with_validators_and_304() {
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(cache),
     );
@@ -498,7 +590,7 @@ fn stale_current_cache_revalidates_with_validators_and_304() {
         .unwrap();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(cache),
     );
@@ -565,7 +657,7 @@ fn stale_current_cache_304_no_store_evicts_entry_after_reuse() {
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(cache),
     );
@@ -587,7 +679,7 @@ fn stale_current_cache_304_no_store_evicts_entry_after_reuse() {
     );
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
     );
@@ -647,7 +739,7 @@ fn fresh_semantically_invalid_current_cache_recovers_unconditionally() {
     let requests = transport.requests.clone();
     let mut session = CranRefreshSession::new_with_clock(
         Rc::new(transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
     );
@@ -688,7 +780,7 @@ fn stale_current_cache_without_validators_uses_unconditional_request() {
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(cache),
     );
@@ -707,7 +799,7 @@ fn stale_current_cache_without_validators_uses_unconditional_request() {
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(cache),
     );
@@ -744,7 +836,7 @@ fn invalid_network_current_response_is_not_persisted() {
     );
     let mut session = CranRefreshSession::new_with_clock(
         Rc::new(transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:00Z".parse().unwrap()),
         Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
     );
@@ -785,7 +877,10 @@ fn current_absence_with_absent_archive_sources_is_empty() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let snapshot = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .expect("empty current result");

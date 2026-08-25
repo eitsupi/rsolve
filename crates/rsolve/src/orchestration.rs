@@ -25,6 +25,7 @@ use tempfile::tempdir;
 pub(crate) use crate::prepared_snapshot::collect_cran_dependency_closure;
 pub(crate) use crate::prepared_snapshot::{
     cran_registry_id, resolve_from_cran_offline_with_store, resolve_from_cran_with_store,
+    resolve_from_cran_with_store_at_policy,
 };
 
 pub(super) struct CandidateLoaderRef<'a>(pub(super) &'a dyn CandidateLoader);

@@ -1,10 +1,777 @@
 use super::*;
+use crate::cran::history::enumerate_archive_rds_for_provider;
 use crate::cran::provider::cache_policy::CacheControlHeader;
 use crate::cran::provider::raw_cache::{
     RawCache, RawCacheLookup, RawCacheRepresentation, RawCacheWrite,
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use std::io::{Read, Write};
+
+const ALLPACKAGES_FIXTURE_URL: &str = "https://feed.invalid/ALLPACKAGES.zst";
+
+fn allpackages_fixture_body(
+    entries: &[crate::cran::history::ArchiveEntry],
+    include_current: bool,
+    omit_entry: Option<usize>,
+) -> Vec<u8> {
+    let mut dcf = String::new();
+    let current_entry = entries.iter().find(|entry| {
+        entry.package().as_str() == "Matrix" && entry.version().to_string() == "1.7-6"
+    });
+    if include_current {
+        let (version, filename) = current_entry
+            .map(|entry| {
+                (
+                    entry.version().to_string(),
+                    entry
+                        .source_archive_relative_path()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                )
+            })
+            .unwrap_or_else(|| ("1.7-6".into(), "Matrix_1.7-6.tar.gz".into()));
+        dcf.push_str(&format!(
+            "Package: Matrix\nVersion: {version}\nLicense: BSD-3-Clause\nSHA256: {}\nSHA256Original: {}\nSnapshot: 2026-08-01\nDownloadURL: https://packagemanager.posit.co/cran/2026-08-01/src/contrib/{filename}\n\n",
+            "b".repeat(64),
+            "a".repeat(64),
+        ));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        if omit_entry == Some(index) {
+            continue;
+        }
+        if include_current
+            && entry.package().as_str() == "Matrix"
+            && entry.version().to_string() == "1.7-6"
+        {
+            continue;
+        }
+        let filename = entry
+            .source_archive_relative_path()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        dcf.push_str(&format!(
+            "Package: {}\nVersion: {}\nLicense: BSD-3-Clause\nSHA256: {}\nSHA256Original: {}\nSnapshot: 2026-08-01\nDownloadURL: https://packagemanager.posit.co/cran/2026-08-01/src/contrib/{filename}\n\n",
+            entry.package(),
+            entry.version(),
+            "b".repeat(64),
+            "a".repeat(64),
+        ));
+    }
+    raw_zstd(dcf.as_bytes())
+}
+
+fn allpackages_transport(feed_body: Vec<u8>, include_package_archive: bool) -> FixtureTransport {
+    let mut responses = std::collections::HashMap::new();
+    responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+    );
+    responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.gz".into(),
+        TransportResponse::new(404, Vec::new()),
+    );
+    responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES".into(),
+        TransportResponse::new(404, Vec::new()),
+    );
+    responses.insert(
+        "https://cloud.r-project.org/src/contrib/Meta/archive.rds".into(),
+        TransportResponse::new(200, HISTORY.to_vec()),
+    );
+    responses.insert(
+        ALLPACKAGES_FIXTURE_URL.into(),
+        TransportResponse::new(200, feed_body),
+    );
+    if include_package_archive {
+        responses.insert(
+            "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds".into(),
+            TransportResponse::new(200, FAST.to_vec()),
+        );
+    }
+    FixtureTransport {
+        responses,
+        requests: Rc::new(RefCell::new(Vec::new())),
+    }
+}
+
+fn custom_mirror_transport(
+    feed_body: Vec<u8>,
+    target_history: &[u8],
+    include_package_archive: bool,
+) -> FixtureTransport {
+    let mut transport = allpackages_transport(feed_body, include_package_archive);
+    transport.responses.insert(
+        "https://mirror.invalid/src/contrib/PACKAGES.rds".into(),
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+    );
+    transport.responses.insert(
+        "https://mirror.invalid/src/contrib/Meta/archive.rds".into(),
+        TransportResponse::new(200, target_history.to_vec()),
+    );
+    if include_package_archive {
+        transport.responses.insert(
+            "https://mirror.invalid/src/contrib/Archive/Matrix/PACKAGES.rds".into(),
+            TransportResponse::new(200, FAST.to_vec()),
+        );
+    }
+    transport
+}
+
+fn allpackages_duplicate_fixture_body(entries: &[crate::cran::history::ArchiveEntry]) -> Vec<u8> {
+    let mut dcf = String::from_utf8(
+        crate::cran::provider::allpackages::decode_zstd(&allpackages_fixture_body(
+            entries, true, None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    dcf.push_str(
+        "Package: Matrix\nVersion: 1.7-0\nLicense: BSD-3-Clause\nSHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nSHA256Original: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\nSnapshot: 2024-10-20\nDownloadURL: https://p3m.dev/cran/2024-10-20/src/contrib/Matrix_1.7-0.tar.gz\n\n",
+    );
+    raw_zstd(dcf.as_bytes())
+}
+
+fn matrix_history_entries() -> Vec<crate::cran::history::ArchiveEntry> {
+    enumerate_archive_rds_for_provider(HISTORY)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|entry| entry.package().as_str() == "Matrix")
+        .collect()
+}
+
+#[test]
+fn allpackages_complete_feed_avoids_package_archive_request() {
+    let (directory, store) = store();
+    let entries = matrix_history_entries();
+    assert!(!entries.is_empty());
+    let transport = allpackages_transport(allpackages_fixture_body(&entries, true, None), false);
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session.refresh_package(&PackageName::new("Matrix").unwrap());
+    let result = result.unwrap();
+    assert!(result.candidates().len() >= entries.len());
+    assert!(session.evidence.borrow().iter().any(|observation| {
+        observation.artifact.as_ref().is_some_and(|artifact| {
+            artifact
+                .checksums
+                .iter()
+                .any(|checksum| checksum.algorithm == "sha256-original")
+        })
+    }));
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
+            .count(),
+        0
+    );
+    drop(directory);
+}
+
+#[test]
+fn allpackages_current_gap_keeps_current_and_bulk_history() {
+    let (directory, store) = store();
+    let entries = matrix_history_entries();
+    let transport = allpackages_transport(allpackages_fixture_body(&entries, false, None), false);
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|release| release.version().to_string() == "1.7-6")
+    );
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
+            .count(),
+        0
+    );
+    drop(directory);
+}
+
+#[test]
+fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuild() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(allpackages_transport(feed.clone(), false)),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let first_result = first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let signature = release_signature(first_result.candidates());
+
+    crate::cran::provider::allpackages::reset_test_counters();
+    let second_transport = allpackages_transport(feed, false);
+    let second_requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let second_result = second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(release_signature(second_result.candidates()), signature);
+    assert!(second_requests.borrow().is_empty());
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+}
+
+#[test]
+fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let headers = TransportResponseHeaders {
+        etag: Some("\"allpackages-e2e\"".into()),
+        cache_control: CacheControlHeader::Valid("max-age=3600".into()),
+        ..TransportResponseHeaders::default()
+    };
+    let mut first_transport = allpackages_transport(feed.clone(), false);
+    first_transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: headers.clone(),
+        },
+    );
+    first_transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Meta/archive.rds".into(),
+        TransportResponse {
+            status: 200,
+            body: HISTORY.to_vec(),
+            headers: headers.clone(),
+        },
+    );
+    first_transport.responses.insert(
+        ALLPACKAGES_FIXTURE_URL.into(),
+        TransportResponse {
+            status: 200,
+            body: feed.clone(),
+            headers: headers.clone(),
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let signature = release_signature(
+        first
+            .refresh_package(&PackageName::new("Matrix").unwrap())
+            .unwrap()
+            .candidates(),
+    );
+
+    let mut not_modified = allpackages_transport(Vec::new(), false);
+    for url in [
+        "https://cloud.r-project.org/src/contrib/PACKAGES.rds".to_owned(),
+        "https://cloud.r-project.org/src/contrib/Meta/archive.rds".to_owned(),
+        ALLPACKAGES_FIXTURE_URL.to_owned(),
+    ] {
+        not_modified.responses.insert(
+            url,
+            TransportResponse {
+                status: 304,
+                body: Vec::new(),
+                headers: headers.clone(),
+            },
+        );
+    }
+    let requests = not_modified.requests.clone();
+    crate::cran::provider::allpackages::reset_test_counters();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(not_modified),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL)
+            .with_refresh_metadata(),
+        Some("2026-08-25T01:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let second_result = second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(release_signature(second_result.candidates()), signature);
+    assert_eq!(requests.borrow().len(), 3);
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+    assert!(requests.borrow().iter().all(|request| {
+        request.validators.if_none_match.as_deref() == Some("\"allpackages-e2e\"")
+    }));
+
+    let mut same_body = allpackages_transport(Vec::new(), false);
+    same_body.responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: headers.clone(),
+        },
+    );
+    same_body.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Meta/archive.rds".into(),
+        TransportResponse {
+            status: 200,
+            body: HISTORY.to_vec(),
+            headers: headers.clone(),
+        },
+    );
+    same_body.responses.insert(
+        ALLPACKAGES_FIXTURE_URL.into(),
+        TransportResponse {
+            status: 200,
+            body: feed,
+            headers,
+        },
+    );
+    crate::cran::provider::allpackages::reset_test_counters();
+    let mut third = CranRefreshSession::new_with_clock(
+        Rc::new(same_body),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL)
+            .with_refresh_metadata(),
+        Some("2026-08-25T02:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let third_result = third
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(release_signature(third_result.candidates()), signature);
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+}
+
+#[test]
+fn corrupt_projection_reports_diagnostic_falls_back_and_rebuilds_next_session() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(allpackages_transport(feed.clone(), false)),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(
+            ALLPACKAGES_FIXTURE_URL,
+            RawCacheRepresentation::AllPackagesZstd,
+        )
+        .unwrap();
+    let projection = cache.projection_path(&key, &feed);
+    std::fs::write(&projection, b"corrupt projection").unwrap();
+    assert!(projection.exists());
+
+    let mut second_transport = allpackages_transport(feed.clone(), true);
+    second_transport.responses.insert(
+        ALLPACKAGES_FIXTURE_URL.into(),
+        TransportResponse::new(500, Vec::new()),
+    );
+    let second_requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(second.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::AllPackages
+            && matches!(diagnostic.status_detail(), CranFastPathStatus::Invalid { diagnostic, .. } if diagnostic.contains("projection"))
+    }));
+    assert!(second_requests.borrow().iter().any(|request| {
+        request.url == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds"
+    }));
+
+    crate::cran::provider::allpackages::reset_test_counters();
+    let mut third = CranRefreshSession::new_with_clock(
+        Rc::new(allpackages_transport(feed, true)),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL)
+            .with_refresh_metadata(),
+        Some("2026-08-25T00:00:02Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    third
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (1, 1));
+}
+
+#[test]
+fn custom_mirror_positive_reuses_actual_canonical_qualification_until_ttl() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut first_transport = custom_mirror_transport(feed.clone(), HISTORY, false);
+    let no_cache_headers = TransportResponseHeaders {
+        cache_control: CacheControlHeader::Valid("no-cache".into()),
+        ..TransportResponseHeaders::default()
+    };
+    first_transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/PACKAGES.rds".into(),
+        TransportResponse {
+            status: 200,
+            body: NATIVE_UTF8_CURRENT.to_vec(),
+            headers: no_cache_headers.clone(),
+        },
+    );
+    first_transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Meta/archive.rds".into(),
+        TransportResponse {
+            status: 200,
+            body: HISTORY.to_vec(),
+            headers: no_cache_headers,
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let first_result = first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let signature = release_signature(first_result.candidates());
+    let raw_cache = RawCache::open(&store).unwrap();
+    let record = crate::cran::provider::qualification::load_result(&raw_cache.qualification_path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.status,
+        crate::cran::provider::qualification::Status::Positive
+    );
+    assert!(!record.canonical_current_digest.is_empty());
+    assert!(!record.canonical_archive_digest.is_empty());
+    assert_eq!(record.canonical_current_digest, record.current_digest);
+    assert_eq!(record.canonical_archive_digest, record.archive_digest);
+
+    crate::cran::provider::allpackages::reset_test_counters();
+    let second_transport = empty_transport();
+    let second_requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T12:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let second_result = second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(release_signature(second_result.candidates()), signature);
+    assert!(second_requests.borrow().is_empty());
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+
+    let third_transport = custom_mirror_transport(feed.clone(), HISTORY, false);
+    let third_requests = third_transport.requests.clone();
+    let mut third = CranRefreshSession::new_with_clock(
+        Rc::new(third_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-26T01:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    third
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        third_requests.borrow().iter().any(|request| {
+            request.url == "https://cloud.r-project.org/src/contrib/PACKAGES.rds"
+        })
+    );
+    assert!(third_requests.borrow().iter().any(|request| {
+        request.url == "https://cloud.r-project.org/src/contrib/Meta/archive.rds"
+    }));
+
+    // An explicit refresh must revalidate canonical evidence even inside the
+    // normal 24-hour qualification reuse window.
+    let forced_transport = custom_mirror_transport(feed, HISTORY, false);
+    let forced_requests = forced_transport.requests.clone();
+    let mut forced = CranRefreshSession::new_with_clock(
+        Rc::new(forced_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL)
+            .with_refresh_metadata(),
+        Some("2026-08-26T02:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    forced
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        forced_requests.borrow().iter().any(|request| {
+            request.url == "https://cloud.r-project.org/src/contrib/PACKAGES.rds"
+        })
+    );
+    assert!(forced_requests.borrow().iter().any(|request| {
+        request.url == "https://cloud.r-project.org/src/contrib/Meta/archive.rds"
+    }));
+}
+
+#[test]
+fn malformed_positive_qualification_is_rebuilt_in_same_refresh() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(custom_mirror_transport(feed.clone(), HISTORY, false)),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let raw_cache = RawCache::open(&store).unwrap();
+    let qualification_path = raw_cache.qualification_path();
+    assert_eq!(
+        crate::cran::provider::qualification::load_result(&qualification_path)
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::cran::provider::qualification::Status::Positive
+    );
+    std::fs::write(&qualification_path, b"malformed qualification").unwrap();
+
+    let second_transport = empty_transport();
+    let second_requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T01:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(second_requests.borrow().is_empty());
+    assert!(second.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::AllPackages
+            && matches!(diagnostic.status_detail(), CranFastPathStatus::Invalid { diagnostic, .. } if diagnostic.contains("invalid ALLPACKAGES qualification"))
+    }));
+    let recovered = crate::cran::provider::qualification::load_result(&qualification_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recovered.status,
+        crate::cran::provider::qualification::Status::Positive
+    );
+    assert!(!recovered.canonical_current_digest.is_empty());
+}
+
+#[test]
+fn custom_mirror_negative_cooldown_and_malformed_qualification_are_observable() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(custom_mirror_transport(feed.clone(), NESTED_HISTORY, true)),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let raw_cache = RawCache::open(&store).unwrap();
+    let qualification_path = raw_cache.qualification_path();
+    let record = crate::cran::provider::qualification::load_result(&qualification_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.status,
+        crate::cran::provider::qualification::Status::Negative
+    );
+    assert_eq!(record.current_digest, record.canonical_current_digest);
+    assert_ne!(record.archive_digest, record.canonical_archive_digest);
+
+    let cooldown_transport = empty_transport();
+    let cooldown_requests = cooldown_transport.requests.clone();
+    let mut cooldown = CranRefreshSession::new_with_clock(
+        Rc::new(cooldown_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T01:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    cooldown
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(cooldown_requests.borrow().is_empty());
+    assert!(cooldown.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::AllPackages
+            && matches!(diagnostic.status_detail(), CranFastPathStatus::Invalid { diagnostic, .. } if diagnostic.contains("qualification"))
+    }));
+
+    std::fs::write(&qualification_path, b"malformed qualification").unwrap();
+    let malformed_transport = empty_transport();
+    let malformed_requests = malformed_transport.requests.clone();
+    let mut malformed = CranRefreshSession::new_with_clock(
+        Rc::new(malformed_transport),
+        CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T02:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    malformed
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(malformed_requests.borrow().is_empty());
+    assert!(malformed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source() == CranRefreshSource::AllPackages
+            && matches!(diagnostic.status_detail(), CranFastPathStatus::Invalid { diagnostic, .. } if diagnostic.contains("invalid ALLPACKAGES qualification"))
+    }));
+}
+
+#[test]
+fn publication_cutoff_disables_allpackages_history_and_uses_archive_index() {
+    let (directory, store) = store();
+    let entries = matrix_history_entries();
+    let transport = allpackages_transport(allpackages_fixture_body(&entries, true, None), true);
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL)
+            .without_allpackages_history(),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|release| release.version().to_string() == "1.6-5")
+    );
+    assert!(
+        !requests
+            .borrow()
+            .iter()
+            .any(|request| request.url == ALLPACKAGES_FIXTURE_URL)
+    );
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
+            .count(),
+        1
+    );
+    drop(directory);
+}
+
+#[test]
+fn allpackages_missing_historical_occurrence_uses_one_package_archive_fallback() {
+    let (directory, store) = store();
+    let entries = matrix_history_entries();
+    let missing_index = entries
+        .iter()
+        .position(|entry| entry.version().to_string() == "1.6-5")
+        .unwrap();
+    let mut transport = allpackages_transport(
+        allpackages_fixture_body(&entries, true, Some(missing_index)),
+        true,
+    );
+    transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds".into(),
+        TransportResponse::new(200, EMPTY_FAST.to_vec()),
+    );
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|release| release.version().to_string() == "1.7-0")
+    );
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
+            .count(),
+        1
+    );
+    drop(directory);
+}
+
+#[test]
+fn allpackages_duplicate_historical_occurrence_selectively_falls_back() {
+    let (directory, store) = store();
+    let entries = matrix_history_entries();
+    let mut transport = allpackages_transport(allpackages_duplicate_fixture_body(&entries), true);
+    transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds".into(),
+        TransportResponse::new(200, EMPTY_FAST.to_vec()),
+    );
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|release| release.version().to_string() == "1.6-5")
+    );
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
+            .count(),
+        1
+    );
+    drop(directory);
+}
 
 fn store() -> (tempfile::TempDir, SnapshotStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -117,7 +884,7 @@ fn archive_history_fresh_cache_hit_avoids_network() {
     let first_requests = first_transport.requests.clone();
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -137,7 +904,7 @@ fn archive_history_fresh_cache_hit_avoids_network() {
     let second_requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -174,7 +941,7 @@ fn archive_history_stale_cache_revalidates_once_and_reuses_body() {
     };
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -199,7 +966,7 @@ fn archive_history_stale_cache_revalidates_once_and_reuses_body() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -243,7 +1010,7 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
     };
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -276,7 +1043,7 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
     };
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -325,7 +1092,7 @@ fn package_archive_fresh_cache_hit_avoids_network() {
     first_transport.responses.insert(fast_url(), fast);
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -337,7 +1104,7 @@ fn package_archive_fresh_cache_hit_avoids_network() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -362,7 +1129,10 @@ fn empty_package_archive_network_response_is_available_without_fallback() {
         .responses
         .insert(fast_url(), TransportResponse::new(200, EMPTY_FAST.to_vec()));
     let requests = transport.requests.clone();
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let releases = session
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .expect("empty archive fast path");
@@ -413,7 +1183,7 @@ fn empty_package_archive_fresh_cache_hit_avoids_network() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -425,7 +1195,7 @@ fn empty_package_archive_fresh_cache_hit_avoids_network() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -474,7 +1244,7 @@ fn empty_package_archive_stale_cache_reuses_body_after_304() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -497,7 +1267,7 @@ fn empty_package_archive_stale_cache_reuses_body_after_304() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -535,7 +1305,10 @@ fn mixed_archive_semantic_rejection_stays_on_fast_path_without_history_or_tarbal
         TransportResponse::new(200, mixed_semantic_archive_index()),
     );
     let requests = transport.requests.clone();
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let releases = session
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
@@ -609,7 +1382,7 @@ fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -626,7 +1399,7 @@ fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
     let fresh_requests = fresh_transport.requests.clone();
     let mut fresh = CranRefreshSession::new_with_clock(
         Rc::new(fresh_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -660,7 +1433,7 @@ fn nlme_dependency_rejection_survives_fresh_and_304_archive_cache_replay() {
     let stale_requests = stale_transport.requests.clone();
     let mut stale = CranRefreshSession::new_with_clock(
         Rc::new(stale_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T01:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -707,7 +1480,7 @@ fn nlme_invalid_version_survives_fresh_and_304_archive_cache_replay() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -743,7 +1516,7 @@ fn nlme_invalid_version_survives_fresh_and_304_archive_cache_replay() {
     let fresh_requests = fresh_transport.requests.clone();
     let mut fresh = CranRefreshSession::new_with_clock(
         Rc::new(fresh_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -777,7 +1550,7 @@ fn nlme_invalid_version_survives_fresh_and_304_archive_cache_replay() {
     let stale_requests = stale_transport.requests.clone();
     let mut stale = CranRefreshSession::new_with_clock(
         Rc::new(stale_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T01:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -920,7 +1693,7 @@ fn mixed_archive_fresh_raw_cache_replay_is_network_free_and_deterministic() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -934,7 +1707,7 @@ fn mixed_archive_fresh_raw_cache_replay_is_network_free_and_deterministic() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -983,7 +1756,7 @@ fn mixed_archive_stale_304_replay_is_deterministic_without_fallback() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1008,7 +1781,7 @@ fn mixed_archive_stale_304_replay_is_deterministic_without_fallback() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1061,7 +1834,7 @@ fn all_archive_semantic_rejections_fail_without_fallback_or_raw_cache_publish() 
     let requests = transport.requests.clone();
     let mut session = CranRefreshSession::new_with_clock(
         Rc::new(transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:00Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1101,7 +1874,10 @@ fn archive_identity_failure_is_hard_without_history_fallback() {
         TransportResponse::new(200, ROOT_DUPLICATE_ARCHIVE.to_vec()),
     );
     let requests = transport.requests.clone();
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let error = session
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .expect_err("identity conflicts must fail closed");
@@ -1149,7 +1925,7 @@ fn package_archive_stale_cache_revalidates_once_with_304() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1176,7 +1952,7 @@ fn package_archive_stale_cache_revalidates_once_with_304() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1247,7 +2023,7 @@ fn tarball_fallback_does_not_receive_metadata_validators_or_enter_raw_cache() {
     );
     let mut first = CranRefreshSession::new_with_clock(
         Rc::new(first_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1289,7 +2065,7 @@ fn tarball_fallback_does_not_receive_metadata_validators_or_enter_raw_cache() {
     let requests = second_transport.requests.clone();
     let mut second = CranRefreshSession::new_with_clock(
         Rc::new(second_transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some("2026-08-23T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
@@ -1361,7 +2137,7 @@ fn invalid_cached_archive_body_is_retried_and_invalid_200_is_not_published() {
     let requests = transport.requests.clone();
     let mut session = CranRefreshSession::new_with_clock(
         Rc::new(transport),
-        "https://cran.invalid",
+        CranMetadataConfig::new("https://cran.invalid", ""),
         Some(t0),
         Some(RawCache::open(&store).unwrap()),
     );

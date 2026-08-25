@@ -296,6 +296,27 @@ fn session_transport(
     }
 }
 
+/// Build a minimal zstd frame containing raw blocks. Keeping this encoder in
+/// the fixture harness avoids a production compression dependency while still
+/// exercising the same streaming decoder as the real ALLPACKAGES feed.
+fn raw_zstd(input: &[u8]) -> Vec<u8> {
+    let mut output = vec![0x28, 0xb5, 0x2f, 0xfd];
+    let chunks = input.chunks(131_071).collect::<Vec<_>>();
+    if input.len() <= u8::MAX as usize {
+        output.extend([0x20, input.len() as u8]);
+    } else {
+        output.push(0x60);
+        output.extend((input.len() as u16 - 256).to_le_bytes());
+    }
+    for (index, chunk) in chunks.iter().enumerate() {
+        let last = usize::from(index + 1 == chunks.len());
+        let header = (chunk.len() << 3) | last;
+        output.extend((header as u32).to_le_bytes()[..3].iter());
+        output.extend_from_slice(chunk);
+    }
+    output
+}
+
 fn logical_signature(provider: &CranProvider<FixtureTransport>) -> Vec<String> {
     provider
             .releases(&SolverKey::InstalledName(

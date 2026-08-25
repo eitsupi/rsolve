@@ -15,7 +15,7 @@ pub(crate) fn input() -> SnapshotBuildInput {
         registry_id: RegistryId::new("cran").unwrap(),
         compatibility_profile: 1,
         parser_schema: 1,
-        normalization_policy: 1,
+        normalization_policy: 2,
         created_at: "2026-08-23T00:00:00Z".into(),
         producer: "test".into(),
         coverage: CoverageV1 {

@@ -102,6 +102,45 @@ pub(crate) struct CranProviderObservationProjection {
     pub(crate) rejections: Vec<CranArchiveReleaseRejection>,
 }
 
+pub(crate) fn allpackages_observations_from_fields(
+    records: Vec<CatalogRecord>,
+) -> CranProviderObservationProjection {
+    // ALLPACKAGES carries transport/evidence columns in addition to the
+    // canonical CRAN PACKAGES semantics.  Keep those columns in the indexed
+    // raw projection for occurrence binding, but never let them affect the
+    // PackageRelease semantic digest.
+    let raw_fields = records
+        .iter()
+        .map(|(index, _, fields)| (*index, fields.clone()))
+        .collect::<HashMap<_, _>>();
+    let records = records
+        .into_iter()
+        .map(|(index, package, fields)| {
+            let fields = fields
+                .into_iter()
+                .filter(|(name, _)| !is_allpackages_transport_field(name))
+                .collect();
+            (index, package, fields)
+        })
+        .collect();
+    let mut projection =
+        provider_observations_from_fields(records, CranCatalogRecordContext::PackagesIndex, None);
+    // Restore raw transport fields after semantic parsing so occurrence
+    // binding can use DownloadURL and checksum/snapshot evidence without
+    // changing release identity.
+    for observation in &mut projection.observations {
+        if let Some(fields) = raw_fields.get(&observation.record_index) {
+            observation.fields = fields.clone();
+        }
+    }
+    for rejection in &mut projection.rejections {
+        if let Some(fields) = raw_fields.get(&rejection.record_index) {
+            rejection.fields = fields.clone();
+        }
+    }
+    projection
+}
+
 /// The semantic scope of a CRAN package-index record.
 ///
 /// A record under `R/Recommended` describes an R-runtime-specific occurrence,
@@ -1007,8 +1046,18 @@ fn is_reserved_field(name: &str) -> bool {
             | "linkingto"
             | "suggests"
             | "enhances"
+            | "md5sum"
             | "published"
     )
+}
+
+fn is_allpackages_transport_field(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized == "downloadurl"
+        || normalized == "filesize"
+        || normalized == "repository"
+        || normalized == "snapshot"
+        || normalized.starts_with("sha256")
 }
 
 fn parse_publication_date(value: &str) -> Result<rsolve_core::ReleasePublication, CranRecordError> {
@@ -1135,6 +1184,41 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name.eq_ignore_ascii_case("Path")
                     && value == "4.7.0/Recommended")
+        );
+    }
+
+    #[test]
+    fn md5sum_is_evidence_only_and_not_release_semantics() {
+        let without = super::validated_observations_from_fields(vec![(
+            0,
+            None,
+            vec![
+                ("Package".into(), "Matrix".into()),
+                ("Version".into(), "1.7-6".into()),
+                ("License".into(), "BSD-3-Clause".into()),
+            ],
+        )])
+        .unwrap();
+        let with = super::validated_observations_from_fields(vec![(
+            0,
+            None,
+            vec![
+                ("Package".into(), "Matrix".into()),
+                ("Version".into(), "1.7-6".into()),
+                ("License".into(), "BSD-3-Clause".into()),
+                ("MD5sum".into(), "00000000000000000000000000000031".into()),
+            ],
+        )])
+        .unwrap();
+        assert_eq!(
+            without[0].release().metadata_digest(),
+            with[0].release().metadata_digest()
+        );
+        assert!(
+            with[0]
+                .fields()
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("MD5sum"))
         );
     }
 

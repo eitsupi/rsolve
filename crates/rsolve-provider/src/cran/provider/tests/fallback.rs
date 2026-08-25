@@ -108,7 +108,10 @@ fn gone_fast_path_is_absent_and_shared_history_is_fetched_once() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap();
@@ -169,7 +172,10 @@ fn absent_fast_path_and_absent_history_use_current_candidates_only() {
             },
         );
         let requests = Rc::clone(&transport.requests);
-        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let mut session = CranRefreshSession::new(
+            Rc::new(transport),
+            CranMetadataConfig::new("https://cran.invalid", ""),
+        );
         let snapshot = session
             .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .expect("current-only refresh");
@@ -232,7 +238,10 @@ fn archive_candidates_are_retained_when_current_index_lacks_package() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let snapshot = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .expect("archive-only candidates");
@@ -291,7 +300,10 @@ fn fast_path_failure_is_not_hidden_by_absent_history() {
                 ..TransportResponse::default()
             },
         );
-        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let mut session = CranRefreshSession::new(
+            Rc::new(transport),
+            CranMetadataConfig::new("https://cran.invalid", ""),
+        );
         let error = session
             .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap_err();
@@ -341,7 +353,10 @@ fn unsupported_fast_path_and_empty_sources_are_negative_cached() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let package = PackageName::new("Matrix").unwrap();
     for _ in 0..2 {
         let snapshot = session
@@ -357,7 +372,7 @@ fn unsupported_fast_path_and_empty_sources_are_negative_cached() {
     let request_count = requests.borrow().len();
     let diagnostic_count = session.diagnostics.len();
     assert_eq!(request_count, 5);
-    assert_eq!(diagnostic_count, 5);
+    assert_eq!(diagnostic_count, 6);
     assert_eq!(
         requests
             .borrow()
@@ -416,7 +431,10 @@ fn invalid_fast_path_failure_is_negative_cached_with_stable_error() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let package = PackageName::new("Matrix").unwrap();
     let first = session
         .refresh_packages(std::slice::from_ref(&package))
@@ -469,7 +487,10 @@ fn tarball_transport_and_metadata_failures_are_negative_cached() {
             .responses
             .insert(old_url(), TransportResponse::new(status, body));
         let requests = Rc::clone(&transport.requests);
-        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let mut session = CranRefreshSession::new(
+            Rc::new(transport),
+            CranMetadataConfig::new("https://cran.invalid", ""),
+        );
         let package = PackageName::new("Matrix").unwrap();
         let first = session
             .refresh_packages(std::slice::from_ref(&package))

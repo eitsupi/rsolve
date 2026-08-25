@@ -7,7 +7,7 @@ use rsolve_core::{
     PublicationDate, RegistryId, SolverKey,
 };
 use rsolve_provider::SnapshotStore;
-use rsolve_provider::cran::{CranCandidateSnapshot, CranSnapshotRefresher};
+use rsolve_provider::cran::{CranCandidateSnapshot, CranMetadataConfig, CranSnapshotRefresher};
 use rsolve_provider::cran::{
     CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,
     CranSnapshotCacheStatus, inspect_cran_snapshot_cache,
@@ -229,8 +229,6 @@ pub(crate) fn resolve_from_cran_with_store(
     )
 }
 
-/// Testable policy seam for the provider-owned cache decision. Production
-/// callers use [`resolve_from_cran_with_store`] and its system clock default.
 pub(crate) fn resolve_from_cran_with_store_at_policy(
     manifest: Manifest,
     base_url: impl AsRef<str>,
@@ -259,7 +257,20 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
             cache_diagnostics: Vec::new(),
         });
     }
-    let refresher = CranSnapshotRefresher::new(base_url).map_err(CranResolutionError::Provider)?;
+    let metadata_config =
+        CranMetadataConfig::for_repository(base_url.as_ref().to_owned().into_boxed_str());
+    let metadata_config = if publication_cutoff.is_some() {
+        metadata_config.without_allpackages_history()
+    } else {
+        metadata_config
+    };
+    let metadata_config = if cache_policy.refresh_metadata {
+        metadata_config.with_refresh_metadata()
+    } else {
+        metadata_config
+    };
+    let refresher =
+        CranSnapshotRefresher::new(metadata_config).map_err(CranResolutionError::Provider)?;
     let cache_policy = cache_policy.with_expected_endpoint(refresher.canonical_endpoint());
     let cache = inspect_cran_snapshot_cache(store, &cache_policy);
     let probe = match cache {

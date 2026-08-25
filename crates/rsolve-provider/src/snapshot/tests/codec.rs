@@ -24,6 +24,10 @@ fn header_decoder_rejects_unknown_fields_versions_and_noncanonical_bytes() {
     let mut version: SnapshotHeaderV1 = serde_json::from_slice(header).unwrap();
     version.version = 2;
     assert!(decode_header(&encode_header(&version).unwrap()).is_err());
+
+    let mut legacy_policy: SnapshotHeaderV1 = serde_json::from_slice(header).unwrap();
+    legacy_policy.normalization_policy = 1;
+    assert!(decode_header(&encode_header(&legacy_policy).unwrap()).is_err());
 }
 
 #[test]

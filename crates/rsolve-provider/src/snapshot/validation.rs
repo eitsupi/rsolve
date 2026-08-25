@@ -81,7 +81,10 @@ pub(super) fn validate_header(header: &SnapshotHeaderV1) -> Result<(), SnapshotE
     if header.format != "rsolve-metadata-snapshot"
         || header.version != 1
         || header.history_encoding != HISTORY_ENCODING
-        || header.normalization_policy != 1
+        // Policy 2 is the only active normalization generation. Older
+        // generations are intentionally rejected at the wire boundary so
+        // they cannot re-enter the cache through another load path.
+        || header.normalization_policy != 2
         || header.compatibility_profile != 1
         || header.parser_schema != 1
     {

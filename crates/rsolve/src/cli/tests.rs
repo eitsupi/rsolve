@@ -230,6 +230,7 @@ fn mirror_and_output_validation_happen_before_resolution() {
         output: temp_path("missing-parent").join("parent").join("lock"),
         metadata_cache: None,
         offline: false,
+        refresh_metadata: false,
     };
     let result = run_lock_with_backend(command, &PanicBackend);
     assert!(matches!(result, Err(CliError::Value(message)) if message.contains("userinfo")));
@@ -307,6 +308,7 @@ impl ResolutionBackend for PanicBackend {
         _cutoff: Option<PublicationDate>,
         _metadata_cache: &MetadataCache,
         _offline: bool,
+        _refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError> {
         panic!("resolution must not be called after validation failure")
     }
@@ -402,6 +404,7 @@ impl ResolutionBackend for MatrixBackend {
         cutoff: Option<PublicationDate>,
         _metadata_cache: &MetadataCache,
         _offline: bool,
+        _refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError> {
         let loader = MatrixLoader {
             releases: vec![
@@ -420,7 +423,7 @@ impl ResolutionBackend for MatrixBackend {
 }
 
 struct ModeBackend<'a> {
-    mode: &'a std::cell::Cell<Option<bool>>,
+    mode: &'a std::cell::Cell<Option<(bool, bool)>>,
 }
 
 impl ResolutionBackend for ModeBackend<'_> {
@@ -431,9 +434,17 @@ impl ResolutionBackend for ModeBackend<'_> {
         cutoff: Option<PublicationDate>,
         metadata_cache: &MetadataCache,
         offline: bool,
+        refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError> {
-        self.mode.set(Some(offline));
-        MatrixBackend.resolve(manifest, mirror, cutoff, metadata_cache, offline)
+        self.mode.set(Some((offline, refresh_metadata)));
+        MatrixBackend.resolve(
+            manifest,
+            mirror,
+            cutoff,
+            metadata_cache,
+            offline,
+            refresh_metadata,
+        )
     }
 }
 
@@ -446,6 +457,7 @@ fn matrix_command(r_version: &str, output: PathBuf) -> LockCommand {
         output,
         metadata_cache: Some(temp_path("matrix-metadata-cache")),
         offline: false,
+        refresh_metadata: false,
     }
 }
 
@@ -462,9 +474,48 @@ fn cli_passes_explicit_online_and_offline_modes_to_backend() {
         let mut command = matrix_command("4.4.0", output.clone());
         command.offline = offline;
         run_lock_with_backend(command, &backend).unwrap();
-        assert_eq!(mode.get(), Some(offline));
+        assert_eq!(mode.get(), Some((offline, false)));
         fs::remove_file(output).unwrap();
     }
+}
+
+#[test]
+fn cli_parses_and_forwards_refresh_metadata_and_rejects_offline_conflict() {
+    let parsed = CommandLine::try_parse_from([
+        "rsolve",
+        "lock",
+        "--r-version",
+        "4.4.0",
+        "--package",
+        "Matrix",
+        "--refresh-metadata",
+    ])
+    .unwrap();
+    let Command::Lock(lock) = parsed.command;
+    assert!(lock.refresh_metadata);
+    assert!(!lock.offline);
+
+    let conflict = CommandLine::try_parse_from([
+        "rsolve",
+        "lock",
+        "--r-version",
+        "4.4.0",
+        "--package",
+        "Matrix",
+        "--offline",
+        "--refresh-metadata",
+    ])
+    .unwrap_err();
+    assert_eq!(conflict.exit_code(), 2);
+
+    let mode = std::cell::Cell::new(None);
+    let backend = ModeBackend { mode: &mode };
+    let output = temp_path("refresh-mode");
+    let mut command = matrix_command("4.4.0", output.clone());
+    command.refresh_metadata = true;
+    run_lock_with_backend(command, &backend).unwrap();
+    assert_eq!(mode.get(), Some((false, true)));
+    fs::remove_file(output).unwrap();
 }
 
 #[test]
@@ -560,6 +611,7 @@ fn resolution_failure_preserves_existing_lockfile() {
             _cutoff: Option<PublicationDate>,
             _metadata_cache: &MetadataCache,
             _offline: bool,
+            _refresh_metadata: bool,
         ) -> Result<ResolvedData, CliError> {
             Err(CliError::Operational("injected resolution failure".into()))
         }

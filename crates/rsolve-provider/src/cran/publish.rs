@@ -270,7 +270,7 @@ mod tests {
         let stale = CranSnapshotCachePolicy::at(
             fresh
                 .now
-                .checked_add(jiff::SignedDuration::from_secs(7200))
+                .checked_add(jiff::SignedDuration::from_secs(26 * 60 * 60))
                 .unwrap(),
         );
         let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
@@ -280,12 +280,24 @@ mod tests {
         };
         assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Stale);
 
-        let mut incompatible = stale;
+        let mut incompatible = stale.clone();
         incompatible.parser_schema = 2;
         let CranSnapshotCacheResult::Rejected(diagnostic) =
             inspect_cran_snapshot_cache(&store, &incompatible)
         else {
             panic!("revision mismatch must reject reuse");
+        };
+        assert_eq!(
+            diagnostic.status(),
+            CranSnapshotCacheStatus::RevisionIncompatible
+        );
+
+        let mut normalization_mismatch = stale;
+        normalization_mismatch.normalization_policy = 1;
+        let CranSnapshotCacheResult::Rejected(diagnostic) =
+            inspect_cran_snapshot_cache(&store, &normalization_mismatch)
+        else {
+            panic!("normalization policy mismatch must reject reuse");
         };
         assert_eq!(
             diagnostic.status(),
@@ -299,7 +311,7 @@ mod tests {
         let store =
             SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
         let t0 = "2026-08-23T00:00:00Z";
-        let t2 = "2026-08-23T02:00:00Z";
+        let t2 = "2026-08-24T02:00:00Z";
         let mut first_context = context();
         first_context.created_at = t0.into();
         let first = publish_snapshot_with_endpoint(

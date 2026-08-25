@@ -12,7 +12,7 @@ use super::super::publish::{
     CranSnapshotPublishError, default_context, publish_snapshot_with_endpoint,
 };
 use super::transport::UreqTransport;
-use super::{CranCandidateSnapshot, CranRefreshDiagnostic, CranRefreshSession};
+use super::{CranCandidateSnapshot, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshSession};
 use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotStore};
 
 /// A transport-neutral failure constructing the CRAN snapshot refresher.
@@ -41,21 +41,27 @@ pub struct CranSnapshotRefresher {
 }
 
 impl CranSnapshotRefresher {
-    pub fn new(base_url: impl AsRef<str>) -> Result<Self, CranSnapshotRefresherError> {
-        let base_url = canonical_base_url(base_url.as_ref())?;
+    pub fn new(metadata: CranMetadataConfig) -> Result<Self, CranSnapshotRefresherError> {
+        let base_url = canonical_base_url(&metadata.repository_endpoint)?;
+        let allpackages_feed_endpoint = canonical_base_url(&metadata.allpackages_feed_endpoint)?;
         let tls_config = ureq::tls::TlsConfig::builder()
             .root_certs(ureq::tls::RootCerts::PlatformVerifier)
             .build();
-        let config = ureq::Agent::config_builder()
+        let agent_config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .tls_config(tls_config)
             .build();
         Ok(Self {
             session: RefCell::new(CranRefreshSession::new(
                 Rc::new(UreqTransport {
-                    agent: config.new_agent(),
+                    agent: agent_config.new_agent(),
                 }),
-                base_url,
+                CranMetadataConfig {
+                    repository_endpoint: base_url,
+                    allpackages_feed_endpoint,
+                    refresh_metadata: metadata.refresh_metadata,
+                    allow_allpackages_history: metadata.allow_allpackages_history,
+                },
             )),
         })
     }
@@ -68,6 +74,16 @@ impl CranSnapshotRefresher {
 
     pub fn canonical_endpoint(&self) -> Box<str> {
         self.session.borrow().base_url.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_metadata_enabled(&self) -> bool {
+        self.session.borrow().refresh_metadata
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allpackages_history_enabled(&self) -> bool {
+        self.session.borrow().allow_allpackages_history
     }
 
     /// Refreshes exactly these package names, then returns a transport-free

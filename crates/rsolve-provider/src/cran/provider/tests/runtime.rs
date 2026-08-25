@@ -189,7 +189,10 @@ fn refresh_session_falls_back_to_plain_current_and_freezes_without_network() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let snapshot = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap();

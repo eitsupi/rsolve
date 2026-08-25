@@ -40,7 +40,10 @@ fn invalid_gzip_current_index_falls_back_to_plain_once() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let snapshot = session
         .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
         .unwrap();
@@ -89,7 +92,10 @@ fn invalid_rds_current_index_falls_back_to_gzip() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     session
         .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
         .unwrap();
@@ -126,7 +132,10 @@ fn semantic_invalid_current_index_falls_back_to_gzip() {
         },
     );
     let requests = Rc::clone(&transport.requests);
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     session
         .refresh_packages(&[PackageName::new("rsolvefixture.plain").unwrap()])
         .unwrap();
@@ -181,7 +190,10 @@ fn history_transport_and_metadata_failures_remain_hard_failures() {
                 ..TransportResponse::default()
             },
         );
-        let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+        let mut session = CranRefreshSession::new(
+            Rc::new(transport),
+            CranMetadataConfig::new("https://cran.invalid", ""),
+        );
         let error = session
             .refresh_packages(&[PackageName::new("Matrix").unwrap()])
             .unwrap_err();
@@ -217,7 +229,10 @@ fn history_transport_error_is_hard_failure_after_absent_fast_path() {
         },
     );
     transport.responses.remove(&history_url());
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let error = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap_err();
@@ -256,7 +271,10 @@ fn fast_path_transport_error_is_diagnostic_and_falls_back() {
         },
     );
     transport.responses.remove(&fast_url());
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap();
@@ -300,7 +318,10 @@ fn fast_path_unexpected_status_keeps_transport_diagnostic() {
     transport
         .responses
         .insert(history_url(), TransportResponse::new(404, Vec::new()));
-    let mut session = CranRefreshSession::new(Rc::new(transport), "https://cran.invalid");
+    let mut session = CranRefreshSession::new(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+    );
     let error = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap_err();

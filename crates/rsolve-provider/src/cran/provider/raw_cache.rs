@@ -23,6 +23,7 @@ use super::{MAX_RESPONSE_BYTES, SnapshotStore};
 const RAW_CACHE_DIRECTORY: &str = "raw-cache";
 const RAW_CACHE_VERSION: &str = "v1";
 const RAW_CACHE_FORMAT: &str = "rsolve-cran-raw-response";
+const PROJECTION_DIRECTORY: &str = "projections";
 const RAW_KEY_FORMAT: &str = "rsolve-cran-raw-key";
 const ENTRY_SUFFIX: &str = ".raw";
 const HEADER_LENGTH_BYTES: usize = 4;
@@ -38,6 +39,7 @@ pub(crate) enum RawCacheRepresentation {
     CurrentDcf,
     ArchiveHistoryRds,
     PackageArchiveIndexRds,
+    AllPackagesZstd,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,6 +206,7 @@ impl RawCache {
             .join(RAW_CACHE_VERSION);
         ensure_directory(&store.root().join(RAW_CACHE_DIRECTORY))?;
         ensure_directory(&directory)?;
+        ensure_directory(&directory.join(PROJECTION_DIRECTORY))?;
         Ok(Self {
             registry_id: store.registry_id().clone(),
             directory,
@@ -216,6 +219,20 @@ impl RawCache {
         representation: RawCacheRepresentation,
     ) -> Result<RawCacheKey, RawCacheError> {
         RawCacheKey::new(&self.registry_id, endpoint, representation)
+    }
+
+    pub(crate) fn projection_key(&self, key: &RawCacheKey, body: &[u8]) -> String {
+        format!("{}-{}", key.digest(), hex(&Sha256::digest(body)))
+    }
+
+    pub(crate) fn projection_path(&self, key: &RawCacheKey, body: &[u8]) -> PathBuf {
+        self.directory
+            .join(PROJECTION_DIRECTORY)
+            .join(format!("{}.redb", self.projection_key(key, body)))
+    }
+
+    pub(crate) fn qualification_path(&self) -> PathBuf {
+        self.directory.join("qualification.json")
     }
 
     pub(crate) fn lookup(&self, key: &RawCacheKey) -> RawCacheLookup {
@@ -805,7 +822,7 @@ mod tests {
             RawCachePublishOutcome::Stored
         ));
         cache.publish(&key, write(b"replacement")).unwrap();
-        assert_eq!(fs::read_dir(&cache.directory).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&cache.directory).unwrap().count(), 2);
         let RawCacheLookup::Hit(entry) = cache.lookup(&key) else {
             panic!("expected hit")
         };
@@ -1049,7 +1066,7 @@ mod tests {
         let second_store = store();
         let cache = RawCache::open(&second_store).unwrap();
         let version = cache.directory;
-        fs::remove_dir(&version).unwrap();
+        fs::remove_dir_all(&version).unwrap();
         symlink(second_store.root().join("generations"), &version).unwrap();
         assert!(RawCache::open(&second_store).is_err());
     }

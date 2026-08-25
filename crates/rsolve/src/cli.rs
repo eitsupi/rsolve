@@ -11,10 +11,13 @@ use tempfile::NamedTempFile;
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
 use crate::metadata_cache::MetadataCache;
-use crate::orchestration::{cran_registry_id, resolve_from_cran_with_store};
+use crate::orchestration::{
+    cran_registry_id, resolve_from_cran_with_store, resolve_from_cran_with_store_at_policy,
+};
 use crate::{
     EnvironmentId, Lockfile, Manifest, ManifestDependency, ManifestTarget, from_toml, to_toml,
 };
+use rsolve_provider::cran::CranSnapshotCachePolicy;
 
 const DEFAULT_CRAN_MIRROR: &str = "https://cloud.r-project.org";
 const DEFAULT_OUTPUT: &str = "rsolve.lock";
@@ -56,8 +59,11 @@ pub struct LockCommand {
     #[arg(long, value_name = "ROOT")]
     pub metadata_cache: Option<PathBuf>,
     /// Resolve only from the current metadata snapshot without network access.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "refresh_metadata")]
     pub offline: bool,
+    /// Revalidate repository metadata and the bulk history feed immediately.
+    #[arg(long, conflicts_with = "offline")]
+    pub refresh_metadata: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -100,6 +106,7 @@ trait ResolutionBackend {
         cutoff: Option<PublicationDate>,
         metadata_cache: &MetadataCache,
         offline: bool,
+        refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError>;
 }
 
@@ -118,6 +125,7 @@ impl ResolutionBackend for CranBackend {
         cutoff: Option<PublicationDate>,
         metadata_cache: &MetadataCache,
         offline: bool,
+        refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError> {
         let registry_id = cran_registry_id(mirror);
         let store = metadata_cache
@@ -126,7 +134,17 @@ impl ResolutionBackend for CranBackend {
         let outcome = if offline {
             crate::orchestration::resolve_from_cran_offline_with_store(manifest, cutoff, &store)
         } else {
-            resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
+            if refresh_metadata {
+                resolve_from_cran_with_store_at_policy(
+                    manifest,
+                    mirror,
+                    cutoff,
+                    &store,
+                    CranSnapshotCachePolicy::default().with_refresh_metadata(),
+                )
+            } else {
+                resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
+            }
         }
         .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
         let warnings: Vec<String> = outcome
@@ -227,7 +245,14 @@ fn run_lock_with_backend(
     let requested_package_count = command.package.len();
     let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
         .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
-    let resolved = backend.resolve(manifest, &mirror, cutoff, &metadata_cache, command.offline)?;
+    let resolved = backend.resolve(
+        manifest,
+        &mirror,
+        cutoff,
+        &metadata_cache,
+        command.offline,
+        command.refresh_metadata,
+    )?;
     let environment = EnvironmentId::new("default")
         .map_err(|error| CliError::Operational(format!("invalid environment: {error}")))?;
     let lock = Lockfile::from_resolution_with_publication_cutoff(

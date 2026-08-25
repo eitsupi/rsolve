@@ -77,6 +77,17 @@ pub(crate) struct ArchiveHistoryProjection {
 }
 
 impl ArchiveEntry {
+    #[cfg(test)]
+    pub(crate) fn for_test(package: &str, version: &str, path: &str, size: u64) -> Self {
+        Self {
+            package: PackageName::new(package).unwrap(),
+            version: RPackageVersion::parse(version).unwrap(),
+            source_archive_relative_path: path.into(),
+            size,
+            mtime: 0,
+        }
+    }
+
     pub fn package(&self) -> &PackageName {
         &self.package
     }

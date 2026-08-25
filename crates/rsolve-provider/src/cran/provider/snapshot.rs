@@ -6,6 +6,8 @@ use super::super::catalog::{
     CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation, CranCatalogRecordScope,
 };
 use super::super::evidence::{CranEvidenceObservation, DistributionRegistryBinding};
+#[cfg(test)]
+use super::CranMetadataConfig;
 use super::refresher::decode_gzip;
 use super::{CranCurrentIndexRepresentation, CranRefreshSession, Transport};
 use crate::snapshot::{
@@ -129,7 +131,32 @@ pub(super) fn tarball_record_to_evidence(
         FreshnessStateV1::BulkGeneration,
         Some(OccurrenceArtifactV1 {
             locator,
+            // DESCRIPTION is self-reported by the artifact and does not
+            // authenticate the tarball bytes at this evidence boundary.
             checksums: Vec::new(),
+            size: Some(size),
+        }),
+    )
+}
+
+/// Projects an ALLPACKAGES observation onto a canonical CRAN archive
+/// locator. The feed's SHA256 is for the mirror artifact and MD5sum has no
+/// provenance here; only a valid upstream SHA256Original may cross this
+/// binding boundary.
+pub(super) fn allpackages_record_to_evidence(
+    record: &CranCatalogObservation,
+    source: SourceInput,
+    locator: String,
+    size: u64,
+) -> CranEvidenceObservation {
+    record_to_evidence(
+        record,
+        source,
+        OccurrenceStateV1::ArtifactBound,
+        FreshnessStateV1::BulkGeneration,
+        Some(OccurrenceArtifactV1 {
+            locator,
+            checksums: checksums_from_allpackages_fields(record),
             size: Some(size),
         }),
     )
@@ -255,14 +282,27 @@ fn checksums_from_index_fields(record: &CranCatalogObservation) -> Vec<ChecksumV
     checksums_from_fields(record.fields())
 }
 
+fn checksums_from_allpackages_fields(record: &CranCatalogObservation) -> Vec<ChecksumV1> {
+    checksums_from_fields(record.fields())
+        .into_iter()
+        .filter(|checksum| {
+            checksum.algorithm == "sha256-original"
+                && checksum.value.len() == 64
+                && checksum.value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .collect()
+}
+
 fn checksums_from_rejection_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
     checksums_from_fields(fields)
         .into_iter()
         .filter(|checksum| match checksum.algorithm.as_str() {
             // The wire validator treats MD5 as an opaque non-empty value,
-            // while SHA-256 values must be exactly 32 bytes of hex.
+            // while the original upstream SHA-256 must be exactly 32 bytes
+            // of hex. P3M's SHA256 is for its rewritten tarball and is not
+            // attached to the canonical CRAN archive locator.
             "md5" => true,
-            "sha256" => {
+            "sha256-original" => {
                 checksum.value.len() == 64
                     && checksum.value.bytes().all(|byte| byte.is_ascii_hexdigit())
             }
@@ -277,8 +317,8 @@ fn checksums_from_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
         .filter_map(|(name, value)| {
             let algorithm = if name.eq_ignore_ascii_case("MD5sum") {
                 "md5"
-            } else if name.eq_ignore_ascii_case("SHA256") {
-                "sha256"
+            } else if name.eq_ignore_ascii_case("SHA256Original") {
+                "sha256-original"
             } else {
                 return None;
             };
@@ -310,7 +350,7 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
     })?;
     let mut session = CranRefreshSession::new_with_clock(
         std::rc::Rc::new(transport),
-        &effective_endpoint,
+        CranMetadataConfig::new(effective_endpoint.as_str(), ""),
         None,
         Some(raw_cache),
     );
@@ -412,6 +452,79 @@ mod tests {
         SnapshotGenerationBuilder::new(input, directory.path().join("generation.redb"))
             .build()
             .expect("quarantined invalid checksum must not block snapshot publish");
+    }
+
+    #[test]
+    fn allpackages_binding_keeps_only_valid_upstream_sha256_original() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_observations_from_fields(
+            vec![(
+                0,
+                Some(package.to_string()),
+                vec![
+                    ("Package".into(), "Matrix".into()),
+                    ("Version".into(), "1.7-0".into()),
+                    ("License".into(), "BSD-3-Clause".into()),
+                    ("MD5sum".into(), "0123456789abcdef0123456789abcdef".into()),
+                    ("SHA256".into(), "a".repeat(64)),
+                    ("SHA256Original".into(), "b".repeat(64)),
+                ],
+            )],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&package),
+        );
+        let record = projection.observations.first().expect("valid observation");
+        let evidence = allpackages_record_to_evidence(
+            record,
+            source_input(
+                "cran-allpackages",
+                "zstd",
+                "https://ppm.r-pkg.org/ALLPACKAGES.zst",
+                b"feed",
+            ),
+            "https://cran.invalid/src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz".into(),
+            123,
+        );
+
+        assert_eq!(
+            evidence.artifact.unwrap().checksums,
+            vec![ChecksumV1 {
+                algorithm: "sha256-original".into(),
+                value: "b".repeat(64),
+            }]
+        );
+    }
+
+    #[test]
+    fn tarball_description_checksums_are_not_artifact_evidence() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_observations_from_fields(
+            vec![(
+                0,
+                Some(package.to_string()),
+                vec![
+                    ("Package".into(), "Matrix".into()),
+                    ("Version".into(), "1.7-0".into()),
+                    ("License".into(), "BSD-3-Clause".into()),
+                    ("MD5sum".into(), "0123456789abcdef0123456789abcdef".into()),
+                    ("SHA256Original".into(), "b".repeat(64)),
+                ],
+            )],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&package),
+        );
+        let evidence = tarball_record_to_evidence(
+            projection.observations.first().expect("valid observation"),
+            source_input(
+                "cran-archive-tarball",
+                "tar.gz",
+                "https://cran.invalid/src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz",
+                b"tarball",
+            ),
+            "https://cran.invalid/src/contrib/Archive/Matrix/Matrix_1.7-0.tar.gz".into(),
+            7,
+        );
+        assert!(evidence.artifact.unwrap().checksums.is_empty());
     }
 
     #[test]

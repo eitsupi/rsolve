@@ -8,6 +8,8 @@ use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use self::raw_cache::{
     RawCache, RawCacheEntry, RawCacheLookup, RawCacheRepresentation, RawCacheWrite,
 };
@@ -29,8 +31,10 @@ use rsolve_core::{
 
 // Raw-response/cache integration consumes this provider-private policy seam
 // without coupling semantic snapshot inspection to response headers.
+mod allpackages;
 pub mod cache_policy;
 mod negative;
+mod qualification;
 // Raw-cache APIs remain provider-private and are used by current-index refresh.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) mod raw_cache;
@@ -47,8 +51,8 @@ pub use refresher::{CranSnapshotRefresher, CranSnapshotRefresherError};
 #[cfg(test)]
 pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
-    archive_rejection_to_evidence, import_current_index, index_record_to_evidence, source_input,
-    tarball_record_to_evidence,
+    allpackages_record_to_evidence, archive_rejection_to_evidence, import_current_index,
+    index_record_to_evidence, source_input, tarball_record_to_evidence,
 };
 #[cfg(test)]
 pub(crate) use transport::TransportError;
@@ -128,6 +132,7 @@ pub enum CranCurrentIndexRepresentation {
 pub enum CranRefreshSource {
     ArchiveFastPath,
     ArchiveHistory,
+    AllPackages,
     CurrentIndex(CranCurrentIndexRepresentation),
 }
 
@@ -135,8 +140,53 @@ pub enum CranRefreshSource {
 /// online when the server has not supplied a stronger freshness policy.
 pub const CRAN_COMPATIBILITY_PROFILE: u32 = 1;
 pub const CRAN_PARSER_SCHEMA: u32 = 1;
-pub const CRAN_NORMALIZATION_POLICY: u32 = 1;
-pub const DEFAULT_COMPATIBLE_GENERATION_TTL: Duration = Duration::from_secs(60 * 60);
+pub const CRAN_NORMALIZATION_POLICY: u32 = 2;
+pub const DEFAULT_COMPATIBLE_GENERATION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The bulk historical feed is an independently configured observation
+/// source. It is not derived from the configured repository URL.
+pub const DEFAULT_ALLPACKAGES_FEED_ENDPOINT: &str = "https://ppm.r-pkg.org/ALLPACKAGES.zst";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CranMetadataConfig {
+    pub repository_endpoint: Box<str>,
+    pub allpackages_feed_endpoint: Box<str>,
+    pub refresh_metadata: bool,
+    /// ALLPACKAGES historical rows have no CRAN publication date. They are
+    /// valid only for resolutions without a publication cutoff.
+    pub allow_allpackages_history: bool,
+}
+
+impl CranMetadataConfig {
+    pub fn new(
+        repository_endpoint: impl Into<Box<str>>,
+        allpackages_feed_endpoint: impl Into<Box<str>>,
+    ) -> Self {
+        Self {
+            repository_endpoint: repository_endpoint.into(),
+            allpackages_feed_endpoint: allpackages_feed_endpoint.into(),
+            refresh_metadata: false,
+            allow_allpackages_history: true,
+        }
+    }
+
+    pub fn for_repository(repository_endpoint: impl Into<Box<str>>) -> Self {
+        Self::new(repository_endpoint, DEFAULT_ALLPACKAGES_FEED_ENDPOINT)
+    }
+
+    pub fn with_refresh_metadata(mut self) -> Self {
+        self.refresh_metadata = true;
+        self
+    }
+
+    /// Disable bulk historical candidates for a dated/publication-cutoff
+    /// resolution. The package-local archive source carries dated evidence
+    /// and remains authoritative for that policy.
+    pub fn without_allpackages_history(mut self) -> Self {
+        self.allow_allpackages_history = false;
+        self
+    }
+}
 
 /// Clock and compatibility policy used by the CRAN snapshot reuse boundary.
 /// Supplying an explicit timestamp keeps this decision deterministic in tests
@@ -144,27 +194,32 @@ pub const DEFAULT_COMPATIBLE_GENERATION_TTL: Duration = Duration::from_secs(60 *
 #[derive(Clone, Debug)]
 pub struct CranSnapshotCachePolicy {
     pub now: jiff::Timestamp,
-    pub fallback_ttl: Duration,
     pub compatibility_profile: u32,
     pub parser_schema: u32,
     pub normalization_policy: u32,
     pub expected_endpoint: Option<Box<str>>,
+    pub refresh_metadata: bool,
 }
 
 impl CranSnapshotCachePolicy {
     pub fn at(now: jiff::Timestamp) -> Self {
         Self {
             now,
-            fallback_ttl: DEFAULT_COMPATIBLE_GENERATION_TTL,
             compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
             parser_schema: CRAN_PARSER_SCHEMA,
             normalization_policy: CRAN_NORMALIZATION_POLICY,
             expected_endpoint: None,
+            refresh_metadata: false,
         }
     }
 
     pub fn with_expected_endpoint(mut self, endpoint: impl AsRef<str>) -> Self {
         self.expected_endpoint = Some(endpoint.as_ref().trim_end_matches('/').to_owned().into());
+        self
+    }
+
+    pub fn with_refresh_metadata(mut self) -> Self {
+        self.refresh_metadata = true;
         self
     }
 }
@@ -384,9 +439,11 @@ pub fn inspect_cran_snapshot_cache(
         });
     }
     let age_seconds = u64::try_from(oldest_source_age).unwrap_or(u64::MAX);
-    let fresh = endpoint_provenance_matches
+    let fresh = !policy.refresh_metadata
+        && endpoint_provenance_matches
         && !future_source
-        && oldest_source_age <= i64::try_from(policy.fallback_ttl.as_secs()).unwrap_or(i64::MAX);
+        && oldest_source_age
+            <= i64::try_from(DEFAULT_COMPATIBLE_GENERATION_TTL.as_secs()).unwrap_or(i64::MAX);
     let status = if fresh {
         CranSnapshotCacheStatus::Fresh
     } else {
@@ -985,14 +1042,78 @@ impl CranCandidateSnapshot {
 /// the resolver-facing snapshot once refresh returns it.
 struct CranRefreshSession<T> {
     base_url: Box<str>,
+    allpackages_feed_endpoint: Box<str>,
+    refresh_metadata: bool,
+    allow_allpackages_history: bool,
     transport: Rc<T>,
     raw_cache: Option<RawCache>,
     test_now: Option<jiff::Timestamp>,
     current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
+    current_surface_digest: Option<Box<str>>,
     history: Option<Result<HistorySource, CandidateLoadError>>,
+    history_surface_digest: Option<Box<str>>,
+    allpackages: Option<Result<Rc<AllPackagesSource>, CandidateLoadError>>,
     packages: HashMap<PackageName, Result<CandidateLoadResult, CandidateLoadError>>,
     diagnostics: Vec<CranRefreshDiagnostic>,
     evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
+}
+
+#[derive(Clone)]
+struct AllPackagesSource {
+    projection: Rc<allpackages::IndexedProjection>,
+    source: crate::snapshot::SourceInput,
+}
+
+struct BulkCandidateResult {
+    candidates: CandidateLoadResult,
+    needs_archive_fallback: bool,
+}
+
+fn catalog_surface_digest(catalog: &CranCatalog) -> Box<str> {
+    let mut digest = Sha256::new();
+    for (package, releases) in catalog.packages() {
+        digest.update(package.as_str().as_bytes());
+        digest.update([0]);
+        for release in releases {
+            digest.update(release.version().to_string().as_bytes());
+            digest.update([0]);
+            digest.update(release.metadata_digest().to_string().as_bytes());
+            digest.update([0]);
+        }
+    }
+    hex_digest(digest.finalize())
+}
+
+fn history_surface_digest(entries: &[ArchiveEntry]) -> Box<str> {
+    let mut rows = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                entry.package(),
+                entry.version(),
+                entry.source_archive_relative_path(),
+                entry.size(),
+                entry.mtime()
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let mut digest = Sha256::new();
+    for row in rows {
+        digest.update(row.as_bytes());
+        digest.update([0]);
+    }
+    hex_digest(digest.finalize())
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> Box<str> {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        .into_boxed_str()
 }
 
 #[derive(Clone)]
@@ -1162,23 +1283,32 @@ impl CurrentBody {
 }
 
 impl<T: Transport> CranRefreshSession<T> {
-    fn new(transport: Rc<T>, base_url: impl AsRef<str>) -> Self {
-        Self::new_with_clock(transport, base_url, None, None)
+    fn new(transport: Rc<T>, config: CranMetadataConfig) -> Self {
+        Self::new_with_clock(transport, config, None, None)
     }
 
     fn new_with_clock(
         transport: Rc<T>,
-        base_url: impl AsRef<str>,
+        config: CranMetadataConfig,
         test_now: Option<jiff::Timestamp>,
         raw_cache: Option<RawCache>,
     ) -> Self {
         Self {
-            base_url: base_url.as_ref().trim_end_matches('/').into(),
+            base_url: config.repository_endpoint.trim_end_matches('/').into(),
+            allpackages_feed_endpoint: config
+                .allpackages_feed_endpoint
+                .trim_end_matches('/')
+                .into(),
+            refresh_metadata: config.refresh_metadata,
+            allow_allpackages_history: config.allow_allpackages_history,
             transport,
             raw_cache,
             test_now,
             current: None,
+            current_surface_digest: None,
             history: None,
+            history_surface_digest: None,
+            allpackages: None,
             packages: HashMap::new(),
             diagnostics: Vec::new(),
             evidence: Rc::new(RefCell::new(Vec::new())),
@@ -1206,13 +1336,13 @@ impl<T: Transport> CranRefreshSession<T> {
         representation: RawCacheRepresentation,
         source_kind: &str,
         source_representation: &str,
-        parse: P,
+        mut parse: P,
     ) -> Result<
         (V, crate::snapshot::SourceInput, MetadataAcquisitionOutcome),
         MetadataAcquisitionFailure,
     >
     where
-        P: Fn(&[u8]) -> Result<V, MetadataParseFailure>,
+        P: FnMut(&[u8]) -> Result<V, MetadataParseFailure>,
     {
         let cache_key = self
             .raw_cache
@@ -1233,7 +1363,9 @@ impl<T: Transport> CranRefreshSession<T> {
                         &entry.cache_control,
                         DEFAULT_COMPATIBLE_GENERATION_TTL,
                     );
-                    if permits_reuse(self.now(), entry.validated_at, policy) {
+                    if !self.refresh_metadata
+                        && permits_reuse(self.now(), entry.validated_at, policy)
+                    {
                         candidate = Some(CurrentBody::from_cache(entry));
                         origin = Some(CurrentBodyOrigin::Cached);
                     } else {
@@ -1460,7 +1592,9 @@ impl<T: Transport> CranRefreshSession<T> {
                             &entry.cache_control,
                             DEFAULT_COMPATIBLE_GENERATION_TTL,
                         );
-                        if permits_reuse(self.now(), entry.validated_at, policy) {
+                        if !self.refresh_metadata
+                            && permits_reuse(self.now(), entry.validated_at, policy)
+                        {
                             candidate = Some(CurrentBody::from_cache(entry));
                             origin = Some(CurrentBodyOrigin::Cached);
                         } else {
@@ -1678,6 +1812,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     status_detail: CranFastPathStatus::Available,
                     source: CranRefreshSource::CurrentIndex(representation),
                 });
+                self.current_surface_digest = Some(catalog_surface_digest(&catalog));
                 let catalog = Rc::new(catalog);
                 self.current = Some(Ok(Rc::clone(&catalog)));
                 return Ok(catalog);
@@ -1748,8 +1883,10 @@ impl<T: Transport> CranRefreshSession<T> {
                         ),
                     );
                 }
+                let entries: Rc<[ArchiveEntry]> = Rc::from(projection.entries.into_boxed_slice());
+                self.history_surface_digest = Some(history_surface_digest(&entries));
                 Ok(HistorySource::Available {
-                    entries: Rc::from(projection.entries.into_boxed_slice()),
+                    entries,
                     rejections: Rc::from(projection.rejections.into_boxed_slice()),
                 })
             }
@@ -1804,6 +1941,463 @@ impl<T: Transport> CranRefreshSession<T> {
         });
     }
 
+    fn push_allpackages_diagnostic(&mut self, status: Option<u16>, diagnostic: String) {
+        self.diagnostics.push(CranRefreshDiagnostic {
+            endpoint: self.allpackages_feed_endpoint.clone(),
+            status,
+            status_detail: CranFastPathStatus::Invalid {
+                status: status.unwrap_or_default(),
+                diagnostic: diagnostic.into_boxed_str(),
+            },
+            source: CranRefreshSource::AllPackages,
+        });
+    }
+
+    /// Acquire the independently configured bulk observation feed. Its rows
+    /// remain observations until they are bound to the target repository's
+    /// current/archive surface.
+    fn ensure_allpackages(&mut self) -> Result<Rc<AllPackagesSource>, CandidateLoadError> {
+        if let Some(result) = &self.allpackages {
+            return result.clone();
+        }
+        if self.raw_cache.is_none() {
+            let error = CandidateLoadError::new(
+                CandidateLoadErrorCategory::TransportFailure,
+                "ALLPACKAGES projection cache is not prepared",
+            );
+            self.push_allpackages_diagnostic(None, error.diagnostic().to_string());
+            self.allpackages = Some(Err(error.clone()));
+            return Err(error);
+        }
+        if self.allpackages_feed_endpoint.is_empty() {
+            let error = CandidateLoadError::new(
+                CandidateLoadErrorCategory::TransportFailure,
+                "ALLPACKAGES feed endpoint is not configured",
+            );
+            self.push_allpackages_diagnostic(None, error.diagnostic().to_string());
+            self.allpackages = Some(Err(error.clone()));
+            return Err(error);
+        }
+        let current_catalog = self.ensure_current()?;
+        self.ensure_history()?;
+        let endpoint = self.allpackages_feed_endpoint.to_string();
+        let qualification_path = self.raw_cache.as_ref().map(RawCache::qualification_path);
+        let current_digest = self.current_surface_digest.clone().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                "current surface digest is unavailable for ALLPACKAGES qualification",
+            )
+        })?;
+        let archive_digest = self.history_surface_digest.clone().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                "archive surface digest is unavailable for ALLPACKAGES qualification",
+            )
+        })?;
+        let persisted_qualification = match qualification_path.as_deref() {
+            Some(path) => match qualification::load_result(path) {
+                Ok(record) => record,
+                Err(error) => {
+                    let diagnostic = format!("invalid ALLPACKAGES qualification: {error}");
+                    self.push_allpackages_diagnostic(None, diagnostic.clone());
+                    if let Err(remove_error) = std::fs::remove_file(path) {
+                        let error = CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!(
+                                "{diagnostic}; unable to remove invalid qualification: {remove_error}"
+                            ),
+                        );
+                        self.push_allpackages_diagnostic(None, error.diagnostic().to_string());
+                        self.allpackages = Some(Err(error.clone()));
+                        return Err(error);
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(record) = persisted_qualification.as_ref()
+            && qualification::matches(
+                record,
+                &self.base_url,
+                &endpoint,
+                &current_digest,
+                &archive_digest,
+                None,
+            )
+            && !self.refresh_metadata
+            && record.status != qualification::Status::Positive
+            && record
+                .next_probe_at
+                .as_deref()
+                .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+                .is_some_and(|next| self.now() < next)
+        {
+            let error = CandidateLoadError::new(
+                CandidateLoadErrorCategory::TransportFailure,
+                format!(
+                    "ALLPACKAGES qualification is {:?} until {}",
+                    record.status,
+                    record.next_probe_at.as_deref().unwrap_or("unknown")
+                ),
+            );
+            self.push_allpackages_diagnostic(None, error.diagnostic().to_string());
+            self.allpackages = Some(Err(error.clone()));
+            return Err(error);
+        }
+        let projection_cache = self.raw_cache.as_ref();
+        let result = match self.acquire_metadata(
+            &endpoint,
+            RawCacheRepresentation::AllPackagesZstd,
+            "cran-allpackages",
+            "zstd",
+            |body| {
+                let projection_path = projection_cache.and_then(|cache| {
+                    cache
+                        .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
+                        .ok()
+                        .map(|key| cache.projection_path(&key, body))
+                });
+                let Some(path) = projection_path.as_deref() else {
+                    return Err(MetadataParseFailure::Invalid(
+                        "ALLPACKAGES projection cache is unavailable".into(),
+                    ));
+                };
+                match allpackages::load_or_build_projection(body, path) {
+                    Ok(projection) => Ok(projection),
+                    Err(error) => {
+                        // Keep this refresh fail-closed, but remove only the
+                        // content-addressed derived file so the next refresh
+                        // can safely rebuild it from the validated raw body.
+                        let _ = std::fs::remove_file(path);
+                        Err(MetadataParseFailure::NoFallback(error.into()))
+                    }
+                }
+            },
+        ) {
+            Ok((projection, source, outcome)) => {
+                let feed_digest = hex_digest(source.content_sha256).to_string();
+                let coverage = projection
+                    .classify_current(&current_catalog)
+                    .map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("invalid ALLPACKAGES coverage projection: {error}"),
+                        )
+                    })?;
+                let (mirror_positive, canonical_current_digest, canonical_archive_digest) =
+                    if self.base_url.as_ref() == "https://cloud.r-project.org" {
+                        // The built-in anchor is immutable by construction;
+                        // avoid re-fetching it solely to qualify itself.
+                        (true, current_digest.clone(), archive_digest.clone())
+                    } else if let Some(record) = qualification_path
+                        .as_deref()
+                        .and_then(qualification::load)
+                        .filter(|record| {
+                            !self.refresh_metadata
+                                && qualification::matches(
+                                    record,
+                                    &self.base_url,
+                                    &endpoint,
+                                    &current_digest,
+                                    &archive_digest,
+                                    Some(&feed_digest),
+                                )
+                                && record.status == qualification::Status::Positive
+                                && qualification::positive_reusable(record, self.now())
+                        })
+                    {
+                        (
+                            true,
+                            record.canonical_current_digest.into(),
+                            record.canonical_archive_digest.into(),
+                        )
+                    } else {
+                        self.custom_surface_matches_canonical()?
+                    };
+                if !mirror_positive {
+                    if let Some(path) = qualification_path.as_deref() {
+                        let previous = qualification::load(path);
+                        let failure_count =
+                            previous.map_or(1, |record| record.failure_count.saturating_add(1));
+                        qualification::publish(
+                            path,
+                            &qualification::Record {
+                                version: 1,
+                                repository_endpoint: self.base_url.to_string(),
+                                feed_endpoint: endpoint.clone(),
+                                current_digest: current_digest.to_string(),
+                                archive_digest: archive_digest.to_string(),
+                                feed_digest: feed_digest.clone(),
+                                feed_etag: source.etag.clone(),
+                                feed_last_modified: source.last_modified.clone(),
+                                canonical_current_digest: canonical_current_digest.to_string(),
+                                canonical_archive_digest: canonical_archive_digest.to_string(),
+                                coverage_status: coverage.status,
+                                covered_count: coverage.covered_count,
+                                gapped_count: coverage.gapped_count,
+                                conflicting_count: coverage.conflicting_count,
+                                coverage_digest: coverage.digest.clone(),
+                                compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+                                parser_schema: CRAN_PARSER_SCHEMA,
+                                normalization_policy: CRAN_NORMALIZATION_POLICY,
+                                status: qualification::Status::Negative,
+                                diagnostic:
+                                    "configured repository does not match canonical CRAN surface"
+                                        .into(),
+                                failure_count,
+                                next_probe_at: Some(
+                                    (self.now() + jiff::SignedDuration::from_hours(6))
+                                        .strftime("%Y-%m-%dT%H:%M:%SZ")
+                                        .to_string(),
+                                ),
+                                validated_at: self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                ..qualification::Record::default()
+                            },
+                        )
+                        .map_err(|error| {
+                            CandidateLoadError::new(
+                                CandidateLoadErrorCategory::SnapshotInvalid,
+                                format!("unable to persist ALLPACKAGES qualification: {error}"),
+                            )
+                        })?;
+                    }
+                    let error = CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        "configured CRAN endpoint does not match canonical CRAN surface",
+                    );
+                    self.push_allpackages_diagnostic(None, error.diagnostic().to_string());
+                    return Err(error);
+                }
+                let validated_at = qualification_path
+                    .as_deref()
+                    .and_then(qualification::load)
+                    .filter(|record| {
+                        !self.refresh_metadata
+                            && record.status == qualification::Status::Positive
+                            && qualification::matches(
+                                record,
+                                &self.base_url,
+                                &endpoint,
+                                &current_digest,
+                                &archive_digest,
+                                Some(&feed_digest),
+                            )
+                            && qualification::positive_reusable(record, self.now())
+                    })
+                    .map(|record| record.validated_at)
+                    .unwrap_or_else(|| self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string());
+                if let Some(path) = qualification_path.as_deref() {
+                    qualification::publish(
+                        path,
+                        &qualification::Record {
+                            version: 1,
+                            repository_endpoint: self.base_url.to_string(),
+                            feed_endpoint: endpoint.clone(),
+                            current_digest: current_digest.to_string(),
+                            archive_digest: archive_digest.to_string(),
+                            feed_digest: feed_digest.clone(),
+                            feed_etag: source.etag.clone(),
+                            feed_last_modified: source.last_modified.clone(),
+                            canonical_current_digest: canonical_current_digest.to_string(),
+                            canonical_archive_digest: canonical_archive_digest.to_string(),
+                            coverage_status: coverage.status,
+                            covered_count: coverage.covered_count,
+                            gapped_count: coverage.gapped_count,
+                            conflicting_count: coverage.conflicting_count,
+                            coverage_digest: coverage.digest.clone(),
+                            compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+                            parser_schema: CRAN_PARSER_SCHEMA,
+                            normalization_policy: CRAN_NORMALIZATION_POLICY,
+                            status: qualification::Status::Positive,
+                            diagnostic: "repository surface qualified as CRAN mirror".into(),
+                            failure_count: 0,
+                            next_probe_at: None,
+                            validated_at,
+                            ..qualification::Record::default()
+                        },
+                    )
+                    .map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("unable to persist ALLPACKAGES qualification: {error}"),
+                        )
+                    })?;
+                }
+                let status = match outcome {
+                    MetadataAcquisitionOutcome::Revalidated304 => 304,
+                    MetadataAcquisitionOutcome::Cached | MetadataAcquisitionOutcome::Network200 => {
+                        200
+                    }
+                };
+                let detail = CranFastPathStatus::Available;
+                self.diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: Some(status),
+                    status_detail: detail,
+                    source: CranRefreshSource::AllPackages,
+                });
+                Ok(Rc::new(AllPackagesSource {
+                    projection: Rc::new(projection),
+                    source,
+                }))
+            }
+            Err(error) if matches!(error.status, Some(404 | 410)) => {
+                let status = error.status.expect("matched status");
+                if let Some(path) = qualification_path.as_deref() {
+                    let failure_count = qualification::load(path)
+                        .map_or(1, |record| record.failure_count.saturating_add(1));
+                    qualification::publish(
+                        path,
+                        &qualification::Record {
+                            version: 1,
+                            repository_endpoint: self.base_url.to_string(),
+                            feed_endpoint: endpoint.clone(),
+                            current_digest: current_digest.to_string(),
+                            archive_digest: archive_digest.to_string(),
+                            feed_digest: String::new(),
+                            compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+                            parser_schema: CRAN_PARSER_SCHEMA,
+                            normalization_policy: CRAN_NORMALIZATION_POLICY,
+                            status: qualification::Status::Negative,
+                            diagnostic: error.diagnostic.to_string(),
+                            failure_count,
+                            next_probe_at: Some(
+                                (self.now() + jiff::SignedDuration::from_hours(6))
+                                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
+                            ),
+                            validated_at: self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                            ..qualification::Record::default()
+                        },
+                    )
+                    .map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("unable to persist ALLPACKAGES qualification: {error}"),
+                        )
+                    })?;
+                }
+                self.diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: Some(status),
+                    status_detail: CranFastPathStatus::Unsupported { status },
+                    source: CranRefreshSource::AllPackages,
+                });
+                Err(error.into_candidate())
+            }
+            Err(error) => {
+                if let Some(path) = qualification_path.as_deref() {
+                    let previous = qualification::load(path);
+                    let failure_count =
+                        previous.map_or(1, |record| record.failure_count.saturating_add(1));
+                    let status = if matches!(error.status, Some(404 | 410)) {
+                        qualification::Status::Negative
+                    } else {
+                        qualification::Status::Unknown
+                    };
+                    qualification::publish(
+                        path,
+                        &qualification::Record {
+                            version: 1,
+                            repository_endpoint: self.base_url.to_string(),
+                            feed_endpoint: endpoint.clone(),
+                            current_digest: current_digest.to_string(),
+                            archive_digest: archive_digest.to_string(),
+                            feed_digest: String::new(),
+                            compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+                            parser_schema: CRAN_PARSER_SCHEMA,
+                            normalization_policy: CRAN_NORMALIZATION_POLICY,
+                            status,
+                            diagnostic: error.diagnostic.to_string(),
+                            failure_count,
+                            next_probe_at: Some(
+                                (self.now()
+                                    + jiff::SignedDuration::from_secs(
+                                        (60_i64 * 2_i64.pow(failure_count.min(8))).min(6 * 60 * 60),
+                                    ))
+                                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                                .to_string(),
+                            ),
+                            validated_at: self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                            ..qualification::Record::default()
+                        },
+                    )
+                    .map_err(|persist_error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("unable to persist ALLPACKAGES qualification: {persist_error}"),
+                        )
+                    })?;
+                }
+                self.diagnostics.push(CranRefreshDiagnostic {
+                    endpoint: endpoint.clone().into_boxed_str(),
+                    status: error.status,
+                    status_detail: CranFastPathStatus::Invalid {
+                        status: error.status.unwrap_or_default(),
+                        diagnostic: error.diagnostic.clone(),
+                    },
+                    source: CranRefreshSource::AllPackages,
+                });
+                Err(error.into_candidate())
+            }
+        };
+        self.allpackages = Some(result.clone());
+        result
+    }
+
+    fn custom_surface_matches_canonical(
+        &mut self,
+    ) -> Result<(bool, Box<str>, Box<str>), CandidateLoadError> {
+        let current_endpoint = "https://cloud.r-project.org/src/contrib/PACKAGES.rds";
+        let (canonical_current, _, _) = self
+            .acquire_metadata(
+                current_endpoint,
+                RawCacheRepresentation::CurrentRds,
+                "cran-canonical-current",
+                "rds",
+                |body| {
+                    Self::parse_current_body(CranCurrentIndexRepresentation::Rds, body)
+                        .map(|(catalog, _)| catalog)
+                        .map_err(|error| MetadataParseFailure::Invalid(error.into()))
+                },
+            )
+            .map_err(MetadataAcquisitionFailure::into_candidate)?;
+        let history_endpoint = "https://cloud.r-project.org/src/contrib/Meta/archive.rds";
+        let (canonical_history, _, _) = self
+            .acquire_metadata(
+                history_endpoint,
+                RawCacheRepresentation::ArchiveHistoryRds,
+                "cran-canonical-history",
+                "rds",
+                |body| {
+                    enumerate_archive_rds_for_provider(body)
+                        .map_err(|error| MetadataParseFailure::Invalid(error.to_string().into()))
+                },
+            )
+            .map_err(MetadataAcquisitionFailure::into_candidate)?;
+        let target_current = self.current_surface_digest.as_deref().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                "target current surface digest is unavailable",
+            )
+        })?;
+        let target_history = self.history_surface_digest.as_deref().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                "target archive surface digest is unavailable",
+            )
+        })?;
+        let canonical_current_digest = catalog_surface_digest(&canonical_current);
+        let canonical_history_digest = history_surface_digest(&canonical_history.entries);
+        Ok((
+            target_current == canonical_current_digest.as_ref()
+                && target_history == canonical_history_digest.as_ref(),
+            canonical_current_digest,
+            canonical_history_digest,
+        ))
+    }
+
     fn refresh_package(
         &mut self,
         package: &PackageName,
@@ -1816,11 +2410,127 @@ impl<T: Transport> CranRefreshSession<T> {
         result
     }
 
+    /// Projects eligible ALLPACKAGES observations for one package. Rows that
+    /// cannot be proven complete or uniquely bound remain eligible for the
+    /// package-local RDS/tarball fallback while valid occurrences stay in the
+    /// bulk result.
+    fn bulk_candidates_for_package(
+        &mut self,
+        package: &PackageName,
+        current: &[PackageRelease],
+        bulk: &AllPackagesSource,
+    ) -> Result<Option<BulkCandidateResult>, CandidateLoadError> {
+        let history = match self.ensure_history()? {
+            HistorySource::Available { entries, .. } => entries,
+            HistorySource::Absent => return Ok(None),
+        };
+        let package_projection =
+            bulk.projection
+                .observations(package.as_str())
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        format!("invalid ALLPACKAGES package projection for {package}: {error}"),
+                    )
+                })?;
+        let package_rows = package_projection
+            .observations
+            .iter()
+            .filter(|row| row.package() == package)
+            .collect::<Vec<_>>();
+        let package_rejections = package_projection
+            .rejections
+            .iter()
+            .filter(|rejection| rejection.package() == Some(package))
+            .collect::<Vec<_>>();
+        let package_entries = history
+            .iter()
+            .filter(|entry| entry.package() == package)
+            .collect::<Vec<_>>();
+        let identity_conflict = |version: &rsolve_core::RPackageVersion| {
+            package_rejections
+                .iter()
+                .any(|rejection| rejection.version() == Some(version))
+        };
+        let row_for_version = |version: &rsolve_core::RPackageVersion| {
+            package_rows
+                .iter()
+                .filter(|row| row.release().version() == version)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+
+        let mut releases = current.to_vec();
+        let mut needs_archive_fallback = false;
+        for entry in &package_entries {
+            // The archive index may repeat the target repository's current
+            // release. The current PACKAGES surface is authoritative for that
+            // identity; requiring a second ALLPACKAGES occurrence would turn
+            // an otherwise usable current-gapped feed into a false fallback.
+            if current
+                .iter()
+                .any(|release| release.version() == entry.version())
+            {
+                continue;
+            }
+            if identity_conflict(entry.version()) {
+                needs_archive_fallback = true;
+                continue;
+            }
+            let rows = row_for_version(entry.version());
+            if rows.len() != 1 || !allpackages::binds_archive_occurrence(rows[0], entry) {
+                needs_archive_fallback = true;
+                continue;
+            }
+            let row = rows[0];
+            releases.push(row.release().clone());
+            let locator = format!(
+                "{}/src/contrib/Archive/{}",
+                self.base_url,
+                entry.source_archive_relative_path()
+            );
+            self.evidence
+                .borrow_mut()
+                .push(allpackages_record_to_evidence(
+                    row,
+                    bulk.source.clone(),
+                    locator,
+                    entry.size(),
+                ));
+        }
+        let mut aggregation = ReleaseAggregation::new();
+        for release in releases {
+            if aggregation.observe_release(release).is_err() {
+                needs_archive_fallback = true;
+            }
+        }
+        let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.version().cmp(right.version()));
+        Ok(Some(BulkCandidateResult {
+            candidates: CandidateLoadResult::new(candidates, Vec::new()),
+            needs_archive_fallback,
+        }))
+    }
+
     fn refresh_package_uncached(
         &mut self,
         package: &PackageName,
     ) -> Result<CandidateLoadResult, CandidateLoadError> {
         let current = self.ensure_current()?.candidates(package).to_vec();
+        let bulk_candidates = if self.allow_allpackages_history {
+            match self.ensure_allpackages() {
+                Ok(bulk) => match self.bulk_candidates_for_package(package, &current, &bulk)? {
+                    Some(result) if !result.needs_archive_fallback => {
+                        return Ok(result.candidates);
+                    }
+                    Some(result) => Some(result.candidates),
+                    None => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let endpoint = format!(
             "{}/src/contrib/Archive/{}/PACKAGES.rds",
             self.base_url,
@@ -1975,6 +2685,11 @@ impl<T: Transport> CranRefreshSession<T> {
         let mut aggregation = ReleaseAggregation::new();
         for release in current
             .into_iter()
+            .chain(
+                bulk_candidates
+                    .into_iter()
+                    .flat_map(|result| result.candidates().to_vec()),
+            )
             .chain(archived.candidates().iter().cloned())
         {
             aggregation.observe_release(release).map_err(|error| {
