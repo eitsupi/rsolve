@@ -693,7 +693,7 @@ fn publication_cutoff_disables_allpackages_history_and_uses_archive_index() {
 }
 
 #[test]
-fn allpackages_missing_historical_occurrence_uses_one_package_archive_fallback() {
+fn allpackages_missing_historical_occurrence_uses_exclusive_package_local_history() {
     let (directory, store) = store();
     let entries = matrix_history_entries();
     let missing_index = entries
@@ -722,6 +722,12 @@ fn allpackages_missing_historical_occurrence_uses_one_package_archive_fallback()
         result
             .candidates()
             .iter()
+            .any(|release| release.version().to_string() == "1.7-6")
+    );
+    assert!(
+        !result
+            .candidates()
+            .iter()
             .any(|release| release.version().to_string() == "1.7-0")
     );
     assert_eq!(
@@ -733,17 +739,26 @@ fn allpackages_missing_historical_occurrence_uses_one_package_archive_fallback()
             .count(),
         1
     );
+    assert!(
+        !session
+            .evidence
+            .borrow()
+            .iter()
+            .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
+    );
     drop(directory);
 }
 
 #[test]
-fn allpackages_duplicate_historical_occurrence_selectively_falls_back() {
+fn allpackages_duplicate_occurrence_uses_exclusive_package_local_history() {
     let (directory, store) = store();
     let entries = matrix_history_entries();
     let mut transport = allpackages_transport(allpackages_duplicate_fixture_body(&entries), true);
     transport.responses.insert(
         "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds".into(),
-        TransportResponse::new(200, EMPTY_FAST.to_vec()),
+        // The package-local index supplies the complete canonical history;
+        // no bulk sibling is mixed with it after the duplicate occurrence.
+        TransportResponse::new(200, FAST.to_vec()),
     );
     let requests = transport.requests.clone();
     let mut session = CranRefreshSession::new_with_clock(
@@ -761,6 +776,12 @@ fn allpackages_duplicate_historical_occurrence_selectively_falls_back() {
             .iter()
             .any(|release| release.version().to_string() == "1.6-5")
     );
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|release| release.version().to_string() == "1.7-0")
+    );
     assert_eq!(
         requests
             .borrow()
@@ -769,6 +790,112 @@ fn allpackages_duplicate_historical_occurrence_selectively_falls_back() {
                 == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
             .count(),
         1
+    );
+    assert!(
+        !session
+            .evidence
+            .borrow()
+            .iter()
+            .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
+    );
+    drop(directory);
+}
+
+#[test]
+fn allpackages_archive_history_rejection_forces_package_local_history() {
+    let (directory, store) = store();
+    let feed = raw_zstd(
+        b"Package: dse\nVersion: 1.0\nLicense: BSD-3-Clause\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSHA256Original: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nSnapshot: 2026-08-01\nDownloadURL: https://packagemanager.posit.co/cran/2026-08-01/src/contrib/dse_1.0.tar.gz\n\n",
+    );
+    let mut transport = allpackages_transport(feed, true);
+    transport.responses.insert(
+        history_url(),
+        TransportResponse::new(200, LEGACY_VERSION_HISTORY.to_vec()),
+    );
+    transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Archive/dse/PACKAGES.rds".into(),
+        TransportResponse::new(200, EMPTY_FAST.to_vec()),
+    );
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session
+        .refresh_package(&PackageName::new("dse").unwrap())
+        .unwrap();
+    assert!(result.candidates().is_empty());
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/dse/PACKAGES.rds")
+            .count(),
+        1
+    );
+    assert!(
+        !session
+            .evidence
+            .borrow()
+            .iter()
+            .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
+    );
+    drop(directory);
+}
+
+#[test]
+fn allpackages_extra_historical_identity_forces_package_local_history() {
+    let (directory, store) = store();
+    let entries = matrix_history_entries();
+    let mut dcf = String::from_utf8(
+        crate::cran::provider::allpackages::decode_zstd(&allpackages_fixture_body(
+            &entries, true, None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    dcf.push_str(
+        "Package: Matrix\nVersion: 9.9-9\nLicense: BSD-3-Clause\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSHA256Original: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nSnapshot: 2026-08-01\nDownloadURL: https://packagemanager.posit.co/cran/2026-08-01/src/contrib/Matrix_9.9-9.tar.gz\n\n",
+    );
+    let mut transport = allpackages_transport(raw_zstd(dcf.as_bytes()), true);
+    transport.responses.insert(
+        "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds".into(),
+        TransportResponse::new(200, FAST.to_vec()),
+    );
+    let requests = transport.requests.clone();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let result = session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|release| release.version().to_string() == "1.7-0")
+    );
+    assert_eq!(
+        requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url
+                == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds")
+            .count(),
+        1
+    );
+    assert!(
+        !session
+            .evidence
+            .borrow()
+            .iter()
+            .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
     );
     drop(directory);
 }
@@ -807,11 +934,18 @@ fn mixed_semantic_archive_index() -> Vec<u8> {
     GzDecoder::new(FAST).read_to_end(&mut decoded).unwrap();
     let original = b"R (>= 3.5.0)";
     let replacement = b"libxml (>= )";
-    let position = decoded
+    let mut offset = 0;
+    let mut replaced = 0;
+    while let Some(relative) = decoded[offset..]
         .windows(original.len())
         .position(|window| window == original)
-        .expect("fixture dependency");
-    decoded[position..position + original.len()].copy_from_slice(replacement);
+    {
+        let position = offset + relative;
+        decoded[position..position + original.len()].copy_from_slice(replacement);
+        offset = position + replacement.len();
+        replaced += 1;
+    }
+    assert!(replaced > 0);
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&decoded).unwrap();
     encoder.finish().unwrap()

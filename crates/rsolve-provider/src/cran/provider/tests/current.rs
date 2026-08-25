@@ -165,7 +165,7 @@ fn refresher_preserves_publication_cutoff_history_policy() {
 }
 
 #[test]
-fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
+fn current_index_is_authoritative_over_same_identity_archive_metadata() {
     let consistent = b"Package: Matrix\nVersion: 1.7-0\nDepends: R (>= 4.4.0)\nImports: methods\nLicense: RSOLVE Fictional Terms Matrix\nNeedsCompilation: yes\n";
     let transport = session_transport(
         TransportResponse {
@@ -191,14 +191,19 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
     let snapshot = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
         .unwrap();
+    let releases = snapshot
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(releases.len(), 2);
     assert_eq!(
-        snapshot
-            .releases(&SolverKey::InstalledName(
-                PackageName::new("Matrix").unwrap()
-            ))
-            .unwrap()
-            .len(),
-        2
+        releases
+            .iter()
+            .find(|release| release.version().to_string() == "1.7-0")
+            .and_then(|release| release.metadata().fields().get("License"))
+            .map(String::as_str),
+        Some("RSOLVE Fictional Terms Matrix")
     );
 
     let conflicting = b"Package: Matrix\nVersion: 1.7-0\nDepends: R (>= 4.4.0)\nImports: methods\nLicense: conflicting\nNeedsCompilation: yes\n";
@@ -223,17 +228,22 @@ fn current_and_archive_same_identity_merge_or_fail_on_metadata_conflict() {
         Rc::new(transport),
         CranMetadataConfig::new("https://cran.invalid", ""),
     );
-    let error = session
+    let snapshot = session
         .refresh_packages(&[PackageName::new("Matrix").unwrap()])
-        .unwrap_err();
+        .unwrap();
+    let releases = snapshot
+        .releases(&SolverKey::InstalledName(
+            PackageName::new("Matrix").unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(releases.len(), 2);
     assert_eq!(
-        error.category(),
-        CandidateLoadErrorCategory::MetadataInvalid
-    );
-    assert!(
-        error
-            .diagnostic()
-            .contains("conflicting CRAN release metadata")
+        releases
+            .iter()
+            .find(|release| release.version().to_string() == "1.7-0")
+            .and_then(|release| release.metadata().fields().get("License"))
+            .map(String::as_str),
+        Some("conflicting")
     );
 }
 

@@ -1088,7 +1088,7 @@ struct AllPackagesSource {
 
 struct BulkCandidateResult {
     candidates: CandidateLoadResult,
-    needs_archive_fallback: bool,
+    evidence: Vec<CranEvidenceObservation>,
 }
 
 fn catalog_surface_digest(catalog: &CranCatalog) -> Box<str> {
@@ -2432,10 +2432,13 @@ impl<T: Transport> CranRefreshSession<T> {
         result
     }
 
-    /// Projects eligible ALLPACKAGES observations for one package. Rows that
-    /// cannot be proven complete or uniquely bound remain eligible for the
-    /// package-local RDS/tarball fallback while valid occurrences stay in the
-    /// bulk result.
+    /// Projects the complete ALLPACKAGES history for one package.
+    ///
+    /// The result is deliberately package-granular: a single rejected or
+    /// unbound archive identity makes the whole historical source fall back to
+    /// the package-local archive. This prevents two presentations of one
+    /// release from entering the same aggregation while retaining the current
+    /// catalog as the sole authority for current identities.
     fn bulk_candidates_for_package(
         &mut self,
         package: &PackageName,
@@ -2443,7 +2446,18 @@ impl<T: Transport> CranRefreshSession<T> {
         bulk: &AllPackagesSource,
     ) -> Result<Option<BulkCandidateResult>, CandidateLoadError> {
         let history = match self.ensure_history()? {
-            HistorySource::Available { entries, .. } => entries,
+            HistorySource::Available {
+                entries,
+                rejections,
+            } => {
+                if rejections
+                    .iter()
+                    .any(|rejection| rejection.package_hint() == package)
+                {
+                    return Ok(None);
+                }
+                entries
+            }
             HistorySource::Absent => return Ok(None),
         };
         let package_projection =
@@ -2469,68 +2483,89 @@ impl<T: Transport> CranRefreshSession<T> {
             .iter()
             .filter(|entry| entry.package() == package)
             .collect::<Vec<_>>();
-        let identity_conflict = |version: &rsolve_core::RPackageVersion| {
-            package_rejections
-                .iter()
-                .any(|rejection| rejection.version() == Some(version))
-        };
-        let row_for_version = |version: &rsolve_core::RPackageVersion| {
-            package_rows
-                .iter()
-                .filter(|row| row.release().version() == version)
-                .copied()
-                .collect::<Vec<_>>()
-        };
+        let current_versions = current
+            .iter()
+            .map(|release| release.version())
+            .collect::<std::collections::BTreeSet<_>>();
 
-        let mut releases = current.to_vec();
-        let mut needs_archive_fallback = false;
-        for entry in &package_entries {
-            // The archive index may repeat the target repository's current
-            // release. The current PACKAGES surface is authoritative for that
-            // identity; requiring a second ALLPACKAGES occurrence would turn
-            // an otherwise usable current-gapped feed into a false fallback.
-            if current
+        // A rejection belongs to the package even when its version could not
+        // be recovered. Treating it as a version-local hole would mix source
+        // presentations and make the resulting history non-deterministic.
+        if !package_rejections.is_empty() {
+            return Ok(None);
+        }
+
+        let historical_entries = package_entries
+            .iter()
+            .copied()
+            .filter(|entry| !current_versions.contains(entry.version()))
+            .collect::<Vec<_>>();
+        let historical_versions = historical_entries
+            .iter()
+            .map(|entry| entry.version())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Rows for current identities are observations only; current metadata
+        // always comes from the target current index. Any other feed identity
+        // must have a corresponding archive occurrence, otherwise the feed is
+        // incomplete for this package and the local history is authoritative.
+        let historical_rows = package_rows
+            .iter()
+            .copied()
+            .filter(|row| !current_versions.contains(row.release().version()))
+            .collect::<Vec<_>>();
+        let feed_versions = historical_rows
+            .iter()
+            .map(|row| row.release().version())
+            .collect::<std::collections::BTreeSet<_>>();
+        if feed_versions != historical_versions {
+            return Ok(None);
+        }
+
+        let mut staged_releases = current.to_vec();
+        let mut staged_evidence = Vec::new();
+        for entry in &historical_entries {
+            let rows = historical_rows
                 .iter()
-                .any(|release| release.version() == entry.version())
+                .filter(|row| row.release().version() == entry.version())
+                .copied()
+                .collect::<Vec<_>>();
+            let entry_count = historical_entries
+                .iter()
+                .filter(|other| other.version() == entry.version())
+                .count();
+            if entry_count != 1
+                || rows.len() != 1
+                || !allpackages::binds_archive_occurrence(rows[0], entry)
             {
-                continue;
-            }
-            if identity_conflict(entry.version()) {
-                needs_archive_fallback = true;
-                continue;
-            }
-            let rows = row_for_version(entry.version());
-            if rows.len() != 1 || !allpackages::binds_archive_occurrence(rows[0], entry) {
-                needs_archive_fallback = true;
-                continue;
+                return Ok(None);
             }
             let row = rows[0];
-            releases.push(row.release().clone());
+            staged_releases.push(row.release().clone());
             let locator = format!(
                 "{}/src/contrib/Archive/{}",
                 self.base_url,
                 entry.source_archive_relative_path()
             );
-            self.evidence
-                .borrow_mut()
-                .push(allpackages_record_to_evidence(
-                    row,
-                    bulk.source.clone(),
-                    locator,
-                    entry.size(),
-                ));
+            staged_evidence.push(allpackages_record_to_evidence(
+                row,
+                bulk.source.clone(),
+                locator,
+                entry.size(),
+            ));
         }
+
         let mut aggregation = ReleaseAggregation::new();
-        for release in releases {
+        for release in staged_releases {
             if aggregation.observe_release(release).is_err() {
-                needs_archive_fallback = true;
+                return Ok(None);
             }
         }
         let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
         Ok(Some(BulkCandidateResult {
             candidates: CandidateLoadResult::new(candidates, Vec::new()),
-            needs_archive_fallback,
+            evidence: staged_evidence,
         }))
     }
 
@@ -2541,18 +2576,16 @@ impl<T: Transport> CranRefreshSession<T> {
         let current = self.ensure_current()?.candidates(package).to_vec();
         let bulk_candidates = if self.allow_allpackages_history {
             match self.ensure_allpackages() {
-                Ok(bulk) => match self.bulk_candidates_for_package(package, &current, &bulk)? {
-                    Some(result) if !result.needs_archive_fallback => {
-                        return Ok(result.candidates);
-                    }
-                    Some(result) => Some(result.candidates),
-                    None => None,
-                },
+                Ok(bulk) => self.bulk_candidates_for_package(package, &current, &bulk)?,
                 Err(_) => None,
             }
         } else {
             None
         };
+        if let Some(result) = bulk_candidates {
+            self.evidence.borrow_mut().extend(result.evidence);
+            return Ok(result.candidates);
+        }
         let endpoint = format!(
             "{}/src/contrib/Archive/{}/PACKAGES.rds",
             self.base_url,
@@ -2704,22 +2737,34 @@ impl<T: Transport> CranRefreshSession<T> {
         self.diagnostics
             .extend(provider.diagnostics().iter().cloned());
         let archived = provider.load(&SolverKey::InstalledName(package.clone()))?;
+        let current_versions = current
+            .iter()
+            .map(|release| release.version())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut aggregation = ReleaseAggregation::new();
-        for release in current
-            .into_iter()
-            .chain(
-                bulk_candidates
-                    .into_iter()
-                    .flat_map(|result| result.candidates().to_vec()),
-            )
-            .chain(archived.candidates().iter().cloned())
+        for release in &current {
+            aggregation
+                .observe_release(release.clone())
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        format!("conflicting CRAN release metadata for {package}: {error}"),
+                    )
+                })?;
+        }
+        for release in archived
+            .candidates()
+            .iter()
+            .filter(|release| !current_versions.contains(release.version()))
         {
-            aggregation.observe_release(release).map_err(|error| {
-                CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("conflicting CRAN release metadata for {package}: {error}"),
-                )
-            })?;
+            aggregation
+                .observe_release(release.clone())
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        format!("conflicting CRAN release metadata for {package}: {error}"),
+                    )
+                })?;
         }
         let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
