@@ -280,10 +280,17 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         .map(|requirement| requirement.name.clone())
         .collect::<Vec<_>>();
     if roots.iter().all(|name| !is_remote_cran_package(name)) {
+        emit_progress(&progress, ProgressEvent::ResolveStarted);
         let resolution = resolve_prepared_snapshot_without_transport(
             request,
             &CranCandidateSnapshot::default(),
         )?;
+        emit_progress(
+            &progress,
+            ProgressEvent::ResolveCompleted {
+                packages: resolution.packages().len(),
+            },
+        );
         return Ok(CranResolutionOutcome {
             resolution,
             diagnostics: Vec::new(),
@@ -956,6 +963,33 @@ mod tests {
             "base-only resolution must bypass cache and refresh"
         );
         assert!(result.unwrap().cache_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn base_only_online_progress_skips_cran_refresh() {
+        let directory = tempdir().unwrap();
+        let store = SnapshotStore::open(directory.path(), cran_registry_id("https://cran.example"))
+            .unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let capture = std::rc::Rc::clone(&events);
+        let callback = std::rc::Rc::new(move |event| capture.borrow_mut().push(event));
+        let methods = PackageName::new("methods").unwrap();
+        resolve_from_cran_with_store_at_policy_with_progress(
+            manifest_for(methods),
+            "not-a-url",
+            None,
+            &store,
+            CranSnapshotCachePolicy::at("2026-08-23T00:00:00Z".parse().unwrap()),
+            Some(callback),
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            [
+                ProgressEvent::ResolveStarted,
+                ProgressEvent::ResolveCompleted { packages: 0 }
+            ]
+        );
     }
 
     #[test]
