@@ -1,8 +1,6 @@
 use super::*;
 #[cfg(test)]
 use std::cell::RefCell;
-#[cfg(unix)]
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -63,8 +61,7 @@ impl Drop for TemporaryPath {
 pub(crate) struct RawCache {
     pub(super) registry_id: RegistryId,
     pub(super) directory: PathBuf,
-    #[cfg(unix)]
-    directory_fd: rustix::fd::OwnedFd,
+    directory_fd: cap_std::fs::Dir,
 }
 
 impl RawCache {
@@ -76,16 +73,16 @@ impl RawCache {
         ensure_directory(&store.root().join(RAW_CACHE_DIRECTORY))?;
         ensure_directory(&directory)?;
         ensure_directory(&directory.join(PROJECTION_DIRECTORY))?;
-        #[cfg(unix)]
         let directory_fd = {
-            let root_fd = open_directory_at(rustix::fs::CWD, store.root())?;
-            let raw_cache_fd = open_directory_at(&root_fd, RAW_CACHE_DIRECTORY)?;
-            open_directory_at(&raw_cache_fd, RAW_CACHE_VERSION)?
+            let root_fd =
+                cap_std::fs::Dir::open_ambient_dir(store.root(), cap_std::ambient_authority())?;
+            let raw_cache_fd =
+                cap_fs_ext::DirExt::open_dir_nofollow(&root_fd, RAW_CACHE_DIRECTORY)?;
+            cap_fs_ext::DirExt::open_dir_nofollow(&raw_cache_fd, RAW_CACHE_VERSION)?
         };
         Ok(Self {
             registry_id: store.registry_id().clone(),
             directory,
-            #[cfg(unix)]
             directory_fd,
         })
     }
@@ -183,14 +180,7 @@ impl RawCache {
             .parent()
             .ok_or_else(|| RawCacheError::Invalid("projection path has no parent".into()))?;
         self.validate_projection_directory(namespace, directory)?;
-        #[cfg(unix)]
-        {
-            retain_projection_files(&self.directory_fd, namespace, directory, active, previous)
-        }
-        #[cfg(not(unix))]
-        {
-            retain_projection_files(directory, active, previous)
-        }
+        retain_projection_files(&self.directory_fd, namespace, directory, active, previous)
     }
 
     fn validate_projection_directory(
@@ -567,44 +557,20 @@ impl RawCache {
     }
 }
 
-#[cfg(unix)]
-fn open_directory_at<Fd: std::os::fd::AsFd, P: rustix::path::Arg>(
-    parent: Fd,
-    path: P,
-) -> Result<rustix::fd::OwnedFd, RawCacheError> {
-    use rustix::fs::{self as rustix_fs, Mode, OFlags};
-
-    rustix_fs::openat(
-        parent,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(io::Error::from)
-    .map_err(Into::into)
-}
-
-#[cfg(unix)]
-fn projection_name(path: &Path, label: &str) -> Result<CString, RawCacheError> {
+fn projection_name(path: &Path, label: &str) -> Result<std::ffi::OsString, RawCacheError> {
     let name = path.file_name().ok_or_else(|| {
         RawCacheError::Invalid(format!("{label} projection has no file name").into())
     })?;
-    CString::new(name.as_encoded_bytes()).map_err(|_| {
-        RawCacheError::Invalid(format!("{label} projection has an invalid file name").into())
-    })
+    Ok(name.to_os_string())
 }
 
-#[cfg(unix)]
-fn require_regular_projection<Fd: std::os::fd::AsFd>(
-    directory_fd: Fd,
-    name: &CString,
+fn require_regular_projection(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
     label: &str,
 ) -> Result<(), RawCacheError> {
-    use rustix::fs::{self as rustix_fs, AtFlags, FileType};
-
-    let stat = rustix_fs::statat(directory_fd, name, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(io::Error::from)?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+    let stat = directory.symlink_metadata(name)?;
+    if !stat.is_file() {
         return Err(RawCacheError::Invalid(
             format!("{label} package projection is missing or not a regular file").into(),
         ));
@@ -612,24 +578,30 @@ fn require_regular_projection<Fd: std::os::fd::AsFd>(
     Ok(())
 }
 
-#[cfg(unix)]
 fn retain_projection_files(
-    cache_directory_fd: &rustix::fd::OwnedFd,
+    cache_directory: &cap_std::fs::Dir,
     namespace: ProjectionNamespace,
     directory: &Path,
     active: &Path,
     previous: Option<&Path>,
 ) -> Result<(), RawCacheError> {
-    use rustix::fs::{self as rustix_fs, AtFlags, FileType};
+    use cap_fs_ext::DirExt;
 
-    let projections_fd = open_directory_at(cache_directory_fd, PROJECTION_DIRECTORY)?;
+    if active.parent() != Some(directory)
+        || previous.is_some_and(|path| path.parent() != Some(directory))
+    {
+        return Err(RawCacheError::Invalid(
+            "projection files must be direct children of their directory".into(),
+        ));
+    }
+    let projections_fd = cache_directory.open_dir_nofollow(PROJECTION_DIRECTORY)?;
     let namespace_fd = match namespace {
         ProjectionNamespace::AllPackages => projections_fd,
-        ProjectionNamespace::Current => open_directory_at(&projections_fd, "current")?,
+        ProjectionNamespace::Current => projections_fd.open_dir_nofollow("current")?,
         ProjectionNamespace::ArchiveHistory => {
-            open_directory_at(&projections_fd, "archive-history")?
+            projections_fd.open_dir_nofollow("archive-history")?
         }
-        ProjectionNamespace::Auxiliary => open_directory_at(&projections_fd, "auxiliary")?,
+        ProjectionNamespace::Auxiliary => projections_fd.open_dir_nofollow("auxiliary")?,
     };
     let directory_fd = if namespace == ProjectionNamespace::AllPackages {
         namespace_fd
@@ -637,66 +609,51 @@ fn retain_projection_files(
         let key_name = directory
             .file_name()
             .ok_or_else(|| RawCacheError::Invalid("projection directory has no name".into()))?;
-        open_directory_at(&namespace_fd, key_name)?
+        namespace_fd.open_dir_nofollow(key_name)?
     };
-    let mut directory_handle = rustix_fs::Dir::new(directory_fd).map_err(io::Error::from)?;
-    let projection_names = directory_handle
-        .by_ref()
-        .map(|entry| entry.map_err(io::Error::from))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_bytes();
-            (name != b"." && name != b".." && name.ends_with(b".redb"))
-                .then(|| CString::new(name).expect("directory entry names cannot contain NUL"))
-        })
-        .collect::<Vec<_>>();
-    let directory_fd = directory_handle.fd().map_err(io::Error::from)?;
     let active_name = projection_name(active, "active")?;
-    require_regular_projection(directory_fd, &active_name, "active")?;
+    require_regular_projection(&directory_fd, &active_name, "active")?;
     let previous_name = previous
         .map(|path| projection_name(path, "previous"))
         .transpose()?;
     if let Some(name) = previous_name.as_ref() {
-        require_regular_projection(directory_fd, name, "previous")?;
+        require_regular_projection(&directory_fd, name, "previous")?;
     }
-    let projection_names = projection_names
-        .into_iter()
-        .filter(|name| {
-            rustix_fs::statat(directory_fd, name, AtFlags::SYMLINK_NOFOLLOW)
-                .map(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
-                .unwrap_or(false)
+    let projection_entries = directory_fd
+        .entries()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".redb"))
         })
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
         .collect::<Vec<_>>();
 
-    // The directory handle pins the original directory inode. Even if any
-    // path component is replaced with a symlink after this point, unlinkat
-    // remains relative to the already-open directory.
+    // The capability directory pins the original directory object. Even if
+    // any path component is replaced with a symlink after this point, entry
+    // removal remains relative to the already-open directory.
     run_retention_before_delete_hook(directory);
-    for name in projection_names {
-        if name.as_bytes() == active_name.as_bytes()
+    for entry in projection_entries {
+        if entry.file_name() == active_name
             || previous_name
                 .as_ref()
-                .is_some_and(|candidate| name.as_bytes() == candidate.as_bytes())
+                .is_some_and(|candidate| entry.file_name() == *candidate)
         {
             continue;
         }
-        let _ = rustix_fs::unlinkat(directory_fd, &name, AtFlags::empty());
+        let _ = entry.remove_file();
     }
-    rustix_fs::fsync(directory_fd).map_err(io::Error::from)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn retain_projection_files(
-    directory: &Path,
-    active: &Path,
-    previous: Option<&Path>,
-) -> Result<(), RawCacheError> {
-    // Without a portable no-follow directory-handle API, retaining files is
-    // safer than risking deletion through a path component replaced by a
-    // symlink. Cleanup is best-effort and never part of correctness.
-    let _ = (directory, active, previous);
+    // Synchronize the same capability when the platform supports directory
+    // synchronization. Cleanup correctness does not depend on this optional
+    // durability step.
+    if let Ok(file) = directory_fd
+        .try_clone()
+        .map(cap_std::fs::Dir::into_std_file)
+    {
+        let _ = file.sync_all();
+    }
     Ok(())
 }
 

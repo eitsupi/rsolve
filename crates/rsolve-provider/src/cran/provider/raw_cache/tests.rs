@@ -362,7 +362,6 @@ fn semantic_snapshot_namespace_is_untouched() {
     assert!(!store.root().join("current").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn projection_retention_keeps_only_a_bounded_recent_set() {
     let store = store();
@@ -401,7 +400,6 @@ fn projection_retention_keeps_only_a_bounded_recent_set() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn projection_retention_does_not_delete_other_source_namespaces() {
     let store = store();
@@ -437,7 +435,6 @@ fn projection_namespace_rejects_symlink_parent() {
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
-#[cfg(unix)]
 #[test]
 fn projection_retention_is_scoped_to_one_raw_cache_key() {
     let store = store();
@@ -463,25 +460,30 @@ fn projection_retention_is_scoped_to_one_raw_cache_key() {
     assert!(other_key.exists());
 }
 
-#[cfg(not(unix))]
 #[test]
-fn projection_retention_safely_keeps_files_without_handle_relative_delete() {
+fn projection_retention_rejects_previous_outside_parent_before_matching_basename() {
     let store = store();
     let cache = RawCache::open(&store).unwrap();
-    let current = cache.projection_namespace_path(ProjectionNamespace::Current);
-    let key_directory = current.join("a".repeat(64));
+    let projections = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let key_directory = projections.join("f".repeat(64));
     fs::create_dir_all(&key_directory).unwrap();
     let active = key_directory.join("active.redb");
-    let orphan = key_directory.join("orphan.redb");
+    let inside_same_name = key_directory.join("previous.redb");
     fs::write(&active, b"active").unwrap();
-    fs::write(&orphan, b"orphan").unwrap();
+    fs::write(&inside_same_name, b"inside").unwrap();
+    let outside = tempdir().unwrap();
+    let outside_previous = outside.path().join("previous.redb");
+    fs::write(&outside_previous, b"outside").unwrap();
 
-    cache
-        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
-        .unwrap();
-
-    assert!(active.exists());
-    assert!(orphan.exists());
+    let error = cache
+        .retain_projection_namespace(
+            ProjectionNamespace::Current,
+            &active,
+            Some(&outside_previous),
+        )
+        .expect_err("previous projection outside the target directory must fail closed");
+    assert!(error.to_string().contains("direct children"));
+    assert!(inside_same_name.exists());
 }
 
 #[cfg(unix)]
