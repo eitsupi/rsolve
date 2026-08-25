@@ -1,4 +1,28 @@
+use std::rc::Rc;
 use std::time::Duration;
+
+/// Coarse semantic milestones emitted during an online CRAN refresh.
+///
+/// The event stream intentionally describes refresh stages rather than
+/// individual requests or package lookups, so callers can present useful
+/// progress without exposing cache paths or transport details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CranRefreshProgress {
+    CurrentIndexStarted,
+    CurrentIndexCompleted { packages: usize },
+    ArchiveHistoryStarted,
+    ArchiveHistoryCompleted { entries: usize },
+    AllPackagesStarted,
+    AllPackagesProjected,
+    AllPackagesQualified { reused: bool },
+    PackageLocalFallbackStarted,
+    SnapshotPublishStarted { packages: usize },
+    SnapshotPublishCompleted,
+}
+
+/// Provider-owned callback used by interactive orchestration to render
+/// semantic refresh milestones. A missing callback keeps the provider silent.
+pub type CranRefreshProgressCallback = Rc<dyn Fn(CranRefreshProgress)>;
 
 /// The observed result of probing one package's CRAN archive fast path.
 #[derive(Clone, Debug, Eq, PartialEq)]

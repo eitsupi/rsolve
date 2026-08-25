@@ -1,13 +1,16 @@
 //! Persistent CRAN snapshot preparation before resolver execution.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind, PackageName,
     PublicationDate, RegistryId, SolverKey,
 };
 use rsolve_provider::SnapshotStore;
-use rsolve_provider::cran::{CranCandidateSnapshot, CranMetadataConfig, CranSnapshotRefresher};
+use rsolve_provider::cran::{
+    CranCandidateSnapshot, CranMetadataConfig, CranRefreshProgressCallback, CranSnapshotRefresher,
+};
 use rsolve_provider::cran::{
     CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,
     CranSnapshotCacheStatus, inspect_cran_snapshot_cache,
@@ -18,6 +21,7 @@ use crate::Manifest;
 use crate::orchestration::{
     CandidateLoaderRef, CranResolutionError, CranResolutionOutcome, resolve_request,
 };
+use crate::progress::{ProgressCallback, ProgressEvent};
 use rsolve_resolver::{RBasePackageOverlay, ResolutionFailure, is_r_base_package_name};
 
 /// Derive the private CRAN registry identity from the canonical endpoint.
@@ -247,6 +251,24 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
     store: &SnapshotStore,
     cache_policy: CranSnapshotCachePolicy,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
+    resolve_from_cran_with_store_at_policy_with_progress(
+        manifest,
+        base_url,
+        publication_cutoff,
+        store,
+        cache_policy,
+        None,
+    )
+}
+
+pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
+    manifest: Manifest,
+    base_url: impl AsRef<str>,
+    publication_cutoff: Option<PublicationDate>,
+    store: &SnapshotStore,
+    cache_policy: CranSnapshotCachePolicy,
+    progress: Option<ProgressCallback>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
     let request = crate::manifest::compose_resolution_request(manifest)
         .map_err(CranResolutionError::Composition)?;
     let request = request.with_optional_publication_cutoff(
@@ -280,8 +302,12 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
     } else {
         metadata_config
     };
-    let refresher =
-        CranSnapshotRefresher::new(metadata_config).map_err(CranResolutionError::Provider)?;
+    let provider_progress = progress.as_ref().map(|progress| {
+        let progress = Rc::clone(progress);
+        Rc::new(move |event| progress(ProgressEvent::Cran(event))) as CranRefreshProgressCallback
+    });
+    let refresher = CranSnapshotRefresher::new_with_progress(metadata_config, provider_progress)
+        .map_err(CranResolutionError::Provider)?;
     let cache_policy = cache_policy
         .with_expected_endpoint(refresher.canonical_endpoint())
         .with_allowed_auxiliary_endpoint(refresher.allpackages_feed_endpoint());
@@ -296,14 +322,23 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
         && let Some(CranSnapshotCacheResult::Compatible { loader, diagnostic }) =
             preflight.cache_result()
         && diagnostic.status() == CranSnapshotCacheStatus::Fresh
-        && let Ok(resolution) =
-            resolve_prepared_snapshot_without_transport(request.clone(), loader.as_ref())
     {
-        return Ok(CranResolutionOutcome {
-            resolution,
-            diagnostics: Vec::new(),
-            cache_diagnostics: vec![diagnostic.clone()],
-        });
+        emit_progress(&progress, ProgressEvent::ResolveStarted);
+        if let Ok(resolution) =
+            resolve_prepared_snapshot_without_transport(request.clone(), loader.as_ref())
+        {
+            emit_progress(
+                &progress,
+                ProgressEvent::ResolveCompleted {
+                    packages: resolution.packages().len(),
+                },
+            );
+            return Ok(CranResolutionOutcome {
+                resolution,
+                diagnostics: Vec::new(),
+                cache_diagnostics: vec![diagnostic.clone()],
+            });
+        }
     }
     // Hold the refresh lock through closure discovery, metadata acquisition,
     // composition and publication. Waiters re-read after lock handoff.
@@ -350,7 +385,14 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
             .map_err(CranResolutionError::Publish)
     })?;
     drop(transaction);
+    emit_progress(&progress, ProgressEvent::ResolveStarted);
     let resolution = resolve_prepared_snapshot_without_transport(request, &loader)?;
+    emit_progress(
+        &progress,
+        ProgressEvent::ResolveCompleted {
+            packages: resolution.packages().len(),
+        },
+    );
     Ok(CranResolutionOutcome {
         resolution,
         diagnostics: refresher.diagnostics(),
@@ -358,8 +400,15 @@ pub(crate) fn resolve_from_cran_with_store_at_policy(
     })
 }
 
+fn emit_progress(progress: &Option<ProgressCallback>, event: ProgressEvent) {
+    if let Some(progress) = progress {
+        progress(event);
+    }
+}
+
 /// Resolve through the configured current generation without creating a
 /// provider refresher. This is the explicit offline policy boundary.
+#[cfg(test)]
 pub(crate) fn resolve_from_cran_offline_with_store(
     manifest: Manifest,
     publication_cutoff: Option<PublicationDate>,
@@ -373,11 +422,28 @@ pub(crate) fn resolve_from_cran_offline_with_store(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_from_cran_offline_with_store_at_policy(
     manifest: Manifest,
     publication_cutoff: Option<PublicationDate>,
     store: &SnapshotStore,
     cache_policy: CranSnapshotCachePolicy,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
+    resolve_from_cran_offline_with_store_at_policy_with_progress(
+        manifest,
+        publication_cutoff,
+        store,
+        cache_policy,
+        None,
+    )
+}
+
+pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
+    manifest: Manifest,
+    publication_cutoff: Option<PublicationDate>,
+    store: &SnapshotStore,
+    cache_policy: CranSnapshotCachePolicy,
+    progress: Option<ProgressCallback>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
     let request = crate::manifest::compose_resolution_request(manifest)
         .map_err(CranResolutionError::Composition)?;
@@ -390,10 +456,17 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy(
         .map(|requirement| requirement.name.clone())
         .collect::<Vec<_>>();
     if roots.iter().all(|name| !is_remote_cran_package(name)) {
+        emit_progress(&progress, ProgressEvent::ResolveStarted);
         let resolution = resolve_prepared_snapshot_without_transport(
             request,
             &CranCandidateSnapshot::default(),
         )?;
+        emit_progress(
+            &progress,
+            ProgressEvent::ResolveCompleted {
+                packages: resolution.packages().len(),
+            },
+        );
         return Ok(CranResolutionOutcome {
             resolution,
             diagnostics: Vec::new(),
@@ -408,7 +481,17 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy(
         },
         CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
     };
-    resolve_offline_from_cache(request, probe)
+    emit_progress(&progress, ProgressEvent::ResolveStarted);
+    let result = resolve_offline_from_cache(request, probe);
+    if let Ok(outcome) = &result {
+        emit_progress(
+            &progress,
+            ProgressEvent::ResolveCompleted {
+                packages: outcome.resolution().packages().len(),
+            },
+        );
+    }
+    result
 }
 
 /// Solve only through the already prepared loader; no refresh callback is
@@ -921,5 +1004,31 @@ mod tests {
 
         assert!(resolution.selected(&methods).is_none());
         assert!(resolution.packages().is_empty());
+    }
+
+    #[test]
+    fn offline_progress_reports_resolution_start_and_completion() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), cran_registry_id("https://cran.test")).unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let capture = std::rc::Rc::clone(&events);
+        let callback = std::rc::Rc::new(move |event| capture.borrow_mut().push(event));
+        let methods = PackageName::new("methods").unwrap();
+        resolve_from_cran_offline_with_store_at_policy_with_progress(
+            manifest_for(methods),
+            None,
+            &store,
+            CranSnapshotCachePolicy::default(),
+            Some(callback),
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            [
+                ProgressEvent::ResolveStarted,
+                ProgressEvent::ResolveCompleted { packages: 0 }
+            ]
+        );
     }
 }

@@ -35,6 +35,63 @@ fn allpackages_complete_feed_avoids_package_archive_request() {
 }
 
 #[test]
+fn refresh_progress_orders_metadata_before_snapshot_publish_and_reports_fallback_once() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let omitted_entry = entries
+        .iter()
+        .position(|entry| {
+            entry.package().as_str() == "Matrix" && entry.version().to_string() != "1.7-6"
+        })
+        .expect("fixture contains a historical Matrix release");
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let capture = Rc::clone(&events);
+    let callback = Rc::new(move |event| capture.borrow_mut().push(event));
+    crate::cran::provider::refresh_and_publish_with_transport_and_progress(
+        &store,
+        allpackages_transport(
+            allpackages_fixture_body(&entries, true, Some(omitted_entry)),
+            true,
+        ),
+        "https://cloud.r-project.org",
+        &[
+            PackageName::new("Matrix").unwrap(),
+            PackageName::new("Matrix").unwrap(),
+        ],
+        Some(callback),
+    )
+    .unwrap();
+    let events = events.borrow();
+    let position = |predicate: fn(&CranRefreshProgress) -> bool| {
+        events
+            .iter()
+            .position(predicate)
+            .expect("progress event is present")
+    };
+    let current =
+        position(|event| matches!(event, CranRefreshProgress::CurrentIndexCompleted { .. }));
+    let history =
+        position(|event| matches!(event, CranRefreshProgress::ArchiveHistoryCompleted { .. }));
+    let qualified =
+        position(|event| matches!(event, CranRefreshProgress::AllPackagesQualified { .. }));
+    let fallback =
+        position(|event| matches!(event, CranRefreshProgress::PackageLocalFallbackStarted));
+    let published =
+        position(|event| matches!(event, CranRefreshProgress::SnapshotPublishStarted { .. }));
+    assert!(current < published);
+    assert!(history < published);
+    assert!(qualified < published);
+    assert!(fallback < published);
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CranRefreshProgress::PackageLocalFallbackStarted))
+            .count()
+            == 1
+    );
+}
+
+#[test]
 fn allpackages_current_gap_keeps_current_and_bulk_history() {
     let (directory, store) = store();
     let entries = matrix_history_entries();

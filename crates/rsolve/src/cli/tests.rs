@@ -57,6 +57,38 @@ fn cache_warning_renderer_filters_fresh_and_missing_but_reports_stale_sources() 
 }
 
 #[test]
+fn terminal_progress_reports_semantic_phases_without_request_noise() {
+    use crate::progress::ProgressEvent;
+    use rsolve_provider::cran::CranRefreshProgress;
+
+    let mut renderer = TerminalProgress { writer: Vec::new() };
+    renderer.render(ProgressEvent::Cran(
+        CranRefreshProgress::CurrentIndexStarted,
+    ));
+    renderer.render(ProgressEvent::Cran(
+        CranRefreshProgress::CurrentIndexCompleted { packages: 42 },
+    ));
+    renderer.render(ProgressEvent::Cran(CranRefreshProgress::AllPackagesStarted));
+    renderer.render(ProgressEvent::Cran(
+        CranRefreshProgress::AllPackagesProjected,
+    ));
+    renderer.render(ProgressEvent::Cran(
+        CranRefreshProgress::AllPackagesQualified { reused: true },
+    ));
+    renderer.render(ProgressEvent::ResolveCompleted { packages: 7 });
+    let output = String::from_utf8(renderer.writer).unwrap();
+    assert_eq!(
+        output,
+        "CRAN: refreshing current index\n\
+CRAN: current index ready (42 packages)\n\
+CRAN: acquiring ALLPACKAGES feed\n\
+CRAN: ALLPACKAGES projection ready\n\
+CRAN: ALLPACKAGES qualification reused\n\
+resolved (7 packages)\n"
+    );
+}
+
+#[test]
 fn output_write_replaces_atomically_and_preserves_on_invalid_target() {
     let path = temp_path("replace");
     fs::write(&path, b"old").unwrap();

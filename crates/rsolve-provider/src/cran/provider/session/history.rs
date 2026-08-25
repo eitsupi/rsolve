@@ -3,6 +3,7 @@ use std::rc::Rc;
 use super::super::super::history::{
     ArchiveEntry, ArchiveHistoryRejection, enumerate_archive_rds_for_provider,
 };
+use super::super::model::CranRefreshProgress;
 use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
 use super::super::raw_cache::RawCacheRepresentation;
 use super::super::transport::Transport;
@@ -16,6 +17,7 @@ impl<T: Transport> CranRefreshSession<T> {
         if let Some(result) = &self.history {
             return result.clone();
         }
+        self.emit_progress(CranRefreshProgress::ArchiveHistoryStarted);
         let endpoint = format!("{}/src/contrib/Meta/archive.rds", self.base_url);
         let result = match self.acquire_metadata(
             &endpoint,
@@ -45,6 +47,9 @@ impl<T: Transport> CranRefreshSession<T> {
                     );
                 }
                 let entries: Rc<[ArchiveEntry]> = Rc::from(projection.entries.into_boxed_slice());
+                self.emit_progress(CranRefreshProgress::ArchiveHistoryCompleted {
+                    entries: entries.len(),
+                });
                 self.history_surface_digest = Some(history_surface_digest(&entries));
                 Ok(HistorySource::Available {
                     entries,
@@ -59,6 +64,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     status_detail: CranFastPathStatus::Absent { status },
                     source: CranRefreshSource::ArchiveHistory,
                 });
+                self.emit_progress(CranRefreshProgress::ArchiveHistoryCompleted { entries: 0 });
                 Ok(HistorySource::Absent)
             }
             Err(error) => {

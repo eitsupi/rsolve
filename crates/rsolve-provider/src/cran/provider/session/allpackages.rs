@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use super::super::super::history::enumerate_archive_rds_for_provider;
+use super::super::model::CranRefreshProgress;
 use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
 use super::super::qualification;
 use super::super::raw_cache::{RawCache, RawCacheRepresentation};
@@ -120,6 +121,7 @@ impl<T: Transport> CranRefreshSession<T> {
             self.allpackages = Some(Err(error.clone()));
             return Err(error);
         }
+        self.emit_progress(CranRefreshProgress::AllPackagesStarted);
         let result = match self.acquire_metadata(
             &endpoint,
             RawCacheRepresentation::AllPackagesZstd,
@@ -150,6 +152,7 @@ impl<T: Transport> CranRefreshSession<T> {
             },
         ) {
             Ok((projection, source, outcome)) => {
+                self.emit_progress(CranRefreshProgress::AllPackagesProjected);
                 let feed_digest = hex_digest(source.content_sha256).to_string();
                 let projection_path = self.raw_cache.as_ref().and_then(|cache| {
                     cache
@@ -196,6 +199,7 @@ impl<T: Transport> CranRefreshSession<T> {
                         status_detail: CranFastPathStatus::Available,
                         source: CranRefreshSource::AllPackages,
                     });
+                    self.emit_progress(CranRefreshProgress::AllPackagesQualified { reused: true });
                     let result = Rc::new(AllPackagesSource {
                         projection: Rc::new(projection),
                         source,
@@ -292,6 +296,7 @@ impl<T: Transport> CranRefreshSession<T> {
                             )
                         })?;
                     }
+                    self.emit_progress(CranRefreshProgress::AllPackagesQualified { reused: false });
                     let error = CandidateLoadError::new(
                         CandidateLoadErrorCategory::MetadataInvalid,
                         "configured CRAN endpoint does not match canonical CRAN surface",
@@ -354,6 +359,7 @@ impl<T: Transport> CranRefreshSession<T> {
                         )
                     })?;
                 }
+                self.emit_progress(CranRefreshProgress::AllPackagesQualified { reused: false });
                 let status = match outcome {
                     MetadataAcquisitionOutcome::Revalidated304 => 304,
                     MetadataAcquisitionOutcome::Cached | MetadataAcquisitionOutcome::Network200 => {

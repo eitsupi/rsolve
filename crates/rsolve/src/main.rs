@@ -2,7 +2,7 @@ use clap::Parser;
 
 fn main() {
     let command = rsolve::cli::CommandLine::parse();
-    match rsolve::cli::run(command) {
+    match rsolve::cli::run_with_progress(command, rsolve::cli::terminal_progress()) {
         Ok(result) => {
             for warning in result.warnings {
                 eprintln!("warning: {warning}");

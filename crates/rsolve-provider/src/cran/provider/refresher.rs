@@ -13,8 +13,9 @@ use super::super::publish::{
 };
 use super::transport::UreqTransport;
 use super::{
-    CranCandidateSnapshot, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshSession,
-    CranSnapshotCachePolicy, CranSnapshotCacheResult,
+    CranCandidateSnapshot, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshProgress,
+    CranRefreshProgressCallback, CranRefreshSession, CranSnapshotCachePolicy,
+    CranSnapshotCacheResult,
 };
 use crate::snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotRefreshGuard, SnapshotStore};
 
@@ -96,6 +97,13 @@ pub(crate) fn refresh_completed_after_wait(
 
 impl CranSnapshotRefresher {
     pub fn new(metadata: CranMetadataConfig) -> Result<Self, CranSnapshotRefresherError> {
+        Self::new_with_progress(metadata, None)
+    }
+
+    pub fn new_with_progress(
+        metadata: CranMetadataConfig,
+        progress: Option<CranRefreshProgressCallback>,
+    ) -> Result<Self, CranSnapshotRefresherError> {
         let base_url = canonical_base_url(&metadata.repository_endpoint)?;
         let allpackages_feed_endpoint = canonical_base_url(&metadata.allpackages_feed_endpoint)?;
         let tls_config = ureq::tls::TlsConfig::builder()
@@ -106,7 +114,7 @@ impl CranSnapshotRefresher {
             .tls_config(tls_config)
             .build();
         Ok(Self {
-            session: RefCell::new(CranRefreshSession::new(
+            session: RefCell::new(CranRefreshSession::new_with_progress(
                 Rc::new(UreqTransport {
                     agent: agent_config.new_agent(),
                 }),
@@ -116,6 +124,9 @@ impl CranSnapshotRefresher {
                     refresh_metadata: metadata.refresh_metadata,
                     allow_allpackages_history: metadata.allow_allpackages_history,
                 },
+                None,
+                None,
+                progress,
             )),
         })
     }
@@ -265,6 +276,11 @@ impl CranSnapshotRefresher {
             .refresh_snapshot_observations(roots)
             .map_err(CranSnapshotPublishError::Acquisition)?;
         drop(session);
+        self.session
+            .borrow()
+            .emit_progress(CranRefreshProgress::SnapshotPublishStarted {
+                packages: roots.len(),
+            });
         let loader = publish_snapshot_with_endpoint_and_refresh_guard(
             guard,
             default_context(store.registry_id().clone()),
@@ -277,6 +293,9 @@ impl CranSnapshotRefresher {
         {
             let _ = raw_cache.retain_projections(&active_projection, previous_projection);
         }
+        self.session
+            .borrow()
+            .emit_progress(CranRefreshProgress::SnapshotPublishCompleted);
         Ok(loader)
     }
 }

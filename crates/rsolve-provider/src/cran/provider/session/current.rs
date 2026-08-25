@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use super::super::super::catalog::CranCatalog;
 use super::super::cache_policy::CacheControlHeader;
+use super::super::model::CranRefreshProgress;
 use super::super::model::{
     CranCurrentIndexRepresentation, CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource,
 };
@@ -30,6 +31,7 @@ impl<T: Transport> CranRefreshSession<T> {
         if let Some(result) = &self.current {
             return result.clone();
         }
+        self.emit_progress(CranRefreshProgress::CurrentIndexStarted);
         let representations = [
             (CranCurrentIndexRepresentation::Rds, "PACKAGES.rds"),
             (CranCurrentIndexRepresentation::Gzip, "PACKAGES.gz"),
@@ -293,6 +295,9 @@ impl<T: Transport> CranRefreshSession<T> {
                     source: CranRefreshSource::CurrentIndex(representation),
                 });
                 self.current_surface_digest = Some(catalog_surface_digest(&catalog));
+                self.emit_progress(CranRefreshProgress::CurrentIndexCompleted {
+                    packages: catalog.packages().count(),
+                });
                 let catalog = Rc::new(catalog);
                 self.current = Some(Ok(Rc::clone(&catalog)));
                 return Ok(catalog);

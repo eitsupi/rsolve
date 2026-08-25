@@ -10,6 +10,7 @@ pub(crate) mod metadata_cache;
 pub mod orchestration;
 pub mod pak;
 mod prepared_snapshot;
+pub mod progress;
 pub mod wire;
 
 pub use lock::{

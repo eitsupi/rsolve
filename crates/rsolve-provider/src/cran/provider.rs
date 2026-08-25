@@ -38,7 +38,8 @@ mod transport;
 pub use model::{
     CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
     CranCurrentIndexRepresentation, CranFastPathStatus, CranMetadataConfig, CranRefreshDiagnostic,
-    CranRefreshSource, DEFAULT_ALLPACKAGES_FEED_ENDPOINT, DEFAULT_COMPATIBLE_GENERATION_TTL,
+    CranRefreshProgress, CranRefreshProgressCallback, CranRefreshSource,
+    DEFAULT_ALLPACKAGES_FEED_ENDPOINT, DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 pub use persistent_cache::{
     CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,
@@ -61,11 +62,13 @@ use runtime::CranProvider;
 #[cfg(test)]
 use runtime::CranRuntimeLoader;
 use session::{CranRefreshSession, HistorySource};
-#[cfg(test)]
-pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
     allpackages_record_to_evidence, archive_rejection_to_evidence, import_current_index,
     index_record_to_evidence, source_input_with_metadata,
+};
+#[cfg(test)]
+pub(crate) use snapshot::{
+    refresh_and_publish_with_transport, refresh_and_publish_with_transport_and_progress,
 };
 pub(crate) use transport::Transport;
 #[cfg(test)]

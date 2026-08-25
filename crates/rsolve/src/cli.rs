@@ -1,23 +1,24 @@
 //! Testable command-line composition for the first lockfile command.
 
 use clap::{Args, Parser, Subcommand};
+use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use tempfile::NamedTempFile;
 
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
 use crate::metadata_cache::MetadataCache;
-use crate::orchestration::{
-    cran_registry_id, resolve_from_cran_with_store, resolve_from_cran_with_store_at_policy,
-};
+use crate::orchestration::cran_registry_id;
+use crate::progress::{ProgressCallback, ProgressEvent};
 use crate::{
     EnvironmentId, Lockfile, Manifest, ManifestDependency, ManifestTarget, from_toml, to_toml,
 };
-use rsolve_provider::cran::CranSnapshotCachePolicy;
+use rsolve_provider::cran::{CranRefreshProgress, CranSnapshotCachePolicy};
 
 const DEFAULT_CRAN_MIRROR: &str = "https://cloud.r-project.org";
 const DEFAULT_OUTPUT: &str = "rsolve.lock";
@@ -108,6 +109,27 @@ trait ResolutionBackend {
         offline: bool,
         refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_progress(
+        &self,
+        manifest: Manifest,
+        mirror: &str,
+        cutoff: Option<PublicationDate>,
+        metadata_cache: &MetadataCache,
+        offline: bool,
+        refresh_metadata: bool,
+        _progress: Option<ProgressCallback>,
+    ) -> Result<ResolvedData, CliError> {
+        self.resolve(
+            manifest,
+            mirror,
+            cutoff,
+            metadata_cache,
+            offline,
+            refresh_metadata,
+        )
+    }
 }
 
 struct CranBackend;
@@ -127,23 +149,59 @@ impl ResolutionBackend for CranBackend {
         offline: bool,
         refresh_metadata: bool,
     ) -> Result<ResolvedData, CliError> {
+        self.resolve_with_progress(
+            manifest,
+            mirror,
+            cutoff,
+            metadata_cache,
+            offline,
+            refresh_metadata,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_progress(
+        &self,
+        manifest: Manifest,
+        mirror: &str,
+        cutoff: Option<PublicationDate>,
+        metadata_cache: &MetadataCache,
+        offline: bool,
+        refresh_metadata: bool,
+        progress: Option<ProgressCallback>,
+    ) -> Result<ResolvedData, CliError> {
         let registry_id = cran_registry_id(mirror);
         let store = metadata_cache
             .open_store(registry_id)
             .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
         let outcome = if offline {
-            crate::orchestration::resolve_from_cran_offline_with_store(manifest, cutoff, &store)
+            crate::prepared_snapshot::resolve_from_cran_offline_with_store_at_policy_with_progress(
+                manifest,
+                cutoff,
+                &store,
+                CranSnapshotCachePolicy::default(),
+                progress,
+            )
         } else {
             if refresh_metadata {
-                resolve_from_cran_with_store_at_policy(
+                crate::prepared_snapshot::resolve_from_cran_with_store_at_policy_with_progress(
                     manifest,
                     mirror,
                     cutoff,
                     &store,
                     CranSnapshotCachePolicy::default().with_refresh_metadata(),
+                    progress,
                 )
             } else {
-                resolve_from_cran_with_store(manifest, mirror, cutoff, &store)
+                crate::prepared_snapshot::resolve_from_cran_with_store_at_policy_with_progress(
+                    manifest,
+                    mirror,
+                    cutoff,
+                    &store,
+                    CranSnapshotCachePolicy::default(),
+                    progress,
+                )
             }
         }
         .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
@@ -204,14 +262,94 @@ fn render_cache_warnings(
 
 /// Execute a parsed command. Successful commands write no stdout.
 pub fn run(command_line: CommandLine) -> Result<CommandResult, CliError> {
+    run_with_progress(command_line, None)
+}
+
+/// Execute a parsed command with an optional semantic progress sink.
+pub fn run_with_progress(
+    command_line: CommandLine,
+    progress: Option<ProgressCallback>,
+) -> Result<CommandResult, CliError> {
     match command_line.command {
-        Command::Lock(command) => run_lock_with_backend(command, &CranBackend),
+        Command::Lock(command) => run_lock_with_backend_progress(command, &CranBackend, progress),
     }
 }
 
+struct TerminalProgress<W> {
+    writer: W,
+}
+
+impl<W: Write> TerminalProgress<W> {
+    fn render(&mut self, event: ProgressEvent) {
+        let message = match event {
+            ProgressEvent::Cran(event) => match event {
+                CranRefreshProgress::CurrentIndexStarted => {
+                    "CRAN: refreshing current index".to_owned()
+                }
+                CranRefreshProgress::CurrentIndexCompleted { packages } => {
+                    format!("CRAN: current index ready ({packages} packages)")
+                }
+                CranRefreshProgress::ArchiveHistoryStarted => {
+                    "CRAN: refreshing archive history".to_owned()
+                }
+                CranRefreshProgress::ArchiveHistoryCompleted { entries } => {
+                    format!("CRAN: archive history ready ({entries} entries)")
+                }
+                CranRefreshProgress::AllPackagesStarted => {
+                    "CRAN: acquiring ALLPACKAGES feed".to_owned()
+                }
+                CranRefreshProgress::AllPackagesProjected => {
+                    "CRAN: ALLPACKAGES projection ready".to_owned()
+                }
+                CranRefreshProgress::AllPackagesQualified { reused } => {
+                    if reused {
+                        "CRAN: ALLPACKAGES qualification reused".to_owned()
+                    } else {
+                        "CRAN: ALLPACKAGES qualification complete".to_owned()
+                    }
+                }
+                CranRefreshProgress::PackageLocalFallbackStarted => {
+                    "CRAN: using package-local archive fallback".to_owned()
+                }
+                CranRefreshProgress::SnapshotPublishStarted { packages } => {
+                    format!("CRAN: publishing snapshot ({packages} packages)")
+                }
+                CranRefreshProgress::SnapshotPublishCompleted => {
+                    "CRAN: snapshot published".to_owned()
+                }
+            },
+            ProgressEvent::ResolveStarted => "resolving dependencies".to_owned(),
+            ProgressEvent::ResolveCompleted { packages } => {
+                format!("resolved ({packages} packages)")
+            }
+        };
+        let _ = writeln!(self.writer, "{message}");
+        let _ = self.writer.flush();
+    }
+}
+
+pub fn terminal_progress() -> Option<ProgressCallback> {
+    if !io::stderr().is_terminal() {
+        return None;
+    }
+    let renderer = Rc::new(RefCell::new(TerminalProgress {
+        writer: io::stderr(),
+    }));
+    Some(Rc::new(move |event| renderer.borrow_mut().render(event)))
+}
+
+#[cfg(test)]
 fn run_lock_with_backend(
     command: LockCommand,
     backend: &dyn ResolutionBackend,
+) -> Result<CommandResult, CliError> {
+    run_lock_with_backend_progress(command, backend, None)
+}
+
+fn run_lock_with_backend_progress(
+    command: LockCommand,
+    backend: &dyn ResolutionBackend,
+    progress: Option<ProgressCallback>,
 ) -> Result<CommandResult, CliError> {
     let target_r = RPackageVersion::parse(&command.r_version)
         .map_err(|error| value_error(format!("invalid --r-version: {error}")))?;
@@ -245,13 +383,14 @@ fn run_lock_with_backend(
     let requested_package_count = command.package.len();
     let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
         .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
-    let resolved = backend.resolve(
+    let resolved = backend.resolve_with_progress(
         manifest,
         &mirror,
         cutoff,
         &metadata_cache,
         command.offline,
         command.refresh_metadata,
+        progress,
     )?;
     let environment = EnvironmentId::new("default")
         .map_err(|error| CliError::Operational(format!("invalid environment: {error}")))?;

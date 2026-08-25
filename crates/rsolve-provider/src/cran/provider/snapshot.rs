@@ -6,10 +6,10 @@ use super::super::catalog::{
     CranArchiveReleaseRejection, CranCatalog, CranCatalogObservation, CranCatalogRecordScope,
 };
 use super::super::evidence::{CranEvidenceObservation, DistributionRegistryBinding};
-#[cfg(test)]
-use super::CranMetadataConfig;
 use super::refresher::decode_gzip;
 use super::{CranCurrentIndexRepresentation, CranRefreshSession, Transport};
+#[cfg(test)]
+use super::{CranMetadataConfig, CranRefreshProgress, CranRefreshProgressCallback};
 use crate::snapshot::{
     ChecksumV1, EvidenceAxesV1, FieldV1, FreshnessStateV1, NamespaceStateV1, OccurrenceArtifactV1,
     OccurrenceStateV1, ParseStateV1, PublicationStateV1, SemanticsStateV1, SourceInput,
@@ -341,6 +341,20 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
     crate::snapshot::ReadOnlySnapshotCandidateLoader,
     super::super::publish::CranSnapshotPublishError,
 > {
+    refresh_and_publish_with_transport_and_progress(store, transport, base_url, roots, None)
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_and_publish_with_transport_and_progress<T: Transport>(
+    store: &crate::snapshot::SnapshotStore,
+    transport: T,
+    base_url: impl AsRef<str>,
+    roots: &[PackageName],
+    progress: Option<CranRefreshProgressCallback>,
+) -> Result<
+    crate::snapshot::ReadOnlySnapshotCandidateLoader,
+    super::super::publish::CranSnapshotPublishError,
+> {
     let effective_endpoint = base_url.as_ref().to_owned();
     let raw_cache = super::raw_cache::RawCache::open(store).map_err(|error| {
         super::super::publish::CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
@@ -348,21 +362,37 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
             format!("unable to open CRAN current raw cache: {error}"),
         ))
     })?;
-    let mut session = CranRefreshSession::new_with_clock(
+    let allpackages_endpoint = progress
+        .as_ref()
+        .map(|_| "https://feed.invalid/ALLPACKAGES.zst")
+        .unwrap_or("");
+    let mut session = CranRefreshSession::new_with_progress(
         std::rc::Rc::new(transport),
-        CranMetadataConfig::new(effective_endpoint.as_str(), ""),
+        CranMetadataConfig::new(effective_endpoint.as_str(), allpackages_endpoint),
         None,
         Some(raw_cache),
+        progress.clone(),
     );
     let observations = session
         .refresh_snapshot_observations(roots)
         .map_err(super::super::publish::CranSnapshotPublishError::Acquisition)?;
-    super::super::publish::publish_snapshot_with_endpoint(
+    if let Some(progress) = &progress {
+        progress(CranRefreshProgress::SnapshotPublishStarted {
+            packages: roots.len(),
+        });
+    }
+    let result = super::super::publish::publish_snapshot_with_endpoint(
         store,
         super::super::publish::default_context(store.registry_id().clone()),
         observations,
         effective_endpoint,
-    )
+    );
+    if result.is_ok()
+        && let Some(progress) = &progress
+    {
+        progress(CranRefreshProgress::SnapshotPublishCompleted);
+    }
+    result
 }
 
 impl<T: Transport> CranRefreshSession<T> {

@@ -188,6 +188,7 @@ impl<T: Transport> CranRefreshSession<T> {
             self.evidence.borrow_mut().extend(result.evidence);
             return Ok(result.candidates);
         }
+        self.emit_package_local_fallback();
         let endpoint = format!(
             "{}/src/contrib/Archive/{}/PACKAGES.rds",
             self.base_url,

@@ -13,8 +13,8 @@ use super::cache_policy::CacheControlHeader;
 use super::cache_policy::{cache_control_policy, permits_reuse};
 use super::model::{
     CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
-    CranCurrentIndexRepresentation, CranMetadataConfig, CranRefreshDiagnostic,
-    DEFAULT_COMPATIBLE_GENERATION_TTL,
+    CranCurrentIndexRepresentation, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshProgress,
+    CranRefreshProgressCallback, DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 use super::qualification;
 use super::raw_cache::{RawCache, RawCacheEntry, RawCacheRepresentation};
@@ -41,6 +41,7 @@ pub(super) struct CranRefreshSession<T> {
     pub(in crate::cran::provider) refresh_metadata: bool,
     pub(in crate::cran::provider) allow_allpackages_history: bool,
     transport: Rc<T>,
+    progress: Option<CranRefreshProgressCallback>,
     raw_cache: Option<RawCache>,
     test_now: Option<jiff::Timestamp>,
     current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
@@ -49,6 +50,7 @@ pub(super) struct CranRefreshSession<T> {
     history_surface_digest: Option<Box<str>>,
     allpackages: Option<Result<Rc<AllPackagesSource>, CandidateLoadError>>,
     packages: HashMap<PackageName, Result<CandidateLoadResult, CandidateLoadError>>,
+    package_local_fallback_reported: bool,
     pub(in crate::cran::provider) diagnostics: Vec<CranRefreshDiagnostic>,
     pub(in crate::cran::provider) evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
 }
@@ -284,15 +286,27 @@ impl CurrentBody {
 }
 
 impl<T: Transport> CranRefreshSession<T> {
+    #[cfg(test)]
     pub(in crate::cran::provider) fn new(transport: Rc<T>, config: CranMetadataConfig) -> Self {
-        Self::new_with_clock(transport, config, None, None)
+        Self::new_with_progress(transport, config, None, None, None)
     }
 
+    #[cfg(test)]
     pub(in crate::cran::provider) fn new_with_clock(
         transport: Rc<T>,
         config: CranMetadataConfig,
         test_now: Option<jiff::Timestamp>,
         raw_cache: Option<RawCache>,
+    ) -> Self {
+        Self::new_with_progress(transport, config, test_now, raw_cache, None)
+    }
+
+    pub(in crate::cran::provider) fn new_with_progress(
+        transport: Rc<T>,
+        config: CranMetadataConfig,
+        test_now: Option<jiff::Timestamp>,
+        raw_cache: Option<RawCache>,
+        progress: Option<CranRefreshProgressCallback>,
     ) -> Self {
         Self {
             base_url: config.repository_endpoint.trim_end_matches('/').into(),
@@ -303,6 +317,7 @@ impl<T: Transport> CranRefreshSession<T> {
             refresh_metadata: config.refresh_metadata,
             allow_allpackages_history: config.allow_allpackages_history,
             transport,
+            progress,
             raw_cache,
             test_now,
             current: None,
@@ -311,8 +326,22 @@ impl<T: Transport> CranRefreshSession<T> {
             history_surface_digest: None,
             allpackages: None,
             packages: HashMap::new(),
+            package_local_fallback_reported: false,
             diagnostics: Vec::new(),
             evidence: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    pub(super) fn emit_progress(&self, event: CranRefreshProgress) {
+        if let Some(progress) = &self.progress {
+            progress(event);
+        }
+    }
+
+    pub(super) fn emit_package_local_fallback(&mut self) {
+        if !self.package_local_fallback_reported {
+            self.package_local_fallback_reported = true;
+            self.emit_progress(CranRefreshProgress::PackageLocalFallbackStarted);
         }
     }
 
