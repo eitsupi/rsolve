@@ -137,21 +137,7 @@ fn persistent_refresh_child_probe() {
             .unwrap();
     let feed = "https://feed.invalid/ALLPACKAGES.zst";
     let now = "2026-08-25T00:00:00Z".parse().unwrap();
-    let initial_revision = if mode.starts_with("failure") {
-        None
-    } else {
-        let initial_policy = CranSnapshotCachePolicy::at(now)
-            .with_expected_endpoint("https://cloud.r-project.org")
-            .with_allowed_auxiliary_endpoint(feed)
-            .with_refresh_metadata();
-        let initial_result = inspect_cran_snapshot_cache(&store, &initial_policy);
-        match &initial_result {
-            CranSnapshotCacheResult::Compatible { diagnostic, .. }
-            | CranSnapshotCacheResult::Rejected(diagnostic) => {
-                diagnostic.revision_token().map(str::to_owned)
-            }
-        }
-    };
+    let pre_wait = crate::cran::provider::refresher::observe_persistent_refresh_probe(&store);
     std::fs::write(
         root.join(if forced {
             if owner {
@@ -234,13 +220,17 @@ fn persistent_refresh_child_probe() {
     );
     let locked_revision = match &locked_result {
         CranSnapshotCacheResult::Compatible { diagnostic, .. }
-        | CranSnapshotCacheResult::Rejected(diagnostic) => {
-            diagnostic.revision_token().map(str::to_owned)
-        }
+        | CranSnapshotCacheResult::Rejected(diagnostic) => diagnostic
+            .revision_token()
+            .map(ToOwned::to_owned)
+            .map(String::into_boxed_str),
     };
     let locked_compatible = matches!(&locked_result, CranSnapshotCacheResult::Compatible { .. });
     let satisfied = if forced {
-        initial_revision != locked_revision && locked_revision.is_some()
+        crate::cran::provider::refresher::refresh_completed_after_wait(
+            &pre_wait,
+            locked_revision.as_deref(),
+        )
     } else {
         locked_compatible
     };
@@ -316,11 +306,11 @@ fn persistent_refresh_child_processes_coalesce_normal_refresh() {
     let root = directory.path();
     let previous = seed_previous_projection(root);
     let owner = spawn_persistent_child(root, "normal-owner");
-    let waiter = spawn_persistent_child(root, "normal-waiter");
     wait_for_child_file(&root.join("normal-owner-probed"));
-    wait_for_child_file(&root.join("normal-waiter-probed"));
     std::fs::write(root.join("normal-owner-start"), b"go").unwrap();
     wait_for_child_file(&root.join("persistent-owner-locked"));
+    let waiter = spawn_persistent_child(root, "normal-waiter");
+    wait_for_child_file(&root.join("normal-waiter-probed"));
     std::fs::write(root.join("normal-waiter-start"), b"go").unwrap();
     wait_for_child_file(&root.join("normal-waiter-attempting-lock"));
     assert!(wait_for_child(owner).success());
@@ -364,11 +354,11 @@ fn persistent_refresh_child_processes_coalesce_forced_refresh_and_retry_after_pa
     let root = directory.path();
     let previous = seed_previous_projection(root);
     let owner = spawn_persistent_child(root, "forced-owner");
-    let waiter = spawn_persistent_child(root, "forced-waiter");
     wait_for_child_file(&root.join("forced-owner-probed"));
-    wait_for_child_file(&root.join("forced-waiter-probed"));
     std::fs::write(root.join("forced-owner-start"), b"go").unwrap();
     wait_for_child_file(&root.join("persistent-owner-locked"));
+    let waiter = spawn_persistent_child(root, "forced-waiter");
+    wait_for_child_file(&root.join("forced-waiter-probed"));
     std::fs::write(root.join("forced-waiter-start"), b"go").unwrap();
     wait_for_child_file(&root.join("forced-waiter-attempting-lock"));
     assert!(wait_for_child(owner).success());

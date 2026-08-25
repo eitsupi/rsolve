@@ -48,6 +48,32 @@ pub struct CranPersistentRefresh<'a> {
     store: &'a SnapshotStore,
     guard: SnapshotRefreshGuard<'a>,
     previous_projection: Option<std::path::PathBuf>,
+    pre_wait: PersistentRefreshProbe,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PersistentRefreshProbe {
+    revision: Option<Box<str>>,
+    observation_valid: bool,
+}
+
+pub(crate) fn observe_persistent_refresh_probe(store: &SnapshotStore) -> PersistentRefreshProbe {
+    match store.read_current_validation_revision_unlocked() {
+        Ok(revision) => PersistentRefreshProbe {
+            revision,
+            observation_valid: true,
+        },
+        Err(_) => PersistentRefreshProbe::default(),
+    }
+}
+
+pub(crate) fn refresh_completed_after_wait(
+    probe: &PersistentRefreshProbe,
+    locked_revision: Option<&str>,
+) -> bool {
+    probe.observation_valid
+        && locked_revision.is_some()
+        && probe.revision.as_deref() != locked_revision
 }
 
 impl CranSnapshotRefresher {
@@ -86,6 +112,11 @@ impl CranSnapshotRefresher {
         &'a self,
         store: &'a SnapshotStore,
     ) -> Result<CranPersistentRefresh<'a>, CranSnapshotPublishError> {
+        // This read intentionally happens immediately before the blocking
+        // lock acquisition. The validation file is atomically replaced, so a
+        // lock-free read observes either a complete old/new canonical record
+        // or a fail-closed invalid result.
+        let pre_wait = observe_persistent_refresh_probe(store);
         let guard = store.begin_refresh().map_err(|error| {
             CranSnapshotPublishError::Acquisition(CandidateLoadError::new(
                 CandidateLoadErrorCategory::SnapshotInvalid,
@@ -103,6 +134,7 @@ impl CranSnapshotRefresher {
             store,
             guard,
             previous_projection,
+            pre_wait,
         })
     }
 
@@ -200,6 +232,12 @@ impl CranSnapshotRefresher {
 }
 
 impl CranPersistentRefresh<'_> {
+    /// Reports whether a successful publication advanced the validation
+    /// revision while this transaction waited for the refresh lock.
+    pub fn refresh_completed_while_waiting(&self, locked_revision: Option<&str>) -> bool {
+        refresh_completed_after_wait(&self.pre_wait, locked_revision)
+    }
+
     pub fn inspect_cache(
         &self,
         policy: &super::super::CranSnapshotCachePolicy,
@@ -325,4 +363,74 @@ pub(super) fn extract_description(input: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     description.ok_or_else(|| "archive root has no DESCRIPTION file".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{observe_persistent_refresh_probe, refresh_completed_after_wait};
+    use crate::snapshot::{CurrentValidationSourceV2, CurrentValidationV2, SnapshotStore};
+    use rsolve_core::RegistryId;
+
+    fn validation(sequence: u64) -> CurrentValidationV2 {
+        CurrentValidationV2 {
+            format: "rsolve-metadata-current-validation".into(),
+            version: 2,
+            registry_id: "cran".into(),
+            generation: "0".repeat(64),
+            compatibility_profile: 1,
+            parser_schema: 1,
+            normalization_policy: 1,
+            validated_at: "2026-08-25T00:00:00Z".into(),
+            refresh_sequence: sequence,
+            effective_endpoint: "https://cloud.r-project.org".into(),
+            sources: vec![CurrentValidationSourceV2 {
+                id: "1".repeat(64),
+                content_sha256: "2".repeat(64),
+                endpoint: "https://cloud.r-project.org/src/contrib/PACKAGES".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn pre_wait_validation_revision_is_stable_and_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let path = store.root().join("current-validation");
+        std::fs::write(&path, serde_json::to_vec(&validation(1)).unwrap()).unwrap();
+        let first = observe_persistent_refresh_probe(&store);
+        std::fs::write(&path, serde_json::to_vec(&validation(2)).unwrap()).unwrap();
+        let second = observe_persistent_refresh_probe(&store);
+        assert!(first.observation_valid && second.observation_valid);
+        assert_ne!(first.revision, second.revision);
+        assert!(refresh_completed_after_wait(
+            &first,
+            second.revision.as_deref()
+        ));
+
+        std::fs::write(&path, serde_json::to_vec(&validation(2)).unwrap()).unwrap();
+        let identical = observe_persistent_refresh_probe(&store);
+        assert_eq!(second.revision, identical.revision);
+        assert!(!refresh_completed_after_wait(
+            &second,
+            identical.revision.as_deref()
+        ));
+
+        std::fs::write(&path, b"invalid").unwrap();
+        let invalid = observe_persistent_refresh_probe(&store);
+        assert!(!invalid.observation_valid);
+        assert!(!refresh_completed_after_wait(
+            &invalid,
+            second.revision.as_deref()
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let unreadable = observe_persistent_refresh_probe(&store);
+        assert!(!unreadable.observation_valid);
+        assert!(!refresh_completed_after_wait(
+            &unreadable,
+            second.revision.as_deref()
+        ));
+    }
 }

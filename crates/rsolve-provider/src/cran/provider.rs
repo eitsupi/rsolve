@@ -47,7 +47,7 @@ use negative::FastPathFailure;
 #[cfg(test)]
 use refresher::canonical_base_url;
 use refresher::extract_description;
-pub use refresher::{CranSnapshotRefresher, CranSnapshotRefresherError};
+pub use refresher::{CranPersistentRefresh, CranSnapshotRefresher, CranSnapshotRefresherError};
 #[cfg(test)]
 pub(crate) use snapshot::refresh_and_publish_with_transport;
 use snapshot::{
@@ -342,26 +342,9 @@ pub enum CranSnapshotCacheResult {
 }
 
 fn cache_revision_token(
-    header: &crate::snapshot::SnapshotHeaderV1,
     validation: Option<&crate::snapshot::CurrentValidationV2>,
-) -> Box<str> {
-    let mut digest = Sha256::new();
-    digest.update(b"rsolve-cran-cache-revision-v1");
-    if let Ok(bytes) = crate::snapshot::encode_header(header) {
-        digest.update((bytes.len() as u64).to_be_bytes());
-        digest.update(bytes);
-    } else {
-        digest.update(0_u64.to_be_bytes());
-    }
-    match validation.and_then(|record| serde_json::to_vec(record).ok()) {
-        Some(bytes) => {
-            digest.update([1]);
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(bytes);
-        }
-        None => digest.update([0]),
-    }
-    hex_digest(digest.finalize())
+) -> Option<Box<str>> {
+    validation.map(crate::snapshot::current_validation_revision_token)
 }
 
 /// Inspect the current immutable generation without transport. This is the
@@ -383,6 +366,34 @@ pub fn inspect_cran_snapshot_cache(
         }
     };
     inspect_cran_snapshot_cache_with_refresh_guard(&guard, policy)
+}
+
+/// Inspect the current snapshot without waiting for another process's
+/// refresh transaction. `None` means the transaction lock was busy; callers
+/// must not interpret that as a missing or fresh generation and should
+/// re-check after acquiring their own transaction.
+pub fn inspect_cran_snapshot_cache_without_wait(
+    store: &SnapshotStore,
+    policy: &CranSnapshotCachePolicy,
+) -> Option<CranSnapshotCacheResult> {
+    let guard = match store.try_begin_refresh() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(CranSnapshotCacheResult::Rejected(
+                CranSnapshotCacheDiagnostic {
+                    status: CranSnapshotCacheStatus::Corrupt,
+                    age_seconds: None,
+                    endpoints: Vec::new(),
+                    diagnostic: format!("unable to acquire snapshot refresh lock: {error}").into(),
+                    revision_token: None,
+                },
+            ));
+        }
+    };
+    Some(inspect_cran_snapshot_cache_with_refresh_guard(
+        &guard, policy,
+    ))
 }
 
 pub(crate) fn inspect_cran_snapshot_cache_with_refresh_guard(
@@ -547,7 +558,7 @@ fn inspect_cran_snapshot_cache_from_reads(
         } else {
             "compatible CRAN snapshot generation is stale but remains usable offline".into()
         },
-        revision_token: Some(cache_revision_token(header, validation.as_ref())),
+        revision_token: cache_revision_token(validation.as_ref()),
     };
     CranSnapshotCacheResult::Compatible {
         loader: Box::new(loader),

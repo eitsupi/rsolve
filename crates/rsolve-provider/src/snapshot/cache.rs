@@ -389,7 +389,27 @@ impl SnapshotStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let record = serde_json::from_slice::<CurrentValidationV2>(&bytes).map_err(|error| {
+        Ok(Some(self.decode_current_validation(&bytes)?))
+    }
+
+    pub(crate) fn read_current_validation_revision_unlocked(
+        &self,
+    ) -> Result<Option<Box<str>>, SnapshotStoreError> {
+        let bytes = match read_at_most(&self.root.join(CURRENT_VALIDATION_NAME), POINTER_LIMIT) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(current_validation_revision_token(
+            &self.decode_current_validation(&bytes)?,
+        )))
+    }
+
+    fn decode_current_validation(
+        &self,
+        bytes: &[u8],
+    ) -> Result<CurrentValidationV2, SnapshotStoreError> {
+        let record = serde_json::from_slice::<CurrentValidationV2>(bytes).map_err(|error| {
             store_invalid(format!("invalid current validation record: {error}"))
         })?;
         if serde_json::to_vec(&record)
@@ -432,7 +452,7 @@ impl SnapshotStore {
                 "current validation source identity is invalid",
             ));
         }
-        Ok(Some(record))
+        Ok(record)
     }
 
     fn write_current_validation(
@@ -558,6 +578,17 @@ impl SnapshotStore {
     pub(crate) fn begin_refresh(&self) -> Result<SnapshotRefreshGuard<'_>, SnapshotStoreError> {
         let lock = self.acquire_refresh_lock(RefreshLockMode::Blocking)?;
         Ok(SnapshotRefreshGuard { store: self, lock })
+    }
+
+    pub(crate) fn try_begin_refresh(
+        &self,
+    ) -> Result<Option<SnapshotRefreshGuard<'_>>, SnapshotStoreError> {
+        let lock = match self.acquire_refresh_lock(RefreshLockMode::Try) {
+            Ok(lock) => lock,
+            Err(SnapshotStoreError::Busy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(SnapshotRefreshGuard { store: self, lock }))
     }
 
     pub(crate) fn publish_generation(
@@ -887,6 +918,15 @@ fn next_refresh_sequence(previous: Option<u64>) -> Result<u64, SnapshotStoreErro
     previous
         .map_or(Some(1), |sequence| sequence.checked_add(1))
         .ok_or_else(|| store_invalid("current validation refresh sequence overflow"))
+}
+
+pub(crate) fn current_validation_revision_token(record: &CurrentValidationV2) -> Box<str> {
+    let bytes = serde_json::to_vec(record).expect("validated current record is serializable");
+    let mut digest = Sha256::new();
+    digest.update(b"rsolve-cran-validation-revision-v1");
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    hex(&digest.finalize()).into_boxed_str()
 }
 
 fn store_candidate_error(error: impl fmt::Display) -> CandidateLoadError {

@@ -56,9 +56,11 @@ pub use generation::{
 };
 
 mod cache;
-pub(crate) use cache::CurrentValidationV2;
+#[cfg(test)]
+pub(crate) use cache::CurrentValidationSourceV2;
 pub(crate) use cache::SnapshotPublishError;
 pub(crate) use cache::SnapshotRefreshGuard;
+pub(crate) use cache::{CurrentValidationV2, current_validation_revision_token};
 pub use cache::{SnapshotStore, SnapshotStoreError};
 
 #[cfg(test)]
