@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -111,7 +112,7 @@ impl<T: Transport> CranRefreshSession<T> {
             &key,
             &hex_digest(Sha256::digest(body)),
         );
-        let projection = PackageProjection::open_or_build(
+        let projection = PackageProjection::open_or_build_validated(
             &path,
             body,
             ProjectionSourceKind::ArchiveHistory,
@@ -121,6 +122,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 normalization_policy: super::CRAN_NORMALIZATION_POLICY,
             },
             || build_archive_projection(body),
+            ArchiveHistorySource::validate_projection,
         )
         .map_err(|error| match error {
             ProjectionError::Build(error) => MetadataParseFailure::Invalid(error.into()),
@@ -129,7 +131,26 @@ impl<T: Transport> CranRefreshSession<T> {
         // Derived projection cleanup is bounded but non-essential to metadata
         // correctness; retry a failed cleanup on a later refresh.
         let _ = cache.retain_projection_namespace(ProjectionNamespace::ArchiveHistory, &path, None);
-        ArchiveHistorySource::from_projection(projection)
+        let rebuild_path = path.clone();
+        let rebuild_body = body.to_vec();
+        let rebuild: Rc<dyn Fn() -> Result<PackageProjection, String>> = Rc::new(move || {
+            PackageProjection::rebuild_validated(
+                &rebuild_path,
+                &rebuild_body,
+                ProjectionSourceKind::ArchiveHistory,
+                ProjectionContract {
+                    parser_schema: super::CRAN_PARSER_SCHEMA,
+                    compatibility_profile: super::CRAN_COMPATIBILITY_PROFILE,
+                    normalization_policy: super::CRAN_NORMALIZATION_POLICY,
+                },
+                || build_archive_projection(&rebuild_body),
+                ArchiveHistorySource::validate_projection,
+            )
+            .map_err(|error| match error {
+                ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
+            })
+        });
+        ArchiveHistorySource::from_projection(projection, Some(rebuild))
             .map(Rc::new)
             .map_err(|error| MetadataParseFailure::SnapshotInvalid(error.into()))
     }
@@ -232,6 +253,8 @@ fn eager_archive_source(
         .collect::<Vec<_>>();
     ArchiveHistorySource {
         projection: None,
+        rebuild: None,
+        rebuild_attempted: Rc::new(Cell::new(false)),
         eager: Some(Rc::new(packages)),
         entry_count,
         rejection_count,

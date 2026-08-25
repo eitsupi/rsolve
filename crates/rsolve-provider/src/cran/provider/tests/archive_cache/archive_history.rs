@@ -176,6 +176,118 @@ fn corrupt_archive_projection_rebuilds_from_cached_raw_without_transport() {
 }
 
 #[test]
+fn semantically_corrupt_archive_summary_rebuilds_from_cached_raw_without_transport() {
+    let (_directory, store) = store();
+    CranRefreshSession::<FixtureTransport>::reset_archive_projection_build_count();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = FixtureTransport {
+        responses: [(history_url(), history_response(Default::default()))]
+            .into_iter()
+            .collect(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first.ensure_history().unwrap();
+    drop(first);
+
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&history_url(), RawCacheRepresentation::ArchiveHistoryRds)
+        .unwrap();
+    let digest = Sha256::digest(HISTORY);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection =
+        cache.projection_path_in_namespace(ProjectionNamespace::ArchiveHistory, &key, &digest);
+    crate::cran::provider::raw_cache::projection::overwrite_projection_summary(
+        &projection,
+        b"invalid summary".to_vec(),
+    );
+
+    let second_transport = empty_transport();
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    assert!(matches!(
+        second.ensure_history(),
+        Ok(HistorySource::Available { .. })
+    ));
+    assert!(requests.borrow().is_empty());
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::archive_projection_build_count(),
+        2
+    );
+}
+
+#[test]
+fn semantically_corrupt_archive_package_rebuilds_on_target_lookup_without_transport() {
+    let (_directory, store) = store();
+    CranRefreshSession::<FixtureTransport>::reset_archive_projection_build_count();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    let first_transport = FixtureTransport {
+        responses: [(history_url(), history_response(Default::default()))]
+            .into_iter()
+            .collect(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some(t0),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first.ensure_history().unwrap();
+    drop(first);
+
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&history_url(), RawCacheRepresentation::ArchiveHistoryRds)
+        .unwrap();
+    let digest = Sha256::digest(HISTORY);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection =
+        cache.projection_path_in_namespace(ProjectionNamespace::ArchiveHistory, &key, &digest);
+    crate::cran::provider::raw_cache::projection::overwrite_projection_package(
+        &projection,
+        "Matrix",
+        b"invalid package payload".to_vec(),
+    );
+
+    let second_transport = empty_transport();
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let source = second.ensure_history().unwrap();
+    let HistorySource::Available { source } = source else {
+        panic!("expected available history");
+    };
+    assert!(source.package(&PackageName::new("Matrix").unwrap()).is_ok());
+    assert!(requests.borrow().is_empty());
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::archive_projection_build_count(),
+        2
+    );
+}
+
+#[test]
 fn archive_history_stale_cache_revalidates_once_and_reuses_body() {
     let (_directory, store) = store();
     let t0 = "2026-08-23T00:00:00Z".parse().unwrap();

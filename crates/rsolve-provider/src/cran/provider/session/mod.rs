@@ -1,6 +1,4 @@
-#[cfg(test)]
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::rc::Rc;
@@ -19,7 +17,7 @@ use super::model::{
     CranRefreshProgressCallback, DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 use super::qualification;
-use super::raw_cache::projection::PackageProjection;
+use super::raw_cache::projection::{PackageProjection, ProjectionLookupError};
 use super::raw_cache::{RawCache, RawCacheEntry, RawCacheRepresentation};
 use super::transport::{Transport, TransportResponse};
 use super::{
@@ -77,7 +75,9 @@ pub(super) struct CranRefreshSession<T> {
 
 #[derive(Clone)]
 pub(super) struct ArchiveHistorySource {
-    projection: Option<Rc<PackageProjection>>,
+    projection: Option<Rc<RefCell<PackageProjection>>>,
+    rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+    rebuild_attempted: Rc<Cell<bool>>,
     eager: Option<Rc<BTreeMap<String, ArchivePackagePayload>>>,
     entry_count: usize,
     rejection_count: usize,
@@ -92,8 +92,14 @@ pub(super) struct ArchiveHistorySummary {
     pub(super) first_rejection: Option<String>,
 }
 
+#[derive(Debug)]
+enum ArchiveProjectionFailure {
+    Storage(String),
+    Semantic(String),
+}
+
 impl ArchiveHistorySource {
-    pub(super) fn from_projection(projection: PackageProjection) -> Result<Self, String> {
+    pub(super) fn validate_projection(projection: &PackageProjection) -> Result<(), String> {
         let summary: ArchiveHistorySummary = postcard::from_bytes(projection.summary())
             .map_err(|error| format!("invalid archive history projection summary: {error}"))?;
         let record_count = summary
@@ -106,9 +112,21 @@ impl ArchiveHistorySource {
                 projection.record_count()
             ));
         }
+        Ok(())
+    }
+
+    pub(super) fn from_projection(
+        projection: PackageProjection,
+        rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+    ) -> Result<Self, String> {
+        Self::validate_projection(&projection)?;
+        let summary: ArchiveHistorySummary = postcard::from_bytes(projection.summary())
+            .map_err(|error| format!("invalid archive history projection summary: {error}"))?;
         Ok(Self {
             surface_digest: projection.surface_digest().into(),
-            projection: Some(Rc::new(projection)),
+            projection: Some(Rc::new(RefCell::new(projection))),
+            rebuild,
+            rebuild_attempted: Rc::new(Cell::new(false)),
             eager: None,
             entry_count: summary.entry_count,
             rejection_count: summary.rejection_count,
@@ -116,65 +134,107 @@ impl ArchiveHistorySource {
         })
     }
 
-    pub(super) fn package(
-        &self,
+    fn decode_projection_package(
+        projection: &PackageProjection,
         package: &PackageName,
-    ) -> Result<ArchivePackagePayload, CandidateLoadError> {
-        let payload = if let Some(projection) = &self.projection {
+    ) -> Result<Option<ArchivePackagePayload>, ArchiveProjectionFailure> {
+        let Some(payload) =
             projection
                 .lookup_package(package.as_str())
-                .map_err(|error| {
-                    CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+                .map_err(|error| match error {
+                    ProjectionLookupError::Storage(error) => {
+                        ArchiveProjectionFailure::Storage(error)
+                    }
+                    ProjectionLookupError::Invalid(error) => {
+                        ArchiveProjectionFailure::Semantic(error)
+                    }
                 })?
-                .map(|payload| {
-                    let record_count = payload.record_count;
-                    postcard::from_bytes::<ArchivePackagePayload>(&payload.bytes)
-                        .map(|payload| (payload, record_count))
-                        .map_err(|error| error.to_string())
-                })
-                .transpose()
-                .map_err(|error| {
-                    CandidateLoadError::new(
-                        CandidateLoadErrorCategory::SnapshotInvalid,
-                        format!("invalid archive package projection: {error}"),
-                    )
-                })?
-        } else {
-            self.eager
-                .as_ref()
-                .and_then(|packages| packages.get(package.as_str()).cloned())
-                .map(|payload| {
-                    let record_count = payload.entries.len() + payload.rejections.len();
-                    (payload, record_count)
-                })
+        else {
+            return Ok(None);
         };
-        let (payload, record_count) = payload.unwrap_or_else(|| {
-            (
-                ArchivePackagePayload {
-                    entries: Vec::new(),
-                    rejections: Vec::new(),
-                },
-                0,
-            )
-        });
+        let record_count = payload.record_count;
+        let payload = postcard::from_bytes::<ArchivePackagePayload>(&payload.bytes)
+            .map_err(|error| ArchiveProjectionFailure::Semantic(error.to_string()))?;
         let expected = payload
             .entries
             .len()
             .checked_add(payload.rejections.len())
             .ok_or_else(|| {
-                CandidateLoadError::new(
-                    CandidateLoadErrorCategory::SnapshotInvalid,
-                    "archive package projection record count overflow",
+                ArchiveProjectionFailure::Semantic(
+                    "archive package projection record count overflow".into(),
                 )
             })?;
         if expected != record_count {
-            return Err(CandidateLoadError::new(
-                CandidateLoadErrorCategory::SnapshotInvalid,
-                format!(
-                    "archive package projection record count mismatch: expected {expected}, stored {record_count}"
-                ),
-            ));
+            return Err(ArchiveProjectionFailure::Semantic(format!(
+                "archive package projection record count mismatch: expected {expected}, stored {record_count}"
+            )));
         }
+        payload
+            .validate_for_package(package)
+            .map(Some)
+            .map_err(ArchiveProjectionFailure::Semantic)
+    }
+
+    pub(super) fn package(
+        &self,
+        package: &PackageName,
+    ) -> Result<ArchivePackagePayload, CandidateLoadError> {
+        let payload = if let Some(projection) = &self.projection {
+            let result = Self::decode_projection_package(&projection.borrow(), package);
+            match result {
+                Ok(result) => result,
+                Err(ArchiveProjectionFailure::Storage(error)) => {
+                    return Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        error,
+                    ));
+                }
+                Err(ArchiveProjectionFailure::Semantic(error)) => {
+                    let Some(rebuild) = &self.rebuild else {
+                        return Err(CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("invalid archive package projection: {error}"),
+                        ));
+                    };
+                    if self.rebuild_attempted.replace(true) {
+                        return Err(CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("invalid archive package projection: {error}"),
+                        ));
+                    }
+                    let rebuilt = rebuild().map_err(|rebuild_error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!(
+                                "failed to rebuild archive package projection: {rebuild_error}"
+                            ),
+                        )
+                    })?;
+                    Self::validate_projection(&rebuilt).map_err(|validation_error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            validation_error,
+                        )
+                    })?;
+                    *projection.borrow_mut() = rebuilt;
+                    Self::decode_projection_package(&projection.borrow(), package).map_err(
+                        |error| {
+                            CandidateLoadError::new(
+                                CandidateLoadErrorCategory::SnapshotInvalid,
+                                format!(
+                                    "invalid archive package projection after rebuild: {error:?}"
+                                ),
+                            )
+                        },
+                    )?
+                }
+            }
+        } else {
+            self.eager
+                .as_ref()
+                .and_then(|packages| packages.get(package.as_str()).cloned())
+        };
+        let payload = payload.unwrap_or_default();
         payload.validate_for_package(package).map_err(|error| {
             CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
         })
@@ -300,7 +360,10 @@ impl CurrentProjection {
             let Some(payload) = projection
                 .lookup_package(package.as_str())
                 .map_err(|error| {
-                    CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        error.to_string(),
+                    )
                 })?
             else {
                 return Ok(super::super::catalog::provider_observations_from_fields(

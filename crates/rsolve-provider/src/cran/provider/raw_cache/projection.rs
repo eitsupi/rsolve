@@ -82,6 +82,20 @@ pub(crate) struct ProjectionPayload {
 }
 
 #[derive(Debug)]
+pub(crate) enum ProjectionLookupError {
+    Storage(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for ProjectionLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum ProjectionError {
     Build(String),
     Storage(String),
@@ -119,21 +133,56 @@ impl PackageProjection {
     where
         F: FnOnce() -> Result<ProjectionBuild, String>,
     {
+        Self::open_or_build_validated(path, raw_body, source_kind, contract, build, |_| Ok(()))
+    }
+
+    pub(crate) fn open_or_build_validated<F, V>(
+        path: &Path,
+        raw_body: &[u8],
+        source_kind: ProjectionSourceKind,
+        contract: ProjectionContract,
+        build: F,
+        validate: V,
+    ) -> Result<Self, ProjectionError>
+    where
+        F: FnOnce() -> Result<ProjectionBuild, String>,
+        V: Fn(&Self) -> Result<(), String>,
+    {
         let raw_digest = hex_digest(Sha256::digest(raw_body));
-        if let Ok(projection) = Self::open(path, &raw_digest, source_kind, &contract) {
+        if let Ok(projection) = Self::open(path, &raw_digest, source_kind, &contract)
+            && validate(&projection).is_ok()
+        {
             return Ok(projection);
         }
+        Self::rebuild_validated(path, raw_body, source_kind, contract, build, validate)
+    }
+
+    pub(crate) fn rebuild_validated<F, V>(
+        path: &Path,
+        raw_body: &[u8],
+        source_kind: ProjectionSourceKind,
+        contract: ProjectionContract,
+        build: F,
+        validate: V,
+    ) -> Result<Self, ProjectionError>
+    where
+        F: FnOnce() -> Result<ProjectionBuild, String>,
+        V: Fn(&Self) -> Result<(), String>,
+    {
+        let raw_digest = hex_digest(Sha256::digest(raw_body));
         let build = build().map_err(ProjectionError::Build)?;
         let counts = build.validate().map_err(ProjectionError::Build)?;
         Self::write(path, raw_digest, source_kind, contract, build, counts)
             .map_err(ProjectionError::Storage)?;
-        Self::open(
+        let projection = Self::open(
             path,
             &hex_digest(Sha256::digest(raw_body)),
             source_kind,
             &contract,
         )
-        .map_err(ProjectionError::Storage)
+        .map_err(ProjectionError::Storage)?;
+        validate(&projection).map_err(ProjectionError::Build)?;
+        Ok(projection)
     }
 
     pub(crate) fn open(
@@ -187,33 +236,40 @@ impl PackageProjection {
     pub(crate) fn lookup_package(
         &self,
         package: &str,
-    ) -> Result<Option<ProjectionPayload>, String> {
+    ) -> Result<Option<ProjectionPayload>, ProjectionLookupError> {
         let read = self
             .database
             .begin_read()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectionLookupError::Storage(error.to_string()))?;
         let packages = read
             .open_table(PACKAGES)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectionLookupError::Storage(error.to_string()))?;
         let counts = read
             .open_table(PACKAGE_COUNTS)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectionLookupError::Storage(error.to_string()))?;
         let payload = packages
             .get(package)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| ProjectionLookupError::Storage(error.to_string()))?
             .map(|value| value.value().to_vec());
-        let count = counts.get(package).map_err(|error| error.to_string())?;
+        let count = counts
+            .get(package)
+            .map_err(|error| ProjectionLookupError::Storage(error.to_string()))?;
         match (payload, count) {
             (None, None) => Ok(None),
-            (Some(_), None) | (None, Some(_)) => {
-                Err("package projection payload/count entry mismatch".into())
-            }
+            (Some(_), None) | (None, Some(_)) => Err(ProjectionLookupError::Invalid(
+                "package projection payload/count entry mismatch".into(),
+            )),
             (Some(bytes), Some(count)) => {
                 if bytes.is_empty() || count.value() == 0 {
-                    return Err("invalid package projection payload/count entry".into());
+                    return Err(ProjectionLookupError::Invalid(
+                        "invalid package projection payload/count entry".into(),
+                    ));
                 }
-                let record_count = usize::try_from(count.value())
-                    .map_err(|_| "package projection record count exceeds usize".to_owned())?;
+                let record_count = usize::try_from(count.value()).map_err(|_| {
+                    ProjectionLookupError::Invalid(
+                        "package projection record count exceeds usize".into(),
+                    )
+                })?;
                 Ok(Some(ProjectionPayload {
                     bytes,
                     record_count,
@@ -468,6 +524,32 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn overwrite_projection_summary(path: &Path, summary: Vec<u8>) {
+    let database = Database::open(path).unwrap();
+    let tx = database.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(HEADER).unwrap();
+        let value = table.get("header").unwrap().unwrap().value().to_vec();
+        let mut header: Header = postcard::from_bytes(&value).unwrap();
+        header.summary = summary;
+        let encoded = postcard::to_stdvec(&header).unwrap();
+        table.insert("header", encoded.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn overwrite_projection_package(path: &Path, package: &str, payload: Vec<u8>) {
+    let database = Database::open(path).unwrap();
+    let tx = database.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(PACKAGES).unwrap();
+        table.insert(package, payload.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
 }
 
 #[cfg(test)]
