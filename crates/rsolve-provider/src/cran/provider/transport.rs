@@ -35,6 +35,7 @@ impl TransportValidators {
 pub(crate) struct TransportResponseHeaders {
     pub(crate) etag: Option<Box<str>>,
     pub(crate) last_modified: Option<Box<str>>,
+    pub(crate) retry_after: Option<Box<str>>,
     pub(crate) cache_control: CacheControlHeader,
 }
 
@@ -53,6 +54,7 @@ impl TransportResponseHeaders {
 fn extract_response_headers(
     etag_values: &[Option<&str>],
     last_modified_values: &[Option<&str>],
+    retry_after_values: &[Option<&str>],
     cache_control_values: &[Option<&str>],
 ) -> TransportResponseHeaders {
     let etag = unique_validator(etag_values);
@@ -61,11 +63,18 @@ fn extract_response_headers(
     TransportResponseHeaders {
         etag,
         last_modified,
+        retry_after: unique_header(retry_after_values),
         cache_control,
     }
 }
 
 fn unique_validator(values: &[Option<&str>]) -> Option<Box<str>> {
+    (values.len() == 1)
+        .then(|| validated_header_value(values[0]))
+        .flatten()
+}
+
+fn unique_header(values: &[Option<&str>]) -> Option<Box<str>> {
     (values.len() == 1)
         .then(|| validated_header_value(values[0]))
         .flatten()
@@ -243,8 +252,18 @@ impl Transport for UreqTransport {
             .iter()
             .map(|value| value.to_str().ok())
             .collect::<Vec<_>>();
-        let headers =
-            extract_response_headers(&etag_values, &last_modified_values, &cache_control_values);
+        let retry_after_values = response
+            .headers()
+            .get_all("Retry-After")
+            .iter()
+            .map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        let headers = extract_response_headers(
+            &etag_values,
+            &last_modified_values,
+            &retry_after_values,
+            &cache_control_values,
+        );
         let mut body = response.into_body();
         let declared_size = body.content_length();
         if status != 304 && declared_size.is_some_and(|length| length > super::MAX_RESPONSE_BYTES) {
@@ -274,9 +293,11 @@ mod tests {
         let headers = extract_response_headers(
             &[Some("  \"tag-1\"  ")],
             &[Some("Wed, 21 Oct 2015 07:28:00 GMT")],
+            &[Some(" 120 ")],
             &[Some("max-age=120")],
         );
         assert_eq!(headers.etag.as_deref(), Some("\"tag-1\""));
+        assert_eq!(headers.retry_after.as_deref(), Some("120"));
         assert_eq!(
             headers.cache_control,
             CacheControlHeader::Valid("max-age=120".into())
@@ -292,6 +313,7 @@ mod tests {
         let unsafe_headers = extract_response_headers(
             &[Some("etag\r\nforged: true")],
             &[Some(&oversized)],
+            &[Some("no-cache\n")],
             &[Some("no-cache\n")],
         );
         assert_eq!(unsafe_headers.etag, None);
@@ -315,10 +337,12 @@ mod tests {
                 Some("Wed, 21 Oct 2015 07:28:00 GMT"),
                 Some("Thu, 22 Oct 2015 07:28:00 GMT"),
             ],
+            &[Some("60"), Some("120")],
             &[Some("max-age=120"), Some("no-cache")],
         );
         assert_eq!(headers.etag, None);
         assert_eq!(headers.last_modified, None);
+        assert_eq!(headers.retry_after, None);
         assert_eq!(
             headers.cache_control,
             CacheControlHeader::Valid("max-age=120,no-cache".into())
@@ -339,7 +363,7 @@ mod tests {
     fn invalid_or_oversized_cache_control_is_marked_fail_closed() {
         let oversized = "x".repeat(MAX_HEADER_VALUE_BYTES + 1);
         for values in [&[None][..], &[Some(oversized.as_str())][..]] {
-            let headers = extract_response_headers(&[], &[], values);
+            let headers = extract_response_headers(&[], &[], &[], values);
             assert_eq!(headers.cache_control, CacheControlHeader::Invalid);
         }
     }

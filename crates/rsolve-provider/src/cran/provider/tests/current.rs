@@ -574,6 +574,7 @@ fn stale_current_cache_revalidates_with_validators_and_304() {
             headers: TransportResponseHeaders {
                 etag: Some(etag.into()),
                 last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+                retry_after: None,
                 cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
                     "no-cache".into(),
                 ),

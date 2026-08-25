@@ -916,6 +916,7 @@ name = "rsolve-provider"
 version = "0.1.0"
 dependencies = [
  "deb822-fast",
+ "fastrand",
  "flate2",
  "jiff",
  "postcard",

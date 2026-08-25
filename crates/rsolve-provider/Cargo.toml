@@ -13,6 +13,7 @@ rsolve-core = { path = "../rsolve-core" }
 deb822-fast = { workspace = true }
 rd-rds = { workspace = true }
 flate2 = { workspace = true }
+fastrand = { workspace = true }
 ruzstd = { workspace = true }
 tar = { workspace = true }
 ureq = { workspace = true }

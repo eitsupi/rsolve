@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use super::DEFAULT_COMPATIBLE_GENERATION_TTL;
 use super::{CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA};
 
+pub(super) const LOCAL_BACKOFF_BASE_SECS: i64 = 60;
+pub(super) const LOCAL_BACKOFF_CAP_SECS: i64 = 6 * 60 * 60;
+pub(super) const SERVER_BACKOFF_CAP_SECS: i64 = 24 * 60 * 60;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Status {
@@ -137,6 +141,80 @@ pub(super) fn positive_reusable(record: &Record, now: jiff::Timestamp) -> bool {
         .is_ok_and(|age: Duration| age <= DEFAULT_COMPATIBLE_GENERATION_TTL)
 }
 
+/// Computes the next probe deadline after a failed qualification attempt.
+/// `sample` is injected by tests; production callers provide an unpredictable
+/// value from the process-local random source. Server guidance wins over the
+/// local jittered exponential window, but is bounded to one metadata TTL.
+pub(super) fn failure_probe_at(
+    now: jiff::Timestamp,
+    failure_count: u32,
+    retry_after: Option<&str>,
+    sample: u64,
+) -> String {
+    let exponent = failure_count.saturating_sub(1).min(9);
+    let local_window = LOCAL_BACKOFF_BASE_SECS
+        .saturating_mul(1_i64 << exponent)
+        .min(LOCAL_BACKOFF_CAP_SECS);
+    let jitter_secs = ((local_window as u128 * sample as u128) / u64::MAX as u128) as i64;
+    let local_deadline = now + jiff::SignedDuration::from_secs(jitter_secs);
+    let server_deadline = retry_after
+        .and_then(|value| parse_retry_after(value, now))
+        .map(|delay| now + jiff::SignedDuration::from_secs(delay));
+    let deadline = server_deadline.map_or(local_deadline, |server| {
+        if server > local_deadline {
+            server
+        } else {
+            local_deadline
+        }
+    });
+    // The persisted wire format has whole-second precision. Ceil rather than
+    // truncate so a fractional production clock can never shorten either
+    // local backoff or server-provided guidance.
+    let deadline = match deadline.subsec_nanosecond() {
+        0 => deadline,
+        nanos => {
+            deadline + jiff::SignedDuration::from_secs(1)
+                - jiff::SignedDuration::from_nanos(i64::from(nanos))
+        }
+    };
+    deadline.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn parse_retry_after(value: &str, now: jiff::Timestamp) -> Option<i64> {
+    let value = value.trim();
+    let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        value
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds.min(SERVER_BACKOFF_CAP_SECS as u64) as i64)
+    } else {
+        parse_http_date(value).and_then(|deadline| {
+            if deadline <= now {
+                None
+            } else {
+                Some(deadline.duration_since(now).as_secs_f64() as i64)
+            }
+        })
+    }?;
+    Some(delay.min(SERVER_BACKOFF_CAP_SECS))
+}
+
+fn parse_http_date(value: &str) -> Option<jiff::Timestamp> {
+    [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ]
+    .into_iter()
+    .find_map(|format| {
+        jiff::civil::DateTime::strptime(format, value)
+            .ok()?
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .ok()
+            .map(|zoned| zoned.timestamp())
+    })
+}
+
 pub(super) fn publish(path: &Path, record: &Record) -> Result<(), String> {
     let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("json.tmp");
@@ -217,5 +295,74 @@ mod tests {
         assert!(!positive_reusable(&record, now));
         record.validated_at = "not-a-timestamp".into();
         assert!(!positive_reusable(&record, now));
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_and_http_dates_with_safe_bounds() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        let max_sample = u64::MAX;
+        assert_eq!(
+            failure_probe_at(now, 1, Some("120"), 0),
+            "2026-08-25T00:02:00Z"
+        );
+        assert_eq!(
+            failure_probe_at(now, 1, Some("172800"), 0),
+            "2026-08-26T00:00:00Z"
+        );
+        assert_eq!(
+            failure_probe_at(now, 1, Some("30"), u64::MAX),
+            "2026-08-25T00:01:00Z"
+        );
+        assert_eq!(
+            failure_probe_at(now, 1, Some("Wed, 26 Aug 2026 00:00:00 GMT"), 0),
+            "2026-08-26T00:00:00Z"
+        );
+        assert_eq!(
+            failure_probe_at(now, 1, Some("Tuesday, 25-Aug-26 12:00:00 GMT"), 0),
+            "2026-08-25T12:00:00Z"
+        );
+        assert_eq!(
+            failure_probe_at(now, 1, Some("Tue Aug 25 18:00:00 2026"), 0),
+            "2026-08-25T18:00:00Z"
+        );
+        for value in [
+            "999999999999999999999",
+            "yesterday",
+            "-1",
+            "Wed, 24 Aug 2026 00:00:00 GMT",
+        ] {
+            assert_eq!(
+                failure_probe_at(now, 1, Some(value), u64::MAX),
+                "2026-08-25T00:01:00Z",
+                "invalid Retry-After guidance must leave local jitter in control: {value}"
+            );
+        }
+        assert_eq!(
+            failure_probe_at(now, 1, None, max_sample),
+            "2026-08-25T00:01:00Z"
+        );
+    }
+
+    #[test]
+    fn local_backoff_is_full_jitter_and_capped() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        assert_eq!(failure_probe_at(now, 1, None, 0), "2026-08-25T00:00:00Z");
+        assert_eq!(
+            failure_probe_at(now, 2, None, u64::MAX),
+            "2026-08-25T00:02:00Z"
+        );
+        assert_eq!(
+            failure_probe_at(now, 100, None, u64::MAX),
+            "2026-08-25T06:00:00Z"
+        );
+    }
+
+    #[test]
+    fn persisted_probe_deadline_ceils_fractional_clock_time() {
+        let now = "2026-08-25T00:00:00.250Z".parse().unwrap();
+        assert_eq!(
+            failure_probe_at(now, 1, Some("120"), 0),
+            "2026-08-25T00:02:01Z"
+        );
     }
 }

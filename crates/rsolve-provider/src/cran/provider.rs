@@ -1158,6 +1158,7 @@ struct CurrentBody {
 
 struct MetadataAcquisitionFailure {
     status: Option<u16>,
+    retry_after: Option<Box<str>>,
     category: CandidateLoadErrorCategory,
     diagnostic: Box<str>,
     fallback_allowed: bool,
@@ -1195,15 +1196,17 @@ impl MetadataAcquisitionFailure {
     fn cache(error: impl std::fmt::Display) -> Self {
         Self {
             status: None,
+            retry_after: None,
             category: CandidateLoadErrorCategory::SnapshotInvalid,
             diagnostic: format!("CRAN metadata raw cache is invalid: {error}").into(),
             fallback_allowed: false,
         }
     }
 
-    fn response(status: u16, diagnostic: impl Into<Box<str>>) -> Self {
+    fn response(status: u16, diagnostic: impl Into<Box<str>>, retry_after: Option<&str>) -> Self {
         Self {
             status: Some(status),
+            retry_after: retry_after.map(Into::into),
             category: CandidateLoadErrorCategory::TransportFailure,
             diagnostic: diagnostic.into(),
             fallback_allowed: true,
@@ -1213,6 +1216,7 @@ impl MetadataAcquisitionFailure {
     fn transport(error: impl std::fmt::Display) -> Self {
         Self {
             status: None,
+            retry_after: None,
             category: CandidateLoadErrorCategory::TransportFailure,
             diagnostic: format!("transport failure: {error}").into(),
             fallback_allowed: true,
@@ -1222,6 +1226,7 @@ impl MetadataAcquisitionFailure {
     fn invalid(status: Option<u16>, diagnostic: impl Into<Box<str>>) -> Self {
         Self {
             status,
+            retry_after: None,
             category: CandidateLoadErrorCategory::MetadataInvalid,
             diagnostic: diagnostic.into(),
             fallback_allowed: true,
@@ -1429,6 +1434,7 @@ impl<T: Transport> CranRefreshSession<T> {
                                 return Err(MetadataAcquisitionFailure::response(
                                     response.status,
                                     format!("unexpected metadata status {}", response.status),
+                                    response.headers.retry_after.as_deref(),
                                 ));
                             }
                             Err(error) => {
@@ -1450,6 +1456,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     return Err(MetadataAcquisitionFailure::response(
                         response.status,
                         format!("unexpected metadata status {}", response.status),
+                        response.headers.retry_after.as_deref(),
                     ));
                 }
                 Err(error) => return Err(MetadataAcquisitionFailure::transport(error)),
@@ -1489,6 +1496,7 @@ impl<T: Transport> CranRefreshSession<T> {
                         let headers = TransportResponseHeaders {
                             etag: body.etag.clone(),
                             last_modified: body.last_modified.clone(),
+                            retry_after: None,
                             cache_control: body.cache_control.clone(),
                         };
                         cache
@@ -1804,6 +1812,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     let headers = TransportResponseHeaders {
                         etag: body.etag.clone(),
                         last_modified: body.last_modified.clone(),
+                        retry_after: None,
                         cache_control: body.cache_control.clone(),
                     };
                     let validated_at = self.now();
@@ -2168,11 +2177,12 @@ impl<T: Transport> CranRefreshSession<T> {
                                     "configured repository does not match canonical CRAN surface"
                                         .into(),
                                 failure_count,
-                                next_probe_at: Some(
-                                    (self.now() + jiff::SignedDuration::from_hours(6))
-                                        .strftime("%Y-%m-%dT%H:%M:%SZ")
-                                        .to_string(),
-                                ),
+                                next_probe_at: Some(qualification::failure_probe_at(
+                                    self.now(),
+                                    failure_count,
+                                    None,
+                                    fastrand::u64(..),
+                                )),
                                 validated_at: self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
                                 ..qualification::Record::default()
                             },
@@ -2284,11 +2294,12 @@ impl<T: Transport> CranRefreshSession<T> {
                             status: qualification::Status::Negative,
                             diagnostic: error.diagnostic.to_string(),
                             failure_count,
-                            next_probe_at: Some(
-                                (self.now() + jiff::SignedDuration::from_hours(6))
-                                    .strftime("%Y-%m-%dT%H:%M:%SZ")
-                                    .to_string(),
-                            ),
+                            next_probe_at: Some(qualification::failure_probe_at(
+                                self.now(),
+                                failure_count,
+                                error.retry_after.as_deref(),
+                                fastrand::u64(..),
+                            )),
                             validated_at: self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
                             ..qualification::Record::default()
                         },
@@ -2333,14 +2344,12 @@ impl<T: Transport> CranRefreshSession<T> {
                             status,
                             diagnostic: error.diagnostic.to_string(),
                             failure_count,
-                            next_probe_at: Some(
-                                (self.now()
-                                    + jiff::SignedDuration::from_secs(
-                                        (60_i64 * 2_i64.pow(failure_count.min(8))).min(6 * 60 * 60),
-                                    ))
-                                .strftime("%Y-%m-%dT%H:%M:%SZ")
-                                .to_string(),
-                            ),
+                            next_probe_at: Some(qualification::failure_probe_at(
+                                self.now(),
+                                failure_count,
+                                error.retry_after.as_deref(),
+                                fastrand::u64(..),
+                            )),
                             validated_at: self.now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
                             ..qualification::Record::default()
                         },

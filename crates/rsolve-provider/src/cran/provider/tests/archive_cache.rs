@@ -293,6 +293,14 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
             .unwrap()
             .candidates(),
     );
+    let qualification_path = RawCache::open(&store).unwrap().qualification_path();
+    let mut degraded = crate::cran::provider::qualification::load_result(&qualification_path)
+        .unwrap()
+        .unwrap();
+    degraded.status = crate::cran::provider::qualification::Status::Unknown;
+    degraded.failure_count = 3;
+    degraded.next_probe_at = Some("2026-08-26T00:00:00Z".into());
+    crate::cran::provider::qualification::publish(&qualification_path, &degraded).unwrap();
 
     let mut not_modified = allpackages_transport(Vec::new(), false);
     for url in [
@@ -327,6 +335,17 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
     assert!(requests.borrow().iter().all(|request| {
         request.validators.if_none_match.as_deref() == Some("\"allpackages-e2e\"")
     }));
+    let qualification = crate::cran::provider::qualification::load_result(
+        &RawCache::open(&store).unwrap().qualification_path(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        qualification.status,
+        crate::cran::provider::qualification::Status::Positive
+    );
+    assert_eq!(qualification.failure_count, 0);
+    assert_eq!(qualification.next_probe_at, None);
 
     let mut same_body = allpackages_transport(Vec::new(), false);
     same_body.responses.insert(
@@ -615,13 +634,20 @@ fn custom_mirror_negative_cooldown_and_malformed_qualification_are_observable() 
     );
     assert_eq!(record.current_digest, record.canonical_current_digest);
     assert_ne!(record.archive_digest, record.canonical_archive_digest);
+    let cooldown_at = record
+        .next_probe_at
+        .as_deref()
+        .unwrap()
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        - jiff::SignedDuration::from_secs(1);
 
     let cooldown_transport = empty_transport();
     let cooldown_requests = cooldown_transport.requests.clone();
     let mut cooldown = CranRefreshSession::new_with_clock(
         Rc::new(cooldown_transport),
         CranMetadataConfig::new("https://mirror.invalid", ALLPACKAGES_FIXTURE_URL),
-        Some("2026-08-25T01:00:00Z".parse().unwrap()),
+        Some(cooldown_at),
         Some(RawCache::open(&store).unwrap()),
     );
     cooldown
@@ -650,6 +676,100 @@ fn custom_mirror_negative_cooldown_and_malformed_qualification_are_observable() 
         diagnostic.source() == CranRefreshSource::AllPackages
             && matches!(diagnostic.status_detail(), CranFastPathStatus::Invalid { diagnostic, .. } if diagnostic.contains("invalid ALLPACKAGES qualification"))
     }));
+}
+
+#[test]
+fn allpackages_retry_after_persists_cooldown_and_explicit_refresh_resets_it() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut failed_transport = allpackages_transport(feed.clone(), true);
+    failed_transport.responses.insert(
+        ALLPACKAGES_FIXTURE_URL.into(),
+        TransportResponse {
+            status: 503,
+            body: Vec::new(),
+            headers: TransportResponseHeaders {
+                retry_after: Some("7200".into()),
+                ..TransportResponseHeaders::default()
+            },
+        },
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(failed_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    first
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    drop(first);
+
+    let raw_cache = RawCache::open(&store).unwrap();
+    let qualification_path = raw_cache.qualification_path();
+    let failed = crate::cran::provider::qualification::load_result(&qualification_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed.status,
+        crate::cran::provider::qualification::Status::Unknown
+    );
+    assert_eq!(failed.failure_count, 1);
+    assert_eq!(
+        failed.next_probe_at.as_deref(),
+        Some("2026-08-25T02:00:00Z")
+    );
+
+    let cooldown_transport = empty_transport();
+    let cooldown_requests = cooldown_transport.requests.clone();
+    let mut cooldown = CranRefreshSession::new_with_clock(
+        Rc::new(cooldown_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T01:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    cooldown
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(
+        cooldown_requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url == ALLPACKAGES_FIXTURE_URL)
+            .count(),
+        0
+    );
+
+    let refresh_transport = allpackages_transport(feed, false);
+    let refresh_requests = refresh_transport.requests.clone();
+    let mut refresh = CranRefreshSession::new_with_clock(
+        Rc::new(refresh_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL)
+            .with_refresh_metadata(),
+        Some("2026-08-25T01:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    refresh
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert_eq!(
+        refresh_requests
+            .borrow()
+            .iter()
+            .filter(|request| request.url == ALLPACKAGES_FIXTURE_URL)
+            .count(),
+        1
+    );
+    let recovered = crate::cran::provider::qualification::load_result(&qualification_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recovered.status,
+        crate::cran::provider::qualification::Status::Positive
+    );
+    assert_eq!(recovered.failure_count, 0);
+    assert_eq!(recovered.next_probe_at, None);
 }
 
 #[test]
