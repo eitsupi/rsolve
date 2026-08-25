@@ -198,18 +198,23 @@ impl CurrentProjection {
     pub(super) fn materialize_catalog(&self) -> Result<CranCatalog, CandidateLoadError> {
         if let Some(catalog) = &self.projection {
             let mut observations = Vec::new();
-            for package in catalog.package_names().map_err(|error| {
-                CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
-            })? {
-                let package = PackageName::new(&package).map_err(|error| {
-                    CandidateLoadError::new(
-                        CandidateLoadErrorCategory::MetadataInvalid,
-                        error.to_string(),
-                    )
+            catalog
+                .visit_package_records(|package, records| {
+                    let package = PackageName::new(package).map_err(|error| error.to_string())?;
+                    let projection = super::super::catalog::provider_observations_from_fields(
+                        records
+                            .into_iter()
+                            .map(|record| (record.record_index, record.package, record.fields))
+                            .collect(),
+                        CranCatalogRecordContext::PackagesIndex,
+                        Some(&package),
+                    );
+                    observations.extend(projection.observations);
+                    Ok(())
+                })
+                .map_err(|error| {
+                    CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
                 })?;
-                let projection = self.observations(&package)?;
-                observations.extend(projection.observations);
-            }
             return Ok(CranCatalog::from_provider_observations(&observations));
         }
         Ok(CranCatalog::from_provider_observations(

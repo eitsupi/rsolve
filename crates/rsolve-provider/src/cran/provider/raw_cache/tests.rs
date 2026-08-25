@@ -440,8 +440,8 @@ fn projection_retention_is_scoped_to_one_raw_cache_key() {
     let store = store();
     let cache = RawCache::open(&store).unwrap();
     let current = cache.projection_namespace_path(ProjectionNamespace::Current);
-    let first = current.join("first");
-    let second = current.join("second");
+    let first = current.join("a".repeat(64));
+    let second = current.join("b".repeat(64));
     fs::create_dir_all(&first).unwrap();
     fs::create_dir_all(&second).unwrap();
     let active = first.join("active.redb");
@@ -458,4 +458,27 @@ fn projection_retention_is_scoped_to_one_raw_cache_key() {
     assert!(active.exists());
     assert!(!orphan.exists());
     assert!(other_key.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_retention_rejects_symlinked_raw_key_directory() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let outside = tempdir().unwrap();
+    let outside_active = outside.path().join("active.redb");
+    let outside_orphan = outside.path().join("orphan.redb");
+    fs::write(&outside_active, b"active").unwrap();
+    fs::write(&outside_orphan, b"orphan").unwrap();
+
+    let namespace = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let key_directory = namespace.join("c".repeat(64));
+    std::fs::create_dir_all(&namespace).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &key_directory).unwrap();
+    let active = key_directory.join("active.redb");
+    let error = cache
+        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
+        .expect_err("a symlinked raw-key directory must fail closed");
+    assert!(error.to_string().contains("raw-key directory"));
+    assert!(outside_orphan.exists());
 }

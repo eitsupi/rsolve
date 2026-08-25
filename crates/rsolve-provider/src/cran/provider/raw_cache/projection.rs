@@ -12,12 +12,29 @@ use std::path::{Path, PathBuf};
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 
 const FORMAT: &str = "rsolve-cran-package-projection";
 const VERSION: u32 = 1;
 const HEADER: TableDefinition<&str, &[u8]> = TableDefinition::new("header");
 const PACKAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("packages");
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static VISIT_PACKAGE_RECORDS_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_visit_package_records_count() {
+    VISIT_PACKAGE_RECORDS_COUNT.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn visit_package_records_count() -> usize {
+    VISIT_PACKAGE_RECORDS_COUNT.with(Cell::get)
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,7 +183,12 @@ impl PackageProjection {
             .map(|records| records.unwrap_or_default())
     }
 
-    pub(crate) fn package_names(&self) -> Result<Vec<String>, String> {
+    pub(crate) fn visit_package_records<F>(&self, mut visitor: F) -> Result<(), String>
+    where
+        F: FnMut(&str, Vec<ProjectionRecord>) -> Result<(), String>,
+    {
+        #[cfg(test)]
+        VISIT_PACKAGE_RECORDS_COUNT.with(|counter| counter.set(counter.get() + 1));
         let read = self
             .database
             .begin_read()
@@ -174,14 +196,15 @@ impl PackageProjection {
         let table = read
             .open_table(PACKAGES)
             .map_err(|error| error.to_string())?;
-        let mut names = Vec::new();
         for item in table.iter().map_err(|error| error.to_string())? {
-            let (key, _) = item.map_err(|error| error.to_string())?;
+            let (key, value) = item.map_err(|error| error.to_string())?;
             if !key.value().is_empty() {
-                names.push(key.value().to_owned());
+                let records =
+                    postcard::from_bytes(value.value()).map_err(|error| error.to_string())?;
+                visitor(key.value(), records)?;
             }
         }
-        Ok(names)
+        Ok(())
     }
 
     pub(crate) fn package_count(&self) -> usize {
@@ -394,6 +417,47 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(projection.package_count(), 1);
         assert_eq!(projection.surface_digest(), "surface-1.0");
+    }
+
+    #[test]
+    fn package_record_visitor_reads_all_keys_in_one_ordered_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("current.redb");
+        let records = vec![
+            ProjectionRecord {
+                record_index: 1,
+                package: Some("b".into()),
+                fields: vec![],
+            },
+            ProjectionRecord {
+                record_index: 0,
+                package: Some("a".into()),
+                fields: vec![],
+            },
+        ];
+        let projection = PackageProjection::open_or_build(
+            &path,
+            b"raw",
+            ProjectionSourceKind::Current,
+            contract(),
+            || {
+                Ok(ProjectionBuild {
+                    records,
+                    surface_digest: "surface".into(),
+                })
+            },
+        )
+        .unwrap();
+        reset_visit_package_records_count();
+        let mut keys = Vec::new();
+        projection
+            .visit_package_records(|package, records| {
+                keys.push((package.to_owned(), records[0].record_index));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visit_package_records_count(), 1);
+        assert_eq!(keys, [("a".into(), 0), ("b".into(), 1)]);
     }
 
     #[test]

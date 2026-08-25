@@ -140,18 +140,13 @@ impl RawCache {
         active: &Path,
         previous: Option<&Path>,
     ) -> Result<(), RawCacheError> {
-        if !is_regular_file(active) {
-            return Err(RawCacheError::Invalid(
-                "active package projection is missing".into(),
-            ));
-        }
         let directory = active
             .parent()
             .ok_or_else(|| RawCacheError::Invalid("projection path has no parent".into()))?;
-        if !directory.starts_with(self.projection_namespace_path(namespace)) {
-            return Err(RawCacheError::Invalid(
-                "projection is outside its namespace".into(),
-            ));
+        self.validate_projection_directory(namespace, directory)?;
+        validate_projection_file(active, directory, "active")?;
+        if let Some(path) = previous {
+            validate_projection_file(path, directory, "previous")?;
         }
         let files = fs::read_dir(directory)?
             .filter_map(Result::ok)
@@ -164,14 +159,11 @@ impl RawCache {
                 is_projection.then_some(path)
             })
             .collect::<Vec<_>>();
-        let previous = match previous {
-            Some(path) if !is_regular_file(path) => {
-                return Err(RawCacheError::Invalid(
-                    "previous package projection is missing".into(),
-                ));
-            }
-            other => other,
-        };
+        self.validate_projection_directory(namespace, directory)?;
+        validate_projection_file(active, directory, "active")?;
+        if let Some(path) = previous {
+            validate_projection_file(path, directory, "previous")?;
+        }
         for path in files {
             if path == active || previous.is_some_and(|candidate| candidate == path) {
                 continue;
@@ -179,6 +171,42 @@ impl RawCache {
             let _ = fs::remove_file(path);
         }
         sync_directory(directory)
+    }
+
+    fn validate_projection_directory(
+        &self,
+        namespace: ProjectionNamespace,
+        directory: &Path,
+    ) -> Result<(), RawCacheError> {
+        let root = self.directory.join(PROJECTION_DIRECTORY);
+        ensure_regular_directory_path(&root, "projection root")?;
+        let namespace_path = self.projection_namespace_path(namespace);
+        ensure_regular_directory_path(&namespace_path, "projection namespace")?;
+        if namespace == ProjectionNamespace::AllPackages {
+            if directory != namespace_path {
+                return Err(RawCacheError::Invalid(
+                    "projection is outside its namespace".into(),
+                ));
+            }
+        } else {
+            if directory.parent() != Some(namespace_path.as_path())
+                || directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| {
+                        name.len() != 64
+                            || !name
+                                .bytes()
+                                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    })
+            {
+                return Err(RawCacheError::Invalid(
+                    "projection is outside its raw-key namespace".into(),
+                ));
+            }
+            ensure_regular_directory_path(directory, "projection raw-key directory")?;
+        }
+        Ok(())
     }
 
     pub(crate) fn projection_namespace_path(&self, namespace: ProjectionNamespace) -> PathBuf {
@@ -522,6 +550,31 @@ fn is_regular_file(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_file())
         .unwrap_or(false)
+}
+
+fn ensure_regular_directory_path(path: &Path, label: &str) -> Result<(), RawCacheError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(RawCacheError::Invalid(
+            format!("{label} is not a regular directory").into(),
+        )),
+        Err(error) => Err(RawCacheError::Invalid(
+            format!("{label} is unavailable: {error}").into(),
+        )),
+    }
+}
+
+fn validate_projection_file(
+    path: &Path,
+    directory: &Path,
+    label: &str,
+) -> Result<(), RawCacheError> {
+    if path.parent() != Some(directory) || !is_regular_file(path) {
+        return Err(RawCacheError::Invalid(
+            format!("{label} package projection is missing or outside its directory").into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_directory(path: &Path) -> Result<(), RawCacheError> {

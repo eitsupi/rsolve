@@ -169,6 +169,7 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
     mismatched.current_digest = "changed-current-surface".into();
     crate::cran::provider::qualification::publish(&qualification_path, &mismatched).unwrap();
     crate::cran::provider::allpackages::reset_test_counters();
+    crate::cran::provider::raw_cache::projection::reset_visit_package_records_count();
     let third_transport = allpackages_transport(feed, false);
     let third_requests = third_transport.requests.clone();
     let mut third = CranRefreshSession::new_with_clock(
@@ -182,6 +183,10 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         .unwrap();
     assert!(third_requests.borrow().is_empty());
     assert!(crate::cran::provider::allpackages::classify_current_count() > 0);
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_package_records_count(),
+        1
+    );
 }
 
 #[test]
