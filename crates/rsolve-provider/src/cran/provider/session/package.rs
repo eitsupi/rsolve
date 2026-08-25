@@ -175,7 +175,22 @@ impl<T: Transport> CranRefreshSession<T> {
         &mut self,
         package: &PackageName,
     ) -> Result<CandidateLoadResult, CandidateLoadError> {
-        let current = self.ensure_current()?.candidates(package).to_vec();
+        let current_projection = self.ensure_current()?;
+        let current = current_projection.candidates(package)?;
+        if let Some(source) = self.current_source.clone() {
+            let observations = current_projection.observations(package)?;
+            self.evidence
+                .borrow_mut()
+                .extend(observations.observations.iter().map(|record| {
+                    index_record_to_evidence(
+                        record,
+                        source.clone(),
+                        &self.base_url,
+                        true,
+                        FreshnessStateV1::CurrentGeneration,
+                    )
+                }));
+        }
         let bulk_candidates = if self.allow_allpackages_history {
             match self.ensure_allpackages() {
                 Ok(bulk) => self.bulk_candidates_for_package(package, &current, &bulk)?,

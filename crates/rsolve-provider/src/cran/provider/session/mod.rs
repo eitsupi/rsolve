@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -5,7 +7,7 @@ use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
 
-use super::super::catalog::{CranCatalog, CranCatalogObservation};
+use super::super::catalog::{CranCatalog, CranCatalogObservation, CranCatalogRecordContext};
 use super::super::evidence::CranEvidenceObservation;
 use super::super::history::{ArchiveEntry, ArchiveHistoryRejection};
 use super::allpackages::IndexedProjection;
@@ -17,6 +19,7 @@ use super::model::{
     CranRefreshProgressCallback, DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 use super::qualification;
+use super::raw_cache::projection::PackageProjection;
 use super::raw_cache::{RawCache, RawCacheEntry, RawCacheRepresentation};
 use super::transport::{Transport, TransportResponse};
 use super::{
@@ -33,6 +36,16 @@ mod current;
 mod history;
 mod package;
 
+#[cfg(test)]
+thread_local! {
+    static CURRENT_PROJECTION_BUILD_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_current_projection_build() {
+    CURRENT_PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
+}
+
 /// A single refresh session. All network and parsing state is discarded from
 /// the resolver-facing snapshot once refresh returns it.
 pub(super) struct CranRefreshSession<T> {
@@ -44,7 +57,8 @@ pub(super) struct CranRefreshSession<T> {
     progress: Option<CranRefreshProgressCallback>,
     raw_cache: Option<RawCache>,
     test_now: Option<jiff::Timestamp>,
-    current: Option<Result<Rc<CranCatalog>, CandidateLoadError>>,
+    current: Option<Result<Rc<CurrentProjection>, CandidateLoadError>>,
+    current_source: Option<crate::snapshot::SourceInput>,
     current_surface_digest: Option<Box<str>>,
     history: Option<Result<HistorySource, CandidateLoadError>>,
     history_surface_digest: Option<Box<str>>,
@@ -65,6 +79,143 @@ pub(super) struct AllPackagesSource {
 pub(super) struct BulkCandidateResult {
     pub(super) candidates: CandidateLoadResult,
     pub(super) evidence: Vec<CranEvidenceObservation>,
+}
+
+pub(super) struct CurrentProjection {
+    projection: Option<PackageProjection>,
+    eager_observations: Rc<[CranCatalogObservation]>,
+    surface_digest: Box<str>,
+}
+
+impl fmt::Debug for CurrentProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CurrentProjection")
+            .field(
+                "projection",
+                &self.projection.as_ref().map(|_| "package-indexed"),
+            )
+            .field("eager_observation_count", &self.eager_observations.len())
+            .field("surface_digest", &self.surface_digest)
+            .finish()
+    }
+}
+
+impl CurrentProjection {
+    pub(super) fn new(projection: PackageProjection) -> Self {
+        let surface_digest = projection.surface_digest().into();
+        Self {
+            projection: Some(projection),
+            eager_observations: Rc::from([]),
+            surface_digest,
+        }
+    }
+
+    pub(super) fn eager(catalog: CranCatalog, observations: Vec<CranCatalogObservation>) -> Self {
+        let surface_digest = catalog_surface_digest(&catalog);
+        Self {
+            projection: None,
+            eager_observations: Rc::from(observations.into_boxed_slice()),
+            surface_digest,
+        }
+    }
+
+    pub(super) fn surface_digest(&self) -> &str {
+        &self.surface_digest
+    }
+
+    pub(super) fn package_count(&self) -> usize {
+        self.projection.as_ref().map_or_else(
+            || {
+                self.eager_observations
+                    .iter()
+                    .map(|row| row.package())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            },
+            PackageProjection::package_count,
+        )
+    }
+
+    pub(super) fn candidates(
+        &self,
+        package: &PackageName,
+    ) -> Result<Vec<rsolve_core::PackageRelease>, CandidateLoadError> {
+        let projection = self.observations(package)?;
+        if let Some(rejection) = projection.rejections.first() {
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                rejection.diagnostic().to_string(),
+            ));
+        }
+        Ok(
+            CranCatalog::from_provider_observations(&projection.observations)
+                .candidates(package)
+                .to_vec(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn candidates_named(
+        &self,
+        package: &str,
+    ) -> Option<Vec<rsolve_core::PackageRelease>> {
+        let package = PackageName::new(package).ok()?;
+        self.candidates(&package).ok()
+    }
+
+    pub(super) fn observations(
+        &self,
+        package: &PackageName,
+    ) -> Result<super::super::catalog::CranProviderObservationProjection, CandidateLoadError> {
+        if let Some(projection) = &self.projection {
+            let records = projection
+                .lookup_package(package.as_str())
+                .map_err(|error| {
+                    CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+                })?;
+            return Ok(super::super::catalog::provider_observations_from_fields(
+                records
+                    .into_iter()
+                    .map(|record| (record.record_index, record.package, record.fields))
+                    .collect(),
+                CranCatalogRecordContext::PackagesIndex,
+                Some(package),
+            ));
+        }
+        let observations = self
+            .eager_observations
+            .iter()
+            .filter(|observation| observation.package() == package)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(super::super::catalog::CranProviderObservationProjection {
+            observations,
+            rejections: Vec::new(),
+        })
+    }
+
+    pub(super) fn materialize_catalog(&self) -> Result<CranCatalog, CandidateLoadError> {
+        if let Some(catalog) = &self.projection {
+            let mut observations = Vec::new();
+            for package in catalog.package_names().map_err(|error| {
+                CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
+            })? {
+                let package = PackageName::new(&package).map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        error.to_string(),
+                    )
+                })?;
+                let projection = self.observations(&package)?;
+                observations.extend(projection.observations);
+            }
+            return Ok(CranCatalog::from_provider_observations(&observations));
+        }
+        Ok(CranCatalog::from_provider_observations(
+            &self.eager_observations,
+        ))
+    }
 }
 
 fn catalog_surface_digest(catalog: &CranCatalog) -> Box<str> {
@@ -287,6 +438,16 @@ impl CurrentBody {
 
 impl<T: Transport> CranRefreshSession<T> {
     #[cfg(test)]
+    pub(in crate::cran::provider) fn reset_current_projection_build_count() {
+        CURRENT_PROJECTION_BUILD_COUNT.with(|counter| counter.set(0));
+    }
+
+    #[cfg(test)]
+    pub(in crate::cran::provider) fn current_projection_build_count() -> usize {
+        CURRENT_PROJECTION_BUILD_COUNT.with(Cell::get)
+    }
+
+    #[cfg(test)]
     pub(in crate::cran::provider) fn new(transport: Rc<T>, config: CranMetadataConfig) -> Self {
         Self::new_with_progress(transport, config, None, None, None)
     }
@@ -321,6 +482,7 @@ impl<T: Transport> CranRefreshSession<T> {
             raw_cache,
             test_now,
             current: None,
+            current_source: None,
             current_surface_digest: None,
             history: None,
             history_surface_digest: None,

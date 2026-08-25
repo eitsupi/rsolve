@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 #[test]
 fn current_index_is_authoritative_over_same_identity_archive_metadata() {
     let consistent = b"Package: Matrix\nVersion: 1.7-0\nDepends: R (>= 4.4.0)\nImports: methods\nLicense: RSOLVE Fictional Terms Matrix\nNeedsCompilation: yes\n";
@@ -82,6 +84,76 @@ fn current_index_is_authoritative_over_same_identity_archive_metadata() {
 }
 
 #[test]
+fn current_projection_storage_failure_does_not_retry_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let body = current_gzip_body();
+    let first_transport = session_transport(
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse {
+            status: 200,
+            body: body.clone(),
+            headers: TransportResponseHeaders {
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=3600".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
+        },
+        TransportResponse::new(404, Vec::new()),
+    );
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:00Z".parse().unwrap()),
+        Some(cache),
+    );
+    first.ensure_current().unwrap();
+
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_gzip_url(), RawCacheRepresentation::CurrentGzip)
+        .unwrap();
+    let digest = Sha256::digest(&body);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection = cache.projection_path_in_namespace(
+        crate::cran::provider::raw_cache::ProjectionNamespace::Current,
+        &key,
+        &digest,
+    );
+    std::fs::remove_file(&projection).unwrap();
+    std::fs::create_dir(&projection).unwrap();
+
+    let second_transport = FixtureTransport {
+        responses: HashMap::new(),
+        requests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let requests = second_transport.requests.clone();
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(cache),
+    );
+    let error = second.ensure_current().unwrap_err();
+    assert!(error.diagnostic().contains("projection storage failed"));
+    let observed = requests.borrow();
+    assert!(
+        observed.is_empty(),
+        "unexpected recovery requests: {observed:?}"
+    );
+}
+
+#[test]
 fn recommended_overlay_does_not_invalidate_unrelated_current_candidates() {
     let current = b"Package: rlang\nVersion: 1.1.0\nLicense: MIT\n\n\
 Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.1.0)\nMD5sum: root\n\n\
@@ -112,6 +184,9 @@ Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.7)\nMD5sum: overlay\nPath: 
         .expect("a Recommended overlay must not make the complete current index invalid");
     assert_eq!(catalog.candidates_named("rlang").unwrap().len(), 1);
     assert_eq!(catalog.candidates_named("survival").unwrap().len(), 1);
+    session
+        .refresh_package(&PackageName::new("survival").unwrap())
+        .unwrap();
 
     let evidence = session.evidence.borrow();
     let survival = evidence
@@ -284,7 +359,12 @@ fn persistent_current_index_cache_reuse_avoids_a_second_request() {
         Some(t0),
         Some(cache),
     );
+    CranRefreshSession::<FixtureTransport>::reset_current_projection_build_count();
     first.ensure_current().unwrap();
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::current_projection_build_count(),
+        1
+    );
     assert_eq!(
         first_requests
             .borrow()
@@ -294,10 +374,11 @@ fn persistent_current_index_cache_reuse_avoids_a_second_request() {
         1
     );
 
-    let second_transport = FixtureTransport {
-        responses: HashMap::new(),
-        requests: Rc::new(RefCell::new(Vec::new())),
-    };
+    let second_transport = session_transport(
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
     let second_requests = second_transport.requests.clone();
     let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
     let mut second = CranRefreshSession::new_with_clock(
@@ -306,8 +387,69 @@ fn persistent_current_index_cache_reuse_avoids_a_second_request() {
         Some(t0),
         Some(cache),
     );
+    CranRefreshSession::<FixtureTransport>::reset_current_projection_build_count();
     second.ensure_current().unwrap();
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::current_projection_build_count(),
+        0
+    );
+    assert!(second.evidence.borrow().is_empty());
     assert!(second_requests.borrow().is_empty());
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let evidence = second.evidence.borrow();
+    let current_evidence = evidence
+        .iter()
+        .filter(|observation| observation.source.representation == "gzip")
+        .collect::<Vec<_>>();
+    assert!(!current_evidence.is_empty());
+    assert!(
+        current_evidence
+            .iter()
+            .all(|observation| observation.package.as_str() == "Matrix")
+    );
+}
+
+#[test]
+fn current_projection_preserves_global_record_indices_for_lazy_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(
+        &mut encoder,
+        b"Package: other\nVersion: 1.0\nLicense: MIT\n\n\
+Package: Matrix\nVersion: 1.7-6\nLicense: MIT\n",
+    )
+    .unwrap();
+    let body = encoder.finish().unwrap();
+    let transport = session_transport(
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(200, body),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:00Z".parse().unwrap()),
+        Some(cache),
+    );
+    session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    let evidence = session.evidence.borrow();
+    let current = evidence
+        .iter()
+        .filter(|observation| observation.source.representation == "gzip")
+        .collect::<Vec<_>>();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].package.as_str(), "Matrix");
+    assert_eq!(current[0].record_index, 1);
 }
 
 #[test]
@@ -370,7 +512,12 @@ fn persistent_refresh_path_uses_current_cache_across_sessions() {
         TransportResponse {
             status: 200,
             body: NATIVE_UTF8_CURRENT.to_vec(),
-            ..TransportResponse::default()
+            headers: TransportResponseHeaders {
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=3600".into(),
+                ),
+                ..TransportResponseHeaders::default()
+            },
         },
         TransportResponse::new(404, Vec::new()),
         TransportResponse::new(404, Vec::new()),
@@ -383,6 +530,11 @@ fn persistent_refresh_path_uses_current_cache_across_sessions() {
     )
     .unwrap();
 
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_rds_url(), RawCacheRepresentation::CurrentRds)
+        .unwrap();
+    assert!(matches!(cache.lookup(&key), RawCacheLookup::Hit(_)));
     let second_transport = FixtureTransport::fallback(FAST.to_vec(), 200);
     let requests = second_transport.requests.clone();
     crate::cran::provider::refresh_and_publish_with_transport(
@@ -462,6 +614,9 @@ fn stale_current_cache_revalidates_with_validators_and_304() {
         Some(cache),
     );
     second.ensure_current().unwrap();
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
     let requests = second_requests.borrow();
     let request = requests
         .iter()

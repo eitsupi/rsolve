@@ -399,3 +399,63 @@ fn projection_retention_keeps_only_a_bounded_recent_set() {
             .exists()
     );
 }
+
+#[test]
+fn projection_retention_does_not_delete_other_source_namespaces() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let projections = cache.directory.join(PROJECTION_DIRECTORY);
+    let current = projections.join("current").join("current.redb");
+    fs::create_dir_all(current.parent().unwrap()).unwrap();
+    fs::write(&current, b"current").unwrap();
+    let active = projections.join("active.redb");
+    let previous = projections.join("previous.redb");
+    fs::write(&active, b"active").unwrap();
+    fs::write(&previous, b"previous").unwrap();
+
+    cache.retain_projections(&active, Some(&previous)).unwrap();
+
+    assert!(current.exists());
+    assert!(active.exists());
+    assert!(previous.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_namespace_rejects_symlink_parent() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let outside = tempdir().unwrap();
+    let namespace = cache.directory.join(PROJECTION_DIRECTORY).join("current");
+    std::os::unix::fs::symlink(outside.path(), &namespace).unwrap();
+    let error = cache
+        .prepare_projection_path(ProjectionNamespace::Current, &key(&store))
+        .expect_err("a symlink namespace must fail closed");
+    assert!(error.to_string().contains("namespace"));
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn projection_retention_is_scoped_to_one_raw_cache_key() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let current = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let first = current.join("first");
+    let second = current.join("second");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    let active = first.join("active.redb");
+    let orphan = first.join("orphan.redb");
+    let other_key = second.join("other.redb");
+    fs::write(&active, b"active").unwrap();
+    fs::write(&orphan, b"orphan").unwrap();
+    fs::write(&other_key, b"other").unwrap();
+
+    cache
+        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
+        .unwrap();
+
+    assert!(active.exists());
+    assert!(!orphan.exists());
+    assert!(other_key.exists());
+}

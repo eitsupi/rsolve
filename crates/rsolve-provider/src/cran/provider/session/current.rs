@@ -1,5 +1,7 @@
 use std::rc::Rc;
 
+use sha2::{Digest, Sha256};
+
 use super::super::super::catalog::CranCatalog;
 use super::super::cache_policy::CacheControlHeader;
 use super::super::model::CranRefreshProgress;
@@ -7,15 +9,56 @@ use super::super::model::{
     CranCurrentIndexRepresentation, CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource,
 };
 use super::super::raw_cache::RawCacheRepresentation;
-use super::super::raw_cache::{RawCacheLookup, RawCacheWrite};
-use super::super::transport::{Transport, TransportResponseHeaders, TransportValidators};
-use super::index_record_to_evidence;
-use super::{
-    CranRefreshSession, CurrentBody, CurrentBodyOrigin, DEFAULT_COMPATIBLE_GENERATION_TTL,
-    cache_control_policy, catalog_surface_digest, permits_reuse,
+use super::super::raw_cache::projection::{
+    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionRecord,
+    ProjectionSourceKind,
 };
-use crate::snapshot::FreshnessStateV1;
+use super::super::raw_cache::{ProjectionNamespace, RawCacheLookup, RawCacheWrite};
+use super::super::transport::{Transport, TransportResponseHeaders, TransportValidators};
+use super::{
+    CranRefreshSession, CurrentBody, CurrentBodyOrigin, CurrentProjection,
+    DEFAULT_COMPATIBLE_GENERATION_TTL, cache_control_policy, permits_reuse,
+};
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory};
+
+fn current_projection_contract() -> ProjectionContract {
+    ProjectionContract {
+        parser_schema: super::CRAN_PARSER_SCHEMA,
+        compatibility_profile: super::CRAN_COMPATIBILITY_PROFILE,
+        normalization_policy: super::CRAN_NORMALIZATION_POLICY,
+    }
+}
+
+fn build_current_projection(
+    representation: CranCurrentIndexRepresentation,
+    body: &[u8],
+) -> Result<
+    (
+        ProjectionBuild,
+        CranCatalog,
+        Vec<super::super::super::catalog::CranCatalogObservation>,
+    ),
+    String,
+> {
+    #[cfg(test)]
+    super::note_current_projection_build();
+    let (catalog, observations) =
+        super::super::snapshot::import_current_index(representation, body)
+            .map_err(|error| error.to_string())?;
+    let records = observations
+        .iter()
+        .map(|observation| ProjectionRecord {
+            record_index: observation.record_index(),
+            package: Some(observation.package().to_string()),
+            fields: observation.fields().to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let build = ProjectionBuild {
+        records,
+        surface_digest: super::catalog_surface_digest(&catalog).into(),
+    };
+    Ok((build, catalog, observations))
+}
 
 impl<T: Transport> CranRefreshSession<T> {
     fn cache_error(error: impl std::fmt::Display) -> CandidateLoadError {
@@ -27,7 +70,7 @@ impl<T: Transport> CranRefreshSession<T> {
 
     pub(in crate::cran::provider) fn ensure_current(
         &mut self,
-    ) -> Result<Rc<CranCatalog>, CandidateLoadError> {
+    ) -> Result<Rc<CurrentProjection>, CandidateLoadError> {
         if let Some(result) = &self.current {
             return result.clone();
         }
@@ -176,10 +219,41 @@ impl<T: Transport> CranRefreshSession<T> {
             }
             let mut retried_unconditionally = false;
             while let Some(body) = candidate.take() {
-                let parsed = Self::parse_current_body(representation, &body.body);
-                let (catalog, records) = match parsed {
-                    Ok(parsed) => parsed,
-                    Err(error)
+                let projection_path = match (&self.raw_cache, &cache_key) {
+                    (Some(cache), Some(key)) => {
+                        cache
+                            .prepare_projection_path(ProjectionNamespace::Current, key)
+                            .map_err(Self::cache_error)?;
+                        Some(cache.projection_path_in_namespace(
+                            ProjectionNamespace::Current,
+                            key,
+                            &super::hex_digest(Sha256::digest(&body.body)),
+                        ))
+                    }
+                    _ => None,
+                };
+                let parsed = match projection_path.as_ref() {
+                    Some(path) => PackageProjection::open_or_build(
+                        path,
+                        &body.body,
+                        ProjectionSourceKind::Current,
+                        current_projection_contract(),
+                        || {
+                            build_current_projection(representation, &body.body)
+                                .map(|(build, _, _)| build)
+                        },
+                    )
+                    .map(CurrentProjection::new),
+                    None => build_current_projection(representation, &body.body)
+                        .map(|(build, catalog, observations)| {
+                            debug_assert_eq!(build.records.len(), observations.len());
+                            CurrentProjection::eager(catalog, observations)
+                        })
+                        .map_err(ProjectionError::Build),
+                };
+                let current_projection = match parsed {
+                    Ok(projection) => projection,
+                    Err(ProjectionError::Build(error))
                         if matches!(
                             origin,
                             Some(CurrentBodyOrigin::Cached | CurrentBodyOrigin::Revalidated304)
@@ -221,7 +295,27 @@ impl<T: Transport> CranRefreshSession<T> {
                         }
                         break;
                     }
-                    Err(error) => {
+                    Err(ProjectionError::Storage(error)) => {
+                        let diagnostic =
+                            format!("current index projection storage failed: {error}");
+                        self.push_current_diagnostic(
+                            endpoint.clone(),
+                            representation,
+                            Some(200),
+                            diagnostic.clone(),
+                        );
+                        failures.push(diagnostic);
+                        let error = CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            failures
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| "current projection storage failed".into()),
+                        );
+                        self.current = Some(Err(error.clone()));
+                        return Err(error);
+                    }
+                    Err(ProjectionError::Build(error)) => {
                         self.push_current_diagnostic(
                             endpoint.clone(),
                             representation,
@@ -233,6 +327,11 @@ impl<T: Transport> CranRefreshSession<T> {
                         break;
                     }
                 };
+                if let (Some(cache), Some(path)) = (&self.raw_cache, projection_path.as_deref()) {
+                    cache
+                        .retain_projection_namespace(ProjectionNamespace::Current, path, None)
+                        .map_err(Self::cache_error)?;
+                }
                 let mut body = Some(body);
                 let source = body
                     .as_ref()
@@ -271,17 +370,6 @@ impl<T: Transport> CranRefreshSession<T> {
                         .update_validated_at_with_headers(key, validated_at, &headers)
                         .map_err(Self::cache_error)?;
                 }
-                self.evidence
-                    .borrow_mut()
-                    .extend(records.iter().map(|record| {
-                        index_record_to_evidence(
-                            record,
-                            source.clone(),
-                            &self.base_url,
-                            true,
-                            FreshnessStateV1::CurrentGeneration,
-                        )
-                    }));
                 self.diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into(),
                     status: Some(
@@ -294,13 +382,14 @@ impl<T: Transport> CranRefreshSession<T> {
                     status_detail: CranFastPathStatus::Available,
                     source: CranRefreshSource::CurrentIndex(representation),
                 });
-                self.current_surface_digest = Some(catalog_surface_digest(&catalog));
+                self.current_surface_digest = Some(current_projection.surface_digest().into());
+                self.current_source = Some(source);
                 self.emit_progress(CranRefreshProgress::CurrentIndexCompleted {
-                    packages: catalog.packages().count(),
+                    packages: current_projection.package_count(),
                 });
-                let catalog = Rc::new(catalog);
-                self.current = Some(Ok(Rc::clone(&catalog)));
-                return Ok(catalog);
+                let current_projection = Rc::new(current_projection);
+                self.current = Some(Ok(Rc::clone(&current_projection)));
+                return Ok(current_projection);
             }
         }
         let error = CandidateLoadError::new(

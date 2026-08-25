@@ -54,7 +54,7 @@ impl<T: Transport> CranRefreshSession<T> {
             self.allpackages = Some(Err(error.clone()));
             return Err(error);
         }
-        let current_catalog = self.ensure_current()?;
+        let current_projection = self.ensure_current()?;
         self.ensure_history()?;
         let endpoint = self.allpackages_feed_endpoint.to_string();
         let qualification_path = self.raw_cache.as_ref().map(RawCache::qualification_path);
@@ -210,6 +210,10 @@ impl<T: Transport> CranRefreshSession<T> {
                     return result;
                 }
 
+                // A stale or unknown qualification is the only path that
+                // needs the complete current surface. Positive reuse above
+                // deliberately avoids materializing every package row.
+                let current_catalog = current_projection.materialize_catalog()?;
                 let coverage = projection
                     .classify_current(&current_catalog)
                     .map_err(|error| {

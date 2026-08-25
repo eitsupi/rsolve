@@ -23,7 +23,17 @@ pub(super) const HEADER_LENGTH_BYTES: usize = 4;
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const MAX_ENTRY_BYTES: u64 = super::MAX_RESPONSE_BYTES + MAX_HEADER_BYTES as u64 + 4;
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionNamespace {
+    AllPackages,
+    Current,
+    ArchiveHistory,
+    Auxiliary,
+}
+
 mod key;
+pub(crate) mod projection;
 mod store;
 #[cfg(test)]
 mod tests;

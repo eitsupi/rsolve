@@ -59,14 +59,31 @@ impl RawCache {
         RawCacheKey::new(&self.registry_id, endpoint, representation)
     }
 
-    pub(crate) fn projection_key(&self, key: &RawCacheKey, body: &[u8]) -> String {
-        format!("{}-{}", key.digest(), hex(&Sha256::digest(body)))
+    pub(crate) fn projection_path(&self, key: &RawCacheKey, body: &[u8]) -> PathBuf {
+        self.projection_path_in_namespace(
+            ProjectionNamespace::AllPackages,
+            key,
+            &hex(&Sha256::digest(body)),
+        )
     }
 
-    pub(crate) fn projection_path(&self, key: &RawCacheKey, body: &[u8]) -> PathBuf {
-        self.directory
-            .join(PROJECTION_DIRECTORY)
-            .join(format!("{}.redb", self.projection_key(key, body)))
+    /// Return a derived projection path scoped to a source namespace. Keeping
+    /// source projections in separate directories prevents ALLPACKAGES
+    /// retention from deleting unrelated current/archive projections.
+    pub(crate) fn projection_path_in_namespace(
+        &self,
+        namespace: ProjectionNamespace,
+        key: &RawCacheKey,
+        body_digest: &str,
+    ) -> PathBuf {
+        let directory = self.projection_namespace_path(namespace);
+        if namespace == ProjectionNamespace::AllPackages {
+            directory.join(format!("{}-{body_digest}.redb", key.digest()))
+        } else {
+            directory
+                .join(key.digest())
+                .join(format!("{body_digest}.redb"))
+        }
     }
 
     pub(crate) fn projection_path_for_digest(
@@ -74,11 +91,11 @@ impl RawCache {
         key: &RawCacheKey,
         content_sha256: &[u8; 32],
     ) -> PathBuf {
-        self.directory.join(PROJECTION_DIRECTORY).join(format!(
-            "{}-{}.redb",
-            key.digest(),
-            hex(content_sha256)
-        ))
+        self.projection_path_in_namespace(
+            ProjectionNamespace::AllPackages,
+            key,
+            &hex(content_sha256),
+        )
     }
 
     pub(crate) fn projection_path_for_hex_digest(
@@ -114,12 +131,29 @@ impl RawCache {
         active: &Path,
         previous: Option<&Path>,
     ) -> Result<(), RawCacheError> {
+        self.retain_projection_namespace(ProjectionNamespace::AllPackages, active, previous)
+    }
+
+    pub(crate) fn retain_projection_namespace(
+        &self,
+        namespace: ProjectionNamespace,
+        active: &Path,
+        previous: Option<&Path>,
+    ) -> Result<(), RawCacheError> {
         if !is_regular_file(active) {
             return Err(RawCacheError::Invalid(
-                "active ALLPACKAGES projection is missing".into(),
+                "active package projection is missing".into(),
             ));
         }
-        let files = fs::read_dir(self.directory.join(PROJECTION_DIRECTORY))?
+        let directory = active
+            .parent()
+            .ok_or_else(|| RawCacheError::Invalid("projection path has no parent".into()))?;
+        if !directory.starts_with(self.projection_namespace_path(namespace)) {
+            return Err(RawCacheError::Invalid(
+                "projection is outside its namespace".into(),
+            ));
+        }
+        let files = fs::read_dir(directory)?
             .filter_map(Result::ok)
             .filter_map(|entry| {
                 let path = entry.path();
@@ -133,7 +167,7 @@ impl RawCache {
         let previous = match previous {
             Some(path) if !is_regular_file(path) => {
                 return Err(RawCacheError::Invalid(
-                    "previous ALLPACKAGES projection is missing".into(),
+                    "previous package projection is missing".into(),
                 ));
             }
             other => other,
@@ -144,7 +178,30 @@ impl RawCache {
             }
             let _ = fs::remove_file(path);
         }
-        sync_directory(&self.directory.join(PROJECTION_DIRECTORY))
+        sync_directory(directory)
+    }
+
+    pub(crate) fn projection_namespace_path(&self, namespace: ProjectionNamespace) -> PathBuf {
+        self.directory
+            .join(PROJECTION_DIRECTORY)
+            .join(match namespace {
+                ProjectionNamespace::AllPackages => "",
+                ProjectionNamespace::Current => "current",
+                ProjectionNamespace::ArchiveHistory => "archive-history",
+                ProjectionNamespace::Auxiliary => "auxiliary",
+            })
+    }
+
+    pub(crate) fn prepare_projection_path(
+        &self,
+        namespace: ProjectionNamespace,
+        key: &RawCacheKey,
+    ) -> Result<(), RawCacheError> {
+        ensure_directory(&self.projection_namespace_path(namespace))?;
+        if namespace != ProjectionNamespace::AllPackages {
+            ensure_directory(&self.projection_namespace_path(namespace).join(key.digest()))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn lookup(&self, key: &RawCacheKey) -> RawCacheLookup {
