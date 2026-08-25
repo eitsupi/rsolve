@@ -328,9 +328,11 @@ impl<T: Transport> CranRefreshSession<T> {
                     }
                 };
                 if let (Some(cache), Some(path)) = (&self.raw_cache, projection_path.as_deref()) {
-                    cache
-                        .retain_projection_namespace(ProjectionNamespace::Current, path, None)
-                        .map_err(Self::cache_error)?;
+                    // Projection cleanup is deliberately best-effort. A
+                    // failed attempt is retried on a later refresh and must
+                    // not turn valid metadata into a refresh failure.
+                    let _ =
+                        cache.retain_projection_namespace(ProjectionNamespace::Current, path, None);
                 }
                 let mut body = Some(body);
                 let source = body

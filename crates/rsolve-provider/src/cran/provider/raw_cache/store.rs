@@ -157,11 +157,11 @@ impl RawCache {
         self.directory.join("qualification.json")
     }
 
-    /// Retain only a bounded set of content-addressed projections. The
-    /// currently usable projection and one previous projection are retained;
-    /// callers run this under the snapshot refresh transaction and treat
-    /// cleanup as best-effort so a failed refresh never removes last-known
-    /// good metadata.
+    /// Attempt to retain only the currently usable projection and one previous
+    /// projection. Other regular files in the internally owned directory are
+    /// cleanup candidates regardless of their names. Cleanup is best-effort;
+    /// callers retry it on a later refresh and must not treat failure as a
+    /// metadata refresh failure.
     pub(crate) fn retain_projections(
         &self,
         active: &Path,
@@ -623,9 +623,6 @@ fn retain_projection_files(
         .entries()?
         .collect::<io::Result<Vec<_>>>()?
         .into_iter()
-        .filter(|entry| {
-            Path::new(&entry.file_name()).extension() == Some(std::ffi::OsStr::new("redb"))
-        })
         .map(|entry| {
             let is_file = entry.file_type()?.is_file();
             Ok(is_file.then_some(entry))
@@ -647,7 +644,7 @@ fn retain_projection_files(
         {
             continue;
         }
-        let _ = entry.remove_file();
+        entry.remove_file()?;
     }
     // Synchronize the same capability when the platform supports directory
     // synchronization. Cleanup correctness does not depend on this optional

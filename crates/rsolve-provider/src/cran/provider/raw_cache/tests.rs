@@ -376,6 +376,24 @@ fn projection_retention_keeps_only_a_bounded_recent_set() {
         )
         .unwrap();
     }
+    fs::write(
+        cache.directory.join(PROJECTION_DIRECTORY).join("crash.tmp"),
+        [4_u8],
+    )
+    .unwrap();
+    fs::write(
+        cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join("unclassified"),
+        [5_u8],
+    )
+    .unwrap();
+    fs::write(
+        cache.directory.join(PROJECTION_DIRECTORY).join(".redb"),
+        [6_u8],
+    )
+    .unwrap();
     let active = cache
         .directory
         .join(PROJECTION_DIRECTORY)
@@ -396,6 +414,27 @@ fn projection_retention_keeps_only_a_bounded_recent_set() {
             .directory
             .join(PROJECTION_DIRECTORY)
             .join("projection-2.redb")
+            .exists()
+    );
+    assert!(
+        !cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join("crash.tmp")
+            .exists()
+    );
+    assert!(
+        !cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join("unclassified")
+            .exists()
+    );
+    assert!(
+        !cache
+            .directory
+            .join(PROJECTION_DIRECTORY)
+            .join(".redb")
             .exists()
     );
 }
@@ -445,7 +484,7 @@ fn projection_retention_is_scoped_to_one_raw_cache_key() {
     fs::create_dir_all(&first).unwrap();
     fs::create_dir_all(&second).unwrap();
     let active = first.join("active.redb");
-    let orphan = first.join("orphan.redb");
+    let orphan = first.join("orphan.tmp");
     let other_key = second.join("other.redb");
     fs::write(&active, b"active").unwrap();
     fs::write(&orphan, b"orphan").unwrap();
