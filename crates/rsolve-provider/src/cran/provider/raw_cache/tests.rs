@@ -362,6 +362,7 @@ fn semantic_snapshot_namespace_is_untouched() {
     assert!(!store.root().join("current").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn projection_retention_keeps_only_a_bounded_recent_set() {
     let store = store();
@@ -400,6 +401,7 @@ fn projection_retention_keeps_only_a_bounded_recent_set() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn projection_retention_does_not_delete_other_source_namespaces() {
     let store = store();
@@ -435,6 +437,7 @@ fn projection_namespace_rejects_symlink_parent() {
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn projection_retention_is_scoped_to_one_raw_cache_key() {
     let store = store();
@@ -460,6 +463,27 @@ fn projection_retention_is_scoped_to_one_raw_cache_key() {
     assert!(other_key.exists());
 }
 
+#[cfg(not(unix))]
+#[test]
+fn projection_retention_safely_keeps_files_without_handle_relative_delete() {
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let current = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let key_directory = current.join("a".repeat(64));
+    fs::create_dir_all(&key_directory).unwrap();
+    let active = key_directory.join("active.redb");
+    let orphan = key_directory.join("orphan.redb");
+    fs::write(&active, b"active").unwrap();
+    fs::write(&orphan, b"orphan").unwrap();
+
+    cache
+        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
+        .unwrap();
+
+    assert!(active.exists());
+    assert!(orphan.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn projection_retention_rejects_symlinked_raw_key_directory() {
@@ -480,5 +504,82 @@ fn projection_retention_rejects_symlinked_raw_key_directory() {
         .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
         .expect_err("a symlinked raw-key directory must fail closed");
     assert!(error.to_string().contains("raw-key directory"));
+    assert!(outside_orphan.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_retention_keeps_deletion_on_open_directory_after_path_swap() {
+    use std::os::unix::fs::symlink;
+
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let namespace = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let key_directory = namespace.join("d".repeat(64));
+    fs::create_dir_all(&key_directory).unwrap();
+    let active = key_directory.join("active.redb");
+    let orphan = key_directory.join("orphan.redb");
+    fs::write(&active, b"active").unwrap();
+    fs::write(&orphan, b"orphan").unwrap();
+
+    let outside = tempdir().unwrap();
+    let outside_active = outside.path().join("active.redb");
+    let outside_orphan = outside.path().join("orphan.redb");
+    fs::write(&outside_active, b"outside-active").unwrap();
+    fs::write(&outside_orphan, b"outside-orphan").unwrap();
+    let moved_directory = namespace.join("moved-key-directory");
+    let hook_directory = key_directory.clone();
+    let hook_moved_directory = moved_directory.clone();
+    let hook_outside = outside.path().to_path_buf();
+    set_retention_before_delete_hook(Some(Box::new(move |directory| {
+        assert_eq!(directory, hook_directory);
+        fs::rename(directory, &hook_moved_directory).unwrap();
+        symlink(&hook_outside, directory).unwrap();
+    })));
+
+    cache
+        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
+        .unwrap();
+
+    assert!(moved_directory.join("active.redb").exists());
+    assert!(!moved_directory.join("orphan.redb").exists());
+    assert!(outside_active.exists());
+    assert!(outside_orphan.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_retention_keeps_deletion_on_open_namespace_after_path_swap() {
+    use std::os::unix::fs::symlink;
+
+    let store = store();
+    let cache = RawCache::open(&store).unwrap();
+    let namespace = cache.projection_namespace_path(ProjectionNamespace::Current);
+    let key_name = "e".repeat(64);
+    let key_directory = namespace.join(&key_name);
+    fs::create_dir_all(&key_directory).unwrap();
+    let active = key_directory.join("active.redb");
+    fs::write(&active, b"active").unwrap();
+
+    let outside = tempdir().unwrap();
+    let outside_key_directory = outside.path().join(&key_name);
+    fs::create_dir(&outside_key_directory).unwrap();
+    let outside_orphan = outside_key_directory.join("orphan.redb");
+    fs::write(&outside_orphan, b"outside-orphan").unwrap();
+    let moved_namespace = namespace.with_file_name("moved-current");
+    let hook_namespace = namespace.clone();
+    let hook_moved_namespace = moved_namespace.clone();
+    let hook_outside = outside.path().to_path_buf();
+    set_retention_before_delete_hook(Some(Box::new(move |directory| {
+        assert_eq!(directory, key_directory);
+        fs::rename(&hook_namespace, &hook_moved_namespace).unwrap();
+        symlink(&hook_outside, &hook_namespace).unwrap();
+    })));
+
+    cache
+        .retain_projection_namespace(ProjectionNamespace::Current, &active, None)
+        .unwrap();
+
+    assert!(moved_namespace.join(&key_name).join("active.redb").exists());
     assert!(outside_orphan.exists());
 }

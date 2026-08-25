@@ -923,6 +923,7 @@ dependencies = [
  "rd-rds",
  "redb",
  "rsolve-core",
+ "rustix",
  "ruzstd",
  "serde",
  "serde_json",

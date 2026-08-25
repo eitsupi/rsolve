@@ -21,6 +21,7 @@ url = { workspace = true }
 jiff = { workspace = true }
 postcard = { workspace = true }
 redb = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

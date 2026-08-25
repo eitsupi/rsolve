@@ -40,6 +40,8 @@ mod tests;
 mod wire;
 
 pub(crate) use store::RawCache;
+#[cfg(test)]
+pub(crate) use store::set_retention_before_delete_hook;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
