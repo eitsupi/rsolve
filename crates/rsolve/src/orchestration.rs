@@ -18,6 +18,7 @@ use rsolve_resolver::{
 
 use crate::lock::{ConsumedLockedGraph, EnvironmentId, LockError, Lockfile, identity_key};
 use crate::manifest::{Manifest, ManifestError, compose_resolution_request};
+use crate::metrics::{Phase, Recorder, ResolutionMetrics};
 use std::io;
 use tempfile::tempdir;
 
@@ -34,6 +35,27 @@ impl CandidateLoader for CandidateLoaderRef<'_> {
 
     fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
         self.0.load(package)
+    }
+}
+
+pub(super) struct MeasuredCandidateLoaderRef<'a> {
+    pub(super) loader: &'a dyn CandidateLoader,
+    pub(super) metrics: Recorder,
+}
+
+impl CandidateLoader for MeasuredCandidateLoaderRef<'_> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        self.metrics.measure(Phase::PreparedLoaderLookup, || {
+            self.metrics.observe_lookup(package);
+            self.loader.releases(package)
+        })
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        self.metrics.measure(Phase::PreparedLoaderLookup, || {
+            self.metrics.observe_lookup(package);
+            self.loader.load(package)
+        })
     }
 }
 
@@ -105,6 +127,7 @@ pub struct CranResolutionOutcome {
     pub(super) resolution: Resolution,
     pub(super) diagnostics: Vec<CranRefreshDiagnostic>,
     pub(super) cache_diagnostics: Vec<CranSnapshotCacheDiagnostic>,
+    pub(super) metrics: ResolutionMetrics,
 }
 
 impl CranResolutionOutcome {
@@ -118,6 +141,10 @@ impl CranResolutionOutcome {
 
     pub fn cache_diagnostics(&self) -> &[CranSnapshotCacheDiagnostic] {
         &self.cache_diagnostics
+    }
+
+    pub fn metrics(&self) -> &ResolutionMetrics {
+        &self.metrics
     }
 }
 
@@ -236,11 +263,30 @@ pub(super) fn resolve_request(
     request: rsolve_core::ResolutionRequest,
     loader: &dyn CandidateLoader,
 ) -> Result<Resolution, CranResolutionError> {
+    resolve_request_with_metrics(request, loader, None)
+}
+
+pub(super) fn resolve_request_with_metrics(
+    request: rsolve_core::ResolutionRequest,
+    loader: &dyn CandidateLoader,
+    metrics: Option<Recorder>,
+) -> Result<Resolution, CranResolutionError> {
     let preference = DefaultCandidatePreference;
     let unlocked = Unlocked;
-    Resolver::new(loader, &preference, &unlocked)
-        .resolve(request)
-        .map_err(CranResolutionError::Resolution)
+    let solve = || {
+        Resolver::new(loader, &preference, &unlocked)
+            .resolve(request)
+            .map_err(CranResolutionError::Resolution)
+    };
+    let result = if let Some(metrics) = &metrics {
+        metrics.measure(Phase::Solve, solve)
+    } else {
+        solve()
+    };
+    if let (Some(metrics), Ok(resolution)) = (&metrics, &result) {
+        metrics.set_solve_output_count(resolution.packages().len());
+    }
+    result
 }
 
 fn resolve_request_with_policy(

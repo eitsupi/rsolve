@@ -28,6 +28,130 @@ fn output_write_is_noop_for_identical_bytes() {
 }
 
 #[test]
+fn metrics_report_is_explicit_and_versioned() {
+    let output = temp_path("metrics-lock");
+    let report = temp_path("metrics-report");
+    assert!(!report.exists());
+    let mut command = matrix_command("4.4.0", output.clone());
+    let without =
+        run_lock_with_backend(matrix_command("4.4.0", output.clone()), &MatrixBackend).unwrap();
+    assert!(!report.exists());
+    let lock_without = fs::read(&output).unwrap();
+    fs::remove_file(&output).unwrap();
+    command.metrics_output = Some(report.clone());
+    let result = run_lock_with_backend(command, &MatrixBackend).unwrap();
+    let encoded = fs::read_to_string(&report).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert!(json["lock_byte_count"].as_u64().unwrap() > 0);
+    assert!(json["metrics"]["phases"]["lock_projection_ns"].is_number());
+    assert_eq!(json["metrics"]["phases"]["solve_ns"], 0);
+    assert_eq!(
+        json["metrics"]["phases"]["refresh_acquisition_ns"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["metrics"]["loader_lookup_calls"], 0);
+    assert_eq!(
+        json["metrics"]["provider_refresh"],
+        serde_json::json!({
+            "http_attempts": 7,
+            "successful_response_body_bytes": 11,
+            "statuses": {
+                "status_200": 1,
+                "status_304": 2,
+                "status_404": 3,
+                "status_410": 4,
+                "other": 5
+            },
+            "current_index": {"requests": 6, "successful_body_bytes": 7},
+            "archive_history": {"requests": 8, "successful_body_bytes": 9},
+            "allpackages": {"requests": 10, "successful_body_bytes": 11},
+            "package_local_index": {"requests": 12, "successful_body_bytes": 13},
+            "tarball_description": {"requests": 14, "successful_body_bytes": 15},
+            "raw_cache_hits": 16,
+            "raw_cache_misses": 17,
+            "raw_cache_corrupt": 18,
+            "projection_reuses": 19,
+            "projection_builds": 20,
+            "projection_rebuilds": 21,
+            "package_history_lookups": 22,
+            "allpackages_adoptions": 23,
+            "package_local_fallbacks": 24,
+            "quarantined_releases": 25,
+            "coverage_gaps": 26,
+            "coverage_conflicts": 27
+        })
+    );
+    assert_eq!(result.summary, without.summary);
+    assert_eq!(result.warnings, without.warnings);
+    assert_eq!(fs::read(&output).unwrap(), lock_without);
+    fs::remove_file(output).unwrap();
+    fs::remove_file(report).unwrap();
+}
+
+#[test]
+fn metrics_output_replaces_existing_report_and_noop_lock_write_is_absent() {
+    let output = temp_path("metrics-noop-lock");
+    let report = temp_path("metrics-noop-report");
+    fs::write(&report, b"stale report").unwrap();
+    let mut command = matrix_command("4.4.0", output.clone());
+    command.metrics_output = Some(report.clone());
+    run_lock_with_backend(command.clone(), &MatrixBackend).unwrap();
+    assert_ne!(fs::read(&report).unwrap(), b"stale report");
+    run_lock_with_backend(command, &MatrixBackend).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(
+        json["metrics"]["phases"]["atomic_lock_write_ns"],
+        serde_json::Value::Null
+    );
+    fs::remove_file(output).unwrap();
+    fs::remove_file(report).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn metrics_output_symlink_is_rejected_without_touching_target() {
+    use std::os::unix::fs::symlink;
+    let output = temp_path("metrics-symlink-lock");
+    let target = temp_path("metrics-symlink-target");
+    let report = temp_path("metrics-symlink-report");
+    fs::write(&target, b"keep").unwrap();
+    symlink(&target, &report).unwrap();
+    let mut command = matrix_command("4.4.0", output);
+    command.metrics_output = Some(report.clone());
+    let result = run_lock_with_backend(command, &MatrixBackend);
+    assert!(matches!(result, Err(CliError::Value(message)) if message.contains("symlink")));
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    fs::remove_file(report).unwrap();
+    fs::remove_file(target).unwrap();
+}
+
+#[test]
+fn metrics_overflow_rejects_report_before_lock_write() {
+    let output = temp_path("metrics-overflow-lock");
+    let report = temp_path("metrics-overflow-report");
+    let mut command = matrix_command("4.4.0", output.clone());
+    command.metrics_output = Some(report.clone());
+    let result = run_lock_with_backend(command, &OverflowBackend);
+    assert!(
+        matches!(result, Err(CliError::Operational(message)) if message.contains("metrics overflow"))
+    );
+    assert!(!output.exists());
+    assert!(!report.exists());
+}
+
+#[test]
+fn metrics_output_rejects_equivalent_lock_destination() {
+    let output = temp_path("metrics-collision");
+    let parent = output.parent().unwrap();
+    let mut command = matrix_command("4.4.0", output.clone());
+    command.metrics_output = Some(parent.join(".").join(output.file_name().unwrap()));
+    let result = run_lock_with_backend(command, &MatrixBackend);
+    assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
+}
+
+#[test]
 fn cache_warning_renderer_filters_fresh_and_missing_but_reports_stale_sources() {
     use rsolve_provider::cran::{CranSnapshotCacheDiagnostic, CranSnapshotCacheStatus};
     let diagnostics = vec![
@@ -235,9 +359,12 @@ fn commit_failure_preserves_existing_bytes_and_owned_temp_cleanup() {
     fs::write(&path, b"old").unwrap();
     let parent = path.parent().unwrap();
     let temp = NamedTempFile::new_in(parent).unwrap();
-    let result = commit_temp(temp, &path, |_temp, _destination| {
-        Err("injected failure".into())
-    });
+    let result = commit_temp(
+        temp,
+        &path,
+        |_temp, _destination| Err("injected failure".into()),
+        "lockfile",
+    );
     let Err(CliError::Operational(message)) = result else {
         panic!("expected injected commit failure");
     };
@@ -263,6 +390,7 @@ fn mirror_and_output_validation_happen_before_resolution() {
         metadata_cache: None,
         offline: false,
         refresh_metadata: false,
+        metrics_output: None,
     };
     let result = run_lock_with_backend(command, &PanicBackend);
     assert!(matches!(result, Err(CliError::Value(message)) if message.contains("userinfo")));
@@ -428,6 +556,31 @@ fn lattice_release() -> PackageRelease {
 
 struct MatrixBackend;
 
+struct OverflowBackend;
+
+impl ResolutionBackend for OverflowBackend {
+    fn resolve(
+        &self,
+        manifest: Manifest,
+        mirror: &str,
+        cutoff: Option<PublicationDate>,
+        metadata_cache: &MetadataCache,
+        offline: bool,
+        refresh_metadata: bool,
+    ) -> Result<ResolvedData, CliError> {
+        let mut data = MatrixBackend.resolve(
+            manifest,
+            mirror,
+            cutoff,
+            metadata_cache,
+            offline,
+            refresh_metadata,
+        )?;
+        data.metrics.metrics_overflow = true;
+        Ok(data)
+    }
+}
+
 impl ResolutionBackend for MatrixBackend {
     fn resolve(
         &self,
@@ -447,9 +600,56 @@ impl ResolutionBackend for MatrixBackend {
         };
         let resolution = resolve_with_loader_with_publication_cutoff(manifest, &loader, cutoff)
             .map_err(|error| CliError::Operational(error.to_string()))?;
+        let mut metrics = ResolutionMetrics::default();
+        metrics.phases.solve_ns = Some(0);
+        metrics.phases.prepared_loader_lookup_ns = Some(0);
+        metrics.provider_refresh = Some(rsolve_provider::cran::CranRefreshMetrics {
+            http_attempts: 7,
+            successful_response_body_bytes: 11,
+            statuses: rsolve_provider::cran::CranRefreshStatusMetrics {
+                status_200: 1,
+                status_304: 2,
+                status_404: 3,
+                status_410: 4,
+                other: 5,
+            },
+            current_index: rsolve_provider::cran::CranRefreshSourceMetrics {
+                requests: 6,
+                successful_body_bytes: 7,
+            },
+            archive_history: rsolve_provider::cran::CranRefreshSourceMetrics {
+                requests: 8,
+                successful_body_bytes: 9,
+            },
+            allpackages: rsolve_provider::cran::CranRefreshSourceMetrics {
+                requests: 10,
+                successful_body_bytes: 11,
+            },
+            package_local_index: rsolve_provider::cran::CranRefreshSourceMetrics {
+                requests: 12,
+                successful_body_bytes: 13,
+            },
+            tarball_description: rsolve_provider::cran::CranRefreshSourceMetrics {
+                requests: 14,
+                successful_body_bytes: 15,
+            },
+            raw_cache_hits: 16,
+            raw_cache_misses: 17,
+            raw_cache_corrupt: 18,
+            projection_reuses: 19,
+            projection_builds: 20,
+            projection_rebuilds: 21,
+            package_history_lookups: 22,
+            allpackages_adoptions: 23,
+            package_local_fallbacks: 24,
+            quarantined_releases: 25,
+            coverage_gaps: 26,
+            coverage_conflicts: 27,
+        });
         Ok(ResolvedData {
             resolution,
             warnings: Vec::new(),
+            metrics,
         })
     }
 }
@@ -490,6 +690,7 @@ fn matrix_command(r_version: &str, output: PathBuf) -> LockCommand {
         metadata_cache: Some(temp_path("matrix-metadata-cache")),
         offline: false,
         refresh_metadata: false,
+        metrics_output: None,
     }
 }
 

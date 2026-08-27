@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -18,7 +19,8 @@ pub(crate) enum CranRefreshMetricsSource {
 /// [`CranSnapshotRefresher::metrics`](crate::cran::CranSnapshotRefresher::metrics).
 /// It contains no endpoint, cache path, or validator information and is not
 /// persisted as part of a metadata generation.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CranRefreshMetrics {
     pub http_attempts: u64,
     pub successful_response_body_bytes: u64,
@@ -42,7 +44,8 @@ pub struct CranRefreshMetrics {
     pub coverage_conflicts: u64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CranRefreshStatusMetrics {
     pub status_200: u64,
     pub status_304: u64,
@@ -51,7 +54,8 @@ pub struct CranRefreshStatusMetrics {
     pub other: u64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CranRefreshSourceMetrics {
     pub requests: u64,
     pub successful_body_bytes: u64,

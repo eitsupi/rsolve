@@ -1,5 +1,6 @@
 //! Persistent CRAN snapshot preparation before resolver execution.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -18,8 +19,10 @@ use rsolve_provider::cran::{
 use sha2::{Digest, Sha256};
 
 use crate::Manifest;
+use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
 use crate::orchestration::{
-    CandidateLoaderRef, CranResolutionError, CranResolutionOutcome, resolve_request,
+    CandidateLoaderRef, CranResolutionError, CranResolutionOutcome, MeasuredCandidateLoaderRef,
+    resolve_request_with_metrics,
 };
 use crate::progress::{ProgressCallback, ProgressEvent};
 use rsolve_resolver::{RBasePackageOverlay, ResolutionFailure, is_r_base_package_name};
@@ -45,6 +48,7 @@ pub(crate) fn cran_registry_id(canonical_endpoint: &str) -> RegistryId {
 /// Collect the transitive CRAN dependency closure without making resolver-time
 /// transport calls. Only Depends, Imports, and LinkingTo participate in the
 /// current resolver policy; Suggests and Enhances remain optional metadata.
+#[cfg(test)]
 pub(crate) fn collect_cran_dependency_closure<F>(
     roots: &[PackageName],
     mut refresh: F,
@@ -79,6 +83,49 @@ where
                     }
                 }
             }
+            refreshed.insert(package.clone());
+        }
+    }
+}
+
+fn collect_cran_dependency_closure_with_metrics<F>(
+    roots: &[PackageName],
+    mut refresh: F,
+    recorder: &Recorder,
+) -> Result<Vec<PackageName>, CandidateLoadError>
+where
+    F: FnMut(&[PackageName]) -> Result<CranCandidateSnapshot, CandidateLoadError>,
+{
+    let mut closure = roots
+        .iter()
+        .filter(|name| is_remote_cran_package(name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut refreshed = BTreeSet::new();
+    loop {
+        let batch = closure.difference(&refreshed).cloned().collect::<Vec<_>>();
+        if batch.is_empty() {
+            return Ok(closure.into_iter().collect());
+        }
+        let snapshot = refresh(&batch)?;
+        for package in &batch {
+            recorder.measure(Phase::ClosureLookup, || {
+                let candidates = snapshot.releases(&SolverKey::InstalledName(package.clone()))?;
+                for release in candidates {
+                    for dependency in release.dependencies() {
+                        if matches!(
+                            dependency.kind,
+                            DependencyKind::Depends
+                                | DependencyKind::Imports
+                                | DependencyKind::LinkingTo
+                        ) && is_remote_cran_package(&dependency.name)
+                        {
+                            closure.insert(dependency.name.clone());
+                        }
+                    }
+                }
+                Ok::<(), CandidateLoadError>(())
+            })?;
             refreshed.insert(package.clone());
         }
     }
@@ -130,6 +177,40 @@ enum CacheProbe<L> {
         diagnostic: CranSnapshotCacheDiagnostic,
     },
     Rejected(CranSnapshotCacheDiagnostic),
+}
+
+fn classify_cache_decision(
+    offline: bool,
+    cache_applicable: bool,
+    refreshed: bool,
+) -> SnapshotCacheDecision {
+    if !cache_applicable {
+        SnapshotCacheDecision::NotApplicable
+    } else if offline {
+        SnapshotCacheDecision::OfflineCompatible
+    } else if refreshed {
+        SnapshotCacheDecision::Refreshed
+    } else {
+        SnapshotCacheDecision::FreshHit
+    }
+}
+
+fn finalize_online_outcome(
+    resolution: rsolve_core::Resolution,
+    diagnostics: Vec<rsolve_provider::cran::CranRefreshDiagnostic>,
+    cache_diagnostics: Vec<CranSnapshotCacheDiagnostic>,
+    recorder: Recorder,
+    decision: SnapshotCacheDecision,
+    provider_metrics: rsolve_provider::cran::CranRefreshMetrics,
+) -> CranResolutionOutcome {
+    recorder.set_cache_decision(decision);
+    recorder.set_provider_refresh(provider_metrics);
+    CranResolutionOutcome {
+        resolution,
+        diagnostics,
+        cache_diagnostics,
+        metrics: recorder.snapshot(),
+    }
 }
 
 fn cache_revision(cache: &CranSnapshotCacheResult) -> Option<Box<str>> {
@@ -202,20 +283,35 @@ fn cache_resolution_error(error: CranResolutionError) -> CandidateLoadError {
     }
 }
 
+#[cfg(test)]
 fn resolve_offline_from_cache<L: CandidateLoader>(
     request: rsolve_core::ResolutionRequest,
     probe: CacheProbe<L>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
+    resolve_offline_from_cache_with_recorder(request, probe, Recorder::new())
+}
+
+fn resolve_offline_from_cache_with_recorder<L: CandidateLoader>(
+    request: rsolve_core::ResolutionRequest,
+    probe: CacheProbe<L>,
+    recorder: Recorder,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
     let (loader, diagnostic) = match probe {
         CacheProbe::Compatible { loader, diagnostic } => (loader, diagnostic),
         CacheProbe::Rejected(diagnostic) => return Err(CranResolutionError::Cache(diagnostic)),
     };
-    let resolution = resolve_prepared_snapshot_without_transport(request, &loader)
-        .map_err(map_offline_resolution_error)?;
+    recorder.set_cache_decision(classify_cache_decision(true, true, false));
+    let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
+        request,
+        &loader,
+        Some(recorder.clone()),
+    )
+    .map_err(map_offline_resolution_error)?;
     Ok(CranResolutionOutcome {
         resolution,
         diagnostics: Vec::new(),
         cache_diagnostics: vec![diagnostic],
+        metrics: recorder.snapshot(),
     })
 }
 
@@ -281,9 +377,12 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         .collect::<Vec<_>>();
     if roots.iter().all(|name| !is_remote_cran_package(name)) {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
-        let resolution = resolve_prepared_snapshot_without_transport(
+        let recorder = Recorder::new();
+        recorder.set_cache_decision(classify_cache_decision(false, false, false));
+        let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
             request,
             &CranCandidateSnapshot::default(),
+            Some(recorder.clone()),
         )?;
         emit_progress(
             &progress,
@@ -295,6 +394,7 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
             resolution,
             diagnostics: Vec::new(),
             cache_diagnostics: Vec::new(),
+            metrics: recorder.snapshot(),
         });
     }
     let metadata_config =
@@ -321,7 +421,10 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
     // Capture the provider-owned validation observation before attempting the
     // non-blocking cache probe. The same observation is consumed by the
     // transaction if this request has to wait for another refresh.
-    let preflight = refresher.preflight_refresh(store, &cache_policy);
+    let recorder = Recorder::new();
+    let preflight = recorder.measure(Phase::SnapshotCacheDecision, || {
+        refresher.preflight_refresh(store, &cache_policy)
+    });
     // Keep the warm, complete-cache path entirely loader-only. Acquiring the
     // persistent refresh transaction here would add lock/raw-cache work to
     // every online invocation even when no metadata refresh is necessary.
@@ -331,30 +434,39 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         && diagnostic.status() == CranSnapshotCacheStatus::Fresh
     {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
-        if let Ok(resolution) =
-            resolve_prepared_snapshot_without_transport(request.clone(), loader.as_ref())
-        {
+        if let Ok(resolution) = resolve_prepared_snapshot_without_transport_with_metrics(
+            request.clone(),
+            loader.as_ref(),
+            Some(recorder.clone()),
+        ) {
             emit_progress(
                 &progress,
                 ProgressEvent::ResolveCompleted {
                     packages: resolution.packages().len(),
                 },
             );
-            return Ok(CranResolutionOutcome {
+            return Ok(finalize_online_outcome(
                 resolution,
-                diagnostics: Vec::new(),
-                cache_diagnostics: vec![diagnostic.clone()],
-            });
+                Vec::new(),
+                vec![diagnostic.clone()],
+                recorder,
+                classify_cache_decision(false, true, false),
+                refresher.metrics(),
+            ));
         }
     }
     // Hold the refresh lock through closure discovery, metadata acquisition,
     // composition and publication. Waiters re-read after lock handoff.
-    let transaction = refresher
-        .begin_persistent_refresh(preflight)
+    let transaction = recorder
+        .measure(Phase::SnapshotCacheDecision, || {
+            refresher.begin_persistent_refresh(preflight)
+        })
         .map_err(CranResolutionError::Publish)?;
     let mut locked_policy = cache_policy.clone();
     locked_policy.refresh_metadata = false;
-    let locked_cache = transaction.inspect_cache(&locked_policy);
+    let locked_cache = recorder.measure(Phase::SnapshotCacheDecision, || {
+        transaction.inspect_cache(&locked_policy)
+    });
     let locked_revision = cache_revision(&locked_cache);
     let forced_refresh_satisfied = cache_policy.refresh_metadata
         && transaction.refresh_completed_while_waiting(locked_revision.as_deref());
@@ -374,10 +486,19 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
             CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
         }
     };
+    let refreshed = Cell::new(false);
     let (loader, cache_diagnostics) = cache_or_refresh(probe, &roots, &request, |batch| {
-        let closure =
-            collect_cran_dependency_closure(batch, |batch| transaction.refresh_packages(batch))
-                .map_err(CranResolutionError::Refresh)?;
+        refreshed.set(true);
+        let closure = collect_cran_dependency_closure_with_metrics(
+            batch,
+            |batch| {
+                recorder.measure(Phase::RefreshAcquisition, || {
+                    transaction.refresh_packages(batch)
+                })
+            },
+            &recorder,
+        )
+        .map_err(CranResolutionError::Refresh)?;
         if closure.is_empty() {
             return Err(CranResolutionError::Refresh(CandidateLoadError::new(
                 CandidateLoadErrorCategory::MetadataInvalid,
@@ -387,24 +508,33 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
                 ),
             )));
         }
-        transaction
-            .refresh_and_publish_snapshot(&closure)
+        recorder
+            .measure(Phase::SnapshotCompositionAndPublication, || {
+                transaction.refresh_and_publish_snapshot(&closure)
+            })
             .map_err(CranResolutionError::Publish)
     })?;
     drop(transaction);
     emit_progress(&progress, ProgressEvent::ResolveStarted);
-    let resolution = resolve_prepared_snapshot_without_transport(request, &loader)?;
+    let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
+        request,
+        &loader,
+        Some(recorder.clone()),
+    )?;
     emit_progress(
         &progress,
         ProgressEvent::ResolveCompleted {
             packages: resolution.packages().len(),
         },
     );
-    Ok(CranResolutionOutcome {
+    Ok(finalize_online_outcome(
         resolution,
-        diagnostics: refresher.diagnostics(),
+        refresher.diagnostics(),
         cache_diagnostics,
-    })
+        recorder,
+        classify_cache_decision(false, true, refreshed.get()),
+        refresher.metrics(),
+    ))
 }
 
 fn emit_progress(progress: &Option<ProgressCallback>, event: ProgressEvent) {
@@ -464,9 +594,12 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
         .collect::<Vec<_>>();
     if roots.iter().all(|name| !is_remote_cran_package(name)) {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
-        let resolution = resolve_prepared_snapshot_without_transport(
+        let recorder = Recorder::new();
+        recorder.set_cache_decision(classify_cache_decision(false, false, false));
+        let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
             request,
             &CranCandidateSnapshot::default(),
+            Some(recorder.clone()),
         )?;
         emit_progress(
             &progress,
@@ -478,9 +611,13 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
             resolution,
             diagnostics: Vec::new(),
             cache_diagnostics: Vec::new(),
+            metrics: recorder.snapshot(),
         });
     }
-    let cache = inspect_cran_snapshot_cache(store, &cache_policy);
+    let recorder = Recorder::new();
+    let cache = recorder.measure(Phase::SnapshotCacheDecision, || {
+        inspect_cran_snapshot_cache(store, &cache_policy)
+    });
     let probe = match cache {
         CranSnapshotCacheResult::Compatible { loader, diagnostic } => CacheProbe::Compatible {
             loader: *loader,
@@ -489,7 +626,7 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
         CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
     };
     emit_progress(&progress, ProgressEvent::ResolveStarted);
-    let result = resolve_offline_from_cache(request, probe);
+    let result = resolve_offline_from_cache_with_recorder(request, probe, recorder);
     if let Ok(outcome) = &result {
         emit_progress(
             &progress,
@@ -507,10 +644,31 @@ fn resolve_prepared_snapshot_without_transport(
     request: rsolve_core::ResolutionRequest,
     loader: &dyn CandidateLoader,
 ) -> Result<rsolve_core::Resolution, CranResolutionError> {
-    let overlay =
-        RBasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
-            .map_err(CranResolutionError::Refresh)?;
-    resolve_request(request, &overlay)
+    resolve_prepared_snapshot_without_transport_with_metrics(request, loader, None)
+}
+
+fn resolve_prepared_snapshot_without_transport_with_metrics(
+    request: rsolve_core::ResolutionRequest,
+    loader: &dyn CandidateLoader,
+    metrics: Option<Recorder>,
+) -> Result<rsolve_core::Resolution, CranResolutionError> {
+    if let Some(metrics) = metrics {
+        let measured = MeasuredCandidateLoaderRef {
+            loader,
+            metrics: metrics.clone(),
+        };
+        let overlay = RBasePackageOverlay::new(
+            CandidateLoaderRef(&measured),
+            request.target.r_version.clone(),
+        )
+        .map_err(CranResolutionError::Refresh)?;
+        resolve_request_with_metrics(request, &overlay, Some(metrics))
+    } else {
+        let overlay =
+            RBasePackageOverlay::new(CandidateLoaderRef(loader), request.target.r_version.clone())
+                .map_err(CranResolutionError::Refresh)?;
+        resolve_request_with_metrics(request, &overlay, None)
+    }
 }
 
 #[cfg(test)]
@@ -675,6 +833,76 @@ mod tests {
             ["https://cran.example/src/contrib/PACKAGES"],
             "test cache decision",
         )
+    }
+
+    #[test]
+    fn cache_decision_classification_preserves_all_operation_paths() {
+        assert_eq!(
+            classify_cache_decision(false, false, false),
+            SnapshotCacheDecision::NotApplicable
+        );
+        assert_eq!(
+            classify_cache_decision(false, true, false),
+            SnapshotCacheDecision::FreshHit
+        );
+        assert_eq!(
+            classify_cache_decision(false, true, true),
+            SnapshotCacheDecision::Refreshed
+        );
+        assert_eq!(
+            classify_cache_decision(true, true, false),
+            SnapshotCacheDecision::OfflineCompatible
+        );
+    }
+
+    #[test]
+    fn online_finalize_preserves_provider_metrics_for_both_cache_branches() {
+        let root = PackageName::new("root").unwrap();
+        let loader = CranCandidateSnapshot::from_candidates([(
+            root.clone(),
+            vec![release_with_dependencies(&root, Vec::new())],
+        )]);
+        let request = crate::manifest::compose_resolution_request(manifest_for(root)).unwrap();
+        let resolution = resolve_prepared_snapshot_without_transport(request, &loader).unwrap();
+
+        let fresh_recorder = Recorder::new();
+        fresh_recorder.record_duration(Phase::Solve, std::time::Duration::ZERO);
+        let fresh = finalize_online_outcome(
+            resolution.clone(),
+            Vec::new(),
+            Vec::new(),
+            fresh_recorder,
+            SnapshotCacheDecision::FreshHit,
+            rsolve_provider::cran::CranRefreshMetrics::default(),
+        );
+        assert_eq!(
+            fresh.metrics().snapshot_cache_decision,
+            Some(SnapshotCacheDecision::FreshHit)
+        );
+        assert!(fresh.metrics().phases.solve_ns.is_some());
+        assert!(fresh.metrics().phases.refresh_acquisition_ns.is_none());
+        assert_eq!(fresh.metrics().provider_refresh, Some(Default::default()));
+
+        let refreshed_recorder = Recorder::new();
+        refreshed_recorder.record_duration(Phase::RefreshAcquisition, std::time::Duration::ZERO);
+        let provider_metrics = rsolve_provider::cran::CranRefreshMetrics {
+            http_attempts: 2,
+            ..Default::default()
+        };
+        let refreshed = finalize_online_outcome(
+            resolution,
+            Vec::new(),
+            Vec::new(),
+            refreshed_recorder,
+            SnapshotCacheDecision::Refreshed,
+            provider_metrics.clone(),
+        );
+        assert_eq!(
+            refreshed.metrics().snapshot_cache_decision,
+            Some(SnapshotCacheDecision::Refreshed)
+        );
+        assert!(refreshed.metrics().phases.refresh_acquisition_ns.is_some());
+        assert_eq!(refreshed.metrics().provider_refresh, Some(provider_metrics));
     }
 
     #[test]
@@ -923,6 +1151,14 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.cache_diagnostics()[0].age_seconds(), Some(7200));
         assert_eq!(
+            outcome.metrics().snapshot_cache_decision,
+            Some(SnapshotCacheDecision::OfflineCompatible)
+        );
+        assert!(outcome.metrics().phases.solve_ns.is_some());
+        assert!(outcome.metrics().phases.refresh_acquisition_ns.is_none());
+        assert!(outcome.metrics().provider_refresh.is_none());
+        assert!(outcome.metrics().loader_lookup_calls > 0);
+        assert_eq!(
             outcome.cache_diagnostics()[0]
                 .endpoints()
                 .collect::<Vec<_>>(),
@@ -962,7 +1198,20 @@ mod tests {
             result.is_ok(),
             "base-only resolution must bypass cache and refresh"
         );
-        assert!(result.unwrap().cache_diagnostics().is_empty());
+        let outcome = result.unwrap();
+        assert!(outcome.cache_diagnostics().is_empty());
+        assert_eq!(
+            outcome.metrics().snapshot_cache_decision,
+            Some(SnapshotCacheDecision::NotApplicable)
+        );
+        assert!(outcome.metrics().phases.solve_ns.is_some());
+        assert!(
+            outcome
+                .metrics()
+                .phases
+                .snapshot_cache_decision_ns
+                .is_none()
+        );
     }
 
     #[test]

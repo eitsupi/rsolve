@@ -1,6 +1,7 @@
 //! Testable command-line composition for the first lockfile command.
 
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
@@ -8,11 +9,13 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 use tempfile::NamedTempFile;
 
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
 use crate::metadata_cache::MetadataCache;
+use crate::metrics::ResolutionMetrics;
 use crate::orchestration::cran_registry_id;
 use crate::progress::{ProgressCallback, ProgressEvent};
 use crate::{
@@ -65,6 +68,9 @@ pub struct LockCommand {
     /// Revalidate repository metadata and the bulk history feed immediately.
     #[arg(long, conflicts_with = "offline")]
     pub refresh_metadata: bool,
+    /// Optional destination for a versioned JSON success metrics report.
+    #[arg(long, value_name = "PATH")]
+    pub metrics_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -97,6 +103,9 @@ impl Error for CliError {}
 pub struct CommandResult {
     pub summary: String,
     pub warnings: Vec<String>,
+    /// Operation-local metrics. This is never rendered unless the caller
+    /// explicitly requests `--metrics-output`.
+    pub metrics: ResolutionMetrics,
 }
 
 trait ResolutionBackend {
@@ -137,6 +146,15 @@ struct CranBackend;
 struct ResolvedData {
     resolution: rsolve_core::Resolution,
     warnings: Vec<String>,
+    metrics: ResolutionMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MetricsSuccessReport {
+    pub schema_version: u32,
+    pub metrics: ResolutionMetrics,
+    pub lock_byte_count: u64,
 }
 
 impl ResolutionBackend for CranBackend {
@@ -221,6 +239,7 @@ impl ResolutionBackend for CranBackend {
         Ok(ResolvedData {
             resolution: outcome.resolution().clone(),
             warnings,
+            metrics: outcome.metrics().clone(),
         })
     }
 }
@@ -369,6 +388,14 @@ fn run_lock_with_backend_progress(
         .map_err(|error| value_error(format!("invalid --publication-cutoff: {error}")))?;
     let mirror = canonical_mirror(&command.cran_mirror)?;
     validate_output_path(&command.output)?;
+    if let Some(metrics_output) = &command.metrics_output {
+        validate_output_path(metrics_output)?;
+        if destination_identity(&command.output)? == destination_identity(metrics_output)? {
+            return Err(CliError::Value(
+                "--metrics-output must differ from --output".into(),
+            ));
+        }
+    }
     let target = ManifestTarget::new(target_r);
     let manifest = Manifest::new(
         VersionConstraint::unconstrained(),
@@ -392,16 +419,26 @@ fn run_lock_with_backend_progress(
         command.refresh_metadata,
         progress,
     )?;
+    if command.metrics_output.is_some() && resolved.metrics.metrics_overflow {
+        return Err(CliError::Operational(
+            "metrics overflow; refusing to write report".into(),
+        ));
+    }
     let environment = EnvironmentId::new("default")
         .map_err(|error| CliError::Operational(format!("invalid environment: {error}")))?;
+    let projection_started = Instant::now();
     let lock = Lockfile::from_resolution_with_publication_cutoff(
         &resolved.resolution,
         environment,
         cutoff,
     )
     .map_err(|error| CliError::Operational(format!("lock projection failed: {error}")))?;
+    let projection_ns = elapsed_ns(projection_started)?;
+    let serialization_started = Instant::now();
     let serialized = to_toml(&lock)
         .map_err(|error| CliError::Operational(format!("lock serialization failed: {error}")))?;
+    let serialization_ns = elapsed_ns(serialization_started)?;
+    let round_trip_started = Instant::now();
     let reparsed = from_toml(&serialized)
         .map_err(|error| CliError::Operational(format!("lock round-trip failed: {error}")))?;
     if reparsed != lock {
@@ -409,10 +446,36 @@ fn run_lock_with_backend_progress(
             "lock round-trip changed the logical lock domain".into(),
         ));
     }
+    let round_trip_ns = elapsed_ns(round_trip_started)?;
+    let reserialization_started = Instant::now();
     let bytes = to_toml(&reparsed)
         .map_err(|error| CliError::Operational(format!("lock re-serialization failed: {error}")))?;
+    let reserialization_ns = elapsed_ns(reserialization_started)?;
 
+    let write_started = Instant::now();
     let changed = write_lockfile(&command.output, bytes.as_bytes())?;
+    let write_ns = elapsed_ns(write_started)?;
+    let mut metrics = resolved.metrics;
+    metrics.phases.lock_projection_ns = Some(projection_ns);
+    metrics.phases.lock_serialization_ns = Some(
+        serialization_ns
+            .checked_add(reserialization_ns)
+            .ok_or_else(|| CliError::Operational("metrics duration overflow".into()))?,
+    );
+    metrics.phases.lock_round_trip_ns = Some(round_trip_ns);
+    metrics.phases.atomic_lock_write_ns = changed.then_some(write_ns);
+    if let Some(path) = command.metrics_output {
+        let report = MetricsSuccessReport {
+            schema_version: 1,
+            metrics: metrics.clone(),
+            lock_byte_count: u64::try_from(bytes.len())
+                .map_err(|_| CliError::Operational("lock byte count overflow".into()))?,
+        };
+        let encoded = serde_json::to_vec_pretty(&report).map_err(|error| {
+            CliError::Operational(format!("metrics report serialization failed: {error}"))
+        })?;
+        write_report(&path, &encoded)?;
+    }
     let status = if changed { "updated" } else { "up-to-date" };
     Ok(CommandResult {
         summary: format!(
@@ -423,7 +486,30 @@ fn run_lock_with_backend_progress(
             status
         ),
         warnings: resolved.warnings,
+        metrics,
     })
+}
+
+fn elapsed_ns(started: Instant) -> Result<u64, CliError> {
+    u64::try_from(started.elapsed().as_nanos())
+        .map_err(|_| CliError::Operational("metrics duration overflow".into()))
+}
+
+fn destination_identity(path: &Path) -> Result<PathBuf, CliError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|error| {
+        CliError::Operational(format!(
+            "cannot canonicalize output parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(parent.join(
+        path.file_name()
+            .ok_or_else(|| CliError::Value("output has no file name".into()))?,
+    ))
 }
 
 fn canonical_mirror(input: &str) -> Result<Box<str>, CliError> {
@@ -557,8 +643,29 @@ fn write_lockfile(path: &Path, bytes: &[u8]) -> Result<bool, CliError> {
     // Re-check after the potentially slow write so a destination replaced by
     // a symlink or special file is rejected before the commit attempt.
     validate_output_path(path)?;
-    commit_temp(temp, path, persist_temp)?;
+    commit_temp(temp, path, persist_temp, "lockfile")?;
     Ok(true)
+}
+
+fn write_report(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    validate_output_path(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = NamedTempFile::new_in(parent).map_err(|error| {
+        CliError::Operational(format!(
+            "atomic metrics report write failed: create temp file: {error}"
+        ))
+    })?;
+    temp.write_all(bytes)
+        .and_then(|()| temp.flush())
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|error| {
+            CliError::Operational(format!("atomic metrics report write failed: {error}"))
+        })?;
+    validate_output_path(path)?;
+    commit_temp(temp, path, persist_temp, "metrics report")
 }
 
 fn persist_temp(temp: NamedTempFile, path: &Path) -> Result<(), String> {
@@ -604,12 +711,12 @@ fn persist_temp(temp: NamedTempFile, path: &Path) -> Result<(), String> {
     }
 }
 
-fn commit_temp<F>(temp: NamedTempFile, path: &Path, commit: F) -> Result<(), CliError>
+fn commit_temp<F>(temp: NamedTempFile, path: &Path, commit: F, kind: &str) -> Result<(), CliError>
 where
     F: FnOnce(NamedTempFile, &Path) -> Result<(), String>,
 {
     commit(temp, path)
-        .map_err(|error| CliError::Operational(format!("atomic lockfile write failed: {error}")))
+        .map_err(|error| CliError::Operational(format!("atomic {kind} write failed: {error}")))
 }
 
 #[cfg(test)]

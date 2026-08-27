@@ -7,6 +7,7 @@ pub mod cli;
 pub mod lock;
 pub mod manifest;
 pub(crate) mod metadata_cache;
+pub mod metrics;
 pub mod orchestration;
 pub mod pak;
 mod prepared_snapshot;
