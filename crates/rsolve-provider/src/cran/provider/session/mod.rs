@@ -369,6 +369,7 @@ pub(super) struct BulkCandidateResult {
 pub(super) struct CurrentProjection {
     projection: PackageProjectionRecovery,
     eager_observations: Rc<[CranCatalogObservation]>,
+    built_catalog: RefCell<Option<Rc<CranCatalog>>>,
     surface_digest: Box<str>,
 }
 
@@ -393,11 +394,13 @@ impl CurrentProjection {
     pub(super) fn new(
         projection: PackageProjection,
         rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+        built_catalog: Option<Rc<CranCatalog>>,
     ) -> Self {
         let surface_digest = projection.surface_digest().into();
         Self {
             projection: PackageProjectionRecovery::new(projection, rebuild),
             eager_observations: Rc::from([]),
+            built_catalog: RefCell::new(built_catalog),
             surface_digest,
         }
     }
@@ -407,6 +410,7 @@ impl CurrentProjection {
         Self {
             projection: PackageProjectionRecovery::eager(),
             eager_observations: Rc::from(observations.into_boxed_slice()),
+            built_catalog: RefCell::new(None),
             surface_digest,
         }
     }
@@ -535,15 +539,19 @@ impl CurrentProjection {
         Ok(observations)
     }
 
-    pub(super) fn materialize_catalog(&self) -> Result<CranCatalog, CandidateLoadError> {
+    pub(super) fn materialize_catalog(&self) -> Result<Rc<CranCatalog>, CandidateLoadError> {
+        if let Some(catalog) = self.built_catalog.borrow_mut().take() {
+            return Ok(catalog);
+        }
         if self.projection.has_projection() {
             return self
                 .projection
-                .decode("current", Self::materialize_projection);
+                .decode("current", Self::materialize_projection)
+                .map(Rc::new);
         }
-        Ok(CranCatalog::from_provider_observations(
+        Ok(Rc::new(CranCatalog::from_provider_observations(
             &self.eager_observations,
-        ))
+        )))
     }
 
     fn materialize_projection(

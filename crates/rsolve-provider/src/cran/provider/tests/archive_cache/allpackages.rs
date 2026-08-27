@@ -135,10 +135,16 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         Some("2026-08-25T00:00:00Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
+    crate::cran::provider::raw_cache::projection::reset_visit_package_records_count();
     let first_result = first
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
     let signature = release_signature(first_result.candidates());
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_package_records_count(),
+        0,
+        "new current projection should supply its catalog without materialization"
+    );
 
     crate::cran::provider::allpackages::reset_test_counters();
     let second_transport = allpackages_transport(feed.clone(), false);

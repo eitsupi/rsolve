@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -277,6 +278,12 @@ impl<T: Transport> CranRefreshSession<T> {
                     Some(path) => {
                         let rebuild_path = path.clone();
                         let rebuild_body = body.body.clone();
+                        // Keep the catalog produced by a projection build as
+                        // a build artifact. Reopening an existing projection
+                        // leaves this empty and therefore retains lazy
+                        // materialization.
+                        let built_catalog = Rc::new(RefCell::new(None));
+                        let build_catalog = Rc::clone(&built_catalog);
                         let rebuild: Rc<dyn Fn() -> Result<PackageProjection, String>> =
                             Rc::new(move || {
                                 PackageProjection::rebuild_validated(
@@ -301,11 +308,21 @@ impl<T: Transport> CranRefreshSession<T> {
                             ProjectionSourceKind::Current,
                             current_projection_contract(),
                             || {
-                                build_current_projection(representation, &body.body)
-                                    .map(|(build, _, _)| build)
+                                build_current_projection(representation, &body.body).map(
+                                    |(build, catalog, _)| {
+                                        *build_catalog.borrow_mut() = Some(catalog);
+                                        build
+                                    },
+                                )
                             },
                         )
-                        .map(|projection| CurrentProjection::new(projection, Some(rebuild)))
+                        .map(|projection| {
+                            CurrentProjection::new(
+                                projection,
+                                Some(rebuild),
+                                built_catalog.borrow_mut().take().map(Rc::new),
+                            )
+                        })
                     }
                     None => build_current_projection(representation, &body.body)
                         .map(|(build, catalog, observations)| {
