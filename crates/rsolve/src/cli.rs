@@ -391,7 +391,9 @@ fn run_lock_with_backend_progress(
     validate_output_path(&command.output)?;
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
-        if destination_paths_equal(&command.output, metrics_output)? {
+        if destination_paths_equal(&command.output, metrics_output)?
+            || existing_destinations_share_identity(&command.output, metrics_output)?
+        {
             return Err(CliError::Value(
                 "--metrics-output must differ from --output".into(),
             ));
@@ -457,21 +459,7 @@ fn run_lock_with_backend_progress(
     let changed = write_lockfile(&command.output, bytes.as_bytes())?;
     let write_ns = elapsed_ns(write_started)?;
     let lock_identity = if command.metrics_output.is_some() {
-        Some(
-            ExistingPathIdentity::from_path(&command.output)
-                .map_err(|error| {
-                    CliError::Operational(format!(
-                        "cannot identify lock output {}: {error}",
-                        command.output.display()
-                    ))
-                })?
-                .ok_or_else(|| {
-                    CliError::Operational(format!(
-                        "lock output disappeared after write: {}",
-                        command.output.display()
-                    ))
-                })?,
-        )
+        Some(lock_output_identity(&command.output)?)
     } else {
         None
     };
@@ -485,15 +473,8 @@ fn run_lock_with_backend_progress(
     metrics.phases.lock_round_trip_ns = Some(round_trip_ns);
     metrics.phases.atomic_lock_write_ns = changed.then_some(write_ns);
     if let Some(path) = command.metrics_output {
-        if let Some(report_identity) = ExistingPathIdentity::from_path(&path).map_err(|error| {
-            CliError::Operational(format!(
-                "cannot identify metrics output {}: {error}",
-                path.display()
-            ))
-        })? && lock_identity
-            .as_ref()
-            .is_some_and(|lock_identity| report_identity == *lock_identity)
-        {
+        let report_identity = path_identity(&path, "metrics output")?;
+        if same_existing_identity(lock_identity.as_ref(), report_identity.as_ref()) {
             return Err(CliError::Value(
                 "--metrics-output must differ from --output".into(),
             ));
@@ -549,6 +530,40 @@ fn destination_paths_equal(left: &Path, right: &Path) -> Result<bool, CliError> 
     let left = destination_identity(left)?;
     let right = destination_identity(right)?;
     Ok(left == right)
+}
+
+fn path_identity(path: &Path, label: &str) -> Result<Option<ExistingPathIdentity>, CliError> {
+    ExistingPathIdentity::from_path(path).map_err(|error| {
+        CliError::Operational(format!(
+            "cannot identify {label} {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn same_existing_identity(
+    left: Option<&ExistingPathIdentity>,
+    right: Option<&ExistingPathIdentity>,
+) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left == right)
+}
+
+fn existing_destinations_share_identity(left: &Path, right: &Path) -> Result<bool, CliError> {
+    let left_identity = path_identity(left, "lock output")?;
+    let right_identity = path_identity(right, "metrics output")?;
+    Ok(same_existing_identity(
+        left_identity.as_ref(),
+        right_identity.as_ref(),
+    ))
+}
+
+fn lock_output_identity(path: &Path) -> Result<ExistingPathIdentity, CliError> {
+    path_identity(path, "lock output")?.ok_or_else(|| {
+        CliError::Operational(format!(
+            "lock output disappeared after write: {}",
+            path.display()
+        ))
+    })
 }
 
 fn canonical_mirror(input: &str) -> Result<Box<str>, CliError> {

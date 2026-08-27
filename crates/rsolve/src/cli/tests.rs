@@ -132,8 +132,8 @@ fn metrics_output_symlink_is_rejected_without_touching_target() {
 fn metrics_output_hardlink_alias_is_rejected_without_touching_lock() {
     let output = temp_path("metrics-hardlink-lock");
     let report = temp_path("metrics-hardlink-report");
-    run_lock_with_backend(matrix_command("4.4.0", output.clone()), &MatrixBackend).unwrap();
-    let lock_bytes = fs::read(&output).unwrap();
+    let lock_bytes = b"pre-existing lock bytes";
+    fs::write(&output, lock_bytes).unwrap();
     fs::hard_link(&output, &report).unwrap();
 
     let mut command = matrix_command("4.4.0", output.clone());
@@ -179,7 +179,8 @@ fn metrics_output_case_variant_follows_filesystem_identity() {
     fs::create_dir(&directory).unwrap();
     let output = directory.join("lock.toml");
     let metrics = directory.join("LOCK.TOML");
-    fs::write(&output, b"probe").unwrap();
+    let original_bytes = b"pre-existing lock bytes";
+    fs::write(&output, original_bytes).unwrap();
     let can_create_variant = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -187,8 +188,8 @@ fn metrics_output_case_variant_follows_filesystem_identity() {
         .is_ok();
     if can_create_variant {
         fs::remove_file(&metrics).unwrap();
+        fs::remove_file(&output).unwrap();
     }
-    fs::remove_file(&output).unwrap();
     let mut command = matrix_command("4.4.0", output.clone());
     command.metrics_output = Some(metrics.clone());
     let result = run_lock_with_backend(command, &MatrixBackend);
@@ -200,6 +201,8 @@ fn metrics_output_case_variant_follows_filesystem_identity() {
         assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
         assert!(output.exists());
         assert!(metrics.exists());
+        assert_eq!(fs::read(&output).unwrap(), original_bytes);
+        assert_eq!(fs::read(&metrics).unwrap(), original_bytes);
     }
     fs::remove_file(output).unwrap();
     if metrics.exists() {
