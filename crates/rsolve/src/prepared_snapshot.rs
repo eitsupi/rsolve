@@ -226,11 +226,26 @@ fn cache_revision(cache: &CranSnapshotCacheResult) -> Option<Box<str>> {
 /// Shared cache decision boundary used by both production resolution and
 /// deterministic orchestration tests. Refresh is invoked only when the
 /// compatible generation is stale or cannot prove the requested resolution.
+#[cfg(test)]
 fn cache_or_refresh<L, F>(
     probe: CacheProbe<L>,
     roots: &[PackageName],
     request: &rsolve_core::ResolutionRequest,
+    refresh: F,
+) -> Result<(L, Vec<CranSnapshotCacheDiagnostic>), CranResolutionError>
+where
+    L: CandidateLoader,
+    F: FnMut(&[PackageName]) -> Result<L, CranResolutionError>,
+{
+    cache_or_refresh_with_recorder(probe, roots, request, refresh, None)
+}
+
+fn cache_or_refresh_with_recorder<L, F>(
+    probe: CacheProbe<L>,
+    roots: &[PackageName],
+    request: &rsolve_core::ResolutionRequest,
     mut refresh: F,
+    recorder: Option<Recorder>,
 ) -> Result<(L, Vec<CranSnapshotCacheDiagnostic>), CranResolutionError>
 where
     L: CandidateLoader,
@@ -241,7 +256,16 @@ where
         CacheProbe::Compatible { loader, diagnostic }
             if diagnostic.status() == CranSnapshotCacheStatus::Fresh =>
         {
-            match resolve_prepared_snapshot_without_transport(request.clone(), &loader) {
+            let result = if let Some(recorder) = &recorder {
+                resolve_prepared_snapshot_without_transport_with_metrics(
+                    request.clone(),
+                    &loader,
+                    Some(recorder.clone()),
+                )
+            } else {
+                resolve_prepared_snapshot_without_transport(request.clone(), &loader)
+            };
+            match result {
                 Ok(_) => return Ok((loader, vec![diagnostic])),
                 Err(error) => {
                     let error = cache_resolution_error(error);
@@ -487,33 +511,39 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         }
     };
     let refreshed = Cell::new(false);
-    let (loader, cache_diagnostics) = cache_or_refresh(probe, &roots, &request, |batch| {
-        refreshed.set(true);
-        let closure = collect_cran_dependency_closure_with_metrics(
-            batch,
-            |batch| {
-                recorder.measure(Phase::RefreshAcquisition, || {
-                    transaction.refresh_packages(batch)
+    let (loader, cache_diagnostics) = cache_or_refresh_with_recorder(
+        probe,
+        &roots,
+        &request,
+        |batch| {
+            refreshed.set(true);
+            let closure = collect_cran_dependency_closure_with_metrics(
+                batch,
+                |batch| {
+                    recorder.measure(Phase::RefreshAcquisition, || {
+                        transaction.refresh_packages(batch)
+                    })
+                },
+                &recorder,
+            )
+            .map_err(CranResolutionError::Refresh)?;
+            if closure.is_empty() {
+                return Err(CranResolutionError::Refresh(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!(
+                        "refresh returned no remote packages for batch of {}",
+                        batch.len()
+                    ),
+                )));
+            }
+            recorder
+                .measure(Phase::SnapshotCompositionAndPublication, || {
+                    transaction.refresh_and_publish_snapshot(&closure)
                 })
-            },
-            &recorder,
-        )
-        .map_err(CranResolutionError::Refresh)?;
-        if closure.is_empty() {
-            return Err(CranResolutionError::Refresh(CandidateLoadError::new(
-                CandidateLoadErrorCategory::MetadataInvalid,
-                format!(
-                    "refresh returned no remote packages for batch of {}",
-                    batch.len()
-                ),
-            )));
-        }
-        recorder
-            .measure(Phase::SnapshotCompositionAndPublication, || {
-                transaction.refresh_and_publish_snapshot(&closure)
-            })
-            .map_err(CranResolutionError::Publish)
-    })?;
+                .map_err(CranResolutionError::Publish)
+        },
+        Some(recorder.clone()),
+    )?;
     drop(transaction);
     emit_progress(&progress, ProgressEvent::ResolveStarted);
     let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
@@ -759,6 +789,69 @@ mod tests {
         ) -> Result<Vec<PackageRelease>, CandidateLoadError> {
             Err(self.0.clone())
         }
+    }
+
+    struct FlakyLoader {
+        snapshot: CranCandidateSnapshot,
+        fail_first_lookup: Cell<bool>,
+    }
+
+    impl CandidateLoader for FlakyLoader {
+        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+            if self.fail_first_lookup.replace(false) {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::TransportFailure,
+                    "synthetic first lookup failure",
+                ));
+            }
+            self.snapshot.releases(package)
+        }
+    }
+
+    #[test]
+    fn measured_cached_retry_accumulates_after_initial_failed_solve() {
+        let root = PackageName::new("root").unwrap();
+        let snapshot = CranCandidateSnapshot::from_candidates([(
+            root.clone(),
+            vec![release_with_dependencies(&root, Vec::new())],
+        )]);
+        let loader = FlakyLoader {
+            snapshot,
+            fail_first_lookup: Cell::new(true),
+        };
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
+        let recorder = Recorder::new();
+        assert!(
+            resolve_prepared_snapshot_without_transport_with_metrics(
+                request.clone(),
+                &loader,
+                Some(recorder.clone()),
+            )
+            .is_err()
+        );
+        let first = recorder.snapshot();
+        let mut refreshes = 0;
+        let (reused, _) = cache_or_refresh_with_recorder(
+            CacheProbe::Compatible {
+                loader,
+                diagnostic: cache_diagnostic(CranSnapshotCacheStatus::Fresh, Some(1)),
+            },
+            std::slice::from_ref(&root),
+            &request,
+            |_| {
+                refreshes += 1;
+                unreachable!("cached retry should succeed without refresh")
+            },
+            Some(recorder.clone()),
+        )
+        .unwrap();
+        assert!(reused.snapshot.contains_package(&root));
+        assert_eq!(refreshes, 0);
+        let second = recorder.snapshot();
+        assert!(second.phases.solve_ns.is_some());
+        assert!(second.loader_lookup_calls > first.loader_lookup_calls);
+        assert!(second.loader_unique_package_count >= first.loader_unique_package_count);
     }
 
     #[test]

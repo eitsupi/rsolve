@@ -390,7 +390,7 @@ fn run_lock_with_backend_progress(
     validate_output_path(&command.output)?;
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
-        if destination_identity(&command.output)? == destination_identity(metrics_output)? {
+        if destinations_collide(&command.output, metrics_output)? {
             return Err(CliError::Value(
                 "--metrics-output must differ from --output".into(),
             ));
@@ -510,6 +510,53 @@ fn destination_identity(path: &Path) -> Result<PathBuf, CliError> {
         path.file_name()
             .ok_or_else(|| CliError::Value("output has no file name".into()))?,
     ))
+}
+
+fn destinations_collide(left: &Path, right: &Path) -> Result<bool, CliError> {
+    let left = destination_identity(left)?;
+    let right = destination_identity(right)?;
+    if left == right {
+        return Ok(true);
+    }
+    let (Some(left_parent), Some(right_parent)) = (left.parent(), right.parent()) else {
+        return Ok(false);
+    };
+    if left_parent != right_parent {
+        return Ok(false);
+    }
+    Ok(portable_basename_case_equal(
+        left.file_name(),
+        right.file_name(),
+    ))
+}
+
+/// Compare destination names conservatively across case-sensitive and
+/// case-insensitive filesystems. Invalid UTF-8 is compared without lossy
+/// conversion, while ASCII case folding remains available.
+fn portable_basename_case_equal(
+    left: Option<&std::ffi::OsStr>,
+    right: Option<&std::ffi::OsStr>,
+) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    let left_bytes = left.as_encoded_bytes();
+    let right_bytes = right.as_encoded_bytes();
+    if ascii_case_equal(left_bytes, right_bytes) {
+        return true;
+    }
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => left.to_lowercase() == right.to_lowercase(),
+        _ => false,
+    }
+}
+
+fn ascii_case_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 fn canonical_mirror(input: &str) -> Result<Box<str>, CliError> {

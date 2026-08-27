@@ -118,13 +118,24 @@ fn metrics_output_symlink_is_rejected_without_touching_target() {
     let report = temp_path("metrics-symlink-report");
     fs::write(&target, b"keep").unwrap();
     symlink(&target, &report).unwrap();
-    let mut command = matrix_command("4.4.0", output);
+    let mut command = matrix_command("4.4.0", output.clone());
     command.metrics_output = Some(report.clone());
     let result = run_lock_with_backend(command, &MatrixBackend);
     assert!(matches!(result, Err(CliError::Value(message)) if message.contains("symlink")));
     assert_eq!(fs::read(&target).unwrap(), b"keep");
     fs::remove_file(report).unwrap();
     fs::remove_file(target).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_case_insensitive_destination_names_are_compared_without_lossy_conversion() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let lower = OsString::from_vec(b"lock-\xff.toml".to_vec());
+    let upper = OsString::from_vec(b"LOCK-\xff.TOML".to_vec());
+    assert!(portable_basename_case_equal(Some(&lower), Some(&upper)));
 }
 
 #[test]
@@ -149,6 +160,19 @@ fn metrics_output_rejects_equivalent_lock_destination() {
     command.metrics_output = Some(parent.join(".").join(output.file_name().unwrap()));
     let result = run_lock_with_backend(command, &MatrixBackend);
     assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
+}
+
+#[test]
+fn metrics_output_rejects_case_insensitive_lock_destination() {
+    let directory = temp_path("case-collision");
+    fs::create_dir(&directory).unwrap();
+    let output = directory.join("lock.toml");
+    let parent = output.parent().unwrap();
+    let mut command = matrix_command("4.4.0", output.clone());
+    command.metrics_output = Some(parent.join("LOCK.TOML"));
+    let result = run_lock_with_backend(command, &MatrixBackend);
+    assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
+    fs::remove_dir(directory).unwrap();
 }
 
 #[test]
