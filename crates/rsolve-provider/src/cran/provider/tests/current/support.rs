@@ -51,7 +51,12 @@ pub(in crate::cran::provider::tests) fn wait_for_child_file(path: &Path) {
 pub(in crate::cran::provider::tests) fn wait_for_child(
     mut child: Child,
 ) -> std::process::ExitStatus {
-    for _ in 0..500 {
+    // The persistent child tests are also exercised in the full workspace
+    // suite, where process scheduling and full-suite load can delay a
+    // child well beyond the focused-test runtime. Keep the synchronization
+    // markers above as the readiness protocol and allow the child itself a
+    // bounded, but generous, completion window.
+    for _ in 0..1500 {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
         }
@@ -85,9 +90,10 @@ pub(in crate::cran::provider::tests) fn seed_previous_projection(root: &Path) ->
     let previous = raw_cache
         .projection_path_for_hex_digest(&key, &digest)
         .unwrap();
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
     std::fs::write(&previous, b"previous").unwrap();
     std::fs::write(
-        root.join("raw-cache/v1/projections/newer-orphan.redb"),
+        previous.parent().unwrap().join("newer-orphan.redb"),
         b"orphan",
     )
     .unwrap();
@@ -115,10 +121,27 @@ pub(in crate::cran::provider::tests) fn append_counter(root: &Path, name: &str) 
 
 pub(in crate::cran::provider::tests) fn projection_files(root: &Path) -> Vec<PathBuf> {
     let directory = root.join("raw-cache/v1/projections");
-    std::fs::read_dir(directory)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("redb"))
+    let mut pending = vec![directory];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("redb") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+pub(in crate::cran::provider::tests) fn auxiliary_projection_files(root: &Path) -> Vec<PathBuf> {
+    projection_files(root)
+        .into_iter()
+        .filter(|path| {
+            path.ancestors()
+                .any(|ancestor| ancestor.file_name().is_some_and(|name| name == "auxiliary"))
+        })
         .collect()
 }

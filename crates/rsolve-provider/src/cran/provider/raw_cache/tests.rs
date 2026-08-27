@@ -366,77 +366,31 @@ fn semantic_snapshot_namespace_is_untouched() {
 fn projection_retention_keeps_only_a_bounded_recent_set() {
     let store = store();
     let cache = RawCache::open(&store).unwrap();
+    let projections = cache
+        .projection_namespace_path(ProjectionNamespace::Auxiliary)
+        .join("a".repeat(64));
+    fs::create_dir_all(&projections).unwrap();
     for index in 0..4 {
         fs::write(
-            cache
-                .directory
-                .join(PROJECTION_DIRECTORY)
-                .join(format!("projection-{index}.redb")),
+            projections.join(format!("projection-{index}.redb")),
             [index as u8],
         )
         .unwrap();
     }
-    fs::write(
-        cache.directory.join(PROJECTION_DIRECTORY).join("crash.tmp"),
-        [4_u8],
-    )
-    .unwrap();
-    fs::write(
-        cache
-            .directory
-            .join(PROJECTION_DIRECTORY)
-            .join("unclassified"),
-        [5_u8],
-    )
-    .unwrap();
-    fs::write(
-        cache.directory.join(PROJECTION_DIRECTORY).join(".redb"),
-        [6_u8],
-    )
-    .unwrap();
-    let active = cache
-        .directory
-        .join(PROJECTION_DIRECTORY)
-        .join("projection-0.redb");
-    let previous = cache
-        .directory
-        .join(PROJECTION_DIRECTORY)
-        .join("projection-1.redb");
+    fs::write(projections.join("crash.tmp"), [4_u8]).unwrap();
+    fs::write(projections.join("unclassified"), [5_u8]).unwrap();
+    fs::write(projections.join(".redb"), [6_u8]).unwrap();
+    let active = projections.join("projection-0.redb");
+    let previous = projections.join("projection-1.redb");
     cache.retain_projections(&active, Some(&previous)).unwrap();
-    let retained = fs::read_dir(cache.directory.join(PROJECTION_DIRECTORY))
-        .unwrap()
-        .count();
+    let retained = fs::read_dir(&projections).unwrap().count();
     assert_eq!(retained, 2);
     assert!(active.exists());
     assert!(previous.exists());
-    assert!(
-        !cache
-            .directory
-            .join(PROJECTION_DIRECTORY)
-            .join("projection-2.redb")
-            .exists()
-    );
-    assert!(
-        !cache
-            .directory
-            .join(PROJECTION_DIRECTORY)
-            .join("crash.tmp")
-            .exists()
-    );
-    assert!(
-        !cache
-            .directory
-            .join(PROJECTION_DIRECTORY)
-            .join("unclassified")
-            .exists()
-    );
-    assert!(
-        !cache
-            .directory
-            .join(PROJECTION_DIRECTORY)
-            .join(".redb")
-            .exists()
-    );
+    assert!(!projections.join("projection-2.redb").exists());
+    assert!(!projections.join("crash.tmp").exists());
+    assert!(!projections.join("unclassified").exists());
+    assert!(!projections.join(".redb").exists());
 }
 
 #[test]
@@ -447,8 +401,10 @@ fn projection_retention_does_not_delete_other_source_namespaces() {
     let current = projections.join("current").join("current.redb");
     fs::create_dir_all(current.parent().unwrap()).unwrap();
     fs::write(&current, b"current").unwrap();
-    let active = projections.join("active.redb");
-    let previous = projections.join("previous.redb");
+    let auxiliary = projections.join("auxiliary").join("a".repeat(64));
+    fs::create_dir_all(&auxiliary).unwrap();
+    let active = auxiliary.join("active.redb");
+    let previous = auxiliary.join("previous.redb");
     fs::write(&active, b"active").unwrap();
     fs::write(&previous, b"previous").unwrap();
 

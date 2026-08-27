@@ -58,14 +58,14 @@ impl<T: Transport> CranRefreshSession<T> {
             HistorySource::Absent => return Ok(None),
         };
         let package_projection =
-            bulk.projection
-                .observations(package.as_str())
-                .map_err(|error| {
+            super::super::allpackages::observations(&bulk.projection, package.as_str()).map_err(
+                |error| {
                     CandidateLoadError::new(
                         CandidateLoadErrorCategory::SnapshotInvalid,
                         format!("invalid ALLPACKAGES package projection for {package}: {error}"),
                     )
-                })?;
+                },
+            )?;
         let package_rows = package_projection
             .observations
             .iter()

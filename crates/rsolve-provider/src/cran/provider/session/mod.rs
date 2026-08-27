@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use super::super::catalog::{CranCatalog, CranCatalogObservation, CranCatalogRecordContext};
 use super::super::evidence::CranEvidenceObservation;
 use super::super::history::{ArchiveEntry, ArchivePackagePayload};
-use super::allpackages::IndexedProjection;
 use super::cache_policy::CacheControlHeader;
 use super::cache_policy::{cache_control_policy, permits_reuse};
 use super::model::{
@@ -274,7 +273,7 @@ impl ArchiveHistorySource {
 
 #[derive(Clone)]
 pub(super) struct AllPackagesSource {
-    pub(super) projection: Rc<IndexedProjection>,
+    pub(super) projection: Rc<PackageProjection>,
     pub(super) source: crate::snapshot::SourceInput,
     projection_path: std::path::PathBuf,
 }

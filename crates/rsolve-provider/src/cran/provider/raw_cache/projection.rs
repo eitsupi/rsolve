@@ -284,6 +284,64 @@ impl PackageProjection {
         }
     }
 
+    /// Visit selected package payloads in one read transaction. Source
+    /// adapters use this for qualification scans that need a package-keyed
+    /// projection without regressing to one transaction per package.
+    pub(crate) fn visit_selected_packages<F, E>(
+        &self,
+        packages: &[&str],
+        mut visitor: F,
+    ) -> Result<(), ProjectionVisitError<E>>
+    where
+        F: FnMut(&str, Option<ProjectionPayload>) -> Result<(), E>,
+    {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
+        let payloads = read
+            .open_table(PACKAGES)
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
+        let counts = read
+            .open_table(PACKAGE_COUNTS)
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
+        for package in packages {
+            let payload = payloads
+                .get(*package)
+                .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?
+                .map(|value| value.value().to_vec());
+            let count = counts
+                .get(*package)
+                .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
+            let payload = match (payload, count) {
+                (None, None) => None,
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(ProjectionVisitError::Invalid(
+                        "package projection payload/count entry mismatch".into(),
+                    ));
+                }
+                (Some(bytes), Some(count)) => {
+                    if bytes.is_empty() || count.value() == 0 {
+                        return Err(ProjectionVisitError::Invalid(
+                            "invalid package projection payload/count entry".into(),
+                        ));
+                    }
+                    let record_count = usize::try_from(count.value()).map_err(|_| {
+                        ProjectionVisitError::Invalid(
+                            "package projection record count exceeds usize".into(),
+                        )
+                    })?;
+                    Some(ProjectionPayload {
+                        bytes,
+                        record_count,
+                    })
+                }
+            };
+            visitor(package, payload).map_err(ProjectionVisitError::Visitor)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn visit_packages<F>(&self, mut visitor: F) -> Result<(), String>
     where
         F: FnMut(&str, &[u8], usize) -> Result<(), String>,

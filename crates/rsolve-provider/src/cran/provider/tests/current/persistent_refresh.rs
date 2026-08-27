@@ -127,10 +127,12 @@ fn persistent_refresh_child_probe() {
     }
     if !satisfied {
         let raw_cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
-        let projection_directory = root.join("raw-cache/v1/projections");
         let previous = captured_previous.expect("positive qualification must bind previous");
-        let orphan = projection_directory.join("newer-orphan.redb");
-        let generated_before = projection_files(&root)
+        let orphan = previous
+            .parent()
+            .expect("positive qualification must bind previous")
+            .join("newer-orphan.redb");
+        let generated_before = auxiliary_projection_files(&root)
             .into_iter()
             .filter(|path| path != &previous && path != &orphan)
             .count();
@@ -166,7 +168,7 @@ fn persistent_refresh_child_probe() {
             "https://cloud.r-project.org",
         )
         .unwrap();
-        let generated_after = projection_files(&root)
+        let generated_after = auxiliary_projection_files(&root)
             .into_iter()
             .filter(|path| path != &previous && path != &orphan)
             .count();
@@ -174,7 +176,7 @@ fn persistent_refresh_child_probe() {
             append_counter(&root, "persistent-refresh-count");
             append_counter(&root, "persistent-projection-build-count");
         }
-        let active = projection_files(&root)
+        let active = auxiliary_projection_files(&root)
             .into_iter()
             .find(|path| path != &previous && path != &orphan)
             .unwrap();
@@ -200,7 +202,7 @@ fn persistent_refresh_child_processes_coalesce_normal_refresh() {
     wait_for_child_file(&root.join("normal-waiter-attempting-lock"));
     assert!(wait_for_child(owner).success());
     assert!(previous.exists());
-    assert_eq!(projection_files(root).len(), 2);
+    assert_eq!(auxiliary_projection_files(root).len(), 2);
     assert!(wait_for_child(waiter).success());
     assert_eq!(
         std::fs::read_to_string(root.join("persistent-request-count"))
@@ -224,8 +226,10 @@ fn persistent_refresh_child_processes_coalesce_normal_refresh() {
         1
     );
     assert!(
-        !root
-            .join("raw-cache/v1/projections/newer-orphan.redb")
+        !previous
+            .parent()
+            .unwrap()
+            .join("newer-orphan.redb")
             .exists()
     );
     let validation: crate::snapshot::CurrentValidationV2 =
@@ -248,7 +252,7 @@ fn persistent_refresh_child_processes_coalesce_forced_refresh_and_retry_after_pa
     wait_for_child_file(&root.join("forced-waiter-attempting-lock"));
     assert!(wait_for_child(owner).success());
     assert!(previous.exists());
-    assert_eq!(projection_files(root).len(), 2);
+    assert_eq!(auxiliary_projection_files(root).len(), 2);
     assert!(wait_for_child(waiter).success());
     assert_eq!(
         std::fs::read_to_string(root.join("persistent-refresh-count"))

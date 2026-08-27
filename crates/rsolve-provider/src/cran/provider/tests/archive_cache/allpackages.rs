@@ -350,7 +350,7 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
 }
 
 #[test]
-fn corrupt_projection_reports_diagnostic_falls_back_and_rebuilds_next_session() {
+fn corrupt_projection_rebuilds_from_cached_raw_without_fallback() {
     let (_directory, store) = store();
     let entries = matrix_history_entries();
     let feed = allpackages_fixture_body(&entries, true, None);
@@ -389,11 +389,11 @@ fn corrupt_projection_reports_diagnostic_falls_back_and_rebuilds_next_session() 
     second
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
-    assert!(second.diagnostics.iter().any(|diagnostic| {
+    assert!(!second.diagnostics.iter().any(|diagnostic| {
         diagnostic.source() == CranRefreshSource::AllPackages
             && matches!(diagnostic.status_detail(), CranFastPathStatus::Invalid { diagnostic, .. } if diagnostic.contains("projection"))
     }));
-    assert!(second_requests.borrow().iter().any(|request| {
+    assert!(!second_requests.borrow().iter().any(|request| {
         request.url == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds"
     }));
 
@@ -408,7 +408,7 @@ fn corrupt_projection_reports_diagnostic_falls_back_and_rebuilds_next_session() 
     third
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
-    assert_eq!(crate::cran::provider::allpackages::test_counters(), (1, 1));
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
 }
 
 #[test]

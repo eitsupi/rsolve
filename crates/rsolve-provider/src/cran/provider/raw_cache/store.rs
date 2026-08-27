@@ -97,7 +97,7 @@ impl RawCache {
 
     pub(crate) fn projection_path(&self, key: &RawCacheKey, body: &[u8]) -> PathBuf {
         self.projection_path_in_namespace(
-            ProjectionNamespace::AllPackages,
+            ProjectionNamespace::Auxiliary,
             key,
             &hex(&Sha256::digest(body)),
         )
@@ -113,25 +113,9 @@ impl RawCache {
         body_digest: &str,
     ) -> PathBuf {
         let directory = self.projection_namespace_path(namespace);
-        if namespace == ProjectionNamespace::AllPackages {
-            directory.join(format!("{}-{body_digest}.redb", key.digest()))
-        } else {
-            directory
-                .join(key.digest())
-                .join(format!("{body_digest}.redb"))
-        }
-    }
-
-    pub(crate) fn projection_path_for_digest(
-        &self,
-        key: &RawCacheKey,
-        content_sha256: &[u8; 32],
-    ) -> PathBuf {
-        self.projection_path_in_namespace(
-            ProjectionNamespace::AllPackages,
-            key,
-            &hex(content_sha256),
-        )
+        directory
+            .join(key.digest())
+            .join(format!("{body_digest}.redb"))
     }
 
     pub(crate) fn projection_path_for_hex_digest(
@@ -146,11 +130,7 @@ impl RawCache {
         {
             return None;
         }
-        Some(
-            self.directory
-                .join(PROJECTION_DIRECTORY)
-                .join(format!("{}-{content_sha256}.redb", key.digest())),
-        )
+        Some(self.projection_path_in_namespace(ProjectionNamespace::Auxiliary, key, content_sha256))
     }
 
     pub(crate) fn qualification_path(&self) -> PathBuf {
@@ -167,7 +147,7 @@ impl RawCache {
         active: &Path,
         previous: Option<&Path>,
     ) -> Result<(), RawCacheError> {
-        self.retain_projection_namespace(ProjectionNamespace::AllPackages, active, previous)
+        self.retain_projection_namespace(ProjectionNamespace::Auxiliary, active, previous)
     }
 
     pub(crate) fn retain_projection_namespace(
@@ -192,30 +172,22 @@ impl RawCache {
         ensure_regular_directory_path(&root, "projection root")?;
         let namespace_path = self.projection_namespace_path(namespace);
         ensure_regular_directory_path(&namespace_path, "projection namespace")?;
-        if namespace == ProjectionNamespace::AllPackages {
-            if directory != namespace_path {
-                return Err(RawCacheError::Invalid(
-                    "projection is outside its namespace".into(),
-                ));
-            }
-        } else {
-            if directory.parent() != Some(namespace_path.as_path())
-                || directory
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_none_or(|name| {
-                        name.len() != 64
-                            || !name
-                                .bytes()
-                                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                    })
-            {
-                return Err(RawCacheError::Invalid(
-                    "projection is outside its raw-key namespace".into(),
-                ));
-            }
-            ensure_regular_directory_path(directory, "projection raw-key directory")?;
+        if directory.parent() != Some(namespace_path.as_path())
+            || directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| {
+                    name.len() != 64
+                        || !name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+        {
+            return Err(RawCacheError::Invalid(
+                "projection is outside its raw-key namespace".into(),
+            ));
         }
+        ensure_regular_directory_path(directory, "projection raw-key directory")?;
         Ok(())
     }
 
@@ -223,7 +195,6 @@ impl RawCache {
         self.directory
             .join(PROJECTION_DIRECTORY)
             .join(match namespace {
-                ProjectionNamespace::AllPackages => "",
                 ProjectionNamespace::Current => "current",
                 ProjectionNamespace::ArchiveHistory => "archive-history",
                 ProjectionNamespace::Auxiliary => "auxiliary",
@@ -236,9 +207,7 @@ impl RawCache {
         key: &RawCacheKey,
     ) -> Result<(), RawCacheError> {
         ensure_directory(&self.projection_namespace_path(namespace))?;
-        if namespace != ProjectionNamespace::AllPackages {
-            ensure_directory(&self.projection_namespace_path(namespace).join(key.digest()))?;
-        }
+        ensure_directory(&self.projection_namespace_path(namespace).join(key.digest()))?;
         Ok(())
     }
 
@@ -596,21 +565,16 @@ fn retain_projection_files(
     }
     let projections_fd = cache_directory.open_dir_nofollow(PROJECTION_DIRECTORY)?;
     let namespace_fd = match namespace {
-        ProjectionNamespace::AllPackages => projections_fd,
         ProjectionNamespace::Current => projections_fd.open_dir_nofollow("current")?,
         ProjectionNamespace::ArchiveHistory => {
             projections_fd.open_dir_nofollow("archive-history")?
         }
         ProjectionNamespace::Auxiliary => projections_fd.open_dir_nofollow("auxiliary")?,
     };
-    let directory_fd = if namespace == ProjectionNamespace::AllPackages {
-        namespace_fd
-    } else {
-        let key_name = directory
-            .file_name()
-            .ok_or_else(|| RawCacheError::Invalid("projection directory has no name".into()))?;
-        namespace_fd.open_dir_nofollow(key_name)?
-    };
+    let key_name = directory
+        .file_name()
+        .ok_or_else(|| RawCacheError::Invalid("projection directory has no name".into()))?;
+    let directory_fd = namespace_fd.open_dir_nofollow(key_name)?;
     let active_name = projection_name(active, "active")?;
     require_regular_projection(&directory_fd, &active_name, "active")?;
     let previous_name = previous

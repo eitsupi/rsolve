@@ -3,34 +3,30 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::Path;
 
 use super::super::catalog::{CranCatalog, CranCatalogObservation};
 use crate::cran::history::ArchiveEntry;
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use rsolve_core::PackageRelease;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::Digest;
 
 use super::super::catalog::{
     CranProviderObservationProjection, allpackages_observations_from_fields,
 };
 use super::super::dcf::DcfDocument;
+use super::model::{CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA};
 use super::qualification::CoverageStatus;
+use super::raw_cache::projection::ProjectionSourceKind;
+use super::raw_cache::projection::{
+    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionPackage,
+    ProjectionPayload,
+};
 
-const PROJECTION_FORMAT: &str = "rsolve-cran-allpackages-projection";
-// Bump when the derived semantic projection changes.  Existing redb files
-// must be rebuilt rather than interpreted with a different field policy.
-const PROJECTION_VERSION: u32 = 2;
 // The current CRAN feed is roughly 100 MiB decompressed. Keep substantial
 // headroom while retaining a hard limit against compressed zip-bomb input.
 const MAX_ALLPACKAGES_DECOMPRESSED_BYTES: usize = 512 * 1024 * 1024;
-const HEADER: TableDefinition<&str, &[u8]> = TableDefinition::new("header");
-const PACKAGE_OBSERVATIONS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("package_observations");
-
 #[cfg(test)]
 thread_local! {
     static PROJECTION_BUILD_COUNT: Cell<usize> = const { Cell::new(0) };
@@ -58,14 +54,10 @@ pub(super) fn classify_current_count() -> usize {
     CLASSIFY_CURRENT_COUNT.with(Cell::get)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 struct IndexedRecord {
     package: Option<String>,
     fields: Vec<(String, String)>,
-}
-
-pub(super) struct IndexedProjection {
-    database: ReadOnlyDatabase,
 }
 
 pub(super) struct CoverageSummary {
@@ -76,78 +68,60 @@ pub(super) struct CoverageSummary {
     pub(super) digest: String,
 }
 
-impl IndexedProjection {
-    pub(super) fn observations(
-        &self,
-        package: &str,
-    ) -> Result<CranProviderObservationProjection, String> {
-        let read = self
-            .database
-            .begin_read()
-            .map_err(|error| error.to_string())?;
-        let table = read
-            .open_table(PACKAGE_OBSERVATIONS)
-            .map_err(|error| error.to_string())?;
-        let records = table
-            .get(package)
-            .map_err(|error| error.to_string())?
-            .map(|value| postcard::from_bytes::<Vec<IndexedRecord>>(value.value()))
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
-        Ok(allpackages_observations_from_fields(
-            records
-                .into_iter()
-                .enumerate()
-                .map(|(index, record)| (index, record.package, record.fields))
-                .collect(),
-        ))
-    }
+pub(super) fn observations(
+    projection: &PackageProjection,
+    package: &str,
+) -> Result<CranProviderObservationProjection, String> {
+    let records = decode_records(
+        projection
+            .lookup_package(package)
+            .map_err(|error| error.to_string())?,
+        package,
+    )?;
+    Ok(allpackages_observations_from_fields(
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| (index, record.package, record.fields))
+            .collect(),
+    ))
+}
 
-    /// Classifies the complete current catalog in one read transaction. The
-    /// transaction is deliberately separate from package lookup so coverage
-    /// qualification never performs one redb transaction per package.
-    pub(super) fn classify_current(
-        &self,
-        current: &CranCatalog,
-    ) -> Result<CoverageSummary, String> {
-        #[cfg(test)]
-        CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(counter.get() + 1));
-        let read = self
-            .database
-            .begin_read()
-            .map_err(|error| error.to_string())?;
-        let table = read
-            .open_table(PACKAGE_OBSERVATIONS)
-            .map_err(|error| error.to_string())?;
-        let mut covered_count = 0;
-        let mut gapped_count = 0;
-        let mut conflicting_count = 0;
-        let mut digest = sha2::Sha256::new();
-        for (package, releases) in current.packages() {
-            let records = table
-                .get(package.as_str())
-                .map_err(|error| error.to_string())?
-                .map(|value| postcard::from_bytes::<Vec<IndexedRecord>>(value.value()))
-                .transpose()
-                .map_err(|error| error.to_string())?
-                .unwrap_or_default();
-            let projection = allpackages_observations_from_fields(
+pub(super) fn classify_current(
+    projection: &PackageProjection,
+    current: &CranCatalog,
+) -> Result<CoverageSummary, String> {
+    #[cfg(test)]
+    CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(counter.get() + 1));
+    let package_index = current
+        .packages()
+        .map(|(package, releases)| (package.as_str(), releases))
+        .collect::<BTreeMap<_, _>>();
+    let packages = package_index.keys().copied().collect::<Vec<_>>();
+    let mut covered_count = 0;
+    let mut gapped_count = 0;
+    let mut conflicting_count = 0;
+    let mut digest = sha2::Sha256::new();
+    projection
+        .visit_selected_packages(&packages, |package, payload| {
+            let records = decode_records(payload, package)?;
+            let observation_projection = allpackages_observations_from_fields(
                 records
                     .into_iter()
                     .enumerate()
                     .map(|(index, record)| (index, record.package, record.fields))
                     .collect(),
             );
+            let releases = package_index.get(package).copied().unwrap_or(&[]);
             for release in releases {
-                let matching = projection
+                let matching = observation_projection
                     .observations
                     .iter()
                     .filter(|row| row.release().version() == release.version())
                     .collect::<Vec<_>>();
-                let rejected = projection.rejections.iter().any(|row| {
+                let rejected = observation_projection.rejections.iter().any(|row| {
                     row.version() == Some(release.version())
-                        && row.package().is_some_and(|name| name == package)
+                        && row.package().is_some_and(|name| name.as_str() == package)
                 });
                 let classification = if rejected || matching.len() > 1 {
                     conflicting_count += 1;
@@ -157,8 +131,6 @@ impl IndexedProjection {
                         covered_count += 1;
                         "covered"
                     } else {
-                        // A same-identity row with different dependency
-                        // semantics conflicts with the current surface.
                         conflicting_count += 1;
                         "conflicting"
                     }
@@ -166,148 +138,121 @@ impl IndexedProjection {
                     gapped_count += 1;
                     "gapped"
                 };
-                digest.update(package.as_str().as_bytes());
+                digest.update(package.as_bytes());
                 digest.update([0]);
                 digest.update(release.version().to_string().as_bytes());
                 digest.update([0]);
                 digest.update(classification.as_bytes());
                 digest.update([0]);
             }
-        }
-        let status = if conflicting_count > 0 {
-            CoverageStatus::CurrentConflicting
-        } else if gapped_count > 0 {
-            CoverageStatus::CurrentGapped
-        } else {
-            CoverageStatus::CurrentComplete
-        };
-        Ok(CoverageSummary {
-            status,
-            covered_count,
-            gapped_count,
-            conflicting_count,
-            digest: sha256_hex(&digest.finalize()),
+            Ok(())
         })
+        .map_err(|error| match error {
+            super::raw_cache::projection::ProjectionVisitError::Storage(error)
+            | super::raw_cache::projection::ProjectionVisitError::Invalid(error)
+            | super::raw_cache::projection::ProjectionVisitError::Visitor(error) => error,
+        })?;
+    let status = if conflicting_count > 0 {
+        CoverageStatus::CurrentConflicting
+    } else if gapped_count > 0 {
+        CoverageStatus::CurrentGapped
+    } else {
+        CoverageStatus::CurrentComplete
+    };
+    Ok(CoverageSummary {
+        status,
+        covered_count,
+        gapped_count,
+        conflicting_count,
+        digest: sha256_hex(&digest.finalize()),
+    })
+}
+
+fn decode_records(
+    payload: Option<ProjectionPayload>,
+    expected_package: &str,
+) -> Result<Vec<IndexedRecord>, String> {
+    let Some(payload) = payload else {
+        return Ok(Vec::new());
+    };
+    let records = postcard::from_bytes::<Vec<IndexedRecord>>(&payload.bytes)
+        .map_err(|error| error.to_string())?;
+    if records.len() != payload.record_count {
+        return Err(format!(
+            "ALLPACKAGES package projection record count mismatch: expected {}, stored {}",
+            payload.record_count,
+            records.len()
+        ));
     }
+    if records
+        .iter()
+        .any(|record| record.package.as_deref() != Some(expected_package))
+    {
+        return Err(format!(
+            "ALLPACKAGES package projection record is not bound to package {expected_package}"
+        ));
+    }
+    Ok(records)
 }
 
 pub(super) fn load_or_build_projection(
     body: &[u8],
     path: &Path,
-) -> Result<IndexedProjection, String> {
-    let body_sha256 = sha256_hex(body);
-    if path.exists() {
-        let database = ReadOnlyDatabase::open(path)
-            .map_err(|error| format!("invalid ALLPACKAGES projection database: {error}"))?;
-        let read = database
-            .begin_read()
-            .map_err(|error| format!("invalid ALLPACKAGES projection transaction: {error}"))?;
-        let table = read
-            .open_table(HEADER)
-            .map_err(|error| format!("invalid ALLPACKAGES projection header: {error}"))?;
-        let value = table
-            .get("header")
-            .map_err(|error| format!("invalid ALLPACKAGES projection header: {error}"))?
-            .ok_or_else(|| "ALLPACKAGES projection header is missing".to_owned())?;
-        let header = postcard::from_bytes::<ProjectionHeader>(value.value())
-            .map_err(|error| format!("invalid ALLPACKAGES projection header: {error}"))?;
-        if header.format != PROJECTION_FORMAT
-            || header.version != PROJECTION_VERSION
-            || header.body_sha256 != body_sha256
-        {
-            return Err("ALLPACKAGES projection header does not match feed digest".into());
-        }
-        drop(table);
-        drop(read);
-        return Ok(IndexedProjection { database });
-    }
-    #[cfg(test)]
-    PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
-    #[cfg(test)]
-    PROJECTION_DECODE_COUNT.with(|counter| counter.set(counter.get() + 1));
-    let decoded = decode_zstd(body)?;
-    let document = DcfDocument::parse(&decoded).map_err(|error| error.to_string())?;
-    let mut records = BTreeMap::<String, Vec<IndexedRecord>>::new();
-    for record in document.records() {
-        let package = record
-            .field("Package")
-            .map(|field| field.value().to_owned());
-        let key = package.clone().unwrap_or_default();
-        let fields = record
-            .fields()
-            .iter()
-            .map(|field| (field.name().to_owned(), field.value().to_owned()))
-            .collect();
-        records
-            .entry(key)
-            .or_default()
-            .push(IndexedRecord { package, fields });
-    }
-    let header = ProjectionHeader {
-        format: PROJECTION_FORMAT.into(),
-        version: PROJECTION_VERSION,
-        body_sha256,
-        record_count: document.records().len(),
-    };
-    let parent = path
-        .parent()
-        .ok_or_else(|| "projection path has no parent".to_owned())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("redb.tmp");
-    let _ = fs::remove_file(&temporary);
-    let mut database = Database::create(&temporary).map_err(|error| error.to_string())?;
-    {
-        let tx = database.begin_write().map_err(|error| error.to_string())?;
-        {
-            let mut table = tx.open_table(HEADER).map_err(|error| error.to_string())?;
-            let encoded = postcard::to_stdvec(&header).map_err(|error| error.to_string())?;
-            table
-                .insert("header", encoded.as_slice())
-                .map_err(|error| error.to_string())?;
-        }
-        {
-            let mut table = tx
-                .open_table(PACKAGE_OBSERVATIONS)
-                .map_err(|error| error.to_string())?;
-            for (package, package_records) in records {
-                let encoded =
-                    postcard::to_stdvec(&package_records).map_err(|error| error.to_string())?;
-                table
-                    .insert(package.as_str(), encoded.as_slice())
-                    .map_err(|error| error.to_string())?;
+) -> Result<PackageProjection, String> {
+    PackageProjection::open_or_build(
+        path,
+        body,
+        ProjectionSourceKind::Auxiliary,
+        ProjectionContract {
+            parser_schema: CRAN_PARSER_SCHEMA,
+            compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+            normalization_policy: CRAN_NORMALIZATION_POLICY,
+        },
+        || {
+            #[cfg(test)]
+            PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
+            #[cfg(test)]
+            PROJECTION_DECODE_COUNT.with(|counter| counter.set(counter.get() + 1));
+            let decoded = decode_zstd(body)?;
+            let document = DcfDocument::parse(&decoded).map_err(|error| error.to_string())?;
+            let mut records = BTreeMap::<String, Vec<IndexedRecord>>::new();
+            for record in document.records() {
+                let package = record
+                    .field("Package")
+                    .map(|field| field.value().to_owned());
+                let key = package.clone().unwrap_or_default();
+                let fields = record
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name().to_owned(), field.value().to_owned()))
+                    .collect();
+                records
+                    .entry(key)
+                    .or_default()
+                    .push(IndexedRecord { package, fields });
             }
-        }
-        tx.commit().map_err(|error| error.to_string())?;
-    }
-    database.compact().map_err(|error| error.to_string())?;
-    drop(database);
-    File::open(&temporary)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
-    sync_parent(parent)?;
-    let database = ReadOnlyDatabase::open(path).map_err(|error| error.to_string())?;
-    Ok(IndexedProjection { database })
-}
-
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ProjectionHeader {
-    format: String,
-    version: u32,
-    body_sha256: String,
-    record_count: usize,
+            let packages = records
+                .into_iter()
+                .map(|(package, records)| {
+                    let record_count = records.len();
+                    Ok(ProjectionPackage {
+                        package,
+                        record_count,
+                        payload: postcard::to_stdvec(&records)
+                            .map_err(|error| error.to_string())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(ProjectionBuild {
+                packages,
+                summary: Vec::new(),
+                surface_digest: String::new(),
+            })
+        },
+    )
+    .map_err(|error| match error {
+        ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
+    })
 }
 
 fn sha256_hex(input: &[u8]) -> String {
@@ -491,20 +436,33 @@ mod tests {
         );
     }
 
-    fn projection_with_rows(rows: Vec<IndexedRecord>) -> (tempfile::TempDir, IndexedProjection) {
+    fn projection_with_rows(rows: Vec<IndexedRecord>) -> (tempfile::TempDir, PackageProjection) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("projection.redb");
-        let database = Database::create(&path).unwrap();
-        let transaction = database.begin_write().unwrap();
-        {
-            let mut table = transaction.open_table(PACKAGE_OBSERVATIONS).unwrap();
-            let encoded = postcard::to_stdvec(&rows).unwrap();
-            table.insert("Matrix", encoded.as_slice()).unwrap();
-        }
-        transaction.commit().unwrap();
-        drop(database);
-        let database = ReadOnlyDatabase::open(path).unwrap();
-        (directory, IndexedProjection { database })
+        let record_count = rows.len();
+        let projection = PackageProjection::open_or_build(
+            &path,
+            b"raw",
+            ProjectionSourceKind::Auxiliary,
+            ProjectionContract {
+                parser_schema: CRAN_PARSER_SCHEMA,
+                compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+                normalization_policy: CRAN_NORMALIZATION_POLICY,
+            },
+            || {
+                Ok(ProjectionBuild {
+                    packages: vec![ProjectionPackage {
+                        package: "Matrix".into(),
+                        record_count,
+                        payload: postcard::to_stdvec(&rows).unwrap(),
+                    }],
+                    summary: Vec::new(),
+                    surface_digest: String::new(),
+                })
+            },
+        )
+        .unwrap();
+        (directory, projection)
     }
 
     fn current_catalog() -> CranCatalog {
@@ -524,11 +482,25 @@ mod tests {
     }
 
     #[test]
+    fn projection_records_must_match_the_lookup_package() {
+        let payload = ProjectionPayload {
+            bytes: postcard::to_stdvec(&vec![IndexedRecord {
+                package: Some("other".into()),
+                fields: Vec::new(),
+            }])
+            .unwrap(),
+            record_count: 1,
+        };
+        let error = decode_records(Some(payload), "Matrix").unwrap_err();
+        assert!(error.contains("not bound to package Matrix"));
+    }
+
+    #[test]
     fn current_coverage_distinguishes_complete_gapped_and_conflicting() {
         let current = current_catalog();
         // A transport/presentation-only metadata difference is still covered.
         let (_complete_dir, complete) = projection_with_rows(vec![current_row("GPL-3")]);
-        let complete_summary = complete.classify_current(&current).unwrap();
+        let complete_summary = classify_current(&complete, &current).unwrap();
         assert_eq!(complete_summary.status, CoverageStatus::CurrentComplete);
         assert_eq!(complete_summary.covered_count, 1);
 
@@ -545,9 +517,8 @@ mod tests {
                 ("License".into(), "GPL-3".into()),
             ],
         }]);
-        let dependency_summary = dependency_conflict
-            .classify_current(&dependency_current)
-            .unwrap();
+        let dependency_summary =
+            classify_current(&dependency_conflict, &dependency_current).unwrap();
         assert_eq!(
             dependency_summary.status,
             CoverageStatus::CurrentConflicting
@@ -562,13 +533,13 @@ mod tests {
                 ("License".into(), "BSD-3-Clause".into()),
             ],
         }]);
-        let gapped_summary = gapped.classify_current(&current).unwrap();
+        let gapped_summary = classify_current(&gapped, &current).unwrap();
         assert_eq!(gapped_summary.status, CoverageStatus::CurrentGapped);
         assert_eq!(gapped_summary.gapped_count, 1);
 
         let (_conflicting_dir, conflicting) =
             projection_with_rows(vec![current_row("BSD-3-Clause"), current_row("GPL-3")]);
-        let conflicting_summary = conflicting.classify_current(&current).unwrap();
+        let conflicting_summary = classify_current(&conflicting, &current).unwrap();
         assert_eq!(
             conflicting_summary.status,
             CoverageStatus::CurrentConflicting

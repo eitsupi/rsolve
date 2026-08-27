@@ -1,10 +1,11 @@
+use sha2::Digest;
 use std::rc::Rc;
 
 use super::super::super::history::enumerate_archive_rds_for_provider;
 use super::super::model::CranRefreshProgress;
 use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
 use super::super::qualification;
-use super::super::raw_cache::{RawCache, RawCacheRepresentation};
+use super::super::raw_cache::{ProjectionNamespace, RawCache, RawCacheRepresentation};
 use super::super::transport::Transport;
 use super::{
     AllPackagesSource, CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
@@ -132,14 +133,28 @@ impl<T: Transport> CranRefreshSession<T> {
                     cache
                         .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
                         .ok()
-                        .map(|key| cache.projection_path(&key, body))
+                        .map(|key| {
+                            cache
+                                .prepare_projection_path(ProjectionNamespace::Auxiliary, &key)
+                                .map_err(|error| error.to_string())
+                                .map(|_| {
+                                    cache.projection_path_in_namespace(
+                                        ProjectionNamespace::Auxiliary,
+                                        &key,
+                                        &super::hex_digest(sha2::Sha256::digest(body)),
+                                    )
+                                })
+                        })
                 });
-                let Some(path) = projection_path.as_deref() else {
+                let Some(path) = projection_path.transpose().map_err(|error| {
+                    MetadataParseFailure::SnapshotInvalid(error.into_boxed_str())
+                })?
+                else {
                     return Err(MetadataParseFailure::Invalid(
                         "ALLPACKAGES projection cache is unavailable".into(),
                     ));
                 };
-                match super::super::allpackages::load_or_build_projection(body, path) {
+                match super::super::allpackages::load_or_build_projection(body, &path) {
                     Ok(projection) => Ok(projection),
                     Err(error) => {
                         // Keep this refresh fail-closed, but remove only the
@@ -158,7 +173,13 @@ impl<T: Transport> CranRefreshSession<T> {
                     cache
                         .key(&endpoint, RawCacheRepresentation::AllPackagesZstd)
                         .ok()
-                        .map(|key| cache.projection_path_for_digest(&key, &source.content_sha256))
+                        .map(|key| {
+                            cache.projection_path_in_namespace(
+                                ProjectionNamespace::Auxiliary,
+                                &key,
+                                feed_digest.as_str(),
+                            )
+                        })
                 });
                 let Some(projection_path) = projection_path else {
                     return Err(CandidateLoadError::new(
@@ -214,14 +235,14 @@ impl<T: Transport> CranRefreshSession<T> {
                 // needs the complete current surface. Positive reuse above
                 // deliberately avoids materializing every package row.
                 let current_catalog = current_projection.materialize_catalog()?;
-                let coverage = projection
-                    .classify_current(&current_catalog)
-                    .map_err(|error| {
-                        CandidateLoadError::new(
-                            CandidateLoadErrorCategory::SnapshotInvalid,
-                            format!("invalid ALLPACKAGES coverage projection: {error}"),
-                        )
-                    })?;
+                let coverage =
+                    super::super::allpackages::classify_current(&projection, &current_catalog)
+                        .map_err(|error| {
+                            CandidateLoadError::new(
+                                CandidateLoadErrorCategory::SnapshotInvalid,
+                                format!("invalid ALLPACKAGES coverage projection: {error}"),
+                            )
+                        })?;
                 let (mirror_positive, canonical_current_digest, canonical_archive_digest) =
                     if self.base_url.as_ref() == "https://cloud.r-project.org" {
                         // The built-in anchor is immutable by construction;
