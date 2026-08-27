@@ -925,6 +925,15 @@ fn source_and_observation_reordering_is_deterministic() {
 }
 
 #[test]
+fn observation_payload_sort_keys_are_computed_once_per_observation() {
+    let observations = fixture_observations();
+    let expected = observations.len();
+    super::indexing::reset_payload_sort_key_count();
+    super::indexing::index_observations(observations).unwrap();
+    assert_eq!(super::indexing::payload_sort_key_count(), expected);
+}
+
+#[test]
 fn composition_is_accepted_by_the_snapshot_builder() {
     let input = compose_snapshot(context(), fixture_observations()).unwrap();
     let directory = tempfile::tempdir().unwrap();

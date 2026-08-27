@@ -4,6 +4,24 @@ use rsolve_core::{DependencySourceConstraint, PackageName, PackageRelease};
 
 use super::types::*;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static PAYLOAD_SORT_KEY_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_payload_sort_key_count() {
+    PAYLOAD_SORT_KEY_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn payload_sort_key_count() -> usize {
+    PAYLOAD_SORT_KEY_COUNT.with(Cell::get)
+}
+
 pub(super) fn index_observations(
     observations: Vec<CranEvidenceObservation>,
 ) -> Result<IndexedInput, EvidenceCompositionError> {
@@ -68,18 +86,33 @@ pub(super) fn index_observations(
             artifact.checksums.dedup();
         }
     }
-    indexed.sort_by(|left, right| {
-        (
-            left.source_index,
-            left.record_index,
-            serde_json::to_vec(&(&left.fields, &left.artifact)).unwrap_or_default(),
-        )
-            .cmp(&(
-                right.source_index,
-                right.record_index,
-                serde_json::to_vec(&(&right.fields, &right.artifact)).unwrap_or_default(),
+    let mut keyed = indexed
+        .into_iter()
+        .map(|observation| {
+            #[cfg(test)]
+            PAYLOAD_SORT_KEY_COUNT.with(|count| count.set(count.get() + 1));
+            let payload_key = serde_json::to_vec(&(&observation.fields, &observation.artifact))
+                .map_err(|error| {
+                    EvidenceCompositionError::Invalid(format!(
+                        "unable to encode observation payload sort key at source index {} record index {}: {error}",
+                        observation.source_index, observation.record_index
+                    ))
+                })?;
+            Ok((
+                (
+                    observation.source_index,
+                    observation.record_index,
+                    payload_key,
+                ),
+                observation,
             ))
-    });
+        })
+        .collect::<Result<Vec<_>, EvidenceCompositionError>>()?;
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    let indexed = keyed
+        .into_iter()
+        .map(|(_, observation)| observation)
+        .collect::<Vec<_>>();
     if indexed.windows(2).any(|pair| {
         pair[0].source_index == pair[1].source_index
             && pair[0].record_index == pair[1].record_index
