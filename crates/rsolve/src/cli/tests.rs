@@ -174,26 +174,34 @@ fn metrics_output_rejects_equivalent_lock_destination() {
 }
 
 #[test]
-fn metrics_output_case_variant_follows_filesystem_identity() {
+fn metrics_output_case_variant_follows_filesystem_publication_contract() {
     let directory = temp_path("case-identity");
     fs::create_dir(&directory).unwrap();
     let output = directory.join("lock.toml");
     let metrics = directory.join("LOCK.TOML");
-    let original_bytes = b"pre-existing lock bytes";
-    fs::write(&output, original_bytes).unwrap();
-    let can_create_variant = std::fs::OpenOptions::new()
+    let probe = directory.join("probe-case-variant-unique");
+    let probe_variant = directory.join("PROBE-CASE-VARIANT-UNIQUE");
+    fs::write(&probe, b"probe").unwrap();
+    let case_sensitive = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&metrics)
-        .is_ok();
-    if can_create_variant {
-        fs::remove_file(&metrics).unwrap();
-        fs::remove_file(&output).unwrap();
-    }
+        .open(&probe_variant)
+    {
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(&probe_variant).unwrap();
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => panic!("unexpected case-variant probe error: {error}"),
+    };
+    fs::remove_file(&probe).unwrap();
+    assert!(!output.exists());
+    assert!(!metrics.exists());
     let mut command = matrix_command("4.4.0", output.clone());
     command.metrics_output = Some(metrics.clone());
     let result = run_lock_with_backend(command, &MatrixBackend);
-    if can_create_variant {
+    if case_sensitive {
         assert!(result.is_ok());
         assert!(output.exists());
         assert!(metrics.exists());
@@ -201,8 +209,10 @@ fn metrics_output_case_variant_follows_filesystem_identity() {
         assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
         assert!(output.exists());
         assert!(metrics.exists());
-        assert_eq!(fs::read(&output).unwrap(), original_bytes);
-        assert_eq!(fs::read(&metrics).unwrap(), original_bytes);
+        let lock_bytes = fs::read(&output).unwrap();
+        assert_eq!(lock_bytes, fs::read(&metrics).unwrap());
+        assert!(from_toml(std::str::from_utf8(&lock_bytes).unwrap()).is_ok());
+        assert!(serde_json::from_slice::<serde_json::Value>(&lock_bytes).is_err());
     }
     fs::remove_file(output).unwrap();
     if metrics.exists() {

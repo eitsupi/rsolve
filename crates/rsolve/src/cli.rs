@@ -69,7 +69,8 @@ pub struct LockCommand {
     /// Revalidate repository metadata and the bulk history feed immediately.
     #[arg(long, conflicts_with = "offline")]
     pub refresh_metadata: bool,
-    /// Optional destination for a versioned JSON success metrics report.
+    /// Optional secondary destination for a versioned JSON success metrics report.
+    /// A report publication failure does not roll back the published lockfile.
     #[arg(long, value_name = "PATH")]
     pub metrics_output: Option<PathBuf>,
 }
@@ -458,6 +459,9 @@ fn run_lock_with_backend_progress(
     let write_started = Instant::now();
     let changed = write_lockfile(&command.output, bytes.as_bytes())?;
     let write_ns = elapsed_ns(write_started)?;
+    // Recheck after publishing the primary lock: this catches aliases that
+    // were both missing during preflight. A report failure leaves that lock
+    // published and valid.
     let lock_identity = if command.metrics_output.is_some() {
         Some(lock_output_identity(&command.output)?)
     } else {
