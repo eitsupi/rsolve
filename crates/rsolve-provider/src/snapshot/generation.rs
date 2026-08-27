@@ -7,6 +7,34 @@ pub struct ValidatedGeneration {
     header_bytes: Vec<u8>,
 }
 
+/// A generation that has been durably written to store staging, but has not
+/// yet been read back and fully validated.  The private fields make this
+/// capability obtainable only through the builder's staging path.
+pub(crate) struct PreparedGeneration {
+    path: PathBuf,
+    generation: String,
+    header: SnapshotHeaderV1,
+    header_bytes: Vec<u8>,
+}
+
+impl PreparedGeneration {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) fn header(&self) -> &SnapshotHeaderV1 {
+        &self.header
+    }
+
+    pub(crate) fn header_bytes(&self) -> &[u8] {
+        &self.header_bytes
+    }
+}
+
 /// A transport-free candidate loader backed by one immutable redb generation.
 ///
 /// The database is opened read-only and remains pinned for the lifetime of the
@@ -260,6 +288,40 @@ impl SnapshotGenerationBuilder {
         sync_file(&self.destination)?;
         sync_directory(parent)?;
         Ok(ValidatedGeneration {
+            path: self.destination,
+            generation,
+            header,
+            header_bytes,
+        })
+    }
+
+    pub(super) fn prepare_staged(self) -> Result<PreparedGeneration, SnapshotError> {
+        let (mut header, histories) = prepare(&self.input)?;
+        let generation = generation_id(&self.input, &header);
+        header.generation = generation.clone();
+        let header_bytes = encode_header(&header)?;
+        let parent = destination_parent(&self.destination);
+        fs::create_dir_all(parent)?;
+        let temp = create_temporary_generation(parent)?;
+        write_generation_unvalidated(&temp.path, &header_bytes, &histories)?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.destination)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    SnapshotError::Invalid("generation destination already exists".into())
+                } else {
+                    error.into()
+                }
+            })?;
+        if let Err(error) = replace_file(&temp.path, &self.destination) {
+            let _ = fs::remove_file(&self.destination);
+            return Err(error.into());
+        }
+        sync_file(&self.destination)?;
+        sync_directory(parent)?;
+        Ok(PreparedGeneration {
             path: self.destination,
             generation,
             header,

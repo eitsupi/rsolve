@@ -36,6 +36,35 @@ fn build_and_publish_returns_the_generation_it_pinned_before_unlock() {
 }
 
 #[test]
+fn combined_build_and_publish_validates_the_staged_generation_once() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    reset_validation_count();
+
+    store.build_and_publish(present_input()).unwrap();
+
+    assert_eq!(validation_count(), 1);
+}
+
+#[test]
+fn publish_rejects_a_corrupt_staged_generation_without_publishing() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    let staged_path = store.root().join("tmp/corrupt-staged.redb");
+    let generation = SnapshotGenerationBuilder::new(present_input(), &staged_path)
+        .build()
+        .unwrap();
+    corrupt_stored_history(&staged_path, "foo");
+
+    let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+    assert!(store.publish_generation(&lock, generation).is_err());
+    drop(lock);
+
+    assert!(staged_path.exists());
+    assert!(store.read_current_optional().unwrap().is_none());
+}
+
+#[test]
 fn build_and_publish_returns_a_even_if_b_publishes_before_return() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();

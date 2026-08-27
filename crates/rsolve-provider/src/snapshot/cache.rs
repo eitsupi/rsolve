@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ReadOnlySnapshotCandidateLoader, SnapshotBuildInput, SnapshotError, SnapshotGenerationBuilder,
-    SnapshotHeaderV1, ValidatedGeneration, decode_header, hex, parse_hex_32, validate_generation,
+    PreparedGeneration, ReadOnlySnapshotCandidateLoader, SnapshotBuildInput, SnapshotError,
+    SnapshotGenerationBuilder, SnapshotHeaderV1, ValidatedGeneration, decode_header, hex,
+    parse_hex_32, validate_generation,
 };
 
 const CURRENT_NAME: &str = "current";
@@ -277,10 +278,10 @@ impl SnapshotStore {
             .transpose()
             .map_err(SnapshotPublishError::Build)?;
         let generation = SnapshotGenerationBuilder::new(input, &staging_path)
-            .build()
+            .prepare_staged()
             .map_err(SnapshotPublishError::Build)?;
         let generation_name = generation.generation().to_owned();
-        self.publish_generation(lock, generation)
+        self.publish_prepared_generation(lock, generation)
             .map_err(SnapshotPublishError::Store)?;
         // Pin the generation that this operation published before releasing
         // the lock. A later publisher may replace `current` immediately after
@@ -596,33 +597,90 @@ impl SnapshotStore {
         lock: &RefreshLock,
         generation: ValidatedGeneration,
     ) -> Result<(), SnapshotStoreError> {
+        let staged_path = generation.path().to_path_buf();
+        let header_bytes = generation.header_bytes().to_vec();
+        let header = self.validate_staged_generation(
+            lock,
+            &staged_path,
+            generation.generation(),
+            &header_bytes,
+            "validated generation",
+        )?;
+        self.publish_staged_generation(lock, staged_path, header, header_bytes)
+    }
+
+    fn publish_prepared_generation(
+        &self,
+        lock: &RefreshLock,
+        generation: PreparedGeneration,
+    ) -> Result<(), SnapshotStoreError> {
+        let staged_path = generation.path().to_path_buf();
+        let header = self.validate_staged_generation(
+            lock,
+            &staged_path,
+            generation.generation(),
+            generation.header_bytes(),
+            "prepared generation",
+        )?;
+        if header != *generation.header() {
+            return Err(store_invalid("prepared generation metadata changed"));
+        }
+        self.publish_staged_generation(
+            lock,
+            staged_path,
+            header,
+            generation.header_bytes().to_vec(),
+        )
+    }
+
+    fn validate_staged_generation(
+        &self,
+        lock: &RefreshLock,
+        staged_path: &Path,
+        generation_name: &str,
+        header_bytes: &[u8],
+        label: &str,
+    ) -> Result<SnapshotHeaderV1, SnapshotStoreError> {
         if lock.path != self.root.join(REFRESH_LOCK_NAME) {
             return Err(store_invalid("refresh lock belongs to another store"));
         }
-        let staged_path = generation.path().to_path_buf();
         let tmp_root = self.root.join(TMP_DIR);
-        if staged_path.parent() != Some(tmp_root.as_path()) || !is_regular_file(&staged_path) {
-            return Err(store_invalid(
-                "validated generation is not a store-owned staged file",
-            ));
+        if staged_path.parent() != Some(tmp_root.as_path()) || !is_regular_file(staged_path) {
+            return Err(store_invalid(format!(
+                "{label} is not a store-owned staged file"
+            )));
         }
-        let header_bytes = generation.header_bytes();
         let header = decode_header(header_bytes).map_err(store_invalid)?;
-        if header.registry_id != self.registry_id.as_str()
-            || header.generation != generation.generation()
-        {
-            return Err(store_invalid("validated generation does not match store"));
+        if header.registry_id != self.registry_id.as_str() || header.generation != generation_name {
+            return Err(store_invalid(format!("{label} does not match store")));
         }
         let source_header =
-            validate_generation(&staged_path, &self.registry_id).map_err(store_invalid)?;
+            validate_generation(staged_path, &self.registry_id).map_err(store_invalid)?;
         if source_header != header {
-            return Err(store_invalid("validated generation changed"));
+            return Err(store_invalid(format!("{label} changed")));
+        }
+        Ok(header)
+    }
+
+    fn publish_staged_generation(
+        &self,
+        lock: &RefreshLock,
+        staged_path: PathBuf,
+        header: SnapshotHeaderV1,
+        header_bytes: Vec<u8>,
+    ) -> Result<(), SnapshotStoreError> {
+        if lock.path != self.root.join(REFRESH_LOCK_NAME) {
+            return Err(store_invalid("refresh lock belongs to another store"));
+        }
+        let tmp_root = self.root.join(TMP_DIR);
+        if staged_path.parent() != Some(tmp_root.as_path()) || !is_regular_file(&staged_path) {
+            return Err(store_invalid("generation is not a store-owned staged file"));
         }
         sync_file(&staged_path).map_err(SnapshotStoreError::Io)?;
         let final_path = self
             .root
             .join(GENERATIONS_DIR)
-            .join(format!("{}.redb", generation.generation()));
+            .join(format!("{}.redb", header.generation));
         let final_is_regular = match fs::symlink_metadata(&final_path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() {

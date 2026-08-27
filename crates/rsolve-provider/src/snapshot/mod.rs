@@ -43,10 +43,13 @@ pub(crate) use codec::replace_file;
 pub use codec::{decode_header, decode_history, encode_header};
 use codec::{
     history_manifest, read_generation_header, sync_directory, sync_file, validate_generation,
-    write_generation,
+    write_generation, write_generation_unvalidated,
 };
+#[cfg(test)]
+pub(crate) use codec::{reset_validation_count, validation_count};
 
 mod generation;
+pub(super) use generation::PreparedGeneration;
 #[cfg(test)]
 use generation::destination_parent;
 pub(crate) use generation::source_observation;

@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 pub(crate) fn encode_history(history: &PackageHistoryV1) -> Result<Vec<u8>, SnapshotError> {
     let payload = postcard::to_stdvec(&PostcardHistoryV1(history.clone()))?;
     if payload.len() > HISTORY_LIMIT - HISTORY_PREFIX_LEN {
@@ -101,6 +104,8 @@ pub(super) fn validate_generation(
     path: impl AsRef<Path>,
     configured_registry_id: &RegistryId,
 ) -> Result<SnapshotHeaderV1, SnapshotError> {
+    #[cfg(test)]
+    VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
     let database = ReadOnlyDatabase::open(path.as_ref())?;
     let read = database.begin_read()?;
     let header_table = read.open_table(SNAPSHOT_HEADER)?;
@@ -161,6 +166,28 @@ pub(super) fn write_generation(
     header: &[u8],
     histories: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), SnapshotError> {
+    write_generation_unvalidated(path, header, histories)?;
+    let parsed_header = decode_header(header)?;
+    let registry_id = RegistryId::new(&parsed_header.registry_id)
+        .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
+    let validated_header = validate_generation(path, &registry_id)?;
+    if encode_header(&validated_header)? != header
+        || validated_header.package_count != histories.len() as u64
+    {
+        return Err(SnapshotError::Invalid(
+            "snapshot validation does not match staged input".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Writes and durably compacts a generation without reading it back.  The
+/// caller must validate the resulting file before publication.
+pub(super) fn write_generation_unvalidated(
+    path: &Path,
+    header: &[u8],
+    histories: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), SnapshotError> {
     let mut database = Database::create(path)?;
     {
         let tx = database.begin_write()?;
@@ -178,19 +205,23 @@ pub(super) fn write_generation(
     }
     database.compact()?;
     drop(database);
-    let parsed_header = decode_header(header)?;
-    let registry_id = RegistryId::new(&parsed_header.registry_id)
-        .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
-    let validated_header = validate_generation(path, &registry_id)?;
-    if encode_header(&validated_header)? != header
-        || validated_header.package_count != histories.len() as u64
-    {
-        return Err(SnapshotError::Invalid(
-            "snapshot validation does not match staged input".into(),
-        ));
-    }
     sync_file(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_count() {
+    VALIDATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn validation_count() -> u64 {
+    VALIDATION_COUNT.with(Cell::get)
 }
 
 pub(super) fn sync_file(path: &Path) -> io::Result<()> {
