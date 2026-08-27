@@ -288,6 +288,10 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertIn("'tidy verse'", command)
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.validate_mirror("https://user:secret@cran.example/cran")
+        for malformed in ("https://[2001:db8::1/cran", "https://cran.example:invalid/cran"):
+            with self.subTest(mirror=malformed):
+                with self.assertRaises(benchmark.BenchmarkError):
+                    benchmark.validate_mirror(malformed)
 
 
 if __name__ == "__main__":

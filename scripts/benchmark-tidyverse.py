@@ -269,8 +269,15 @@ def prepare_projection_cache(source: Path, destination: Path) -> Path:
 
 
 def validate_mirror(value: str) -> str:
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        # Accessing port validates the optional numeric port and can raise
+        # ValueError for malformed values even after urlsplit succeeds.
+        parsed.port
+    except ValueError as exc:
+        raise BenchmarkError("mirror must be a valid HTTP(S) URL") from exc
+    if parsed.scheme not in {"http", "https"} or not hostname:
         raise BenchmarkError("mirror must be an HTTP(S) URL with a host")
     if parsed.username is not None or parsed.password is not None:
         raise BenchmarkError("mirror userinfo is not permitted")
