@@ -281,16 +281,20 @@ fn build_projection(body: &[u8]) -> Result<ProjectionBuild, String> {
     let decoded = decode_zstd(body)?;
     let document = DcfDocument::parse(&decoded).map_err(|error| error.to_string())?;
     let mut records = BTreeMap::<String, Vec<IndexedRecord>>::new();
-    for record in document.records() {
-        let package = record
-            .field("Package")
-            .map(|field| field.value().to_owned());
-        let key = package.clone().unwrap_or_default();
+    for record in document.into_records() {
+        let mut package = None;
         let fields = record
-            .fields()
-            .iter()
-            .map(|field| (field.name().to_owned(), field.value().to_owned()))
-            .collect();
+            .into_fields()
+            .into_iter()
+            .map(|field| {
+                let (name, value) = field.into_parts();
+                if package.is_none() && name.eq_ignore_ascii_case("Package") {
+                    package = Some(value.clone());
+                }
+                (name, value)
+            })
+            .collect::<Vec<_>>();
+        let key = package.clone().unwrap_or_default();
         records
             .entry(key)
             .or_default()

@@ -12,6 +12,7 @@
 //! single `\n`, and CR bytes belonging to CRLF line endings are removed. All
 //! other valid UTF-8 value bytes are retained.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::Utf8Error;
 
@@ -90,6 +91,10 @@ impl DcfField {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    pub(crate) fn into_parts(self) -> (String, String) {
+        (self.name, self.value)
+    }
 }
 
 /// One DCF record (paragraph).
@@ -119,6 +124,10 @@ impl DcfRecord {
         self.fields
             .iter()
             .filter(move |field| field.name.eq_ignore_ascii_case(name))
+    }
+
+    pub(crate) fn into_fields(self) -> Vec<DcfField> {
+        self.fields
     }
 }
 
@@ -180,9 +189,16 @@ impl DcfDocument {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    pub(crate) fn into_records(self) -> Vec<DcfRecord> {
+        self.records
+    }
 }
 
-fn normalize_line_endings(input: &str) -> Result<String, DcfError> {
+fn normalize_line_endings(input: &str) -> Result<Cow<'_, str>, DcfError> {
+    if !input.as_bytes().contains(&b'\r') && (input.is_empty() || input.ends_with('\n')) {
+        return Ok(Cow::Borrowed(input));
+    }
     let mut normalized = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut index = 0;
@@ -216,7 +232,7 @@ fn normalize_line_endings(input: &str) -> Result<String, DcfError> {
     if !normalized.is_empty() && !normalized.ends_with('\n') {
         normalized.push('\n');
     }
-    Ok(normalized)
+    Ok(Cow::Owned(normalized))
 }
 
 fn validate_lines(input: &str) -> Result<(), DcfError> {
@@ -245,4 +261,34 @@ fn validate_lines(input: &str) -> Result<(), DcfError> {
         has_field = true;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalization_borrows_already_canonical_lf_input() {
+        assert!(matches!(normalize_line_endings(""), Ok(Cow::Borrowed(""))));
+        assert!(matches!(
+            normalize_line_endings("Package: demo\n"),
+            Ok(Cow::Borrowed("Package: demo\n"))
+        ));
+    }
+
+    #[test]
+    fn normalization_owns_rewritten_line_endings() {
+        assert!(matches!(
+            normalize_line_endings("Package: demo\r\n"),
+            Ok(Cow::Owned(value)) if value == "Package: demo\n"
+        ));
+        assert!(matches!(
+            normalize_line_endings("Package: demo"),
+            Ok(Cow::Owned(value)) if value == "Package: demo\n"
+        ));
+        assert!(matches!(
+            normalize_line_endings("Package: demo\r"),
+            Err(DcfError::InvalidLineEnding { line: 1 })
+        ));
+    }
 }
