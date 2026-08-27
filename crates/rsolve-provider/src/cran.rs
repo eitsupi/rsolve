@@ -18,11 +18,11 @@ pub use provider::{
     CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
     CranCandidateSnapshot, CranCurrentIndexRepresentation, CranFastPathStatus, CranMetadataConfig,
     CranPersistentRefresh, CranPersistentRefreshPreflight, CranRefreshDiagnostic,
-    CranRefreshProgress, CranRefreshProgressCallback, CranRefreshSource,
-    CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,
-    CranSnapshotCacheStatus, CranSnapshotRefresher, CranSnapshotRefresherError,
-    DEFAULT_ALLPACKAGES_FEED_ENDPOINT, DEFAULT_COMPATIBLE_GENERATION_TTL,
-    inspect_cran_snapshot_cache,
+    CranRefreshMetrics, CranRefreshProgress, CranRefreshProgressCallback, CranRefreshSource,
+    CranRefreshSourceMetrics, CranRefreshStatusMetrics, CranSnapshotCacheDiagnostic,
+    CranSnapshotCachePolicy, CranSnapshotCacheResult, CranSnapshotCacheStatus,
+    CranSnapshotRefresher, CranSnapshotRefresherError, DEFAULT_ALLPACKAGES_FEED_ENDPOINT,
+    DEFAULT_COMPATIBLE_GENERATION_TTL, inspect_cran_snapshot_cache,
 };
 
 pub use publish::CranSnapshotPublishError;

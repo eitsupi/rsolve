@@ -14,7 +14,7 @@ pub(super) enum FastPathFailure {
     },
 }
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     pub(super) fn resolve_fast_path_failure(
         &mut self,
         package: &PackageName,

@@ -137,6 +137,13 @@ impl CranSnapshotRefresher {
         diagnostics
     }
 
+    /// Return the cumulative acquisition counters for this refresher.
+    /// Counters are cloned while the session is borrowed, so the returned
+    /// value is an immutable point-in-time snapshot.
+    pub fn metrics(&self) -> super::CranRefreshMetrics {
+        self.session.borrow().metrics()
+    }
+
     pub fn preflight_refresh<'a>(
         &self,
         store: &'a SnapshotStore,

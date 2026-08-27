@@ -8,12 +8,13 @@ use super::super::super::catalog::CranCatalog;
 use super::super::cache_policy::CacheControlHeader;
 use super::super::model::CranRefreshProgress;
 use super::super::model::{
-    CranCurrentIndexRepresentation, CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource,
+    CranCurrentIndexRepresentation, CranFastPathStatus, CranRefreshDiagnostic,
+    CranRefreshMetricsSource, CranRefreshSource,
 };
 use super::super::raw_cache::RawCacheRepresentation;
 use super::super::raw_cache::projection::{
-    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionPackage,
-    ProjectionSourceKind,
+    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionOpenOutcome,
+    ProjectionPackage, ProjectionSourceKind,
 };
 use super::super::raw_cache::{ProjectionNamespace, RawCacheLookup, RawCacheWrite};
 use super::super::transport::{Transport, TransportResponseHeaders, TransportValidators};
@@ -102,7 +103,7 @@ fn build_current_projection(
     Ok((build, catalog, observations))
 }
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     fn cache_error(error: impl std::fmt::Display) -> CandidateLoadError {
         CandidateLoadError::new(
             CandidateLoadErrorCategory::SnapshotInvalid,
@@ -154,6 +155,7 @@ impl<T: Transport> CranRefreshSession<T> {
             if let (Some(cache), Some(key)) = (&self.raw_cache, &cache_key) {
                 match cache.lookup(key) {
                     RawCacheLookup::Hit(entry) => {
+                        self.metrics.borrow_mut().raw_cache_hits += 1;
                         let policy = cache_control_policy(
                             &entry.cache_control,
                             DEFAULT_COMPATIBLE_GENERATION_TTL,
@@ -172,9 +174,16 @@ impl<T: Transport> CranRefreshSession<T> {
                             let response = if validators.if_none_match.is_some()
                                 || validators.if_modified_since.is_some()
                             {
-                                self.transport.get_with_validators(&endpoint, &validators)
+                                self.transport.get_with_validators_with_source(
+                                    &endpoint,
+                                    &validators,
+                                    CranRefreshMetricsSource::CurrentIndex,
+                                )
                             } else {
-                                self.transport.get(&endpoint)
+                                self.transport.get_with_source(
+                                    &endpoint,
+                                    CranRefreshMetricsSource::CurrentIndex,
+                                )
                             };
                             match response {
                                 Ok(response)
@@ -227,11 +236,19 @@ impl<T: Transport> CranRefreshSession<T> {
                             }
                         }
                     }
-                    RawCacheLookup::Missing | RawCacheLookup::Corrupt(_) => {}
+                    RawCacheLookup::Missing => {
+                        self.metrics.borrow_mut().raw_cache_misses += 1;
+                    }
+                    RawCacheLookup::Corrupt(_) => {
+                        self.metrics.borrow_mut().raw_cache_corrupt += 1;
+                    }
                 }
             }
             if candidate.is_none() && !network_attempted {
-                match self.transport.get(&endpoint) {
+                match self
+                    .transport
+                    .get_with_source(&endpoint, CranRefreshMetricsSource::CurrentIndex)
+                {
                     Ok(response) if response.status == 200 => {
                         candidate = Some(CurrentBody::from_response(response, self.now()));
                         origin = Some(CurrentBodyOrigin::Network200);
@@ -302,7 +319,7 @@ impl<T: Transport> CranRefreshSession<T> {
                                     | ProjectionError::Storage(error) => error,
                                 })
                             });
-                        PackageProjection::open_or_build(
+                        PackageProjection::open_or_build_with_outcome(
                             path,
                             &body.body,
                             ProjectionSourceKind::Current,
@@ -316,11 +333,23 @@ impl<T: Transport> CranRefreshSession<T> {
                                 )
                             },
                         )
-                        .map(|projection| {
+                        .map(|(projection, outcome)| {
+                            match outcome {
+                                ProjectionOpenOutcome::Reused => {
+                                    self.metrics.borrow_mut().projection_reuses += 1
+                                }
+                                ProjectionOpenOutcome::Built => {
+                                    self.metrics.borrow_mut().projection_builds += 1
+                                }
+                                ProjectionOpenOutcome::Rebuilt => {
+                                    self.metrics.borrow_mut().projection_rebuilds += 1
+                                }
+                            }
                             CurrentProjection::new(
                                 projection,
                                 Some(rebuild),
                                 built_catalog.borrow_mut().take().map(Rc::new),
+                                self.metrics.clone(),
                             )
                         })
                     }
@@ -348,7 +377,10 @@ impl<T: Transport> CranRefreshSession<T> {
                     {
                         retried_unconditionally = true;
                         let cached_error = error;
-                        match self.transport.get(&endpoint) {
+                        match self
+                            .transport
+                            .get_with_source(&endpoint, CranRefreshMetricsSource::CurrentIndex)
+                        {
                             Ok(response) if response.status == 200 => {
                                 candidate = Some(CurrentBody::from_response(response, self.now()));
                                 origin = Some(CurrentBodyOrigin::Network200);

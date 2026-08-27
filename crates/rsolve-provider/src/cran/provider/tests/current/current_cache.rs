@@ -944,6 +944,60 @@ fn fresh_semantically_invalid_current_cache_recovers_unconditionally() {
 }
 
 #[test]
+fn corrupt_raw_cache_is_counted_before_network_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_rds_url(), RawCacheRepresentation::CurrentRds)
+        .unwrap();
+    let t0 = "2026-08-23T00:00:00Z".parse().unwrap();
+    cache
+        .publish(
+            &key,
+            RawCacheWrite {
+                status: 200,
+                body: NATIVE_UTF8_CURRENT.to_vec(),
+                observed_at: t0,
+                validated_at: t0,
+                etag: None,
+                last_modified: None,
+                cache_control: crate::cran::provider::cache_policy::CacheControlHeader::Valid(
+                    "max-age=3600".into(),
+                ),
+            },
+        )
+        .unwrap();
+    std::fs::write(cache.entry_path(&key), b"corrupt raw cache entry").unwrap();
+
+    let transport = session_transport(
+        TransportResponse::new(200, NATIVE_UTF8_CURRENT.to_vec()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    session.ensure_current().unwrap();
+
+    let metrics = session.metrics();
+    assert_eq!(metrics.raw_cache_corrupt, 1);
+    assert_eq!(metrics.raw_cache_misses, 1);
+    assert_eq!(metrics.raw_cache_hits, 0);
+    assert_eq!(metrics.http_attempts, 2);
+    assert_eq!(metrics.current_index.requests, 2);
+    assert_eq!(metrics.statuses.status_200, 1);
+    assert_eq!(metrics.statuses.status_404, 1);
+}
+
+#[test]
 fn stale_current_cache_without_validators_uses_unconditional_request() {
     let directory = tempfile::tempdir().unwrap();
     let store = crate::snapshot::SnapshotStore::open(
@@ -1091,6 +1145,12 @@ fn current_absence_with_absent_archive_sources_is_empty() {
                 CranFastPathStatus::Absent { status: 404 }
             )
     }));
+    let metrics = session.metrics();
+    assert_eq!(metrics.statuses.status_404, 4);
+    assert_eq!(metrics.statuses.status_200, 1);
+    assert_eq!(metrics.statuses.status_304, 0);
+    assert_eq!(metrics.statuses.status_410, 0);
+    assert_eq!(metrics.statuses.other, 0);
 }
 use super::*;
 use crate::cran::provider::raw_cache::{

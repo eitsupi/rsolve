@@ -1,9 +1,11 @@
+use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
 use std::rc::Rc;
 
 use super::cache_policy::CacheControlHeader;
+use super::model::{CranRefreshMetrics, CranRefreshMetricsSource};
 
 const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
@@ -195,6 +197,85 @@ pub(crate) trait Transport {
     }
 }
 
+/// Provider-private measurement boundary.  Keeping this wrapper above both
+/// ureq and fixture transports ensures that retries and conditional requests
+/// have exactly the same accounting semantics.
+pub(super) struct MeasuredTransport<T> {
+    inner: Rc<T>,
+    metrics: Rc<RefCell<CranRefreshMetrics>>,
+}
+
+impl<T> MeasuredTransport<T> {
+    pub(super) fn new(inner: Rc<T>, metrics: Rc<RefCell<CranRefreshMetrics>>) -> Self {
+        Self { inner, metrics }
+    }
+}
+
+impl<T: Transport> Transport for MeasuredTransport<T> {
+    fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
+        let _ = url;
+        Err(TransportError::new(
+            "measured transport requires an explicit source tag",
+        ))
+    }
+
+    fn get_with_validators(
+        &self,
+        url: &str,
+        validators: &TransportValidators,
+    ) -> Result<TransportResponse, TransportError> {
+        let _ = (url, validators);
+        Err(TransportError::new(
+            "measured transport requires an explicit source tag",
+        ))
+    }
+}
+
+impl<T: Transport> MeasuredTransport<T> {
+    pub(super) fn get_with_source(
+        &self,
+        url: &str,
+        source: CranRefreshMetricsSource,
+    ) -> Result<TransportResponse, TransportError> {
+        match self.inner.get(url) {
+            Ok(response) => {
+                self.metrics.borrow_mut().observe_response(
+                    source,
+                    response.status,
+                    response.body.len(),
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                self.metrics.borrow_mut().observe_attempt(source);
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn get_with_validators_with_source(
+        &self,
+        url: &str,
+        validators: &TransportValidators,
+        source: CranRefreshMetricsSource,
+    ) -> Result<TransportResponse, TransportError> {
+        match self.inner.get_with_validators(url, validators) {
+            Ok(response) => {
+                self.metrics.borrow_mut().observe_response(
+                    source,
+                    response.status,
+                    response.body.len(),
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                self.metrics.borrow_mut().observe_attempt(source);
+                Err(error)
+            }
+        }
+    }
+}
+
 impl<T: Transport + ?Sized> Transport for Rc<T> {
     fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
         self.as_ref().get(url)
@@ -287,6 +368,128 @@ impl Transport for UreqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct FixtureTransport {
+        calls: Cell<usize>,
+    }
+
+    impl Transport for FixtureTransport {
+        fn get(&self, _url: &str) -> Result<TransportResponse, TransportError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(TransportResponse::new(200, b"fixture".to_vec()))
+        }
+    }
+
+    struct FailingTransport;
+
+    impl Transport for FailingTransport {
+        fn get(&self, _url: &str) -> Result<TransportResponse, TransportError> {
+            Err(TransportError::new("fixture transport failure"))
+        }
+    }
+
+    struct StatusTransport {
+        responses: RefCell<Vec<Result<TransportResponse, TransportError>>>,
+    }
+
+    impl Transport for StatusTransport {
+        fn get(&self, _url: &str) -> Result<TransportResponse, TransportError> {
+            self.responses.borrow_mut().remove(0)
+        }
+    }
+
+    #[test]
+    fn measured_transport_uses_explicit_source_without_url_inference() {
+        let metrics = Rc::new(RefCell::new(CranRefreshMetrics::default()));
+        let fixture = Rc::new(FixtureTransport {
+            calls: Cell::new(0),
+        });
+        let transport = MeasuredTransport::new(Rc::clone(&fixture), Rc::clone(&metrics));
+        transport
+            .get_with_source(
+                "https://example.invalid/not-an-allpackages-url",
+                CranRefreshMetricsSource::AllPackages,
+            )
+            .unwrap();
+        transport
+            .get_with_validators_with_source(
+                "https://example.invalid/not-a-tarball-url",
+                &TransportValidators::default(),
+                CranRefreshMetricsSource::TarballDescription,
+            )
+            .unwrap();
+        assert_eq!(fixture.calls.get(), 2);
+        let snapshot = metrics.borrow();
+        assert_eq!(snapshot.http_attempts, 2);
+        assert_eq!(snapshot.successful_response_body_bytes, 14);
+        assert_eq!(snapshot.allpackages.requests, 1);
+        assert_eq!(snapshot.tarball_description.requests, 1);
+        assert_eq!(snapshot.current_index.requests, 0);
+
+        drop(snapshot);
+        let failing = MeasuredTransport::new(Rc::new(FailingTransport), Rc::clone(&metrics));
+        assert!(
+            failing
+                .get_with_source(
+                    "https://custom.invalid/feed",
+                    CranRefreshMetricsSource::AllPackages,
+                )
+                .is_err()
+        );
+        let snapshot = metrics.borrow();
+        assert_eq!(snapshot.http_attempts, 3);
+        assert_eq!(snapshot.allpackages.requests, 2);
+        assert_eq!(snapshot.allpackages.successful_body_bytes, 7);
+        assert_eq!(snapshot.statuses.status_200, 2);
+        assert_eq!(snapshot.statuses.status_304, 0);
+        assert_eq!(snapshot.statuses.status_404, 0);
+        assert_eq!(snapshot.statuses.status_410, 0);
+        assert_eq!(snapshot.statuses.other, 0);
+    }
+
+    #[test]
+    fn measured_transport_classifies_status_buckets_and_transport_errors() {
+        let metrics = Rc::new(RefCell::new(CranRefreshMetrics::default()));
+        let transport = MeasuredTransport::new(
+            Rc::new(StatusTransport {
+                responses: RefCell::new(vec![
+                    Ok(TransportResponse::new(200, b"ok".to_vec())),
+                    Ok(TransportResponse::new(304, Vec::new())),
+                    Ok(TransportResponse::new(404, Vec::new())),
+                    Ok(TransportResponse::new(410, Vec::new())),
+                    Ok(TransportResponse::new(500, b"error".to_vec())),
+                    Err(TransportError::new("fixture transport failure")),
+                ]),
+            }),
+            Rc::clone(&metrics),
+        );
+        for _ in 0..5 {
+            let _ = transport.get_with_source(
+                "https://example.invalid/custom-feed",
+                CranRefreshMetricsSource::ArchiveHistory,
+            );
+        }
+        assert!(
+            transport
+                .get_with_source(
+                    "https://example.invalid/custom-feed",
+                    CranRefreshMetricsSource::ArchiveHistory,
+                )
+                .is_err()
+        );
+
+        let snapshot = metrics.borrow();
+        assert_eq!(snapshot.http_attempts, 6);
+        assert_eq!(snapshot.archive_history.requests, 6);
+        assert_eq!(snapshot.archive_history.successful_body_bytes, 2);
+        assert_eq!(snapshot.successful_response_body_bytes, 2);
+        assert_eq!(snapshot.statuses.status_200, 1);
+        assert_eq!(snapshot.statuses.status_304, 1);
+        assert_eq!(snapshot.statuses.status_404, 1);
+        assert_eq!(snapshot.statuses.status_410, 1);
+        assert_eq!(snapshot.statuses.other, 1);
+    }
 
     #[test]
     fn response_headers_are_bounded_and_project_validators() {

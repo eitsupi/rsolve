@@ -1,6 +1,106 @@
 use std::rc::Rc;
 use std::time::Duration;
 
+/// The source buckets used by provider acquisition telemetry.  They describe
+/// the kind of observation, never the endpoint from which it was obtained.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum CranRefreshMetricsSource {
+    CurrentIndex,
+    ArchiveHistory,
+    AllPackages,
+    PackageLocalIndex,
+    TarballDescription,
+}
+
+/// Counts collected by one CRAN refresher lifetime.
+///
+/// This is intentionally an immutable snapshot returned by
+/// [`CranSnapshotRefresher::metrics`](crate::cran::CranSnapshotRefresher::metrics).
+/// It contains no endpoint, cache path, or validator information and is not
+/// persisted as part of a metadata generation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CranRefreshMetrics {
+    pub http_attempts: u64,
+    pub successful_response_body_bytes: u64,
+    pub statuses: CranRefreshStatusMetrics,
+    pub current_index: CranRefreshSourceMetrics,
+    pub archive_history: CranRefreshSourceMetrics,
+    pub allpackages: CranRefreshSourceMetrics,
+    pub package_local_index: CranRefreshSourceMetrics,
+    pub tarball_description: CranRefreshSourceMetrics,
+    pub raw_cache_hits: u64,
+    pub raw_cache_misses: u64,
+    pub raw_cache_corrupt: u64,
+    pub projection_reuses: u64,
+    pub projection_builds: u64,
+    pub projection_rebuilds: u64,
+    pub package_history_lookups: u64,
+    pub allpackages_adoptions: u64,
+    pub package_local_fallbacks: u64,
+    pub quarantined_releases: u64,
+    pub coverage_gaps: u64,
+    pub coverage_conflicts: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CranRefreshStatusMetrics {
+    pub status_200: u64,
+    pub status_304: u64,
+    pub status_404: u64,
+    pub status_410: u64,
+    pub other: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CranRefreshSourceMetrics {
+    pub requests: u64,
+    pub successful_body_bytes: u64,
+}
+
+impl CranRefreshMetrics {
+    pub(crate) fn observe_response(
+        &mut self,
+        source: CranRefreshMetricsSource,
+        status: u16,
+        body_len: usize,
+    ) {
+        self.http_attempts += 1;
+        match status {
+            200 => self.statuses.status_200 += 1,
+            304 => self.statuses.status_304 += 1,
+            404 => self.statuses.status_404 += 1,
+            410 => self.statuses.status_410 += 1,
+            _ => self.statuses.other += 1,
+        }
+        if (200..300).contains(&status) {
+            self.successful_response_body_bytes += body_len as u64;
+        }
+        let bucket = match source {
+            CranRefreshMetricsSource::CurrentIndex => &mut self.current_index,
+            CranRefreshMetricsSource::ArchiveHistory => &mut self.archive_history,
+            CranRefreshMetricsSource::AllPackages => &mut self.allpackages,
+            CranRefreshMetricsSource::PackageLocalIndex => &mut self.package_local_index,
+            CranRefreshMetricsSource::TarballDescription => &mut self.tarball_description,
+        };
+        bucket.requests += 1;
+        if (200..300).contains(&status) {
+            bucket.successful_body_bytes += body_len as u64;
+        }
+    }
+
+    pub(crate) fn observe_attempt(&mut self, source: CranRefreshMetricsSource) {
+        self.http_attempts += 1;
+        let bucket = match source {
+            CranRefreshMetricsSource::CurrentIndex => &mut self.current_index,
+            CranRefreshMetricsSource::ArchiveHistory => &mut self.archive_history,
+            CranRefreshMetricsSource::AllPackages => &mut self.allpackages,
+            CranRefreshMetricsSource::PackageLocalIndex => &mut self.package_local_index,
+            CranRefreshMetricsSource::TarballDescription => &mut self.tarball_description,
+        };
+        bucket.requests += 1;
+    }
+}
+
 /// Coarse semantic milestones emitted during an online CRAN refresh.
 ///
 /// The event stream intentionally describes refresh stages rather than

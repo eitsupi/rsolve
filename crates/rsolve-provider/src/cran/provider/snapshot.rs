@@ -332,7 +332,7 @@ fn checksums_from_fields(fields: &[(String, String)]) -> Vec<ChecksumV1> {
 }
 
 #[cfg(test)]
-pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
+pub(crate) fn refresh_and_publish_with_transport<T: Transport + 'static>(
     store: &crate::snapshot::SnapshotStore,
     transport: T,
     base_url: impl AsRef<str>,
@@ -345,7 +345,7 @@ pub(crate) fn refresh_and_publish_with_transport<T: Transport>(
 }
 
 #[cfg(test)]
-pub(crate) fn refresh_and_publish_with_transport_and_progress<T: Transport>(
+pub(crate) fn refresh_and_publish_with_transport_and_progress<T: Transport + 'static>(
     store: &crate::snapshot::SnapshotStore,
     transport: T,
     base_url: impl AsRef<str>,
@@ -395,7 +395,7 @@ pub(crate) fn refresh_and_publish_with_transport_and_progress<T: Transport>(
     result
 }
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     pub(super) fn refresh_snapshot_observations(
         &mut self,
         roots: &[PackageName],

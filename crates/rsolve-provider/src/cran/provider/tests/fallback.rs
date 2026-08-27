@@ -635,6 +635,7 @@ fn provider_projects_legacy_version_as_a_package_local_rejection() {
         },
         Vec::new(),
         None,
+        None,
     );
     let error = provider
         .releases(&SolverKey::InstalledName(package))

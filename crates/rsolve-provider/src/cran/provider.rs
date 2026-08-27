@@ -38,8 +38,9 @@ mod transport;
 pub use model::{
     CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
     CranCurrentIndexRepresentation, CranFastPathStatus, CranMetadataConfig, CranRefreshDiagnostic,
-    CranRefreshProgress, CranRefreshProgressCallback, CranRefreshSource,
-    DEFAULT_ALLPACKAGES_FEED_ENDPOINT, DEFAULT_COMPATIBLE_GENERATION_TTL,
+    CranRefreshMetrics, CranRefreshProgress, CranRefreshProgressCallback, CranRefreshSource,
+    CranRefreshSourceMetrics, CranRefreshStatusMetrics, DEFAULT_ALLPACKAGES_FEED_ENDPOINT,
+    DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 pub use persistent_cache::{
     CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,

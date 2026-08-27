@@ -70,6 +70,14 @@ fn archive_history_fresh_cache_hit_avoids_network() {
             .iter()
             .any(|request| request.url == legacy_history_url())
     );
+    let metrics = second.metrics();
+    assert_eq!(metrics.http_attempts, 0);
+    assert_eq!(metrics.archive_history.requests, 0);
+    assert_eq!(metrics.raw_cache_hits, 1);
+    assert_eq!(metrics.raw_cache_misses, 0);
+    assert_eq!(metrics.raw_cache_corrupt, 0);
+    assert_eq!(metrics.projection_reuses, 1);
+    assert_eq!(metrics.projection_builds, 0);
 }
 
 #[test]
@@ -387,6 +395,7 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
     let package = PackageName::new("calibFit").unwrap();
     let first_payload = source.package(&package).expect("package payload");
     assert_eq!(first_payload.rejections.len(), 1);
+    assert_eq!(first.metrics().quarantined_releases, 1);
     assert!(first.diagnostics.iter().any(|diagnostic| matches!(
         diagnostic.status_detail(),
         CranFastPathStatus::Invalid { diagnostic, .. }
@@ -421,6 +430,7 @@ fn archive_history_rejections_survive_fresh_and_304_cache_decode() {
     };
     let second_payload = source.package(&package).expect("package payload");
     assert_eq!(second_payload.rejections.len(), 1);
+    assert_eq!(second.metrics().quarantined_releases, 1);
     assert_eq!(
         second_payload.rejections[0].raw_path(),
         "calibFit/Ancestry/calib_0.1.02.tar.gz"

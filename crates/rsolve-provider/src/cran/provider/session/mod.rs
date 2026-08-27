@@ -12,15 +12,15 @@ use super::cache_policy::CacheControlHeader;
 use super::cache_policy::{cache_control_policy, permits_reuse};
 use super::model::{
     CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
-    CranCurrentIndexRepresentation, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshProgress,
-    CranRefreshProgressCallback, DEFAULT_COMPATIBLE_GENERATION_TTL,
+    CranCurrentIndexRepresentation, CranMetadataConfig, CranRefreshDiagnostic, CranRefreshMetrics,
+    CranRefreshProgress, CranRefreshProgressCallback, DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 use super::qualification;
 use super::raw_cache::projection::{
     PackageProjection, ProjectionLookupError, ProjectionVisitError,
 };
 use super::raw_cache::{RawCache, RawCacheEntry, RawCacheRepresentation};
-use super::transport::{Transport, TransportResponse};
+use super::transport::{MeasuredTransport, Transport, TransportResponse};
 use super::{
     allpackages_record_to_evidence, archive_rejection_to_evidence, import_current_index,
     index_record_to_evidence, source_input_with_metadata,
@@ -40,6 +40,7 @@ pub(super) struct PackageProjectionRecovery {
     projection: Option<Rc<RefCell<Option<PackageProjection>>>>,
     rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
     rebuild_attempted: Rc<Cell<bool>>,
+    metrics: Option<Rc<RefCell<CranRefreshMetrics>>>,
 }
 
 #[derive(Debug)]
@@ -57,7 +58,18 @@ impl PackageProjectionRecovery {
             projection: Some(Rc::new(RefCell::new(Some(projection)))),
             rebuild,
             rebuild_attempted: Rc::new(Cell::new(false)),
+            metrics: None,
         }
+    }
+
+    pub(super) fn with_metrics(
+        projection: PackageProjection,
+        rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+        metrics: Rc<RefCell<CranRefreshMetrics>>,
+    ) -> Self {
+        let mut recovery = Self::new(projection, rebuild);
+        recovery.metrics = Some(metrics);
+        recovery
     }
 
     pub(super) fn eager() -> Self {
@@ -65,6 +77,7 @@ impl PackageProjectionRecovery {
             projection: None,
             rebuild: None,
             rebuild_attempted: Rc::new(Cell::new(false)),
+            metrics: None,
         }
     }
 
@@ -122,6 +135,9 @@ impl PackageProjectionRecovery {
                         format!("failed to rebuild {label} projection: {rebuild_error}"),
                     )
                 })?;
+                if let Some(metrics) = &self.metrics {
+                    metrics.borrow_mut().projection_rebuilds += 1;
+                }
                 *projection_cell.borrow_mut() = Some(rebuilt);
                 let projection_ref = projection_cell.borrow();
                 let Some(projection) = projection_ref.as_ref() else {
@@ -172,7 +188,8 @@ pub(super) struct CranRefreshSession<T> {
     pub(in crate::cran::provider) allpackages_feed_endpoint: Box<str>,
     pub(in crate::cran::provider) refresh_metadata: bool,
     pub(in crate::cran::provider) allow_allpackages_history: bool,
-    transport: Rc<T>,
+    transport: Rc<MeasuredTransport<T>>,
+    pub(in crate::cran::provider) metrics: Rc<RefCell<CranRefreshMetrics>>,
     progress: Option<CranRefreshProgressCallback>,
     raw_cache: Option<RawCache>,
     test_now: Option<jiff::Timestamp>,
@@ -225,13 +242,14 @@ impl ArchiveHistorySource {
     pub(super) fn from_projection(
         projection: PackageProjection,
         rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+        metrics: Rc<RefCell<CranRefreshMetrics>>,
     ) -> Result<Self, String> {
         Self::validate_projection(&projection)?;
         let summary: ArchiveHistorySummary = postcard::from_bytes(projection.summary())
             .map_err(|error| format!("invalid archive history projection summary: {error}"))?;
         Ok(Self {
             surface_digest: projection.surface_digest().into(),
-            projection: PackageProjectionRecovery::new(projection, rebuild),
+            projection: PackageProjectionRecovery::with_metrics(projection, rebuild, metrics),
             eager: None,
             entry_count: summary.entry_count,
             rejection_count: summary.rejection_count,
@@ -395,10 +413,11 @@ impl CurrentProjection {
         projection: PackageProjection,
         rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
         built_catalog: Option<Rc<CranCatalog>>,
+        metrics: Rc<RefCell<CranRefreshMetrics>>,
     ) -> Self {
         let surface_digest = projection.surface_digest().into();
         Self {
-            projection: PackageProjectionRecovery::new(projection, rebuild),
+            projection: PackageProjectionRecovery::with_metrics(projection, rebuild, metrics),
             eager_observations: Rc::from([]),
             built_catalog: RefCell::new(built_catalog),
             surface_digest,
@@ -821,7 +840,7 @@ impl CurrentBody {
     }
 }
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     #[cfg(test)]
     pub(in crate::cran::provider) fn reset_current_projection_build_count() {
         CURRENT_PROJECTION_BUILD_COUNT.with(|counter| counter.set(0));
@@ -864,6 +883,7 @@ impl<T: Transport> CranRefreshSession<T> {
         raw_cache: Option<RawCache>,
         progress: Option<CranRefreshProgressCallback>,
     ) -> Self {
+        let metrics = Rc::new(RefCell::new(CranRefreshMetrics::default()));
         Self {
             base_url: config.repository_endpoint.trim_end_matches('/').into(),
             allpackages_feed_endpoint: config
@@ -872,7 +892,8 @@ impl<T: Transport> CranRefreshSession<T> {
                 .into(),
             refresh_metadata: config.refresh_metadata,
             allow_allpackages_history: config.allow_allpackages_history,
-            transport,
+            transport: Rc::new(MeasuredTransport::new(transport, Rc::clone(&metrics))),
+            metrics,
             progress,
             raw_cache,
             test_now,
@@ -889,6 +910,10 @@ impl<T: Transport> CranRefreshSession<T> {
         }
     }
 
+    pub(in crate::cran::provider) fn metrics(&self) -> CranRefreshMetrics {
+        self.metrics.borrow().clone()
+    }
+
     pub(super) fn emit_progress(&self, event: CranRefreshProgress) {
         if let Some(progress) = &self.progress {
             progress(event);
@@ -896,6 +921,7 @@ impl<T: Transport> CranRefreshSession<T> {
     }
 
     pub(super) fn emit_package_local_fallback(&mut self) {
+        self.metrics.borrow_mut().package_local_fallbacks += 1;
         if !self.package_local_fallback_reported {
             self.package_local_fallback_reported = true;
             self.emit_progress(CranRefreshProgress::PackageLocalFallbackStarted);

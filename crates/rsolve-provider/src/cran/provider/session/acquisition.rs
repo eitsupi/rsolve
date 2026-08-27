@@ -1,3 +1,4 @@
+use super::super::model::CranRefreshMetricsSource;
 use super::super::raw_cache::{RawCacheLookup, RawCacheRepresentation, RawCacheWrite};
 use super::super::transport::{Transport, TransportResponseHeaders, TransportValidators};
 use super::{
@@ -6,13 +7,14 @@ use super::{
     cache_control_policy, permits_reuse,
 };
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     pub(super) fn acquire_metadata<V, P>(
         &self,
         endpoint: &str,
         representation: RawCacheRepresentation,
         source_kind: &str,
         source_representation: &str,
+        metrics_source: CranRefreshMetricsSource,
         mut parse: P,
     ) -> Result<
         (V, crate::snapshot::SourceInput, MetadataAcquisitionOutcome),
@@ -36,6 +38,7 @@ impl<T: Transport> CranRefreshSession<T> {
         if let (Some(cache), Some(key)) = (&self.raw_cache, &cache_key) {
             match cache.lookup(key) {
                 RawCacheLookup::Hit(entry) => {
+                    self.metrics.borrow_mut().raw_cache_hits += 1;
                     let policy = cache_control_policy(
                         &entry.cache_control,
                         DEFAULT_COMPATIBLE_GENERATION_TTL,
@@ -54,9 +57,13 @@ impl<T: Transport> CranRefreshSession<T> {
                         let response = if validators.if_none_match.is_some()
                             || validators.if_modified_since.is_some()
                         {
-                            self.transport.get_with_validators(endpoint, &validators)
+                            self.transport.get_with_validators_with_source(
+                                endpoint,
+                                &validators,
+                                metrics_source,
+                            )
                         } else {
-                            self.transport.get(endpoint)
+                            self.transport.get_with_source(endpoint, metrics_source)
                         };
                         match response {
                             Ok(response) if response.status == 304 && response.body.is_empty() => {
@@ -93,11 +100,16 @@ impl<T: Transport> CranRefreshSession<T> {
                         }
                     }
                 }
-                RawCacheLookup::Missing | RawCacheLookup::Corrupt(_) => {}
+                RawCacheLookup::Missing => {
+                    self.metrics.borrow_mut().raw_cache_misses += 1;
+                }
+                RawCacheLookup::Corrupt(_) => {
+                    self.metrics.borrow_mut().raw_cache_corrupt += 1;
+                }
             }
         }
         if candidate.is_none() && !network_attempted {
-            match self.transport.get(endpoint) {
+            match self.transport.get_with_source(endpoint, metrics_source) {
                 Ok(response) if response.status == 200 => {
                     candidate = Some(CurrentBody::from_response(response, self.now()));
                     origin = Some(CurrentBodyOrigin::Network200);
@@ -179,7 +191,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 {
                     retried_unconditionally = true;
                     let allows_fallback = error.allows_fallback();
-                    match self.transport.get(endpoint) {
+                    match self.transport.get_with_source(endpoint, metrics_source) {
                         Ok(response) if response.status == 200 => {
                             candidate = Some(CurrentBody::from_response(response, self.now()));
                             origin = Some(CurrentBodyOrigin::Network200);

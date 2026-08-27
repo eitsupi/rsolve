@@ -31,6 +31,21 @@ fn allpackages_complete_feed_avoids_package_archive_request() {
             .count(),
         0
     );
+    let metrics = session.metrics();
+    assert_eq!(metrics.current_index.requests, 1);
+    assert_eq!(metrics.archive_history.requests, 1);
+    assert_eq!(metrics.allpackages.requests, 1);
+    assert_eq!(metrics.package_local_index.requests, 0);
+    assert_eq!(metrics.tarball_description.requests, 0);
+    assert_eq!(metrics.http_attempts, 3);
+    assert!(metrics.successful_response_body_bytes > 0);
+    assert_eq!(metrics.raw_cache_misses, 3);
+    assert_eq!(metrics.raw_cache_corrupt, 0);
+    assert_eq!(metrics.projection_builds, 3);
+    assert_eq!(metrics.projection_reuses, 0);
+    assert_eq!(metrics.package_history_lookups, 1);
+    assert_eq!(metrics.allpackages_adoptions, 1);
+    assert_eq!(metrics.package_local_fallbacks, 0);
     drop(directory);
 }
 
@@ -121,7 +136,36 @@ fn allpackages_current_gap_keeps_current_and_bulk_history() {
             .count(),
         0
     );
+    let metrics = session.metrics();
+    assert!(metrics.coverage_gaps > 0);
+    assert_eq!(metrics.allpackages_adoptions, 1);
     drop(directory);
+}
+
+#[test]
+fn allpackages_current_conflict_is_counted_in_metrics() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let mut feed = String::from_utf8(
+        crate::cran::provider::allpackages::decode_zstd(&allpackages_fixture_body(
+            &entries, true, None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    feed.push_str(
+        "Package: Matrix\nVersion: 1.7-6\nLicense: Definitely-Different\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSHA256Original: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nSnapshot: 2026-08-01\nDownloadURL: https://packagemanager.posit.co/cran/2026-08-01/src/contrib/Matrix_1.7-6.tar.gz\n\n",
+    );
+    let mut session = CranRefreshSession::new_with_clock(
+        Rc::new(allpackages_transport(raw_zstd(feed.as_bytes()), true)),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    session
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .unwrap();
+    assert!(session.metrics().coverage_conflicts > 0);
 }
 
 #[test]
@@ -177,6 +221,12 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         crate::cran::provider::raw_cache::projection::visit_selected_package_records_count(),
         0
     );
+    let metrics = second.metrics();
+    assert_eq!(metrics.http_attempts, 0);
+    assert_eq!(metrics.raw_cache_hits, 3);
+    assert_eq!(metrics.projection_reuses, 3);
+    assert_eq!(metrics.package_history_lookups, 1);
+    assert_eq!(metrics.allpackages_adoptions, 1);
 
     // A changed qualification binding is not a reusable decision even when
     // every raw artifact remains fresh. The normal path must reclassify it.
@@ -306,6 +356,14 @@ fn allpackages_forced_refresh_304_and_same_digest_200_reopen_projection() {
     assert_eq!(release_signature(second_result.candidates()), signature);
     assert_eq!(requests.borrow().len(), 3);
     assert_eq!(crate::cran::provider::allpackages::test_counters(), (0, 0));
+    let metrics = second.metrics();
+    assert_eq!(metrics.http_attempts, 3);
+    assert_eq!(metrics.raw_cache_hits, 3);
+    assert_eq!(metrics.statuses.status_304, 3);
+    assert_eq!(metrics.statuses.status_200, 0);
+    assert_eq!(metrics.statuses.status_404, 0);
+    assert_eq!(metrics.statuses.status_410, 0);
+    assert_eq!(metrics.statuses.other, 0);
     assert!(crate::cran::provider::allpackages::classify_current_count() > 0);
     assert!(requests.borrow().iter().all(|request| {
         request.validators.if_none_match.as_deref() == Some("\"allpackages-e2e\"")
@@ -418,6 +476,10 @@ fn corrupt_projection_rebuilds_from_cached_raw_without_fallback() {
     assert!(!second_requests.borrow().iter().any(|request| {
         request.url == "https://cloud.r-project.org/src/contrib/Archive/Matrix/PACKAGES.rds"
     }));
+    let metrics = second.metrics();
+    assert_eq!(metrics.http_attempts, 0);
+    assert_eq!(metrics.raw_cache_hits, 3);
+    assert_eq!(metrics.projection_rebuilds, 1);
 
     crate::cran::provider::allpackages::reset_test_counters();
     let mut third = CranRefreshSession::new_with_clock(
@@ -899,6 +961,10 @@ fn allpackages_missing_historical_occurrence_uses_exclusive_package_local_histor
             .iter()
             .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
     );
+    let metrics = session.metrics();
+    assert_eq!(metrics.package_history_lookups, 1);
+    assert_eq!(metrics.package_local_fallbacks, 1);
+    assert_eq!(metrics.package_local_index.requests, 1);
     drop(directory);
 }
 
@@ -951,6 +1017,9 @@ fn allpackages_duplicate_occurrence_uses_exclusive_package_local_history() {
             .iter()
             .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
     );
+    let metrics = session.metrics();
+    assert_eq!(metrics.package_local_fallbacks, 1);
+    assert_eq!(metrics.package_local_index.requests, 1);
     drop(directory);
 }
 
@@ -996,6 +1065,9 @@ fn allpackages_archive_history_rejection_forces_package_local_history() {
             .iter()
             .any(|observation| observation.source.endpoint == ALLPACKAGES_FIXTURE_URL)
     );
+    let metrics = session.metrics();
+    assert_eq!(metrics.package_local_fallbacks, 1);
+    assert_eq!(metrics.package_local_index.requests, 1);
     drop(directory);
 }
 

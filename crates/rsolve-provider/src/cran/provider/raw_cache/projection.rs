@@ -118,6 +118,13 @@ pub(crate) enum ProjectionError {
     Storage(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionOpenOutcome {
+    Reused,
+    Built,
+    Rebuilt,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Header {
@@ -153,6 +160,26 @@ impl PackageProjection {
         Self::open_or_build_validated(path, raw_body, source_kind, contract, build, |_| Ok(()))
     }
 
+    pub(crate) fn open_or_build_with_outcome<F>(
+        path: &Path,
+        raw_body: &[u8],
+        source_kind: ProjectionSourceKind,
+        contract: ProjectionContract,
+        build: F,
+    ) -> Result<(Self, ProjectionOpenOutcome), ProjectionError>
+    where
+        F: FnOnce() -> Result<ProjectionBuild, String>,
+    {
+        Self::open_or_build_validated_with_outcome(
+            path,
+            raw_body,
+            source_kind,
+            contract,
+            build,
+            |_| Ok(()),
+        )
+    }
+
     pub(crate) fn open_or_build_validated<F, V>(
         path: &Path,
         raw_body: &[u8],
@@ -165,13 +192,42 @@ impl PackageProjection {
         F: FnOnce() -> Result<ProjectionBuild, String>,
         V: Fn(&Self) -> Result<(), String>,
     {
+        Self::open_or_build_validated_with_outcome(
+            path,
+            raw_body,
+            source_kind,
+            contract,
+            build,
+            validate,
+        )
+        .map(|(projection, _)| projection)
+    }
+
+    pub(crate) fn open_or_build_validated_with_outcome<F, V>(
+        path: &Path,
+        raw_body: &[u8],
+        source_kind: ProjectionSourceKind,
+        contract: ProjectionContract,
+        build: F,
+        validate: V,
+    ) -> Result<(Self, ProjectionOpenOutcome), ProjectionError>
+    where
+        F: FnOnce() -> Result<ProjectionBuild, String>,
+        V: Fn(&Self) -> Result<(), String>,
+    {
         let raw_digest = hex_digest(Sha256::digest(raw_body));
         if let Ok(projection) = Self::open(path, &raw_digest, source_kind, &contract)
             && validate(&projection).is_ok()
         {
-            return Ok(projection);
+            return Ok((projection, ProjectionOpenOutcome::Reused));
         }
+        let outcome = if path.exists() {
+            ProjectionOpenOutcome::Rebuilt
+        } else {
+            ProjectionOpenOutcome::Built
+        };
         Self::rebuild_validated(path, raw_body, source_kind, contract, build, validate)
+            .map(|projection| (projection, outcome))
     }
 
     pub(crate) fn rebuild_validated<F, V>(

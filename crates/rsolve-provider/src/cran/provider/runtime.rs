@@ -10,11 +10,12 @@ use super::super::evidence::CranEvidenceObservation;
 use super::super::history::enumerate_archive_rds_for_provider;
 use super::super::history::{ArchiveEntry, ArchiveHistoryRejection};
 use super::snapshot::source_input;
+use super::transport::{Transport, TransportError, TransportResponse};
+
+type TarballGetter = Rc<dyn Fn(&str) -> Result<TransportResponse, TransportError>>;
 #[cfg(test)]
-use super::{
-    CranFastPathStatus, CranProviderError, CranRefreshSource, TransportError, provider_error,
-};
-use super::{CranRefreshDiagnostic, Transport, extract_description};
+use super::{CranFastPathStatus, CranProviderError, CranRefreshSource, provider_error};
+use super::{CranRefreshDiagnostic, extract_description};
 use crate::cran::provider::snapshot::tarball_record_to_evidence;
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
@@ -41,6 +42,7 @@ pub(crate) struct CranProvider<T> {
     diagnostics: Vec<CranRefreshDiagnostic>,
     loaded: RefCell<Option<Result<CandidateLoadResult, CandidateLoadError>>>,
     evidence: Option<Rc<RefCell<Vec<CranEvidenceObservation>>>>,
+    tarball_get: Option<TarballGetter>,
 }
 
 impl<T: Transport> CranProvider<T> {
@@ -121,6 +123,7 @@ impl<T: Transport> CranProvider<T> {
             diagnostics,
             loaded: RefCell::new(None),
             evidence: None,
+            tarball_get: None,
         })
     }
 
@@ -135,6 +138,7 @@ impl<T: Transport> CranProvider<T> {
         source: CandidateSource,
         diagnostics: Vec<CranRefreshDiagnostic>,
         evidence: Option<Rc<RefCell<Vec<CranEvidenceObservation>>>>,
+        tarball_get: Option<TarballGetter>,
     ) -> Self {
         Self {
             package,
@@ -144,6 +148,7 @@ impl<T: Transport> CranProvider<T> {
             diagnostics,
             loaded: RefCell::new(None),
             evidence,
+            tarball_get,
         }
     }
 
@@ -196,7 +201,12 @@ impl<T: Transport> CranProvider<T> {
                 entry.source_archive_relative_path()
             );
             let transport = self.transport.borrow();
-            let response = transport.get(&url).map_err(|error| {
+            let response = if let Some(get) = &self.tarball_get {
+                get(&url)
+            } else {
+                transport.get(&url)
+            }
+            .map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::TransportFailure,
                     format!(

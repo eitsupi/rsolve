@@ -3,9 +3,11 @@ use std::rc::Rc;
 
 use super::super::super::history::enumerate_archive_rds_for_provider;
 use super::super::model::CranRefreshProgress;
-use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
+use super::super::model::{
+    CranFastPathStatus, CranRefreshDiagnostic, CranRefreshMetricsSource, CranRefreshSource,
+};
 use super::super::qualification;
-use super::super::raw_cache::projection::PackageProjection;
+use super::super::raw_cache::projection::{PackageProjection, ProjectionOpenOutcome};
 use super::super::raw_cache::{ProjectionNamespace, RawCache, RawCacheRepresentation};
 use super::super::transport::Transport;
 use super::{
@@ -32,7 +34,7 @@ fn allpackages_rebuild(
     Rc::new(move || super::super::allpackages::rebuild_projection(&body, &path))
 }
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     fn push_allpackages_diagnostic(&mut self, status: Option<u16>, diagnostic: String) {
         self.diagnostics.push(CranRefreshDiagnostic {
             endpoint: self.allpackages_feed_endpoint.clone(),
@@ -183,6 +185,7 @@ impl<T: Transport> CranRefreshSession<T> {
             RawCacheRepresentation::AllPackagesZstd,
             "cran-allpackages",
             "zstd",
+            CranRefreshMetricsSource::AllPackages,
             |body| {
                 let projection_path = self.raw_cache.as_ref().and_then(|cache| {
                     cache
@@ -222,15 +225,28 @@ impl<T: Transport> CranRefreshSession<T> {
                     &path,
                     current_catalog,
                 ) {
-                    Ok((projection, built_coverage)) => Ok(AcquiredAllPackagesProjection {
-                        projection,
-                        body: body.to_vec(),
-                        current_catalog: built_coverage
-                            .is_none()
-                            .then(|| preloaded_current_catalog.clone())
-                            .flatten(),
-                        built_coverage,
-                    }),
+                    Ok((projection, built_coverage, projection_outcome)) => {
+                        match projection_outcome {
+                            ProjectionOpenOutcome::Reused => {
+                                self.metrics.borrow_mut().projection_reuses += 1
+                            }
+                            ProjectionOpenOutcome::Built => {
+                                self.metrics.borrow_mut().projection_builds += 1
+                            }
+                            ProjectionOpenOutcome::Rebuilt => {
+                                self.metrics.borrow_mut().projection_rebuilds += 1
+                            }
+                        }
+                        Ok(AcquiredAllPackagesProjection {
+                            projection,
+                            body: body.to_vec(),
+                            current_catalog: built_coverage
+                                .is_none()
+                                .then(|| preloaded_current_catalog.clone())
+                                .flatten(),
+                            built_coverage,
+                        })
+                    }
                     Err(error) => {
                         // Keep this refresh fail-closed, but remove only the
                         // content-addressed derived file so the next refresh
@@ -268,9 +284,10 @@ impl<T: Transport> CranRefreshSession<T> {
                         "ALLPACKAGES projection cache path is unavailable",
                     ));
                 };
-                let projection = PackageProjectionRecovery::new(
+                let projection = PackageProjectionRecovery::with_metrics(
                     projection,
                     Some(allpackages_rebuild(&projection_path, &body)),
+                    self.metrics.clone(),
                 );
 
                 // A positive qualification is the durable result of the
@@ -284,6 +301,11 @@ impl<T: Transport> CranRefreshSession<T> {
                     .as_ref()
                     .filter(|_| qualification_reusable(&feed_digest, self.now()));
                 if reusable_positive.is_some() {
+                    if let Some(record) = reusable_positive {
+                        self.metrics.borrow_mut().coverage_gaps += record.gapped_count as u64;
+                        self.metrics.borrow_mut().coverage_conflicts +=
+                            record.conflicting_count as u64;
+                    }
                     let status = match outcome {
                         MetadataAcquisitionOutcome::Revalidated304 => 304,
                         MetadataAcquisitionOutcome::Cached
@@ -324,6 +346,8 @@ impl<T: Transport> CranRefreshSession<T> {
                         coverage_source.classify_current(&current_catalog)?
                     }
                 };
+                self.metrics.borrow_mut().coverage_gaps += coverage.gapped_count as u64;
+                self.metrics.borrow_mut().coverage_conflicts += coverage.conflicting_count as u64;
                 let (mirror_positive, canonical_current_digest, canonical_archive_digest) =
                     if self.base_url.as_ref() == "https://cloud.r-project.org" {
                         // The built-in anchor is immutable by construction;
@@ -598,6 +622,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 RawCacheRepresentation::CurrentRds,
                 "cran-canonical-current",
                 "rds",
+                CranRefreshMetricsSource::CurrentIndex,
                 |body| {
                     Self::parse_current_body(CranCurrentIndexRepresentation::Rds, body)
                         .map(|(catalog, _)| catalog)
@@ -612,6 +637,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 RawCacheRepresentation::ArchiveHistoryRds,
                 "cran-canonical-history",
                 "rds",
+                CranRefreshMetricsSource::ArchiveHistory,
                 |body| {
                     enumerate_archive_rds_for_provider(body)
                         .map_err(|error| MetadataParseFailure::Invalid(error.to_string().into()))

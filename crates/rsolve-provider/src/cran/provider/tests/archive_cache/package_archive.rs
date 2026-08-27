@@ -72,6 +72,12 @@ fn empty_package_archive_stale_cache_reuses_body_after_304() {
         .expect("empty archive 304 diagnostic");
     assert_eq!(diagnostic.status(), Some(304));
     assert_eq!(diagnostic.status_detail(), &CranFastPathStatus::Available);
+    let metrics = second.metrics();
+    assert_eq!(metrics.statuses.status_304, 1);
+    assert_eq!(metrics.statuses.status_200, 0);
+    assert_eq!(metrics.statuses.status_404, 0);
+    assert_eq!(metrics.statuses.status_410, 0);
+    assert_eq!(metrics.statuses.other, 0);
 }
 
 #[test]

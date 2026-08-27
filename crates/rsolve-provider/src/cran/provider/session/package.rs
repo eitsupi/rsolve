@@ -3,7 +3,9 @@ use std::rc::Rc;
 use super::super::super::archive_index::{
     CranArchiveIndexProviderError, provider_archive_index_rds,
 };
-use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
+use super::super::model::{
+    CranFastPathStatus, CranRefreshDiagnostic, CranRefreshMetricsSource, CranRefreshSource,
+};
 use super::super::negative::FastPathFailure;
 use super::super::raw_cache::RawCacheRepresentation;
 use super::super::runtime::CandidateSource;
@@ -21,7 +23,7 @@ use rsolve_core::{
     PackageName, PackageRelease, ReleaseAggregation, SolverKey,
 };
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     pub(in crate::cran::provider) fn refresh_package(
         &mut self,
         package: &PackageName,
@@ -81,6 +83,7 @@ impl<T: Transport> CranRefreshSession<T> {
         // be recovered. Treating it as a version-local hole would mix source
         // presentations and make the resulting history non-deterministic.
         if !package_rejections.is_empty() {
+            self.metrics.borrow_mut().quarantined_releases += package_rejections.len() as u64;
             return Ok(None);
         }
 
@@ -162,6 +165,7 @@ impl<T: Transport> CranRefreshSession<T> {
         &mut self,
         package: &PackageName,
     ) -> Result<CandidateLoadResult, CandidateLoadError> {
+        self.metrics.borrow_mut().package_history_lookups += 1;
         let current_projection = self.ensure_current()?;
         let current = current_projection.candidates(package)?;
         if let Some(source) = self.current_source.clone() {
@@ -187,6 +191,7 @@ impl<T: Transport> CranRefreshSession<T> {
             None
         };
         if let Some(result) = bulk_candidates {
+            self.metrics.borrow_mut().allpackages_adoptions += 1;
             self.evidence.borrow_mut().extend(result.evidence);
             return Ok(result.candidates);
         }
@@ -202,6 +207,7 @@ impl<T: Transport> CranRefreshSession<T> {
             RawCacheRepresentation::PackageArchiveIndexRds,
             "cran-archive-index",
             "rds",
+            CranRefreshMetricsSource::PackageLocalIndex,
             |body| {
                 let projection = provider_archive_index_rds(body, package).map_err(|error| {
                     let diagnostic = error.to_string().into_boxed_str();
@@ -242,6 +248,7 @@ impl<T: Transport> CranRefreshSession<T> {
                             FreshnessStateV1::BulkGeneration,
                         )
                     }));
+                self.metrics.borrow_mut().quarantined_releases += rejections.len() as u64;
                 package_diagnostics.push(CranRefreshDiagnostic {
                     endpoint: endpoint.clone().into_boxed_str(),
                     status: Some(match outcome {
@@ -340,6 +347,12 @@ impl<T: Transport> CranRefreshSession<T> {
             source,
             provider_diagnostics,
             Some(Rc::clone(&self.evidence)),
+            Some(Rc::new({
+                let transport = Rc::clone(&self.transport);
+                move |url| {
+                    transport.get_with_source(url, CranRefreshMetricsSource::TarballDescription)
+                }
+            })),
         );
         self.diagnostics
             .extend(provider.diagnostics().iter().cloned());

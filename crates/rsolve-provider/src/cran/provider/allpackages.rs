@@ -22,7 +22,7 @@ use super::qualification::CoverageStatus;
 use super::raw_cache::projection::ProjectionSourceKind;
 use super::raw_cache::projection::{
     PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionLookupError,
-    ProjectionPackage, ProjectionPayload, ProjectionVisitError,
+    ProjectionOpenOutcome, ProjectionPackage, ProjectionPayload, ProjectionVisitError,
 };
 
 // The current CRAN feed is roughly 100 MiB decompressed. Keep substantial
@@ -281,9 +281,16 @@ pub(super) fn load_or_build_projection_with_coverage(
     body: &[u8],
     path: &Path,
     current: Option<&CranCatalog>,
-) -> Result<(PackageProjection, Option<CoverageSummary>), String> {
+) -> Result<
+    (
+        PackageProjection,
+        Option<CoverageSummary>,
+        ProjectionOpenOutcome,
+    ),
+    String,
+> {
     let built_coverage = RefCell::new(None);
-    let projection = PackageProjection::open_or_build(
+    let (projection, outcome) = PackageProjection::open_or_build_with_outcome(
         path,
         body,
         ProjectionSourceKind::Auxiliary,
@@ -301,7 +308,7 @@ pub(super) fn load_or_build_projection_with_coverage(
     .map_err(|error| match error {
         ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
     })?;
-    Ok((projection, built_coverage.into_inner()))
+    Ok((projection, built_coverage.into_inner(), outcome))
 }
 
 pub(super) fn rebuild_projection(body: &[u8], path: &Path) -> Result<PackageProjection, String> {

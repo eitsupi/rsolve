@@ -473,7 +473,7 @@ impl RawCache {
         Ok(())
     }
 
-    pub(super) fn entry_path(&self, key: &RawCacheKey) -> PathBuf {
+    pub(crate) fn entry_path(&self, key: &RawCacheKey) -> PathBuf {
         self.directory
             .join(format!("{}{}", key.digest(), ENTRY_SUFFIX))
     }

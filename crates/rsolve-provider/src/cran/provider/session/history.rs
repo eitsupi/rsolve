@@ -5,12 +5,14 @@ use super::super::super::history::{
     ArchiveHistoryRejection, ArchivePackagePayload, enumerate_archive_rds_for_provider,
 };
 use super::super::model::CranRefreshProgress;
-use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
+use super::super::model::{
+    CranFastPathStatus, CranRefreshDiagnostic, CranRefreshMetricsSource, CranRefreshSource,
+};
 use super::super::raw_cache::ProjectionNamespace;
 use super::super::raw_cache::RawCacheRepresentation;
 use super::super::raw_cache::projection::{
-    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionPackage,
-    ProjectionSourceKind,
+    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionOpenOutcome,
+    ProjectionPackage, ProjectionSourceKind,
 };
 use super::super::transport::Transport;
 use super::{
@@ -20,7 +22,7 @@ use super::{
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory};
 use sha2::{Digest, Sha256};
 
-impl<T: Transport> CranRefreshSession<T> {
+impl<T: Transport + 'static> CranRefreshSession<T> {
     pub(in crate::cran::provider) fn ensure_history(
         &mut self,
     ) -> Result<HistorySource, CandidateLoadError> {
@@ -34,9 +36,11 @@ impl<T: Transport> CranRefreshSession<T> {
             RawCacheRepresentation::ArchiveHistoryRds,
             "cran-archive-history",
             "rds",
+            CranRefreshMetricsSource::ArchiveHistory,
             |body| self.parse_archive_history_projection(&endpoint, body),
         ) {
             Ok((source, _source_input, _outcome)) => {
+                self.metrics.borrow_mut().quarantined_releases += source.rejections() as u64;
                 if source.rejections() != 0 {
                     let first = source.first_rejection().unwrap_or("no rejection detail");
                     let additional = source.rejections().saturating_sub(1);
@@ -111,22 +115,30 @@ impl<T: Transport> CranRefreshSession<T> {
             &key,
             &hex_digest(Sha256::digest(body)),
         );
-        let projection = PackageProjection::open_or_build_validated(
-            &path,
-            body,
-            ProjectionSourceKind::ArchiveHistory,
-            ProjectionContract {
-                parser_schema: super::CRAN_PARSER_SCHEMA,
-                compatibility_profile: super::CRAN_COMPATIBILITY_PROFILE,
-                normalization_policy: super::CRAN_NORMALIZATION_POLICY,
-            },
-            || build_archive_projection(body),
-            ArchiveHistorySource::validate_projection,
-        )
-        .map_err(|error| match error {
-            ProjectionError::Build(error) => MetadataParseFailure::Invalid(error.into()),
-            ProjectionError::Storage(error) => MetadataParseFailure::SnapshotInvalid(error.into()),
-        })?;
+        let (projection, projection_outcome) =
+            PackageProjection::open_or_build_validated_with_outcome(
+                &path,
+                body,
+                ProjectionSourceKind::ArchiveHistory,
+                ProjectionContract {
+                    parser_schema: super::CRAN_PARSER_SCHEMA,
+                    compatibility_profile: super::CRAN_COMPATIBILITY_PROFILE,
+                    normalization_policy: super::CRAN_NORMALIZATION_POLICY,
+                },
+                || build_archive_projection(body),
+                ArchiveHistorySource::validate_projection,
+            )
+            .map_err(|error| match error {
+                ProjectionError::Build(error) => MetadataParseFailure::Invalid(error.into()),
+                ProjectionError::Storage(error) => {
+                    MetadataParseFailure::SnapshotInvalid(error.into())
+                }
+            })?;
+        match projection_outcome {
+            ProjectionOpenOutcome::Reused => self.metrics.borrow_mut().projection_reuses += 1,
+            ProjectionOpenOutcome::Built => self.metrics.borrow_mut().projection_builds += 1,
+            ProjectionOpenOutcome::Rebuilt => self.metrics.borrow_mut().projection_rebuilds += 1,
+        }
         // Derived projection cleanup is bounded but non-essential to metadata
         // correctness; retry a failed cleanup on a later refresh.
         let _ = cache.retain_projection_namespace(ProjectionNamespace::ArchiveHistory, &path, None);
@@ -149,7 +161,7 @@ impl<T: Transport> CranRefreshSession<T> {
                 ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
             })
         });
-        ArchiveHistorySource::from_projection(projection, Some(rebuild))
+        ArchiveHistorySource::from_projection(projection, Some(rebuild), self.metrics.clone())
             .map(Rc::new)
             .map_err(|error| MetadataParseFailure::SnapshotInvalid(error.into()))
     }
