@@ -7,6 +7,7 @@ cd "$repo_dir"
 cargo fmt --all -- --check
 cargo metadata --locked --offline
 scripts/check-deps.sh
+python3 scripts/test_benchmark_tidyverse.py
 scripts/check-test-profiles.sh
 sh scripts/check-test-profiles-negative.sh
 sh scripts/validate-pak-gate-inputs.sh
