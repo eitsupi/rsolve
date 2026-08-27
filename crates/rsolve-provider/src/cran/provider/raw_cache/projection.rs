@@ -25,6 +25,7 @@ static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg(test)]
 thread_local! {
     static VISIT_PACKAGE_RECORDS_COUNT: Cell<usize> = const { Cell::new(0) };
+    static VISIT_SELECTED_PACKAGE_RECORDS_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -35,6 +36,16 @@ pub(crate) fn reset_visit_package_records_count() {
 #[cfg(test)]
 pub(crate) fn visit_package_records_count() -> usize {
     VISIT_PACKAGE_RECORDS_COUNT.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_visit_selected_package_records_count() {
+    VISIT_SELECTED_PACKAGE_RECORDS_COUNT.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn visit_selected_package_records_count() -> usize {
+    VISIT_SELECTED_PACKAGE_RECORDS_COUNT.with(Cell::get)
 }
 
 #[allow(dead_code)]
@@ -295,6 +306,8 @@ impl PackageProjection {
     where
         F: FnMut(&str, Option<ProjectionPayload>) -> Result<(), E>,
     {
+        #[cfg(test)]
+        VISIT_SELECTED_PACKAGE_RECORDS_COUNT.with(|counter| counter.set(counter.get() + 1));
         let read = self
             .database
             .begin_read()

@@ -19,6 +19,8 @@ use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory};
 struct AcquiredAllPackagesProjection {
     projection: PackageProjection,
     body: Vec<u8>,
+    built_coverage: Option<super::super::allpackages::CoverageSummary>,
+    current_catalog: Option<Rc<super::super::super::catalog::CranCatalog>>,
 }
 
 fn allpackages_rebuild(
@@ -138,6 +140,44 @@ impl<T: Transport> CranRefreshSession<T> {
             return Err(error);
         }
         self.emit_progress(CranRefreshProgress::AllPackagesStarted);
+        let positive_may_reuse = !self.refresh_metadata
+            && persisted_qualification.as_ref().is_some_and(|record| {
+                record.status == qualification::Status::Positive
+                    && qualification::matches(
+                        record,
+                        &self.base_url,
+                        &endpoint,
+                        &current_digest,
+                        &archive_digest,
+                        None,
+                    )
+                    && qualification::positive_reusable(record, self.now())
+            });
+        let preloaded_current_catalog = if positive_may_reuse {
+            None
+        } else {
+            Some(current_projection.materialize_catalog()?)
+        };
+        let refresh_metadata = self.refresh_metadata;
+        let qualification_base_url = self.base_url.clone();
+        let qualification_endpoint = endpoint.clone();
+        let qualification_current_digest = current_digest.clone();
+        let qualification_archive_digest = archive_digest.clone();
+        let qualification_reusable = |feed_digest: &str, now: jiff::Timestamp| {
+            !refresh_metadata
+                && persisted_qualification.as_ref().is_some_and(|record| {
+                    record.status == qualification::Status::Positive
+                        && qualification::matches(
+                            record,
+                            &qualification_base_url,
+                            &qualification_endpoint,
+                            &qualification_current_digest,
+                            &qualification_archive_digest,
+                            Some(feed_digest),
+                        )
+                        && qualification::positive_reusable(record, now)
+                })
+        };
         let result = match self.acquire_metadata(
             &endpoint,
             RawCacheRepresentation::AllPackagesZstd,
@@ -169,10 +209,27 @@ impl<T: Transport> CranRefreshSession<T> {
                         "ALLPACKAGES projection cache is unavailable".into(),
                     ));
                 };
-                match super::super::allpackages::load_or_build_projection(body, &path) {
-                    Ok(projection) => Ok(AcquiredAllPackagesProjection {
+                let current_catalog = if qualification_reusable(
+                    &hex_digest(sha2::Sha256::digest(body)),
+                    self.now(),
+                ) {
+                    None
+                } else {
+                    preloaded_current_catalog.as_deref()
+                };
+                match super::super::allpackages::load_or_build_projection_with_coverage(
+                    body,
+                    &path,
+                    current_catalog,
+                ) {
+                    Ok((projection, built_coverage)) => Ok(AcquiredAllPackagesProjection {
                         projection,
                         body: body.to_vec(),
+                        current_catalog: built_coverage
+                            .is_none()
+                            .then(|| preloaded_current_catalog.clone())
+                            .flatten(),
+                        built_coverage,
                     }),
                     Err(error) => {
                         // Keep this refresh fail-closed, but remove only the
@@ -185,7 +242,12 @@ impl<T: Transport> CranRefreshSession<T> {
             },
         ) {
             Ok((acquired, source, outcome)) => {
-                let AcquiredAllPackagesProjection { projection, body } = acquired;
+                let AcquiredAllPackagesProjection {
+                    projection,
+                    body,
+                    built_coverage,
+                    current_catalog,
+                } = acquired;
                 self.emit_progress(CranRefreshProgress::AllPackagesProjected);
                 let feed_digest = hex_digest(source.content_sha256).to_string();
                 let projection_path = self.raw_cache.as_ref().and_then(|cache| {
@@ -218,19 +280,9 @@ impl<T: Transport> CranRefreshSession<T> {
                 // fetching canonical evidence again. Forced refreshes and
                 // stale or mismatched records deliberately fall through to
                 // the full validation path below.
-                let reusable_positive = persisted_qualification.as_ref().filter(|record| {
-                    !self.refresh_metadata
-                        && record.status == qualification::Status::Positive
-                        && qualification::matches(
-                            record,
-                            &self.base_url,
-                            &endpoint,
-                            &current_digest,
-                            &archive_digest,
-                            Some(&feed_digest),
-                        )
-                        && qualification::positive_reusable(record, self.now())
-                });
+                let reusable_positive = persisted_qualification
+                    .as_ref()
+                    .filter(|_| qualification_reusable(&feed_digest, self.now()));
                 if reusable_positive.is_some() {
                     let status = match outcome {
                         MetadataAcquisitionOutcome::Revalidated304 => 304,
@@ -257,13 +309,21 @@ impl<T: Transport> CranRefreshSession<T> {
                 // A stale or unknown qualification is the only path that
                 // needs the complete current surface. Positive reuse above
                 // deliberately avoids materializing every package row.
-                let current_catalog = current_projection.materialize_catalog()?;
                 let coverage_source = AllPackagesSource {
                     projection: projection.clone(),
                     source: source.clone(),
                     projection_path: projection_path.clone(),
                 };
-                let coverage = coverage_source.classify_current(&current_catalog)?;
+                let coverage = match built_coverage {
+                    Some(coverage) => coverage,
+                    None => {
+                        let current_catalog = match current_catalog {
+                            Some(current_catalog) => current_catalog,
+                            None => current_projection.materialize_catalog()?,
+                        };
+                        coverage_source.classify_current(&current_catalog)?
+                    }
+                };
                 let (mirror_positive, canonical_current_digest, canonical_archive_digest) =
                     if self.base_url.as_ref() == "https://cloud.r-project.org" {
                         // The built-in anchor is immutable by construction;

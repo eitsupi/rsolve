@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -75,6 +76,115 @@ pub(super) struct CoverageSummary {
     pub(super) digest: String,
 }
 
+struct CoverageAccumulator<'a> {
+    package_index: BTreeMap<&'a str, &'a [PackageRelease]>,
+    package_results: BTreeMap<&'a str, Vec<&'static str>>,
+}
+
+impl<'a> CoverageAccumulator<'a> {
+    fn new(current: &'a CranCatalog) -> Self {
+        Self {
+            package_index: current
+                .packages()
+                .map(|(package, releases)| (package.as_str(), releases))
+                .collect(),
+            package_results: BTreeMap::new(),
+        }
+    }
+
+    fn add_package(&mut self, package: &str, records: Vec<IndexedRecord>) {
+        let Some((package, releases)) = self.package_index.get_key_value(package) else {
+            return;
+        };
+        let package = *package;
+        let records = records
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let version = record
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("Version"))
+                    .and_then(|(_, value)| RPackageVersion::parse(value.trim()).ok());
+                version
+                    .is_some_and(|version| {
+                        releases.iter().any(|release| release.version() == &version)
+                    })
+                    .then_some((index, record.package, record.fields))
+            })
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        CLASSIFY_CURRENT_RECORD_COUNT.with(|counter| counter.set(counter.get() + records.len()));
+        let observation_projection = allpackages_observations_from_fields(records);
+        let mut results = Vec::with_capacity(releases.len());
+        for release in releases.iter() {
+            let matching = observation_projection
+                .observations
+                .iter()
+                .filter(|row| row.release().version() == release.version())
+                .collect::<Vec<_>>();
+            let rejected = observation_projection.rejections.iter().any(|row| {
+                row.version() == Some(release.version())
+                    && row.package().is_some_and(|name| name.as_str() == package)
+            });
+            let classification = if rejected || matching.len() > 1 {
+                "conflicting"
+            } else if let Some(row) = matching.first() {
+                if current_semantics_match(row.release(), release) {
+                    "covered"
+                } else {
+                    "conflicting"
+                }
+            } else {
+                "gapped"
+            };
+            results.push(classification);
+        }
+        self.package_results.insert(package, results);
+    }
+
+    fn finish(self) -> CoverageSummary {
+        let mut covered_count = 0;
+        let mut gapped_count = 0;
+        let mut conflicting_count = 0;
+        let mut digest = sha2::Sha256::new();
+        for (package, releases) in self.package_index {
+            let results = self.package_results.get(package).map(Vec::as_slice);
+            for (index, release) in releases.iter().enumerate() {
+                let classification = results
+                    .and_then(|results| results.get(index).copied())
+                    .unwrap_or("gapped");
+                match classification {
+                    "covered" => covered_count += 1,
+                    "gapped" => gapped_count += 1,
+                    "conflicting" => conflicting_count += 1,
+                    _ => unreachable!("coverage classifier emitted unknown result"),
+                }
+                digest.update(package.as_bytes());
+                digest.update([0]);
+                digest.update(release.version().to_string().as_bytes());
+                digest.update([0]);
+                digest.update(classification.as_bytes());
+                digest.update([0]);
+            }
+        }
+        let status = if conflicting_count > 0 {
+            CoverageStatus::CurrentConflicting
+        } else if gapped_count > 0 {
+            CoverageStatus::CurrentGapped
+        } else {
+            CoverageStatus::CurrentComplete
+        };
+        CoverageSummary {
+            status,
+            covered_count,
+            gapped_count,
+            conflicting_count,
+            digest: sha256_hex(&digest.finalize()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum AllPackagesProjectionError {
     Storage(String),
@@ -120,71 +230,16 @@ pub(super) fn classify_current(
 ) -> Result<CoverageSummary, AllPackagesProjectionError> {
     #[cfg(test)]
     CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(counter.get() + 1));
-    let package_index = current
-        .packages()
-        .map(|(package, releases)| (package.as_str(), releases))
-        .collect::<BTreeMap<_, _>>();
-    let packages = package_index.keys().copied().collect::<Vec<_>>();
-    let mut covered_count = 0;
-    let mut gapped_count = 0;
-    let mut conflicting_count = 0;
-    let mut digest = sha2::Sha256::new();
+    let mut accumulator = CoverageAccumulator::new(current);
+    let packages = accumulator
+        .package_index
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
     projection
         .visit_selected_packages(&packages, |package, payload| {
             let records = decode_records(payload, package)?;
-            let releases = package_index.get(package).copied().unwrap_or(&[]);
-            let records = records
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, record)| {
-                    let version = record
-                        .fields
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("Version"))
-                        .and_then(|(_, value)| RPackageVersion::parse(value.trim()).ok());
-                    version
-                        .is_some_and(|version| {
-                            releases.iter().any(|release| release.version() == &version)
-                        })
-                        .then_some((index, record.package, record.fields))
-                })
-                .collect::<Vec<_>>();
-            #[cfg(test)]
-            CLASSIFY_CURRENT_RECORD_COUNT
-                .with(|counter| counter.set(counter.get() + records.len()));
-            let observation_projection = allpackages_observations_from_fields(records);
-            for release in releases {
-                let matching = observation_projection
-                    .observations
-                    .iter()
-                    .filter(|row| row.release().version() == release.version())
-                    .collect::<Vec<_>>();
-                let rejected = observation_projection.rejections.iter().any(|row| {
-                    row.version() == Some(release.version())
-                        && row.package().is_some_and(|name| name.as_str() == package)
-                });
-                let classification = if rejected || matching.len() > 1 {
-                    conflicting_count += 1;
-                    "conflicting"
-                } else if let Some(row) = matching.first() {
-                    if current_semantics_match(row.release(), release) {
-                        covered_count += 1;
-                        "covered"
-                    } else {
-                        conflicting_count += 1;
-                        "conflicting"
-                    }
-                } else {
-                    gapped_count += 1;
-                    "gapped"
-                };
-                digest.update(package.as_bytes());
-                digest.update([0]);
-                digest.update(release.version().to_string().as_bytes());
-                digest.update([0]);
-                digest.update(classification.as_bytes());
-                digest.update([0]);
-            }
+            accumulator.add_package(package, records);
             Ok(())
         })
         .map_err(|error| match error {
@@ -192,20 +247,7 @@ pub(super) fn classify_current(
             ProjectionVisitError::Invalid(error) => AllPackagesProjectionError::Semantic(error),
             ProjectionVisitError::Visitor(error) => AllPackagesProjectionError::Semantic(error),
         })?;
-    let status = if conflicting_count > 0 {
-        CoverageStatus::CurrentConflicting
-    } else if gapped_count > 0 {
-        CoverageStatus::CurrentGapped
-    } else {
-        CoverageStatus::CurrentComplete
-    };
-    Ok(CoverageSummary {
-        status,
-        covered_count,
-        gapped_count,
-        conflicting_count,
-        digest: sha256_hex(&digest.finalize()),
-    })
+    Ok(accumulator.finish())
 }
 
 fn decode_records(
@@ -235,11 +277,13 @@ fn decode_records(
     Ok(records)
 }
 
-pub(super) fn load_or_build_projection(
+pub(super) fn load_or_build_projection_with_coverage(
     body: &[u8],
     path: &Path,
-) -> Result<PackageProjection, String> {
-    PackageProjection::open_or_build(
+    current: Option<&CranCatalog>,
+) -> Result<(PackageProjection, Option<CoverageSummary>), String> {
+    let built_coverage = RefCell::new(None);
+    let projection = PackageProjection::open_or_build(
         path,
         body,
         ProjectionSourceKind::Auxiliary,
@@ -248,11 +292,16 @@ pub(super) fn load_or_build_projection(
             compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
             normalization_policy: CRAN_NORMALIZATION_POLICY,
         },
-        || build_projection(body),
+        || {
+            let (build, coverage) = build_projection_with_coverage(body, current)?;
+            *built_coverage.borrow_mut() = coverage;
+            Ok(build)
+        },
     )
     .map_err(|error| match error {
         ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
-    })
+    })?;
+    Ok((projection, built_coverage.into_inner()))
 }
 
 pub(super) fn rebuild_projection(body: &[u8], path: &Path) -> Result<PackageProjection, String> {
@@ -274,6 +323,13 @@ pub(super) fn rebuild_projection(body: &[u8], path: &Path) -> Result<PackageProj
 }
 
 fn build_projection(body: &[u8]) -> Result<ProjectionBuild, String> {
+    build_projection_with_coverage(body, None).map(|(build, _)| build)
+}
+
+fn build_projection_with_coverage(
+    body: &[u8],
+    current: Option<&CranCatalog>,
+) -> Result<(ProjectionBuild, Option<CoverageSummary>), String> {
     #[cfg(test)]
     PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
     #[cfg(test)]
@@ -300,22 +356,30 @@ fn build_projection(body: &[u8]) -> Result<ProjectionBuild, String> {
             .or_default()
             .push(IndexedRecord { package, fields });
     }
+    let mut accumulator = current.map(CoverageAccumulator::new);
     let packages = records
         .into_iter()
         .map(|(package, records)| {
             let record_count = records.len();
+            let payload = postcard::to_stdvec(&records).map_err(|error| error.to_string())?;
+            if let Some(accumulator) = accumulator.as_mut() {
+                accumulator.add_package(&package, records);
+            }
             Ok(ProjectionPackage {
                 package,
                 record_count,
-                payload: postcard::to_stdvec(&records).map_err(|error| error.to_string())?,
+                payload,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(ProjectionBuild {
-        packages,
-        summary: Vec::new(),
-        surface_digest: String::new(),
-    })
+    Ok((
+        ProjectionBuild {
+            packages,
+            summary: Vec::new(),
+            surface_digest: String::new(),
+        },
+        accumulator.map(CoverageAccumulator::finish),
+    ))
 }
 
 fn sha256_hex(input: &[u8]) -> String {
@@ -544,6 +608,14 @@ mod tests {
         }
     }
 
+    fn assert_same_coverage(left: &CoverageSummary, right: &CoverageSummary) {
+        assert_eq!(left.status, right.status);
+        assert_eq!(left.covered_count, right.covered_count);
+        assert_eq!(left.gapped_count, right.gapped_count);
+        assert_eq!(left.conflicting_count, right.conflicting_count);
+        assert_eq!(left.digest, right.digest);
+    }
+
     #[test]
     fn projection_records_must_match_the_lookup_package() {
         let payload = ProjectionPayload {
@@ -660,6 +732,44 @@ mod tests {
 
         assert_eq!(summary.status, CoverageStatus::CurrentConflicting);
         assert_eq!(summary.conflicting_count, 1);
+    }
+
+    #[test]
+    fn owned_records_and_projection_path_produce_identical_coverage() {
+        let current = current_catalog();
+        let cases = [
+            (vec![current_row("GPL-3")], vec![current_row("GPL-3")]),
+            (
+                vec![IndexedRecord {
+                    package: Some("Matrix".into()),
+                    fields: vec![
+                        ("Package".into(), "Matrix".into()),
+                        ("Version".into(), "0.9.0".into()),
+                        ("License".into(), "BSD-3-Clause".into()),
+                    ],
+                }],
+                vec![IndexedRecord {
+                    package: Some("Matrix".into()),
+                    fields: vec![
+                        ("Package".into(), "Matrix".into()),
+                        ("Version".into(), "0.9.0".into()),
+                        ("License".into(), "BSD-3-Clause".into()),
+                    ],
+                }],
+            ),
+            (
+                vec![current_row("BSD-3-Clause"), current_row("GPL-3")],
+                vec![current_row("BSD-3-Clause"), current_row("GPL-3")],
+            ),
+        ];
+        for (projection_rows, owned_rows) in cases {
+            let (_directory, projection) = projection_with_rows(projection_rows);
+            let projection_summary = classify_current(&projection, &current).unwrap();
+            let mut accumulator = CoverageAccumulator::new(&current);
+            accumulator.add_package("Matrix", owned_rows);
+            let owned_summary = accumulator.finish();
+            assert_same_coverage(&projection_summary, &owned_summary);
+        }
     }
 
     #[test]

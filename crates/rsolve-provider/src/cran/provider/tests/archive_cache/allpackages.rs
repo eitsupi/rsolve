@@ -136,6 +136,7 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         Some(RawCache::open(&store).unwrap()),
     );
     crate::cran::provider::raw_cache::projection::reset_visit_package_records_count();
+    crate::cran::provider::raw_cache::projection::reset_visit_selected_package_records_count();
     let first_result = first
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
@@ -145,6 +146,12 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         0,
         "new current projection should supply its catalog without materialization"
     );
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_selected_package_records_count(),
+        0,
+        "new ALLPACKAGES projection should supply coverage without selected reads"
+    );
+    let qualification_path = RawCache::open(&store).unwrap().qualification_path();
 
     crate::cran::provider::allpackages::reset_test_counters();
     let second_transport = allpackages_transport(feed.clone(), false);
@@ -155,6 +162,7 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         Some("2026-08-25T00:00:01Z".parse().unwrap()),
         Some(RawCache::open(&store).unwrap()),
     );
+    crate::cran::provider::raw_cache::projection::reset_visit_selected_package_records_count();
     let second_result = second
         .refresh_package(&PackageName::new("Matrix").unwrap())
         .unwrap();
@@ -165,10 +173,13 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
         crate::cran::provider::allpackages::classify_current_count(),
         0
     );
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_selected_package_records_count(),
+        0
+    );
 
     // A changed qualification binding is not a reusable decision even when
     // every raw artifact remains fresh. The normal path must reclassify it.
-    let qualification_path = RawCache::open(&store).unwrap().qualification_path();
     let mut mismatched = crate::cran::provider::qualification::load_result(&qualification_path)
         .unwrap()
         .unwrap();
@@ -176,6 +187,7 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
     crate::cran::provider::qualification::publish(&qualification_path, &mismatched).unwrap();
     crate::cran::provider::allpackages::reset_test_counters();
     crate::cran::provider::raw_cache::projection::reset_visit_package_records_count();
+    crate::cran::provider::raw_cache::projection::reset_visit_selected_package_records_count();
     let third_transport = allpackages_transport(feed, false);
     let third_requests = third_transport.requests.clone();
     let mut third = CranRefreshSession::new_with_clock(
@@ -191,6 +203,10 @@ fn allpackages_fresh_second_session_reuses_projection_without_requests_or_rebuil
     assert!(crate::cran::provider::allpackages::classify_current_count() > 0);
     assert_eq!(
         crate::cran::provider::raw_cache::projection::visit_package_records_count(),
+        1
+    );
+    assert_eq!(
+        crate::cran::provider::raw_cache::projection::visit_selected_package_records_count(),
         1
     );
 }
