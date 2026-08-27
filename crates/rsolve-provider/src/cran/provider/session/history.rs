@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -252,9 +251,7 @@ fn eager_archive_source(
         .flat_map(|p| p.entries.iter().cloned())
         .collect::<Vec<_>>();
     ArchiveHistorySource {
-        projection: None,
-        rebuild: None,
-        rebuild_attempted: Rc::new(Cell::new(false)),
+        projection: super::PackageProjectionRecovery::eager(),
         eager: Some(Rc::new(packages)),
         entry_count,
         rejection_count,

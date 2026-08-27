@@ -412,6 +412,51 @@ fn corrupt_projection_rebuilds_from_cached_raw_without_fallback() {
 }
 
 #[test]
+fn corrupt_allpackages_package_payload_rebuilds_from_cached_raw_without_fallback() {
+    let (_directory, store) = store();
+    let entries = matrix_history_entries();
+    let feed = allpackages_fixture_body(&entries, true, None);
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(allpackages_transport(feed.clone(), false)),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:00Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let package = PackageName::new("Matrix").unwrap();
+    let first_result = first.refresh_package(&package).unwrap();
+    let signature = release_signature(first_result.candidates());
+    drop(first);
+
+    let cache = RawCache::open(&store).unwrap();
+    let key = cache
+        .key(
+            ALLPACKAGES_FIXTURE_URL,
+            RawCacheRepresentation::AllPackagesZstd,
+        )
+        .unwrap();
+    let projection = cache.projection_path(&key, &feed);
+    crate::cran::provider::raw_cache::projection::overwrite_projection_package(
+        &projection,
+        "Matrix",
+        vec![0xff],
+    );
+
+    crate::cran::provider::allpackages::reset_test_counters();
+    let second_transport = allpackages_transport(feed, true);
+    let second_requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cloud.r-project.org", ALLPACKAGES_FIXTURE_URL),
+        Some("2026-08-25T00:00:01Z".parse().unwrap()),
+        Some(RawCache::open(&store).unwrap()),
+    );
+    let second_result = second.refresh_package(&package).unwrap();
+    assert_eq!(release_signature(second_result.candidates()), signature);
+    assert!(second_requests.borrow().is_empty());
+    assert_eq!(crate::cran::provider::allpackages::test_counters(), (1, 1));
+}
+
+#[test]
 fn custom_mirror_positive_reuses_actual_canonical_qualification_until_ttl() {
     let (_directory, store) = store();
     let entries = matrix_history_entries();

@@ -5,15 +5,30 @@ use super::super::super::history::enumerate_archive_rds_for_provider;
 use super::super::model::CranRefreshProgress;
 use super::super::model::{CranFastPathStatus, CranRefreshDiagnostic, CranRefreshSource};
 use super::super::qualification;
+use super::super::raw_cache::projection::PackageProjection;
 use super::super::raw_cache::{ProjectionNamespace, RawCache, RawCacheRepresentation};
 use super::super::transport::Transport;
 use super::{
     AllPackagesSource, CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_PARSER_SCHEMA,
     CranCurrentIndexRepresentation, CranRefreshSession, MetadataAcquisitionFailure,
-    MetadataAcquisitionOutcome, MetadataParseFailure, catalog_surface_digest, hex_digest,
-    history_surface_digest,
+    MetadataAcquisitionOutcome, MetadataParseFailure, PackageProjectionRecovery,
+    catalog_surface_digest, hex_digest, history_surface_digest,
 };
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory};
+
+struct AcquiredAllPackagesProjection {
+    projection: PackageProjection,
+    body: Vec<u8>,
+}
+
+fn allpackages_rebuild(
+    path: &std::path::Path,
+    body: &[u8],
+) -> Rc<dyn Fn() -> Result<PackageProjection, String>> {
+    let path = path.to_owned();
+    let body = body.to_vec();
+    Rc::new(move || super::super::allpackages::rebuild_projection(&body, &path))
+}
 
 impl<T: Transport> CranRefreshSession<T> {
     fn push_allpackages_diagnostic(&mut self, status: Option<u16>, diagnostic: String) {
@@ -155,7 +170,10 @@ impl<T: Transport> CranRefreshSession<T> {
                     ));
                 };
                 match super::super::allpackages::load_or_build_projection(body, &path) {
-                    Ok(projection) => Ok(projection),
+                    Ok(projection) => Ok(AcquiredAllPackagesProjection {
+                        projection,
+                        body: body.to_vec(),
+                    }),
                     Err(error) => {
                         // Keep this refresh fail-closed, but remove only the
                         // content-addressed derived file so the next refresh
@@ -166,7 +184,8 @@ impl<T: Transport> CranRefreshSession<T> {
                 }
             },
         ) {
-            Ok((projection, source, outcome)) => {
+            Ok((acquired, source, outcome)) => {
+                let AcquiredAllPackagesProjection { projection, body } = acquired;
                 self.emit_progress(CranRefreshProgress::AllPackagesProjected);
                 let feed_digest = hex_digest(source.content_sha256).to_string();
                 let projection_path = self.raw_cache.as_ref().and_then(|cache| {
@@ -187,6 +206,10 @@ impl<T: Transport> CranRefreshSession<T> {
                         "ALLPACKAGES projection cache path is unavailable",
                     ));
                 };
+                let projection = PackageProjectionRecovery::new(
+                    projection,
+                    Some(allpackages_rebuild(&projection_path, &body)),
+                );
 
                 // A positive qualification is the durable result of the
                 // complete mirror decision. Once the feed bytes have been
@@ -222,7 +245,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     });
                     self.emit_progress(CranRefreshProgress::AllPackagesQualified { reused: true });
                     let result = Rc::new(AllPackagesSource {
-                        projection: Rc::new(projection),
+                        projection: projection.clone(),
                         source,
                         projection_path,
                     });
@@ -235,14 +258,12 @@ impl<T: Transport> CranRefreshSession<T> {
                 // needs the complete current surface. Positive reuse above
                 // deliberately avoids materializing every package row.
                 let current_catalog = current_projection.materialize_catalog()?;
-                let coverage =
-                    super::super::allpackages::classify_current(&projection, &current_catalog)
-                        .map_err(|error| {
-                            CandidateLoadError::new(
-                                CandidateLoadErrorCategory::SnapshotInvalid,
-                                format!("invalid ALLPACKAGES coverage projection: {error}"),
-                            )
-                        })?;
+                let coverage_source = AllPackagesSource {
+                    projection: projection.clone(),
+                    source: source.clone(),
+                    projection_path: projection_path.clone(),
+                };
+                let coverage = coverage_source.classify_current(&current_catalog)?;
                 let (mirror_positive, canonical_current_digest, canonical_archive_digest) =
                     if self.base_url.as_ref() == "https://cloud.r-project.org" {
                         // The built-in anchor is immutable by construction;
@@ -399,7 +420,7 @@ impl<T: Transport> CranRefreshSession<T> {
                     source: CranRefreshSource::AllPackages,
                 });
                 Ok(Rc::new(AllPackagesSource {
-                    projection: Rc::new(projection),
+                    projection,
                     source,
                     projection_path,
                 }))

@@ -20,8 +20,8 @@ use super::model::{CRAN_COMPATIBILITY_PROFILE, CRAN_NORMALIZATION_POLICY, CRAN_P
 use super::qualification::CoverageStatus;
 use super::raw_cache::projection::ProjectionSourceKind;
 use super::raw_cache::projection::{
-    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionPackage,
-    ProjectionPayload,
+    PackageProjection, ProjectionBuild, ProjectionContract, ProjectionError, ProjectionLookupError,
+    ProjectionPackage, ProjectionPayload, ProjectionVisitError,
 };
 
 // The current CRAN feed is roughly 100 MiB decompressed. Keep substantial
@@ -68,16 +68,36 @@ pub(super) struct CoverageSummary {
     pub(super) digest: String,
 }
 
+#[derive(Debug)]
+pub(super) enum AllPackagesProjectionError {
+    Storage(String),
+    Semantic(String),
+}
+
+impl std::fmt::Display for AllPackagesProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) | Self::Semantic(error) => formatter.write_str(error),
+        }
+    }
+}
+
 pub(super) fn observations(
     projection: &PackageProjection,
     package: &str,
-) -> Result<CranProviderObservationProjection, String> {
+) -> Result<CranProviderObservationProjection, AllPackagesProjectionError> {
     let records = decode_records(
         projection
             .lookup_package(package)
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| match error {
+                ProjectionLookupError::Storage(error) => AllPackagesProjectionError::Storage(error),
+                ProjectionLookupError::Invalid(error) => {
+                    AllPackagesProjectionError::Semantic(error)
+                }
+            })?,
         package,
-    )?;
+    )
+    .map_err(AllPackagesProjectionError::Semantic)?;
     Ok(allpackages_observations_from_fields(
         records
             .into_iter()
@@ -90,7 +110,7 @@ pub(super) fn observations(
 pub(super) fn classify_current(
     projection: &PackageProjection,
     current: &CranCatalog,
-) -> Result<CoverageSummary, String> {
+) -> Result<CoverageSummary, AllPackagesProjectionError> {
     #[cfg(test)]
     CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(counter.get() + 1));
     let package_index = current
@@ -148,9 +168,9 @@ pub(super) fn classify_current(
             Ok(())
         })
         .map_err(|error| match error {
-            super::raw_cache::projection::ProjectionVisitError::Storage(error)
-            | super::raw_cache::projection::ProjectionVisitError::Invalid(error)
-            | super::raw_cache::projection::ProjectionVisitError::Visitor(error) => error,
+            ProjectionVisitError::Storage(error) => AllPackagesProjectionError::Storage(error),
+            ProjectionVisitError::Invalid(error) => AllPackagesProjectionError::Semantic(error),
+            ProjectionVisitError::Visitor(error) => AllPackagesProjectionError::Semantic(error),
         })?;
     let status = if conflicting_count > 0 {
         CoverageStatus::CurrentConflicting
@@ -208,50 +228,69 @@ pub(super) fn load_or_build_projection(
             compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
             normalization_policy: CRAN_NORMALIZATION_POLICY,
         },
-        || {
-            #[cfg(test)]
-            PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
-            #[cfg(test)]
-            PROJECTION_DECODE_COUNT.with(|counter| counter.set(counter.get() + 1));
-            let decoded = decode_zstd(body)?;
-            let document = DcfDocument::parse(&decoded).map_err(|error| error.to_string())?;
-            let mut records = BTreeMap::<String, Vec<IndexedRecord>>::new();
-            for record in document.records() {
-                let package = record
-                    .field("Package")
-                    .map(|field| field.value().to_owned());
-                let key = package.clone().unwrap_or_default();
-                let fields = record
-                    .fields()
-                    .iter()
-                    .map(|field| (field.name().to_owned(), field.value().to_owned()))
-                    .collect();
-                records
-                    .entry(key)
-                    .or_default()
-                    .push(IndexedRecord { package, fields });
-            }
-            let packages = records
-                .into_iter()
-                .map(|(package, records)| {
-                    let record_count = records.len();
-                    Ok(ProjectionPackage {
-                        package,
-                        record_count,
-                        payload: postcard::to_stdvec(&records)
-                            .map_err(|error| error.to_string())?,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(ProjectionBuild {
-                packages,
-                summary: Vec::new(),
-                surface_digest: String::new(),
-            })
-        },
+        || build_projection(body),
     )
     .map_err(|error| match error {
         ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
+    })
+}
+
+pub(super) fn rebuild_projection(body: &[u8], path: &Path) -> Result<PackageProjection, String> {
+    PackageProjection::rebuild_validated(
+        path,
+        body,
+        ProjectionSourceKind::Auxiliary,
+        ProjectionContract {
+            parser_schema: CRAN_PARSER_SCHEMA,
+            compatibility_profile: CRAN_COMPATIBILITY_PROFILE,
+            normalization_policy: CRAN_NORMALIZATION_POLICY,
+        },
+        || build_projection(body),
+        |_| Ok(()),
+    )
+    .map_err(|error| match error {
+        ProjectionError::Build(error) | ProjectionError::Storage(error) => error,
+    })
+}
+
+fn build_projection(body: &[u8]) -> Result<ProjectionBuild, String> {
+    #[cfg(test)]
+    PROJECTION_BUILD_COUNT.with(|counter| counter.set(counter.get() + 1));
+    #[cfg(test)]
+    PROJECTION_DECODE_COUNT.with(|counter| counter.set(counter.get() + 1));
+    let decoded = decode_zstd(body)?;
+    let document = DcfDocument::parse(&decoded).map_err(|error| error.to_string())?;
+    let mut records = BTreeMap::<String, Vec<IndexedRecord>>::new();
+    for record in document.records() {
+        let package = record
+            .field("Package")
+            .map(|field| field.value().to_owned());
+        let key = package.clone().unwrap_or_default();
+        let fields = record
+            .fields()
+            .iter()
+            .map(|field| (field.name().to_owned(), field.value().to_owned()))
+            .collect();
+        records
+            .entry(key)
+            .or_default()
+            .push(IndexedRecord { package, fields });
+    }
+    let packages = records
+        .into_iter()
+        .map(|(package, records)| {
+            let record_count = records.len();
+            Ok(ProjectionPackage {
+                package,
+                record_count,
+                payload: postcard::to_stdvec(&records).map_err(|error| error.to_string())?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ProjectionBuild {
+        packages,
+        summary: Vec::new(),
+        surface_digest: String::new(),
     })
 }
 
