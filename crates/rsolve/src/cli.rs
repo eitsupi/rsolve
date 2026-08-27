@@ -14,6 +14,7 @@ use tempfile::NamedTempFile;
 
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
+use crate::filesystem::ExistingPathIdentity;
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::ResolutionMetrics;
 use crate::orchestration::cran_registry_id;
@@ -390,7 +391,7 @@ fn run_lock_with_backend_progress(
     validate_output_path(&command.output)?;
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
-        if destinations_collide(&command.output, metrics_output)? {
+        if destination_paths_equal(&command.output, metrics_output)? {
             return Err(CliError::Value(
                 "--metrics-output must differ from --output".into(),
             ));
@@ -455,16 +456,48 @@ fn run_lock_with_backend_progress(
     let write_started = Instant::now();
     let changed = write_lockfile(&command.output, bytes.as_bytes())?;
     let write_ns = elapsed_ns(write_started)?;
+    let lock_identity = if command.metrics_output.is_some() {
+        Some(
+            ExistingPathIdentity::from_path(&command.output)
+                .map_err(|error| {
+                    CliError::Operational(format!(
+                        "cannot identify lock output {}: {error}",
+                        command.output.display()
+                    ))
+                })?
+                .ok_or_else(|| {
+                    CliError::Operational(format!(
+                        "lock output disappeared after write: {}",
+                        command.output.display()
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
     let mut metrics = resolved.metrics;
     metrics.phases.lock_projection_ns = Some(projection_ns);
     metrics.phases.lock_serialization_ns = Some(
         serialization_ns
             .checked_add(reserialization_ns)
-            .ok_or_else(|| CliError::Operational("metrics duration overflow".into()))?,
+            .ok_or_else(|| CliError::Operational("metrics overflow".into()))?,
     );
     metrics.phases.lock_round_trip_ns = Some(round_trip_ns);
     metrics.phases.atomic_lock_write_ns = changed.then_some(write_ns);
     if let Some(path) = command.metrics_output {
+        if let Some(report_identity) = ExistingPathIdentity::from_path(&path).map_err(|error| {
+            CliError::Operational(format!(
+                "cannot identify metrics output {}: {error}",
+                path.display()
+            ))
+        })? && lock_identity
+            .as_ref()
+            .is_some_and(|lock_identity| report_identity == *lock_identity)
+        {
+            return Err(CliError::Value(
+                "--metrics-output must differ from --output".into(),
+            ));
+        }
         let report = MetricsSuccessReport {
             schema_version: 1,
             metrics: metrics.clone(),
@@ -492,7 +525,7 @@ fn run_lock_with_backend_progress(
 
 fn elapsed_ns(started: Instant) -> Result<u64, CliError> {
     u64::try_from(started.elapsed().as_nanos())
-        .map_err(|_| CliError::Operational("metrics duration overflow".into()))
+        .map_err(|_| CliError::Operational("metrics overflow".into()))
 }
 
 fn destination_identity(path: &Path) -> Result<PathBuf, CliError> {
@@ -512,51 +545,10 @@ fn destination_identity(path: &Path) -> Result<PathBuf, CliError> {
     ))
 }
 
-fn destinations_collide(left: &Path, right: &Path) -> Result<bool, CliError> {
+fn destination_paths_equal(left: &Path, right: &Path) -> Result<bool, CliError> {
     let left = destination_identity(left)?;
     let right = destination_identity(right)?;
-    if left == right {
-        return Ok(true);
-    }
-    let (Some(left_parent), Some(right_parent)) = (left.parent(), right.parent()) else {
-        return Ok(false);
-    };
-    if left_parent != right_parent {
-        return Ok(false);
-    }
-    Ok(portable_basename_case_equal(
-        left.file_name(),
-        right.file_name(),
-    ))
-}
-
-/// Compare destination names conservatively across case-sensitive and
-/// case-insensitive filesystems. Invalid UTF-8 is compared without lossy
-/// conversion, while ASCII case folding remains available.
-fn portable_basename_case_equal(
-    left: Option<&std::ffi::OsStr>,
-    right: Option<&std::ffi::OsStr>,
-) -> bool {
-    let (Some(left), Some(right)) = (left, right) else {
-        return false;
-    };
-    let left_bytes = left.as_encoded_bytes();
-    let right_bytes = right.as_encoded_bytes();
-    if ascii_case_equal(left_bytes, right_bytes) {
-        return true;
-    }
-    match (left.to_str(), right.to_str()) {
-        (Some(left), Some(right)) => left.to_lowercase() == right.to_lowercase(),
-        _ => false,
-    }
-}
-
-fn ascii_case_equal(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    Ok(left == right)
 }
 
 fn canonical_mirror(input: &str) -> Result<Box<str>, CliError> {

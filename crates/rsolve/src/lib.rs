@@ -4,6 +4,7 @@
 //! implementation into the binary beyond composition responsibilities.
 
 pub mod cli;
+pub(crate) mod filesystem;
 pub mod lock;
 pub mod manifest;
 pub(crate) mod metadata_cache;

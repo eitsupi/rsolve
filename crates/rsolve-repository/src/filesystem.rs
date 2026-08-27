@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -104,13 +104,17 @@ pub(super) fn hash_file(path: &Path) -> Result<String, MaterializationError> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
-pub(super) fn copy_file(source: &Path, destination: &Path) -> Result<(), MaterializationError> {
-    fs::copy(source, destination)
-        .map_err(|error| io_error("copy cache object", destination, error))?;
-    make_writable(destination)?;
-    File::open(destination)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| io_error("sync copied artifact", destination, error))
+pub(super) fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut input = File::open(source)?;
+    io::copy(&mut input, &mut output)?;
+    output.flush()?;
+    output.sync_all()?;
+    drop(output);
+    make_writable_io(destination)
 }
 
 pub(super) fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
@@ -146,11 +150,6 @@ pub(super) fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
             "reflink clone is unavailable on this target",
         ))
     }
-}
-
-fn make_writable(path: &Path) -> Result<(), MaterializationError> {
-    make_writable_io(path)
-        .map_err(|source| io_error("make materialized artifact writable", path, source))
 }
 
 fn make_writable_io(path: &Path) -> io::Result<()> {

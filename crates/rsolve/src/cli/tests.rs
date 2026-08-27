@@ -129,13 +129,24 @@ fn metrics_output_symlink_is_rejected_without_touching_target() {
 
 #[cfg(unix)]
 #[test]
-fn non_utf8_case_insensitive_destination_names_are_compared_without_lossy_conversion() {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
+fn metrics_output_hardlink_alias_is_rejected_without_touching_lock() {
+    let output = temp_path("metrics-hardlink-lock");
+    let report = temp_path("metrics-hardlink-report");
+    run_lock_with_backend(matrix_command("4.4.0", output.clone()), &MatrixBackend).unwrap();
+    let lock_bytes = fs::read(&output).unwrap();
+    fs::hard_link(&output, &report).unwrap();
 
-    let lower = OsString::from_vec(b"lock-\xff.toml".to_vec());
-    let upper = OsString::from_vec(b"LOCK-\xff.TOML".to_vec());
-    assert!(portable_basename_case_equal(Some(&lower), Some(&upper)));
+    let mut command = matrix_command("4.4.0", output.clone());
+    command.metrics_output = Some(report.clone());
+    let result = run_lock_with_backend(command, &MatrixBackend);
+    assert!(matches!(
+        result,
+        Err(CliError::Value(message)) if message.contains("must differ")
+    ));
+    assert_eq!(fs::read(&output).unwrap(), lock_bytes);
+    assert_eq!(fs::read(&report).unwrap(), lock_bytes);
+    fs::remove_file(output).unwrap();
+    fs::remove_file(report).unwrap();
 }
 
 #[test]
@@ -163,15 +174,37 @@ fn metrics_output_rejects_equivalent_lock_destination() {
 }
 
 #[test]
-fn metrics_output_rejects_case_insensitive_lock_destination() {
-    let directory = temp_path("case-collision");
+fn metrics_output_case_variant_follows_filesystem_identity() {
+    let directory = temp_path("case-identity");
     fs::create_dir(&directory).unwrap();
     let output = directory.join("lock.toml");
-    let parent = output.parent().unwrap();
+    let metrics = directory.join("LOCK.TOML");
+    fs::write(&output, b"probe").unwrap();
+    let can_create_variant = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&metrics)
+        .is_ok();
+    if can_create_variant {
+        fs::remove_file(&metrics).unwrap();
+    }
+    fs::remove_file(&output).unwrap();
     let mut command = matrix_command("4.4.0", output.clone());
-    command.metrics_output = Some(parent.join("LOCK.TOML"));
+    command.metrics_output = Some(metrics.clone());
     let result = run_lock_with_backend(command, &MatrixBackend);
-    assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
+    if can_create_variant {
+        assert!(result.is_ok());
+        assert!(output.exists());
+        assert!(metrics.exists());
+    } else {
+        assert!(matches!(result, Err(CliError::Value(message)) if message.contains("must differ")));
+        assert!(output.exists());
+        assert!(metrics.exists());
+    }
+    fs::remove_file(output).unwrap();
+    if metrics.exists() {
+        fs::remove_file(metrics).unwrap();
+    }
     fs::remove_dir(directory).unwrap();
 }
 

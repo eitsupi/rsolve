@@ -501,26 +501,29 @@ fn materialize_files(
             selected.version
         ));
         verify_cache_object(&selected.artifact)?;
-        let partial = destination.with_file_name(format!(".partial.{}", unique_nonce()));
-        let method = match clone_file(selected.artifact.path(), &partial) {
+        let method = match clone_file(selected.artifact.path(), &destination) {
             Ok(()) => MaterializationMethod::Clone,
             Err(source) if clone_unsupported(&source) => {
-                copy_file(selected.artifact.path(), &partial)?;
+                match copy_file(selected.artifact.path(), &destination) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                        return Err(MaterializationError::DuplicateDestination {
+                            path: destination,
+                        });
+                    }
+                    Err(source) => {
+                        return Err(io_error("copy cache object", &destination, source));
+                    }
+                }
                 MaterializationMethod::Copy
             }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(MaterializationError::DuplicateDestination { path: destination });
+            }
             Err(source) => {
-                let _ = fs::remove_file(&partial);
                 return Err(io_error("clone cache object", &destination, source));
             }
         };
-        if let Err(source) = fs::rename(&partial, &destination) {
-            let _ = fs::remove_file(&partial);
-            return Err(io_error(
-                "publish repository artifact",
-                &destination,
-                source,
-            ));
-        }
         methods.push(method);
     }
     Ok(methods)
@@ -660,5 +663,54 @@ pub(super) fn identity_key(identity: &ReleaseIdentity) -> String {
         Provenance::ImmutableSource { scheme, digest } => {
             format!("immutable:{scheme}:{digest}::{name}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::unique_nonce;
+    use rsolve_core::{PackageName, Sha256Digest, SourceScheme};
+
+    #[test]
+    fn destination_collision_preserves_existing_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "rsolve-materialization-collision-{}",
+            unique_nonce()
+        ));
+        let contrib = root.join("src").join("contrib");
+        fs::create_dir_all(&contrib).unwrap();
+        let source = root.join("source.bin");
+        let source_bytes = b"source bytes";
+        fs::write(&source, source_bytes).unwrap();
+        let digest = Sha256Digest::new(hex_lower(&Sha256::digest(source_bytes))).unwrap();
+        let cached = crate::CachedArtifact {
+            object_path: source,
+            metadata_path: root.join("source.json"),
+            sha256: digest.clone(),
+            size: source_bytes.len() as u64,
+            verification: crate::VerificationStrength::None,
+        };
+        let selected = MaterializationArtifact::new(
+            ReleaseIdentity::new(
+                PackageName::new("collision").unwrap(),
+                Provenance::ImmutableSource {
+                    scheme: SourceScheme::new("fixture").unwrap(),
+                    digest,
+                },
+            ),
+            RPackageVersion::parse("1.0.0").unwrap(),
+            cached,
+        );
+        let destination = contrib.join("collision_1.0.0.tar.gz");
+        fs::write(&destination, b"keep existing bytes").unwrap();
+
+        let result = materialize_files(&contrib, std::slice::from_ref(&selected));
+        assert!(matches!(
+            result,
+            Err(MaterializationError::DuplicateDestination { path }) if path == destination
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"keep existing bytes");
+        fs::remove_dir_all(root).unwrap();
     }
 }
