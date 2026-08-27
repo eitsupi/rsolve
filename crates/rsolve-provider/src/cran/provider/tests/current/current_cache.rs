@@ -231,6 +231,96 @@ fn corrupt_current_package_projection_rebuilds_from_cached_raw_without_transport
 }
 
 #[test]
+fn semantically_invalid_current_package_projection_rebuilds_from_cached_raw() {
+    #[derive(serde::Serialize)]
+    struct TestRecord {
+        record_index: usize,
+        package: String,
+        fields: Vec<(String, String)>,
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::snapshot::SnapshotStore::open(
+        directory.path(),
+        rsolve_core::RegistryId::new("cran").unwrap(),
+    )
+    .unwrap();
+    let body = current_gzip_body();
+    let first_transport = session_transport(
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(200, body.clone()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    let mut first = CranRefreshSession::new_with_clock(
+        Rc::new(first_transport),
+        CranMetadataConfig::new("https://cran.invalid", ""),
+        Some("2026-08-23T00:00:00Z".parse().unwrap()),
+        Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
+    );
+    first.ensure_current().unwrap();
+    drop(first);
+
+    let cache = crate::cran::provider::raw_cache::RawCache::open(&store).unwrap();
+    let key = cache
+        .key(&current_gzip_url(), RawCacheRepresentation::CurrentGzip)
+        .unwrap();
+    let digest = Sha256::digest(&body);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection = cache.projection_path_in_namespace(
+        crate::cran::provider::raw_cache::ProjectionNamespace::Current,
+        &key,
+        &digest,
+    );
+    let payload = postcard::to_stdvec(&vec![TestRecord {
+        record_index: 0,
+        package: "Matrix".into(),
+        fields: vec![
+            ("Package".into(), "Matrix".into()),
+            ("Version".into(), "not-a-version".into()),
+        ],
+    }])
+    .unwrap();
+    crate::cran::provider::raw_cache::projection::overwrite_projection_package(
+        &projection,
+        "Matrix",
+        payload,
+    );
+
+    let mut second_transport = session_transport(
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+        TransportResponse::new(404, Vec::new()),
+    );
+    second_transport
+        .responses
+        .insert(history_url(), TransportResponse::new(404, Vec::new()));
+    let requests = second_transport.requests.clone();
+    let mut second = CranRefreshSession::new_with_clock(
+        Rc::new(second_transport),
+        CranMetadataConfig::new("https://cran.invalid", "").without_allpackages_history(),
+        Some("2026-08-23T00:00:01Z".parse().unwrap()),
+        Some(crate::cran::provider::raw_cache::RawCache::open(&store).unwrap()),
+    );
+    CranRefreshSession::<FixtureTransport>::reset_current_projection_build_count();
+    second
+        .refresh_package(&PackageName::new("Matrix").unwrap())
+        .expect("semantic projection corruption should self-heal");
+    assert_eq!(
+        CranRefreshSession::<FixtureTransport>::current_projection_build_count(),
+        1
+    );
+    assert!(
+        !requests
+            .borrow()
+            .iter()
+            .any(|request| request.url == current_gzip_url())
+    );
+}
+
+#[test]
 fn recommended_overlay_does_not_invalidate_unrelated_current_candidates() {
     let current = b"Package: rlang\nVersion: 1.1.0\nLicense: MIT\n\n\
 Package: survival\nVersion: 3.8-11\nDepends: R (>= 4.1.0)\nMD5sum: root\n\n\

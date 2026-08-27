@@ -400,10 +400,10 @@ impl CurrentProjection {
                         "current package projection is unavailable after a failed rebuild",
                     ));
                 };
-                Self::decode_projection_package(projection, package)
+                Self::decode_projection_observations(projection, package)
             };
-            let records = match result {
-                Ok(records) => records,
+            let observations = match result {
+                Ok(observations) => observations,
                 Err(CurrentProjectionFailure::Storage(error)) => {
                     return Err(CandidateLoadError::new(
                         CandidateLoadErrorCategory::SnapshotInvalid,
@@ -435,7 +435,7 @@ impl CurrentProjection {
                             "current package projection is unavailable after rebuild",
                         ));
                     };
-                    Self::decode_projection_package(projection, package).map_err(|error| {
+                    Self::decode_projection_observations(projection, package).map_err(|error| {
                         CandidateLoadError::new(
                             CandidateLoadErrorCategory::SnapshotInvalid,
                             format!("invalid current package projection after rebuild: {error:?}"),
@@ -443,7 +443,7 @@ impl CurrentProjection {
                     })?
                 }
             };
-            return Ok(Self::observations_from_records(records, package));
+            return Ok(observations);
         }
         let observations = self
             .eager_observations
@@ -506,6 +506,22 @@ impl CurrentProjection {
             CranCatalogRecordContext::PackagesIndex,
             Some(package),
         )
+    }
+
+    fn decode_projection_observations(
+        projection: &PackageProjection,
+        package: &PackageName,
+    ) -> Result<super::super::catalog::CranProviderObservationProjection, CurrentProjectionFailure>
+    {
+        let records = Self::decode_projection_package(projection, package)?;
+        let observations = Self::observations_from_records(records, package);
+        if let Some(rejection) = observations.rejections.first() {
+            return Err(CurrentProjectionFailure::Semantic(format!(
+                "current package projection contains an invalid record: {}",
+                rejection.diagnostic()
+            )));
+        }
+        Ok(observations)
     }
 
     pub(super) fn materialize_catalog(&self) -> Result<CranCatalog, CandidateLoadError> {
@@ -587,6 +603,12 @@ impl CurrentProjection {
                     CranCatalogRecordContext::PackagesIndex,
                     Some(&package),
                 );
+                if let Some(rejection) = projection.rejections.first() {
+                    return Err(format!(
+                        "current package projection contains an invalid record: {}",
+                        rejection.diagnostic()
+                    ));
+                }
                 observations.extend(projection.observations);
                 Ok(())
             })
