@@ -17,7 +17,9 @@ use super::model::{
     CranRefreshProgressCallback, DEFAULT_COMPATIBLE_GENERATION_TTL,
 };
 use super::qualification;
-use super::raw_cache::projection::{PackageProjection, ProjectionLookupError};
+use super::raw_cache::projection::{
+    PackageProjection, ProjectionLookupError, ProjectionVisitError,
+};
 use super::raw_cache::{RawCache, RawCacheEntry, RawCacheRepresentation};
 use super::transport::{Transport, TransportResponse};
 use super::{
@@ -283,9 +285,17 @@ pub(super) struct BulkCandidateResult {
 }
 
 pub(super) struct CurrentProjection {
-    projection: Option<PackageProjection>,
+    projection: Option<Rc<RefCell<Option<PackageProjection>>>>,
+    rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+    rebuild_attempted: Rc<Cell<bool>>,
     eager_observations: Rc<[CranCatalogObservation]>,
     surface_digest: Box<str>,
+}
+
+#[derive(Debug)]
+enum CurrentProjectionFailure {
+    Storage(String),
+    Semantic(String),
 }
 
 impl fmt::Debug for CurrentProjection {
@@ -303,10 +313,15 @@ impl fmt::Debug for CurrentProjection {
 }
 
 impl CurrentProjection {
-    pub(super) fn new(projection: PackageProjection) -> Self {
+    pub(super) fn new(
+        projection: PackageProjection,
+        rebuild: Option<Rc<dyn Fn() -> Result<PackageProjection, String>>>,
+    ) -> Self {
         let surface_digest = projection.surface_digest().into();
         Self {
-            projection: Some(projection),
+            projection: Some(Rc::new(RefCell::new(Some(projection)))),
+            rebuild,
+            rebuild_attempted: Rc::new(Cell::new(false)),
             eager_observations: Rc::from([]),
             surface_digest,
         }
@@ -316,6 +331,8 @@ impl CurrentProjection {
         let surface_digest = catalog_surface_digest(&catalog);
         Self {
             projection: None,
+            rebuild: None,
+            rebuild_attempted: Rc::new(Cell::new(false)),
             eager_observations: Rc::from(observations.into_boxed_slice()),
             surface_digest,
         }
@@ -334,7 +351,12 @@ impl CurrentProjection {
                     .collect::<std::collections::BTreeSet<_>>()
                     .len()
             },
-            PackageProjection::package_count,
+            |projection| {
+                projection
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, PackageProjection::package_count)
+            },
         )
     }
 
@@ -369,47 +391,59 @@ impl CurrentProjection {
         &self,
         package: &PackageName,
     ) -> Result<super::super::catalog::CranProviderObservationProjection, CandidateLoadError> {
-        if let Some(projection) = &self.projection {
-            let Some(payload) = projection
-                .lookup_package(package.as_str())
-                .map_err(|error| {
-                    CandidateLoadError::new(
+        if let Some(projection_cell) = &self.projection {
+            let result = {
+                let projection_ref = projection_cell.borrow();
+                let Some(projection) = projection_ref.as_ref() else {
+                    return Err(CandidateLoadError::new(
                         CandidateLoadErrorCategory::SnapshotInvalid,
-                        error.to_string(),
-                    )
-                })?
-            else {
-                return Ok(super::super::catalog::provider_observations_from_fields(
-                    Vec::new(),
-                    CranCatalogRecordContext::PackagesIndex,
-                    Some(package),
-                ));
+                        "current package projection is unavailable after a failed rebuild",
+                    ));
+                };
+                Self::decode_projection_package(projection, package)
             };
-            let record_count = payload.record_count;
-            let records =
-                current::decode_current_records(&payload.bytes, package).map_err(|error| {
-                    CandidateLoadError::new(
+            let records = match result {
+                Ok(records) => records,
+                Err(CurrentProjectionFailure::Storage(error)) => {
+                    return Err(CandidateLoadError::new(
                         CandidateLoadErrorCategory::SnapshotInvalid,
-                        format!("invalid current package projection: {error}"),
-                    )
-                })?;
-            if records.len() != record_count {
-                return Err(CandidateLoadError::new(
-                    CandidateLoadErrorCategory::SnapshotInvalid,
-                    format!(
-                        "current package projection record count mismatch: expected {}, stored {record_count}",
-                        records.len()
-                    ),
-                ));
-            }
-            return Ok(super::super::catalog::provider_observations_from_fields(
-                records
-                    .into_iter()
-                    .map(|record| (record.record_index, Some(record.package), record.fields))
-                    .collect(),
-                CranCatalogRecordContext::PackagesIndex,
-                Some(package),
-            ));
+                        error,
+                    ));
+                }
+                Err(CurrentProjectionFailure::Semantic(error)) => {
+                    let Some(rebuild) = &self.rebuild else {
+                        return Err(Self::invalid_projection_error(error));
+                    };
+                    if self.rebuild_attempted.replace(true) {
+                        return Err(Self::invalid_projection_error(error));
+                    }
+                    let old_projection = projection_cell.borrow_mut().take();
+                    drop(old_projection);
+                    let rebuilt = rebuild().map_err(|rebuild_error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!(
+                                "failed to rebuild current package projection: {rebuild_error}"
+                            ),
+                        )
+                    })?;
+                    *projection_cell.borrow_mut() = Some(rebuilt);
+                    let projection_ref = projection_cell.borrow();
+                    let Some(projection) = projection_ref.as_ref() else {
+                        return Err(CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            "current package projection is unavailable after rebuild",
+                        ));
+                    };
+                    Self::decode_projection_package(projection, package).map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("invalid current package projection after rebuild: {error:?}"),
+                        )
+                    })?
+                }
+            };
+            return Ok(Self::observations_from_records(records, package));
         }
         let observations = self
             .eager_observations
@@ -423,40 +457,145 @@ impl CurrentProjection {
         })
     }
 
-    pub(super) fn materialize_catalog(&self) -> Result<CranCatalog, CandidateLoadError> {
-        if let Some(catalog) = &self.projection {
-            let mut observations = Vec::new();
-            catalog
-                .visit_packages(|package, payload, record_count| {
-                    let package = PackageName::new(package).map_err(|error| error.to_string())?;
-                    let records = current::decode_current_records(payload, &package)?;
-                    if records.len() != record_count {
-                        return Err(format!(
-                            "current package projection record count mismatch: expected {}, stored {record_count}",
-                            records.len()
-                        ));
+    fn invalid_projection_error(error: String) -> CandidateLoadError {
+        CandidateLoadError::new(
+            CandidateLoadErrorCategory::SnapshotInvalid,
+            format!("invalid current package projection: {error}"),
+        )
+    }
+
+    fn decode_projection_package(
+        projection: &PackageProjection,
+        package: &PackageName,
+    ) -> Result<Vec<current::CurrentProjectionRecord>, CurrentProjectionFailure> {
+        let Some(payload) =
+            projection
+                .lookup_package(package.as_str())
+                .map_err(|error| match error {
+                    ProjectionLookupError::Storage(error) => {
+                        CurrentProjectionFailure::Storage(error)
                     }
-                    let projection = super::super::catalog::provider_observations_from_fields(
-                        records
-                            .into_iter()
-                            .map(|record| {
-                                (record.record_index, Some(record.package), record.fields)
-                            })
-                            .collect(),
-                        CranCatalogRecordContext::PackagesIndex,
-                        Some(&package),
-                    );
-                    observations.extend(projection.observations);
-                    Ok(())
-                })
-                .map_err(|error| {
-                    CandidateLoadError::new(CandidateLoadErrorCategory::SnapshotInvalid, error)
-                })?;
-            return Ok(CranCatalog::from_provider_observations(&observations));
+                    ProjectionLookupError::Invalid(error) => {
+                        CurrentProjectionFailure::Semantic(error)
+                    }
+                })?
+        else {
+            return Ok(Vec::new());
+        };
+        let record_count = payload.record_count;
+        let records = current::decode_current_records(&payload.bytes, package)
+            .map_err(CurrentProjectionFailure::Semantic)?;
+        if records.len() != record_count {
+            return Err(CurrentProjectionFailure::Semantic(format!(
+                "current package projection record count mismatch: expected {}, stored {record_count}",
+                records.len()
+            )));
+        }
+        Ok(records)
+    }
+
+    fn observations_from_records(
+        records: Vec<current::CurrentProjectionRecord>,
+        package: &PackageName,
+    ) -> super::super::catalog::CranProviderObservationProjection {
+        super::super::catalog::provider_observations_from_fields(
+            records
+                .into_iter()
+                .map(|record| (record.record_index, Some(record.package), record.fields))
+                .collect(),
+            CranCatalogRecordContext::PackagesIndex,
+            Some(package),
+        )
+    }
+
+    pub(super) fn materialize_catalog(&self) -> Result<CranCatalog, CandidateLoadError> {
+        if let Some(projection_cell) = &self.projection {
+            let result = {
+                let projection_ref = projection_cell.borrow();
+                let Some(projection) = projection_ref.as_ref() else {
+                    return Err(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::SnapshotInvalid,
+                        "current package projection is unavailable after a failed rebuild",
+                    ));
+                };
+                Self::materialize_projection(projection)
+            };
+            return match result {
+                Ok(catalog) => Ok(catalog),
+                Err(CurrentProjectionFailure::Storage(error)) => Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::SnapshotInvalid,
+                    error,
+                )),
+                Err(CurrentProjectionFailure::Semantic(error)) => {
+                    let Some(rebuild) = &self.rebuild else {
+                        return Err(Self::invalid_projection_error(error));
+                    };
+                    if self.rebuild_attempted.replace(true) {
+                        return Err(Self::invalid_projection_error(error));
+                    }
+                    let old_projection = projection_cell.borrow_mut().take();
+                    drop(old_projection);
+                    let rebuilt = rebuild().map_err(|rebuild_error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!(
+                                "failed to rebuild current package projection: {rebuild_error}"
+                            ),
+                        )
+                    })?;
+                    *projection_cell.borrow_mut() = Some(rebuilt);
+                    let projection_ref = projection_cell.borrow();
+                    let Some(projection) = projection_ref.as_ref() else {
+                        return Err(CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            "current package projection is unavailable after rebuild",
+                        ));
+                    };
+                    Self::materialize_projection(projection).map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::SnapshotInvalid,
+                            format!("invalid current package projection after rebuild: {error:?}"),
+                        )
+                    })
+                }
+            };
         }
         Ok(CranCatalog::from_provider_observations(
             &self.eager_observations,
         ))
+    }
+
+    fn materialize_projection(
+        projection: &PackageProjection,
+    ) -> Result<CranCatalog, CurrentProjectionFailure> {
+        let mut observations = Vec::new();
+        projection
+            .visit_packages_with_error(|package, payload, record_count| {
+                let package = PackageName::new(package).map_err(|error| error.to_string())?;
+                let records = current::decode_current_records(payload, &package)?;
+                if records.len() != record_count {
+                    return Err(format!(
+                        "current package projection record count mismatch: expected {}, stored {record_count}",
+                        records.len()
+                    ));
+                }
+                let projection = super::super::catalog::provider_observations_from_fields(
+                    records
+                        .into_iter()
+                        .map(|record| (record.record_index, Some(record.package), record.fields))
+                        .collect(),
+                    CranCatalogRecordContext::PackagesIndex,
+                    Some(&package),
+                );
+                observations.extend(projection.observations);
+                Ok(())
+            })
+            .map_err(|error| match error {
+                ProjectionVisitError::Storage(error) => CurrentProjectionFailure::Storage(error),
+                ProjectionVisitError::Invalid(error) => CurrentProjectionFailure::Semantic(error),
+                ProjectionVisitError::Visitor(error) => CurrentProjectionFailure::Semantic(error),
+            })?;
+        Ok(CranCatalog::from_provider_observations(&observations))
     }
 }
 

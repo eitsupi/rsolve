@@ -274,17 +274,39 @@ impl<T: Transport> CranRefreshSession<T> {
                     _ => None,
                 };
                 let parsed = match projection_path.as_ref() {
-                    Some(path) => PackageProjection::open_or_build(
-                        path,
-                        &body.body,
-                        ProjectionSourceKind::Current,
-                        current_projection_contract(),
-                        || {
-                            build_current_projection(representation, &body.body)
-                                .map(|(build, _, _)| build)
-                        },
-                    )
-                    .map(CurrentProjection::new),
+                    Some(path) => {
+                        let rebuild_path = path.clone();
+                        let rebuild_body = body.body.clone();
+                        let rebuild: Rc<dyn Fn() -> Result<PackageProjection, String>> =
+                            Rc::new(move || {
+                                PackageProjection::rebuild_validated(
+                                    &rebuild_path,
+                                    &rebuild_body,
+                                    ProjectionSourceKind::Current,
+                                    current_projection_contract(),
+                                    || {
+                                        build_current_projection(representation, &rebuild_body)
+                                            .map(|(build, _, _)| build)
+                                    },
+                                    |_| Ok(()),
+                                )
+                                .map_err(|error| match error {
+                                    ProjectionError::Build(error)
+                                    | ProjectionError::Storage(error) => error,
+                                })
+                            });
+                        PackageProjection::open_or_build(
+                            path,
+                            &body.body,
+                            ProjectionSourceKind::Current,
+                            current_projection_contract(),
+                            || {
+                                build_current_projection(representation, &body.body)
+                                    .map(|(build, _, _)| build)
+                            },
+                        )
+                        .map(|projection| CurrentProjection::new(projection, Some(rebuild)))
+                    }
                     None => build_current_projection(representation, &body.body)
                         .map(|(build, catalog, observations)| {
                             debug_assert_eq!(

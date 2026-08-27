@@ -87,6 +87,12 @@ pub(crate) enum ProjectionLookupError {
     Invalid(String),
 }
 
+pub(crate) enum ProjectionVisitError<E> {
+    Storage(String),
+    Invalid(String),
+    Visitor(E),
+}
+
 impl std::fmt::Display for ProjectionLookupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -282,56 +288,101 @@ impl PackageProjection {
     where
         F: FnMut(&str, &[u8], usize) -> Result<(), String>,
     {
+        self.visit_packages_with_error(|package, payload, record_count| {
+            visitor(package, payload, record_count)
+        })
+        .map_err(|error| match error {
+            ProjectionVisitError::Storage(error)
+            | ProjectionVisitError::Invalid(error)
+            | ProjectionVisitError::Visitor(error) => error,
+        })
+    }
+
+    pub(crate) fn visit_packages_with_error<F, E>(
+        &self,
+        mut visitor: F,
+    ) -> Result<(), ProjectionVisitError<E>>
+    where
+        F: FnMut(&str, &[u8], usize) -> Result<(), E>,
+    {
         #[cfg(test)]
         VISIT_PACKAGE_RECORDS_COUNT.with(|counter| counter.set(counter.get() + 1));
         let read = self
             .database
             .begin_read()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
         let packages = read
             .open_table(PACKAGES)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
         let counts = read
             .open_table(PACKAGE_COUNTS)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
         let mut package_count = 0usize;
         let mut record_count = 0usize;
-        for item in packages.iter().map_err(|error| error.to_string())? {
-            let (key, value) = item.map_err(|error| error.to_string())?;
+        for item in packages
+            .iter()
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?
+        {
+            let (key, value) =
+                item.map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
             if key.value().is_empty() || value.value().is_empty() {
-                return Err("invalid package projection payload entry".into());
+                return Err(ProjectionVisitError::Invalid(
+                    "invalid package projection payload entry".into(),
+                ));
             }
-            let Some(count) = counts.get(key.value()).map_err(|error| error.to_string())? else {
-                return Err("package projection payload has no count entry".into());
+            let Some(count) = counts
+                .get(key.value())
+                .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?
+            else {
+                return Err(ProjectionVisitError::Invalid(
+                    "package projection payload has no count entry".into(),
+                ));
             };
             if count.value() == 0 {
-                return Err("invalid package projection count entry".into());
+                return Err(ProjectionVisitError::Invalid(
+                    "invalid package projection count entry".into(),
+                ));
             }
-            let count = usize::try_from(count.value())
-                .map_err(|_| "package projection record count exceeds usize".to_owned())?;
-            package_count = package_count
-                .checked_add(1)
-                .ok_or_else(|| "package projection package count overflow".to_owned())?;
-            record_count = record_count
-                .checked_add(count)
-                .ok_or_else(|| "package projection record count overflow".to_owned())?;
-            visitor(key.value(), value.value(), count)?;
+            let count = usize::try_from(count.value()).map_err(|_| {
+                ProjectionVisitError::Invalid(
+                    "package projection record count exceeds usize".to_owned(),
+                )
+            })?;
+            package_count = package_count.checked_add(1).ok_or_else(|| {
+                ProjectionVisitError::Invalid(
+                    "package projection package count overflow".to_owned(),
+                )
+            })?;
+            record_count = record_count.checked_add(count).ok_or_else(|| {
+                ProjectionVisitError::Invalid("package projection record count overflow".to_owned())
+            })?;
+            visitor(key.value(), value.value(), count).map_err(ProjectionVisitError::Visitor)?;
         }
-        for item in counts.iter().map_err(|error| error.to_string())? {
-            let (key, count) = item.map_err(|error| error.to_string())?;
+        for item in counts
+            .iter()
+            .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?
+        {
+            let (key, count) =
+                item.map_err(|error| ProjectionVisitError::Storage(error.to_string()))?;
             if key.value().is_empty() || count.value() == 0 {
-                return Err("invalid package projection count entry".into());
+                return Err(ProjectionVisitError::Invalid(
+                    "invalid package projection count entry".into(),
+                ));
             }
             if packages
                 .get(key.value())
-                .map_err(|error| error.to_string())?
+                .map_err(|error| ProjectionVisitError::Storage(error.to_string()))?
                 .is_none()
             {
-                return Err("package projection count has no payload".into());
+                return Err(ProjectionVisitError::Invalid(
+                    "package projection count has no payload".into(),
+                ));
             }
         }
         if package_count != self.header.package_count || record_count != self.header.record_count {
-            return Err("package projection counts do not match its header".into());
+            return Err(ProjectionVisitError::Invalid(
+                "package projection counts do not match its header".into(),
+            ));
         }
         Ok(())
     }
