@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::super::catalog::{CranCatalog, CranCatalogObservation};
 use crate::cran::history::ArchiveEntry;
-use rsolve_core::PackageRelease;
+use rsolve_core::{PackageRelease, RPackageVersion};
 use serde::Deserialize;
 use sha2::Digest;
 
@@ -32,6 +32,7 @@ thread_local! {
     static PROJECTION_BUILD_COUNT: Cell<usize> = const { Cell::new(0) };
     static PROJECTION_DECODE_COUNT: Cell<usize> = const { Cell::new(0) };
     static CLASSIFY_CURRENT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static CLASSIFY_CURRENT_RECORD_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -39,6 +40,7 @@ pub(super) fn reset_test_counters() {
     PROJECTION_BUILD_COUNT.with(|counter| counter.set(0));
     PROJECTION_DECODE_COUNT.with(|counter| counter.set(0));
     CLASSIFY_CURRENT_COUNT.with(|counter| counter.set(0));
+    CLASSIFY_CURRENT_RECORD_COUNT.with(|counter| counter.set(0));
 }
 
 #[cfg(test)]
@@ -52,6 +54,11 @@ pub(super) fn test_counters() -> (usize, usize) {
 #[cfg(test)]
 pub(super) fn classify_current_count() -> usize {
     CLASSIFY_CURRENT_COUNT.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn classify_current_record_count() -> usize {
+    CLASSIFY_CURRENT_RECORD_COUNT.with(Cell::get)
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -125,14 +132,27 @@ pub(super) fn classify_current(
     projection
         .visit_selected_packages(&packages, |package, payload| {
             let records = decode_records(payload, package)?;
-            let observation_projection = allpackages_observations_from_fields(
-                records
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, record)| (index, record.package, record.fields))
-                    .collect(),
-            );
             let releases = package_index.get(package).copied().unwrap_or(&[]);
+            let records = records
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, record)| {
+                    let version = record
+                        .fields
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("Version"))
+                        .and_then(|(_, value)| RPackageVersion::parse(value.trim()).ok());
+                    version
+                        .is_some_and(|version| {
+                            releases.iter().any(|release| release.version() == &version)
+                        })
+                        .then_some((index, record.package, record.fields))
+                })
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            CLASSIFY_CURRENT_RECORD_COUNT
+                .with(|counter| counter.set(counter.get() + records.len()));
+            let observation_projection = allpackages_observations_from_fields(records);
             for release in releases {
                 let matching = observation_projection
                     .observations
@@ -584,6 +604,58 @@ mod tests {
             CoverageStatus::CurrentConflicting
         );
         assert_eq!(conflicting_summary.conflicting_count, 1);
+    }
+
+    #[test]
+    fn classify_current_converts_only_records_with_current_versions() {
+        let current = current_catalog();
+        let mut matching = current_row("BSD-3-Clause");
+        matching
+            .fields
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Version"))
+            .unwrap()
+            .1 = "1.0".into();
+        let (_directory, projection) = projection_with_rows(vec![
+            matching,
+            IndexedRecord {
+                package: Some("Matrix".into()),
+                fields: vec![
+                    ("Package".into(), "Matrix".into()),
+                    ("Version".into(), "0.9.0".into()),
+                    ("License".into(), "not-a-valid-license".into()),
+                ],
+            },
+            IndexedRecord {
+                package: Some("Matrix".into()),
+                fields: vec![("Package".into(), "Matrix".into())],
+            },
+        ]);
+
+        reset_test_counters();
+        let summary = classify_current(&projection, &current).unwrap();
+
+        assert_eq!(summary.status, CoverageStatus::CurrentComplete);
+        assert_eq!(classify_current_record_count(), 1);
+    }
+
+    #[test]
+    fn current_version_semantic_rejection_is_classified_as_conflicting() {
+        let current = current_catalog();
+        let (_directory, projection) = projection_with_rows(vec![IndexedRecord {
+            package: Some("Matrix".into()),
+            fields: vec![
+                ("Package".into(), "Matrix".into()),
+                ("Version".into(), "1.0.0".into()),
+                ("Depends".into(), "R (= 1.0.0)".into()),
+                ("License".into(), "BSD-3-Clause".into()),
+            ],
+        }]);
+
+        let summary = classify_current(&projection, &current).unwrap();
+
+        assert_eq!(summary.status, CoverageStatus::CurrentConflicting);
+        assert_eq!(summary.conflicting_count, 1);
     }
 
     #[test]
