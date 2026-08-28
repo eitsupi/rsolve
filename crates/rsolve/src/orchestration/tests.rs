@@ -1,11 +1,12 @@
 use super::*;
+use crate::manifest::{Endpoint, RegistrySpec, RepositorySpec};
 use crate::{LockedPackage, LockedResolution};
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
     DeclaredDependency, DependencyKind, DependencySourceConstraint, GitCommitId, NormalizedGitUrl,
     PackageName, PackageNamespace, PackageRelease, Provenance, RPackageVersion, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, ResolutionTarget, Sha256Digest, SolverKey, SourceScheme,
-    VersionConstraint,
+    ReleaseMetadata, ReleaseObservation, RepositoryId, ResolutionTarget, Sha256Digest, SolverKey,
+    SourceScheme, VersionConstraint,
 };
 use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_resolver::R_BASE_PACKAGE_NAMES;
@@ -366,22 +367,41 @@ fn manifest_for(name: PackageName) -> Manifest {
 
 #[test]
 fn cran_registry_ids_are_endpoint_scoped_and_canonical() {
-    let first = cran_registry_id("https://cloud.r-project.org/cran");
-    let same = cran_registry_id("https://cloud.r-project.org/cran");
-    let different = cran_registry_id("https://mirror.example.test/cran");
+    let first = cran_registry_id("https://cloud.r-project.org/cran").unwrap();
+    let same = cran_registry_id("https://cloud.r-project.org/cran").unwrap();
+    let different = cran_registry_id("https://mirror.example.test/cran").unwrap();
     assert_eq!(first, same);
     assert_ne!(first, different);
-    assert_eq!(
-        first.as_str(),
-        "cran-sha256:4d1af2a840d22f869630003ab8b6a4677859fb2dc2e67685eca7af1d2aeae7bf"
+    assert_eq!(first.as_str().len(), 64);
+    assert!(
+        first
+            .as_str()
+            .chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
     );
-    assert!(first.as_str().starts_with("cran-sha256:"));
-    assert!(first.as_str().chars().all(|character| {
-        character == ':'
-            || character == '-'
-            || character.is_ascii_digit()
-            || character.is_ascii_lowercase()
-    }));
+}
+
+#[test]
+fn cran_endpoint_normalization_is_shared_with_manifest_registry_identity() {
+    let endpoint = Endpoint::parse("https://cloud.r-project.org/cran///").unwrap();
+    let repository = RepositorySpec::new(
+        RepositoryId::new("cran").unwrap(),
+        RegistrySpec::Cran,
+        endpoint,
+    )
+    .unwrap();
+    let canonical = canonical_cran_endpoint(" https://cloud.r-project.org/cran/// ").unwrap();
+    assert_eq!(canonical.as_ref(), "https://cloud.r-project.org/cran///");
+    assert_eq!(
+        repository.configured_registry_id().unwrap(),
+        cran_registry_id(&canonical).unwrap()
+    );
+    assert!(matches!(
+        canonical_cran_endpoint("https://cloud.r-project.org:0"),
+        Err(CranResolutionError::Provider(
+            CranSnapshotRefresherError::InvalidBaseUrl { .. }
+        ))
+    ));
 }
 
 #[test]

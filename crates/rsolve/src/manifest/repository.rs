@@ -100,9 +100,9 @@ pub(super) fn normalize_url_path(path: &str) -> Result<String, ManifestError> {
     let trailing = path.ends_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
-        match part {
-            "." => {}
-            ".." => {
+        match dot_segment_kind(part) {
+            Some(DotSegment::Current) => {}
+            Some(DotSegment::Parent) => {
                 match parts.last() {
                     // The first empty segment is the URL's root marker; a
                     // parent segment cannot remove it.
@@ -129,7 +129,7 @@ pub(super) fn normalize_url_path(path: &str) -> Result<String, ManifestError> {
                     });
                 }
             }
-            value => parts.push(value),
+            None => parts.push(part),
         }
     }
     let mut result = parts.join("/");
@@ -156,9 +156,9 @@ pub(super) fn reject_raw_root_escape(input: &str) -> Result<(), ManifestError> {
     let path = path.split(['?', '#']).next().unwrap_or("");
     let mut segments = Vec::new();
     for segment in path.split('/') {
-        match segment {
-            "." => {}
-            ".." => {
+        match dot_segment_kind(segment) {
+            Some(DotSegment::Current) => {}
+            Some(DotSegment::Parent) => {
                 if segments.len() <= 1 {
                     return Err(ManifestError::InvalidEndpoint {
                         value: input.into(),
@@ -167,10 +167,52 @@ pub(super) fn reject_raw_root_escape(input: &str) -> Result<(), ManifestError> {
                 }
                 segments.pop();
             }
-            value => segments.push(value),
+            None => segments.push(segment),
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DotSegment {
+    Current,
+    Parent,
+}
+
+/// Recognize literal and percent-encoded dot path segments without decoding
+/// any other URL data.  This keeps query strings opaque while treating
+/// encoded traversal spellings exactly like their literal counterparts.
+fn dot_segment_kind(segment: &str) -> Option<DotSegment> {
+    if segment == "." {
+        return Some(DotSegment::Current);
+    }
+    if segment == ".." {
+        return Some(DotSegment::Parent);
+    }
+
+    let bytes = segment.as_bytes();
+    let mut index = 0;
+    let mut dots = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'.' {
+            dots += 1;
+            index += 1;
+        } else if index + 2 < bytes.len()
+            && bytes[index] == b'%'
+            && bytes[index + 1] == b'2'
+            && matches!(bytes[index + 2], b'e' | b'E')
+        {
+            dots += 1;
+            index += 3;
+        } else {
+            return None;
+        }
+    }
+    match dots {
+        1 => Some(DotSegment::Current),
+        2 => Some(DotSegment::Parent),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,21 +315,30 @@ impl RepositorySpec {
     /// The configured registry identity excludes repository IDs and ephemeral
     /// endpoint overrides by construction.
     pub fn configured_registry_id(&self) -> Result<RegistryId, ManifestError> {
-        let namespace = match &self.registry {
-            RegistrySpec::CranLike { namespace } => Some(namespace.as_str().as_bytes()),
-            _ => None,
-        };
-        let mut fields = vec![self.registry.tag().as_bytes()];
-        if let Some(namespace) = namespace {
-            fields.push(namespace);
-        }
-        fields.push(self.manifest_endpoint.as_str().as_bytes());
-        let digest = digest_fields(&fields);
-        RegistryId::new(hex_digest(&digest)).map_err(|error| ManifestError::InvalidRepository {
-            reason: error.to_string(),
-        })
+        configured_registry_id_for(&self.registry, &self.manifest_endpoint)
     }
+}
 
+pub(crate) fn configured_registry_id_for(
+    registry: &RegistrySpec,
+    endpoint: &Endpoint,
+) -> Result<RegistryId, ManifestError> {
+    let namespace = match registry {
+        RegistrySpec::CranLike { namespace } => Some(namespace.as_str().as_bytes()),
+        _ => None,
+    };
+    let mut fields = vec![registry.tag().as_bytes()];
+    if let Some(namespace) = namespace {
+        fields.push(namespace);
+    }
+    fields.push(endpoint.as_str().as_bytes());
+    let digest = digest_fields(&fields);
+    RegistryId::new(hex_digest(&digest)).map_err(|error| ManifestError::InvalidRepository {
+        reason: error.to_string(),
+    })
+}
+
+impl RepositorySpec {
     pub fn registry_id(&self) -> Result<RegistryId, ManifestError> {
         self.configured_registry_id()
     }

@@ -110,6 +110,8 @@ pub enum ManifestError {
     InvalidRepository { reason: String },
     DuplicateRepository { id: RepositoryId },
     UnknownRepositoryReference { id: RepositoryId, field: String },
+    UnknownEnvironmentGroup { environment: String, group: String },
+    DuplicateEnvironmentGroup { environment: String, group: String },
     InvalidIdentifier { kind: String, value: String },
     InvalidEndpoint { value: String, reason: String },
     SourceConflict { field: String },
@@ -158,6 +160,14 @@ impl fmt::Display for ManifestError {
                     "dependency `{field}` references unknown repository `{id}`"
                 )
             }
+            Self::UnknownEnvironmentGroup { environment, group } => write!(
+                f,
+                "environment `{environment}` references unknown group `{group}`"
+            ),
+            Self::DuplicateEnvironmentGroup { environment, group } => write!(
+                f,
+                "environment `{environment}` references group `{group}` more than once"
+            ),
             Self::InvalidIdentifier { kind, value } => {
                 write!(f, "invalid {kind} identifier `{value}`")
             }
@@ -220,6 +230,7 @@ pub fn compose_resolution_request_with_locked(
 mod repository;
 mod wire;
 
+pub(crate) use repository::configured_registry_id_for;
 pub use repository::{
     EffectiveRepository, Endpoint, RegistryProvenancePolicy, RegistrySpec, RepositorySpec,
 };

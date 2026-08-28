@@ -4,6 +4,14 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use crate::Manifest;
+use crate::manifest::{Endpoint, ManifestError, RegistrySpec, configured_registry_id_for};
+use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
+use crate::orchestration::{
+    CandidateLoaderRef, CranResolutionError, CranResolutionOutcome, MeasuredCandidateLoaderRef,
+    resolve_request_with_metrics,
+};
+use crate::progress::{ProgressCallback, ProgressEvent};
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind, PackageName,
     PublicationDate, RegistryId, SolverKey,
@@ -16,33 +24,17 @@ use rsolve_provider::cran::{
     CranSnapshotCacheDiagnostic, CranSnapshotCachePolicy, CranSnapshotCacheResult,
     CranSnapshotCacheStatus, inspect_cran_snapshot_cache,
 };
-use sha2::{Digest, Sha256};
-
-use crate::Manifest;
-use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
-use crate::orchestration::{
-    CandidateLoaderRef, CranResolutionError, CranResolutionOutcome, MeasuredCandidateLoaderRef,
-    resolve_request_with_metrics,
-};
-use crate::progress::{ProgressCallback, ProgressEvent};
 use rsolve_resolver::{RBasePackageOverlay, ResolutionFailure, is_r_base_package_name};
 
-/// Derive the private CRAN registry identity from the canonical endpoint.
-/// The provider kind and endpoint are length-delimited to avoid ambiguous
-/// concatenations; the input bytes are not case-folded.
-pub(crate) fn cran_registry_id(canonical_endpoint: &str) -> RegistryId {
-    let mut digest = Sha256::new();
-    digest.update(b"rsolve-registry-id-v1");
-    for field in [b"cran".as_slice(), canonical_endpoint.as_bytes()] {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field);
-    }
-    let hexadecimal = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    RegistryId::new(format!("cran-sha256:{hexadecimal}")).expect("derived registry id is valid")
+/// Derive the CRAN registry identity from a normalized endpoint.
+///
+/// The input is intentionally kept as `&str` for the existing cache API. The
+/// endpoint is revalidated and normalized here as well, so invalid input is
+/// returned as a typed error rather than being able to panic. Manifest code
+/// uses the same canonical helper directly.
+pub(crate) fn cran_registry_id(canonical_endpoint: &str) -> Result<RegistryId, ManifestError> {
+    let endpoint = Endpoint::parse(canonical_endpoint)?;
+    configured_registry_id_for(&RegistrySpec::Cran, &endpoint)
 }
 
 /// Collect the transitive CRAN dependency closure without making resolver-time
@@ -1279,8 +1271,11 @@ mod tests {
     #[test]
     fn base_only_online_resolution_bypasses_cache_inspection() {
         let directory = tempdir().unwrap();
-        let store = SnapshotStore::open(directory.path(), cran_registry_id("https://cran.example"))
-            .unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.example").unwrap(),
+        )
+        .unwrap();
         let result = resolve_from_cran_with_store_at_policy(
             manifest_for(PackageName::new("methods").unwrap()),
             "not-a-url",
@@ -1311,8 +1306,11 @@ mod tests {
     #[test]
     fn base_only_online_progress_skips_cran_refresh() {
         let directory = tempdir().unwrap();
-        let store = SnapshotStore::open(directory.path(), cran_registry_id("https://cran.example"))
-            .unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.example").unwrap(),
+        )
+        .unwrap();
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let capture = std::rc::Rc::clone(&events);
         let callback = std::rc::Rc::new(move |event| capture.borrow_mut().push(event));
@@ -1353,8 +1351,11 @@ mod tests {
     #[test]
     fn offline_missing_current_returns_snapshot_invalid_without_fallback() {
         let directory = tempdir().unwrap();
-        let store =
-            SnapshotStore::open(directory.path(), cran_registry_id("https://cran.test")).unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.test").unwrap(),
+        )
+        .unwrap();
         let error = resolve_from_cran_offline_with_store(
             manifest_for(PackageName::new("remote").unwrap()),
             None,
@@ -1370,8 +1371,11 @@ mod tests {
     #[test]
     fn offline_base_package_succeeds_without_current_snapshot() {
         let directory = tempdir().unwrap();
-        let store =
-            SnapshotStore::open(directory.path(), cran_registry_id("https://cran.test")).unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.test").unwrap(),
+        )
+        .unwrap();
         let methods = PackageName::new("methods").unwrap();
         let resolution =
             resolve_from_cran_offline_with_store(manifest_for(methods.clone()), None, &store)
@@ -1386,8 +1390,11 @@ mod tests {
     #[test]
     fn offline_progress_reports_resolution_start_and_completion() {
         let directory = tempdir().unwrap();
-        let store =
-            SnapshotStore::open(directory.path(), cran_registry_id("https://cran.test")).unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.test").unwrap(),
+        )
+        .unwrap();
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let capture = std::rc::Rc::clone(&events);
         let callback = std::rc::Rc::new(move |event| capture.borrow_mut().push(event));

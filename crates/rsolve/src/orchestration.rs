@@ -17,7 +17,7 @@ use rsolve_resolver::{
 };
 
 use crate::lock::{ConsumedLockedGraph, EnvironmentId, LockError, Lockfile, identity_key};
-use crate::manifest::{Manifest, ManifestError, compose_resolution_request};
+use crate::manifest::{Endpoint, Manifest, ManifestError, compose_resolution_request};
 use crate::metrics::{Phase, Recorder, ResolutionMetrics};
 use std::io;
 use tempfile::tempdir;
@@ -325,8 +325,13 @@ pub fn resolve_from_cran_with_publication_cutoff(
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
     let endpoint = canonical_cran_endpoint(base_url.as_ref())?;
     let directory = tempdir().map_err(CranResolutionError::TemporaryStore)?;
-    let store = SnapshotStore::open(directory.path(), cran_registry_id(&endpoint))
-        .map_err(CranResolutionError::Store)?;
+    let registry_id = cran_registry_id(&endpoint).map_err(|error| {
+        CranResolutionError::Provider(CranSnapshotRefresherError::InvalidBaseUrl {
+            diagnostic: format!("invalid CRAN base URL: {error}").into(),
+        })
+    })?;
+    let store =
+        SnapshotStore::open(directory.path(), registry_id).map_err(CranResolutionError::Store)?;
     resolve_from_cran_with_store(manifest, endpoint, publication_cutoff, &store)
 }
 
@@ -339,42 +344,13 @@ fn canonical_cran_endpoint(input: &str) -> Result<Box<str>, CranResolutionError>
             },
         ));
     }
-    let mut url = url::Url::parse(input).map_err(|error| {
-        CranResolutionError::Provider(CranSnapshotRefresherError::InvalidBaseUrl {
-            diagnostic: format!("invalid CRAN base URL: {error}").into(),
+    Endpoint::parse(input)
+        .map(|endpoint| endpoint.as_str().into())
+        .map_err(|error| {
+            CranResolutionError::Provider(CranSnapshotRefresherError::InvalidBaseUrl {
+                diagnostic: format!("invalid CRAN base URL: {error}").into(),
+            })
         })
-    })?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(CranResolutionError::Provider(
-            CranSnapshotRefresherError::InvalidBaseUrl {
-                diagnostic: "CRAN base URL must use HTTP or HTTPS".into(),
-            },
-        ));
-    }
-    if url.host_str().is_none() || url.cannot_be_a_base() {
-        return Err(CranResolutionError::Provider(
-            CranSnapshotRefresherError::InvalidBaseUrl {
-                diagnostic: "CRAN base URL must be hierarchical and include a host".into(),
-            },
-        ));
-    }
-    if url.query().is_some() {
-        return Err(CranResolutionError::Provider(
-            CranSnapshotRefresherError::InvalidBaseUrl {
-                diagnostic: "CRAN base URL must not include a query".into(),
-            },
-        ));
-    }
-    if url.fragment().is_some() {
-        return Err(CranResolutionError::Provider(
-            CranSnapshotRefresherError::InvalidBaseUrl {
-                diagnostic: "CRAN base URL must not include a fragment".into(),
-            },
-        ));
-    }
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(if path.is_empty() { "/" } else { &path });
-    Ok(url.to_string().trim_end_matches('/').into())
 }
 
 #[cfg(test)]

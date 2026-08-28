@@ -471,7 +471,7 @@ fn mirror_validation_canonicalizes_and_rejects_unsafe_forms() {
         canonical_mirror(" https://example.test/cran/// ")
             .unwrap()
             .as_ref(),
-        "https://example.test/cran"
+        "https://example.test/cran///"
     );
     for value in [
         "ftp://example.test",
@@ -483,6 +483,10 @@ fn mirror_validation_canonicalizes_and_rejects_unsafe_forms() {
     ] {
         assert!(canonical_mirror(value).is_err(), "{value}");
     }
+    assert!(matches!(
+        canonical_mirror("https://example.test:0"),
+        Err(CliError::Value(message)) if message.contains("port zero")
+    ));
 }
 
 #[test]

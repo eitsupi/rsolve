@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
 use crate::filesystem::ExistingPathIdentity;
+use crate::manifest::{Endpoint, ManifestError};
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::ResolutionMetrics;
 use crate::orchestration::cran_registry_id;
@@ -191,7 +192,8 @@ impl ResolutionBackend for CranBackend {
         refresh_metadata: bool,
         progress: Option<ProgressCallback>,
     ) -> Result<ResolvedData, CliError> {
-        let registry_id = cran_registry_id(mirror);
+        let registry_id = cran_registry_id(mirror)
+            .map_err(|error| CliError::Value(format!("invalid --cran-mirror: {error}")))?;
         let store = metadata_cache
             .open_store(registry_id)
             .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
@@ -575,36 +577,24 @@ fn canonical_mirror(input: &str) -> Result<Box<str>, CliError> {
     if input.is_empty() {
         return Err(value_error("--cran-mirror must not be empty".into()));
     }
-    let mut url = url::Url::parse(input)
-        .map_err(|error| value_error(format!("invalid --cran-mirror: {error}")))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(value_error(
-            "invalid --cran-mirror: mirror URL must not include userinfo".into(),
-        ));
-    }
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(value_error(
-            "invalid --cran-mirror: mirror must use HTTP or HTTPS".into(),
-        ));
-    }
-    if url.host_str().is_none() || url.cannot_be_a_base() {
-        return Err(value_error(
-            "invalid --cran-mirror: mirror must include a host".into(),
-        ));
-    }
-    if url.query().is_some() {
-        return Err(value_error(
-            "invalid --cran-mirror: mirror must not include a query".into(),
-        ));
-    }
-    if url.fragment().is_some() {
-        return Err(value_error(
-            "invalid --cran-mirror: mirror must not include a fragment".into(),
-        ));
-    }
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(if path.is_empty() { "/" } else { &path });
-    Ok(url.to_string().trim_end_matches('/').into())
+    Endpoint::parse(input)
+        .map(|endpoint| endpoint.as_str().into())
+        .map_err(|error| {
+            let detail = match &error {
+                ManifestError::InvalidEndpoint { reason, .. }
+                    if reason == "credentials are forbidden" =>
+                {
+                    "mirror URL must not include userinfo".to_owned()
+                }
+                ManifestError::InvalidEndpoint { reason, .. }
+                    if reason == "query and fragment are forbidden" =>
+                {
+                    "mirror must not include a query or fragment".to_owned()
+                }
+                _ => error.to_string(),
+            };
+            value_error(format!("invalid --cran-mirror: {detail}"))
+        })
 }
 
 fn value_error(message: String) -> CliError {

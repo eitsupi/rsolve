@@ -225,6 +225,7 @@ fn parse_manifest_value(
         .map(|repository| repository.id().clone())
         .collect();
     validate_repository_references(&dependencies, &groups, &repository_ids)?;
+    validate_environment_references(&environments, &groups)?;
     Ok(ManifestDocument {
         schema: schema as u32,
         project_root,
@@ -511,11 +512,14 @@ fn parse_dependency(
     context: &str,
 ) -> Result<ManifestDependencySpec, ManifestError> {
     let (version, source, include_suggests) = match value {
-        toml::Value::String(version) => (
-            version.clone(),
-            ManifestSource::Registry { repository: None },
-            false,
-        ),
+        toml::Value::String(version) => {
+            validate_version(version, context)?;
+            (
+                version.clone(),
+                ManifestSource::Registry { repository: None },
+                false,
+            )
+        }
         toml::Value::Table(table) => {
             reject_unknown(
                 table,
@@ -535,12 +539,7 @@ fn parse_dependency(
                 context,
             )?;
             let version = string(table, "version")?.unwrap_or_else(|| "*".into());
-            if version.chars().any(|character| character.is_control()) {
-                return Err(ManifestError::InvalidDependencyField {
-                    name: context.into(),
-                    reason: "version contains control character".into(),
-                });
-            }
+            validate_version(&version, context)?;
             let include = match table.get("include-suggests") {
                 None => false,
                 Some(toml::Value::Boolean(value)) => *value,
@@ -731,6 +730,16 @@ fn parse_dependency(
     })
 }
 
+fn validate_version(value: &str, context: &str) -> Result<(), ManifestError> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(ManifestError::InvalidDependencyField {
+            name: context.into(),
+            reason: "version must be non-empty and contain no control characters".into(),
+        });
+    }
+    Ok(())
+}
+
 fn parse_groups(
     value: Option<&toml::Value>,
 ) -> Result<BTreeMap<String, BTreeMap<PackageName, ManifestDependencySpec>>, ManifestError> {
@@ -794,4 +803,28 @@ fn parse_environments(
             Ok((id.clone(), groups))
         })
         .collect()
+}
+
+fn validate_environment_references(
+    environments: &BTreeMap<String, Vec<String>>,
+    groups: &BTreeMap<String, BTreeMap<PackageName, ManifestDependencySpec>>,
+) -> Result<(), ManifestError> {
+    for (environment, references) in environments {
+        let mut seen = HashSet::with_capacity(references.len());
+        for group in references {
+            if !groups.contains_key(group) {
+                return Err(ManifestError::UnknownEnvironmentGroup {
+                    environment: environment.clone(),
+                    group: group.clone(),
+                });
+            }
+            if !seen.insert(group) {
+                return Err(ManifestError::DuplicateEnvironmentGroup {
+                    environment: environment.clone(),
+                    group: group.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }

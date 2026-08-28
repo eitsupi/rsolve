@@ -300,6 +300,13 @@ fn source_union_rejects_invalid_combinations_and_preserves_query() {
         ))
         .is_err()
     );
+    let encoded_query = parse_manifest(&format!(
+        "{base}{{ url='https://example.org?redirect=%2e%2e/x' }}"
+    ))
+    .unwrap();
+    assert!(
+        matches!(&encoded_query.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/?redirect=%2e%2e/x")
+    );
 }
 
 #[test]
@@ -325,6 +332,32 @@ fn url_normalization_preserves_repeated_slashes() {
         "https://example.org/repo/path"
     );
     assert!(parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/../path'\nregistry='cran'\n").is_err());
+    let encoded_parent = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/repo/%2e%2e/path'\nregistry='cran'\n").unwrap();
+    assert_eq!(
+        encoded_parent.repositories[0].manifest_endpoint().as_str(),
+        "https://example.org/path"
+    );
+    let encoded_repeated_parent = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/repo//%2E%2E/path'\nregistry='cran'\n").unwrap();
+    assert_eq!(
+        encoded_repeated_parent.repositories[0]
+            .manifest_endpoint()
+            .as_str(),
+        "https://example.org/repo/path"
+    );
+    assert!(parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/%2e%2e/path'\nregistry='cran'\n").is_err());
+    let encoded_direct = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={url='https://example.org/repo/%2e%2e/pkg.tar.gz?x=1'}\n").unwrap();
+    assert!(
+        matches!(&encoded_direct.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/pkg.tar.gz?x=1")
+    );
+}
+
+#[test]
+fn runtime_cran_registry_id_uses_manifest_endpoint_normalization() {
+    let document = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://cloud.r-project.org'\nregistry='cran'\n").unwrap();
+    let configured = document.repositories[0].configured_registry_id().unwrap();
+    let runtime =
+        crate::prepared_snapshot::cran_registry_id("https://cloud.r-project.org/").unwrap();
+    assert_eq!(configured, runtime);
 }
 
 #[test]
@@ -389,6 +422,48 @@ fn explicit_repository_references_are_validated_during_parse() {
     let error = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nR='*'\n")
         .unwrap_err();
     assert_eq!(error, ManifestError::RIsNotAPackageRequirement);
+}
+
+#[test]
+fn dependency_versions_reject_empty_values_in_both_wire_forms() {
+    for dependency in ["''", "{version=''}"] {
+        let error = parse_manifest(&format!(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={dependency}\n"
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ManifestError::InvalidDependencyField { .. }
+        ));
+    }
+}
+
+#[test]
+fn environment_group_references_are_validated_without_reordering() {
+    let unknown =
+        parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[environments]\nci=['missing']\n")
+            .unwrap_err();
+    assert!(matches!(
+        unknown,
+        ManifestError::UnknownEnvironmentGroup { environment, group }
+            if environment == "ci" && group == "missing"
+    ));
+
+    let duplicate = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[groups.check]\n[environments]\nci=['check','check']\n",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        duplicate,
+        ManifestError::DuplicateEnvironmentGroup { environment, group }
+            if environment == "ci" && group == "check"
+    ));
+
+    let valid = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[groups.check]\n[groups.lint]\n[environments]\nci=['lint','check']\n",
+    )
+    .unwrap();
+    assert_eq!(valid.environments["ci"], vec!["lint", "check"]);
 }
 
 #[test]
