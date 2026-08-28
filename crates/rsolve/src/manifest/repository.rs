@@ -18,6 +18,7 @@ impl Endpoint {
 
     pub fn parse(input: impl AsRef<str>) -> Result<Self, ManifestError> {
         let original = input.as_ref();
+        reject_raw_root_escape(original)?;
         let mut url = Url::parse(original).map_err(|error| ManifestError::InvalidEndpoint {
             value: original.to_owned(),
             reason: error.to_string(),
@@ -96,14 +97,32 @@ pub(super) fn normalize_url_path(path: &str) -> Result<String, ManifestError> {
             reason: "path contains control or whitespace".into(),
         });
     }
-    let absolute = path.starts_with('/');
     let trailing = path.ends_with('/');
-    let mut parts = Vec::new();
+    let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
         match part {
-            "" | "." => {}
+            "." => {}
             ".." => {
-                if parts.pop().is_none() {
+                match parts.last() {
+                    // The first empty segment is the URL's root marker; a
+                    // parent segment cannot remove it.
+                    Some(&"") if parts.len() == 1 && path.starts_with('/') => {
+                        return Err(ManifestError::InvalidEndpoint {
+                            value: path.into(),
+                            reason: "path escapes the URL root".into(),
+                        });
+                    }
+                    Some(_) => {
+                        parts.pop();
+                    }
+                    None => {
+                        return Err(ManifestError::InvalidEndpoint {
+                            value: path.into(),
+                            reason: "path escapes the URL root".into(),
+                        });
+                    }
+                }
+                if parts.is_empty() && path.starts_with('/') {
                     return Err(ManifestError::InvalidEndpoint {
                         value: path.into(),
                         reason: "path escapes the URL root".into(),
@@ -113,12 +132,7 @@ pub(super) fn normalize_url_path(path: &str) -> Result<String, ManifestError> {
             value => parts.push(value),
         }
     }
-    let mut result = if absolute {
-        "/".to_owned()
-    } else {
-        String::new()
-    };
-    result.push_str(&parts.join("/"));
+    let mut result = parts.join("/");
     if trailing && !result.ends_with('/') {
         result.push('/');
     }
@@ -126,6 +140,36 @@ pub(super) fn normalize_url_path(path: &str) -> Result<String, ManifestError> {
         result.push('/');
     }
     Ok(result)
+}
+
+/// URL parsers may erase leading dot segments before exposing `path()`. Keep
+/// the fail-closed root-escape check on the manifest spelling as well.
+pub(super) fn reject_raw_root_escape(input: &str) -> Result<(), ManifestError> {
+    let Some((_, authority_and_path)) = input.split_once("://") else {
+        return Ok(());
+    };
+    let path = authority_and_path
+        .find('/')
+        .map(|index| &authority_and_path[index..])
+        .unwrap_or("");
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                if segments.len() <= 1 {
+                    return Err(ManifestError::InvalidEndpoint {
+                        value: input.into(),
+                        reason: "path escapes the URL root".into(),
+                    });
+                }
+                segments.pop();
+            }
+            value => segments.push(value),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

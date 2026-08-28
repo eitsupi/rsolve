@@ -1,5 +1,5 @@
 use super::repository::{
-    digest_fields, hex_digest, normalize_requested_path, validate_named_id,
+    digest_fields, hex_digest, normalize_requested_path, reject_raw_root_escape, validate_named_id,
     validate_relative_subdirectory, validate_repository_id, validate_selector,
 };
 use super::{Endpoint, ManifestError, RegistrySpec, RepositorySpec};
@@ -52,6 +52,7 @@ pub struct DirectUrl(Box<str>);
 impl DirectUrl {
     pub fn parse(input: impl AsRef<str>) -> Result<Self, ManifestError> {
         let original = input.as_ref();
+        reject_raw_root_escape(original)?;
         let mut url =
             url::Url::parse(original).map_err(|error| ManifestError::InvalidEndpoint {
                 value: original.into(),
@@ -206,6 +207,7 @@ fn parse_manifest_value(
         "root",
     )?;
     let rsolve = table(root, "rsolve")?;
+    reject_unknown(rsolve, &["schema"], "rsolve")?;
     let schema = integer(rsolve, "schema")?.ok_or(ManifestError::MissingField {
         field: "rsolve.schema".into(),
     })?;

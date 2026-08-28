@@ -123,6 +123,9 @@ fn strict_codec_normalizes_repositories_and_rejects_unknown_fields() {
 
     let error = parse_manifest("[rsolve]\nschema = 1\n[unexpected]\nvalue = true\n").unwrap_err();
     assert!(matches!(error, ManifestError::UnknownField { .. }));
+    let error =
+        parse_manifest("[rsolve]\nschema = 1\nextra = true\n[r]\nversion='*'\n").unwrap_err();
+    assert!(matches!(error, ManifestError::UnknownField { .. }));
 }
 
 #[test]
@@ -284,6 +287,31 @@ fn source_union_rejects_invalid_combinations_and_preserves_query() {
     assert!(
         matches!(&query.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/a.tar.gz?x=1")
     );
+}
+
+#[test]
+fn url_normalization_preserves_repeated_slashes() {
+    let repeated = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/repo//path'\nregistry='cran'\n[dependencies]\nfoo={url='https://example.org/repo//pkg.tar.gz?x=1'}\n").unwrap();
+    let single = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/repo/path'\nregistry='cran'\n").unwrap();
+    assert_eq!(
+        repeated.repositories[0].manifest_endpoint().as_str(),
+        "https://example.org/repo//path"
+    );
+    assert_ne!(
+        repeated.repositories[0].configured_registry_id().unwrap(),
+        single.repositories[0].configured_registry_id().unwrap()
+    );
+    assert!(
+        matches!(&repeated.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/repo//pkg.tar.gz?x=1")
+    );
+    let parent_after_empty = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/repo//../path'\nregistry='cran'\n").unwrap();
+    assert_eq!(
+        parent_after_empty.repositories[0]
+            .manifest_endpoint()
+            .as_str(),
+        "https://example.org/repo/path"
+    );
+    assert!(parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/../path'\nregistry='cran'\n").is_err());
 }
 
 #[test]
