@@ -1,8 +1,9 @@
 use super::*;
 use rsolve_core::{
     PackageName, PackageNamespace, Provenance, RelationOp, ReleaseIdentity, RepositoryId,
-    SolverKey, VersionClause,
+    ResolutionTarget, SolverKey, VersionClause,
 };
+use std::path::PathBuf;
 
 fn version(value: &str) -> RPackageVersion {
     RPackageVersion::parse(value).unwrap()
@@ -464,6 +465,12 @@ fn environment_group_references_are_validated_without_reordering() {
     )
     .unwrap();
     assert_eq!(valid.environments["ci"], vec!["lint", "check"]);
+
+    let digit = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[groups.check]\n[environments]\n'1ci'=['check']\n",
+    )
+    .unwrap();
+    assert!(digit.environments.contains_key("1ci"));
 }
 
 #[test]
@@ -485,4 +492,422 @@ fn repository_constructor_enforces_registry_invariants() {
     .unwrap();
     assert_eq!(spec.id().as_str(), "main");
     assert_eq!(spec.manifest_endpoint().as_str(), "https://example.org/");
+}
+
+#[test]
+fn document_composition_merges_base_and_selected_groups_deterministically() {
+    let document = parse_manifest(
+        r#"
+        [rsolve]
+        schema = 1
+        [r]
+        version = ">= 4.0, < 5.0"
+        [[repositories]]
+        id = "main"
+        url = "https://example.org"
+        registry = "cran"
+        [dependencies]
+        zzz = ">= 1.0"
+        foo = { version = ">= 1.0" }
+        [groups.test.dependencies]
+        foo = { version = "< 2.0", repository = "main", include-suggests = true }
+        aaa = "*"
+        [environments]
+        test = ["test"]
+        "#,
+    )
+    .unwrap();
+    let composed = document
+        .compose_environment("test", ResolutionTarget::new(version("4.4.0")))
+        .unwrap();
+    assert_eq!(
+        composed
+            .roots
+            .iter()
+            .map(|root| root.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aaa", "foo", "zzz"]
+    );
+    let foo = &composed.roots[1];
+    assert_eq!(foo.constraint.clauses.len(), 2);
+    assert_eq!(foo.expansion, RootExpansionPolicy::DirectSuggests);
+    assert!(matches!(
+        foo.source,
+        ManifestSource::Registry {
+            repository: Some(ref id)
+        } if id.as_str() == "main"
+    ));
+    let request = composed.into_resolution_request().unwrap();
+    assert_eq!(request.roots.len(), 3);
+    assert_eq!(
+        request.r_requirement,
+        super::compose::parse_version_constraint(">= 4.0, < 5.0", "r").unwrap()
+    );
+    assert!(request.publication_cutoff.is_none());
+}
+
+#[test]
+fn direct_sources_remain_pending_until_acquisition() {
+    let document = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={url='https://example.org/foo.tar.gz'}\n",
+    )
+    .unwrap();
+    let composed = document
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap();
+    assert!(matches!(
+        composed.clone().into_resolution_request(),
+        Err(ManifestError::DirectSourceRequiresAcquisition { name }) if name.as_str() == "foo"
+    ));
+    assert!(matches!(
+        composed.roots[0].source,
+        ManifestSource::Url { .. }
+    ));
+}
+
+#[test]
+fn composition_rejects_unknown_environment_and_incompatible_target() {
+    let document = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='>= 5.0'\n").unwrap();
+    let unknown = document
+        .compose_environment("dev", ResolutionTarget::new(version("5.1.0")))
+        .unwrap_err();
+    assert!(matches!(unknown, ManifestError::UnknownEnvironment { .. }));
+    let incompatible = document
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap_err();
+    assert!(matches!(
+        incompatible,
+        ManifestError::TargetOutsideRConstraint { .. }
+    ));
+}
+
+#[test]
+fn composition_revalidates_public_environment_and_repository_references() {
+    let mut document = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[groups.test.dependencies]\nfoo='*'\n",
+    )
+    .unwrap();
+    document
+        .environments
+        .insert("dev".into(), vec!["missing".into()]);
+    let error = document
+        .compose_environment("dev", ResolutionTarget::new(version("4.4.0")))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ManifestError::UnknownEnvironmentGroup { .. }
+    ));
+}
+
+#[test]
+fn composition_canonicalizes_public_requested_source_paths() {
+    let mut document = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\ngitpkg={git='https://github.com/example/pkg.git',subdirectory='pkg/./src'}\nlocalpkg={path='local/../tree'}\n",
+    )
+    .unwrap();
+    if let ManifestSource::Git { subdirectory, .. } = &mut document
+        .dependencies
+        .get_mut(&package("gitpkg"))
+        .unwrap()
+        .source
+    {
+        *subdirectory = Some("pkg/./src".into());
+    }
+    if let ManifestSource::Path { path, .. } = &mut document
+        .dependencies
+        .get_mut(&package("localpkg"))
+        .unwrap()
+        .source
+    {
+        *path = "local/../tree".into();
+    }
+    let composed = document
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap();
+    assert!(matches!(
+        &composed.roots[0].source,
+        ManifestSource::Git { subdirectory: Some(value), .. } if value == "pkg/src"
+    ));
+    assert!(matches!(
+        &composed.roots[1].source,
+        ManifestSource::Path { path, .. } if path == "tree"
+    ));
+}
+
+#[test]
+fn equivalent_constraint_spellings_have_the_same_intent_digest() {
+    let first = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='>= 4.0, < 5.0'\n[dependencies]\nfoo='>= 1.0, >= 1.0.0, < 2.0'\n",
+    )
+    .unwrap()
+    .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+    .unwrap();
+    let second = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='>= 4.0.0, < 5'\n[dependencies]\nfoo='< 2.0, >= 1.0'\n",
+    )
+    .unwrap()
+    .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+    .unwrap();
+    assert_eq!(
+        first.resolution_intent_digest().unwrap(),
+        second.resolution_intent_digest().unwrap()
+    );
+    let mut zero = first.clone();
+    zero.roots[0].constraint =
+        VersionConstraint::from_clause(RelationOp::Eq, RPackageVersion::parse_bare("0").unwrap());
+    assert!(zero.resolution_intent_digest().is_ok());
+}
+
+#[test]
+fn selected_environment_digest_excludes_unselected_groups_and_project_root() {
+    let input = "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo='>= 1.0'\n[groups.other.dependencies]\nbar='*'\n";
+    let first = parse_manifest(input)
+        .unwrap()
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap();
+    let mut changed = parse_manifest(input).unwrap();
+    changed.project_root = Some(PathBuf::from("/machine/local/project"));
+    changed
+        .groups
+        .get_mut("other")
+        .unwrap()
+        .get_mut(&package("bar"))
+        .unwrap()
+        .version = "< 9.0".into();
+    let second = changed
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap();
+    assert_eq!(
+        first.resolution_intent_digest().unwrap(),
+        second.resolution_intent_digest().unwrap()
+    );
+}
+
+#[test]
+fn composition_rejects_conflicting_repository_and_git_intents() {
+    let repositories = "[[repositories]]\nid='one'\nurl='https://one.example'\nregistry='cran'\n[[repositories]]\nid='two'\nurl='https://two.example'\nregistry='cran'\n";
+    let repository_conflict = parse_manifest(&format!(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n{repositories}[dependencies]\nfoo={{repository='one'}}\n[groups.dev.dependencies]\nfoo={{repository='two'}}\n[environments]\ndev=['dev']\n"
+    ))
+    .unwrap();
+    assert!(matches!(
+        repository_conflict.compose_environment("dev", ResolutionTarget::new(version("4.4.0"))),
+        Err(ManifestError::SourceConflict { .. })
+    ));
+
+    let git_conflict = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={git='https://github.com/example/foo.git',branch='main'}\n[groups.dev.dependencies]\nfoo={git='https://github.com/example/foo.git',tag='v1'}\n[environments]\ndev=['dev']\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        git_conflict.compose_environment("dev", ResolutionTarget::new(version("4.4.0"))),
+        Err(ManifestError::SourceConflict { .. })
+    ));
+}
+
+#[test]
+fn composition_revalidates_bypassed_repository_references_and_duplicate_groups() {
+    let mut document = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[groups.check.dependencies]\nfoo='*'\n[environments]\nci=['check']\n",
+    )
+    .unwrap();
+    document
+        .environments
+        .insert("ci".into(), vec!["check".into(), "check".into()]);
+    let duplicate = document
+        .clone()
+        .compose_environment("ci", ResolutionTarget::new(version("4.4.0")))
+        .unwrap_err();
+    assert!(matches!(
+        duplicate,
+        ManifestError::DuplicateEnvironmentGroup { .. }
+    ));
+
+    document
+        .environments
+        .insert("ci".into(), vec!["check".into()]);
+    document.dependencies.insert(
+        package("bar"),
+        ManifestDependencySpec {
+            version: "*".into(),
+            source: ManifestSource::Registry {
+                repository: Some(RepositoryId::new("missing").unwrap()),
+            },
+            include_suggests: false,
+        },
+    );
+    let unknown = document
+        .compose_environment("ci", ResolutionTarget::new(version("4.4.0")))
+        .unwrap_err();
+    assert!(matches!(
+        unknown,
+        ManifestError::UnknownRepositoryReference { .. }
+    ));
+}
+
+#[test]
+fn registry_request_preserves_locked_mapping_and_publication_cutoff() {
+    let document = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[resolution]\npublished-before='2026-08-01'\n[dependencies]\nfoo='*'\n",
+    )
+    .unwrap();
+    let key = SolverKey::InstalledName(package("foo"));
+    let identity = ReleaseIdentity::new(
+        package("foo"),
+        Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("1.0.0"),
+        },
+    );
+    let mut locked = LockedIdentities::new();
+    locked.insert(key.clone(), identity.clone());
+    let request = document
+        .compose_environment_with_locked(
+            "default",
+            ResolutionTarget::new(version("4.4.0")),
+            locked.clone(),
+        )
+        .unwrap()
+        .into_resolution_request()
+        .unwrap();
+    assert_eq!(request.locked.get(&key), Some(&identity));
+    assert_eq!(
+        request.publication_cutoff.unwrap().date().to_string(),
+        "2026-08-01"
+    );
+}
+
+#[test]
+fn source_path_spellings_canonicalize_to_equal_intents() {
+    let first = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\ngitpkg={git='https://github.com/example/pkg.git',subdirectory='pkg/src'}\nlocalpkg={path='tree'}\n",
+    )
+    .unwrap()
+    .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+    .unwrap();
+    let second = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\ngitpkg={git='https://github.com/example/pkg.git',subdirectory='pkg/./src'}\nlocalpkg={path='work/../tree'}\n",
+    )
+    .unwrap()
+    .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+    .unwrap();
+    assert_eq!(first.roots, second.roots);
+    assert_eq!(
+        first.resolution_intent_digest().unwrap(),
+        second.resolution_intent_digest().unwrap()
+    );
+    let leading = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={path='../foo'}\n",
+    )
+    .unwrap()
+    .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+    .unwrap();
+    assert!(
+        matches!(&leading.roots[0].source, ManifestSource::Path { path, .. } if path == "../foo")
+    );
+    assert!(
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={path='tree/..'}\n"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn zero_and_equivalent_constraints_have_canonical_digests() {
+    let zero = |constraint: &str| {
+        parse_manifest(&format!(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo='{constraint}'\n"
+        ))
+        .unwrap()
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap()
+        .resolution_intent_digest()
+        .unwrap()
+    };
+    assert_eq!(zero("=0"), zero("=0.0"));
+}
+
+#[test]
+fn group_reference_order_does_not_affect_canonical_composition() {
+    let manifest = |order: &str| {
+        parse_manifest(&format!(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org'\nregistry='cran'\n[groups.a.dependencies]\nfoo={{version='>= 1.0'}}\n[groups.b.dependencies]\nfoo={{version='< 2.0',repository='main',include-suggests=true}}\n[environments]\ndev=[{order}]\n"
+        ))
+        .unwrap()
+        .compose_environment("dev", ResolutionTarget::new(version("4.4.0")))
+        .unwrap()
+    };
+    let first = manifest("'a','b'");
+    let second = manifest("'b','a'");
+    assert_eq!(first.roots, second.roots);
+    assert_eq!(
+        first.clone().into_resolution_request().unwrap().roots,
+        second.clone().into_resolution_request().unwrap().roots
+    );
+    assert_eq!(
+        first.resolution_intent_digest().unwrap(),
+        second.resolution_intent_digest().unwrap()
+    );
+}
+
+#[test]
+fn resolution_intent_digest_tracks_selected_inputs_only() {
+    let baseline = "[rsolve]\nschema=1\n[r]\nversion='>= 4.0, < 5.0'\n[resolution]\npublished-before='2026-08-01'\n[[repositories]]\nid='one'\nurl='https://one.example'\nregistry='cran'\n[[repositories]]\nid='two'\nurl='https://two.example'\nregistry='cran'\n[dependencies]\nfoo={version='>= 1.0',git='https://github.com/example/foo.git',branch='main',include-suggests=true}\n[groups.unselected.dependencies]\nbar='*'\n[environments]\ndev=['unselected']\n";
+    let target = ResolutionTarget::new(version("4.4.0"));
+    let baseline_document = parse_manifest(baseline).unwrap();
+    let baseline_environment = baseline_document
+        .compose_environment_with_locked("default", target.clone(), LockedIdentities::new())
+        .unwrap();
+    let baseline_digest = baseline_environment.resolution_intent_digest().unwrap();
+
+    let changed = [
+        baseline.replace(
+            "[[repositories]]\nid='one'\nurl='https://one.example'\nregistry='cran'\n[[repositories]]\nid='two'\nurl='https://two.example'\nregistry='cran'",
+            "[[repositories]]\nid='two'\nurl='https://two.example'\nregistry='cran'\n[[repositories]]\nid='one'\nurl='https://one.example'\nregistry='cran'",
+        ),
+        baseline.replace("url='https://one.example'", "url='https://changed.example'"),
+        baseline.replace("version='>= 1.0'", "version='>= 2.0'"),
+        baseline.replace("branch='main'", "tag='v1'"),
+        baseline.replace("include-suggests=true", "include-suggests=false"),
+        baseline.replace("published-before='2026-08-01'", "published-before='2026-09-01'"),
+        baseline.replace("version='>= 4.0, < 5.0'", "version='>= 4.1, < 5.0'"),
+    ];
+    for input in changed {
+        let digest = parse_manifest(&input)
+            .unwrap()
+            .compose_environment("default", target.clone())
+            .unwrap()
+            .resolution_intent_digest()
+            .unwrap();
+        assert_ne!(baseline_digest, digest);
+    }
+
+    let unselected_changed = baseline.replace("dev=['unselected']", "dev=[]");
+    let digest = parse_manifest(&unselected_changed)
+        .unwrap()
+        .compose_environment("default", target.clone())
+        .unwrap()
+        .resolution_intent_digest()
+        .unwrap();
+    assert_eq!(baseline_digest, digest);
+
+    let identity = ReleaseIdentity::new(
+        package("foo"),
+        Provenance::RegistryRelease {
+            namespace: PackageNamespace::new("cran").unwrap(),
+            version: version("1.0.0"),
+        },
+    );
+    let key = SolverKey::InstalledName(package("foo"));
+    let mut locked = LockedIdentities::new();
+    locked.insert(key, identity);
+    let compatible_target = ResolutionTarget::new(version("4.3.0"));
+    let digest = parse_manifest(baseline)
+        .unwrap()
+        .compose_environment_with_locked("default", compatible_target, locked)
+        .unwrap()
+        .resolution_intent_digest()
+        .unwrap();
+    assert_eq!(baseline_digest, digest);
 }

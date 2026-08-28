@@ -4,7 +4,8 @@ use super::repository::{
 };
 use super::{Endpoint, ManifestError, RegistrySpec, RepositorySpec};
 use rsolve_core::{
-    NormalizedGitUrl, PackageName, PackageNamespace, PublicationDate, RepositoryId, Sha256Digest,
+    EnvironmentId, NormalizedGitUrl, PackageName, PackageNamespace, PublicationDate, RepositoryId,
+    Sha256Digest,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -783,7 +784,10 @@ fn parse_environments(
     environments
         .iter()
         .map(|(id, value)| {
-            validate_named_id(id, "environment")?;
+            EnvironmentId::new(id).map_err(|_error| ManifestError::InvalidIdentifier {
+                kind: "environment".into(),
+                value: id.clone(),
+            })?;
             let groups = value.as_array().ok_or_else(|| ManifestError::WrongType {
                 field: format!("environments.{id}"),
                 expected: "array of strings".into(),

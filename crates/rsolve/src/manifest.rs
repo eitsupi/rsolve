@@ -112,6 +112,10 @@ pub enum ManifestError {
     UnknownRepositoryReference { id: RepositoryId, field: String },
     UnknownEnvironmentGroup { environment: String, group: String },
     DuplicateEnvironmentGroup { environment: String, group: String },
+    UnknownEnvironment { id: String },
+    InvalidVersionConstraint { field: String, reason: String },
+    TargetOutsideRConstraint { target: String, constraint: String },
+    DirectSourceRequiresAcquisition { name: rsolve_core::PackageName },
     InvalidIdentifier { kind: String, value: String },
     InvalidEndpoint { value: String, reason: String },
     SourceConflict { field: String },
@@ -167,6 +171,18 @@ impl fmt::Display for ManifestError {
             Self::DuplicateEnvironmentGroup { environment, group } => write!(
                 f,
                 "environment `{environment}` references group `{group}` more than once"
+            ),
+            Self::UnknownEnvironment { id } => write!(f, "unknown environment `{id}`"),
+            Self::InvalidVersionConstraint { field, reason } => {
+                write!(f, "invalid version constraint `{field}`: {reason}")
+            }
+            Self::TargetOutsideRConstraint { target, constraint } => write!(
+                f,
+                "target R version `{target}` does not satisfy constraint `{constraint}`"
+            ),
+            Self::DirectSourceRequiresAcquisition { name } => write!(
+                f,
+                "direct source for `{name}` requires acquisition before resolution"
             ),
             Self::InvalidIdentifier { kind, value } => {
                 write!(f, "invalid {kind} identifier `{value}`")
@@ -227,9 +243,11 @@ pub fn compose_resolution_request_with_locked(
     ))
 }
 
+mod compose;
 mod repository;
 mod wire;
 
+pub use compose::{ComposedEnvironment, ComposedRootIntent};
 pub(crate) use repository::configured_registry_id_for;
 pub use repository::{
     EffectiveRepository, Endpoint, RegistryProvenancePolicy, RegistrySpec, RepositorySpec,

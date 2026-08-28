@@ -396,25 +396,32 @@ pub(super) fn validate_selector(value: &str, context: &str) -> Result<(), Manife
 }
 
 pub(super) fn validate_relative_subdirectory(value: &str) -> Result<(), String> {
+    normalize_relative_subdirectory(value).map(|_| ())
+}
+
+pub(super) fn normalize_relative_subdirectory(value: &str) -> Result<String, String> {
     if value.is_empty() || value.starts_with('/') || value.contains('\\') {
         return Err("subdirectory must be a non-empty relative slash path".into());
     }
     if value.chars().any(char::is_control) {
         return Err("subdirectory contains a control character".into());
     }
-    let mut depth = 0usize;
+    let mut parts = Vec::new();
     for component in value.split('/') {
         match component {
             "" | "." => {}
-            ".." if depth > 0 => depth -= 1,
-            ".." => return Err("subdirectory escapes the source root".into()),
-            _ => depth += 1,
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err("subdirectory escapes the source root".into());
+                }
+            }
+            component => parts.push(component),
         }
     }
-    if depth == 0 {
+    if parts.is_empty() {
         return Err("subdirectory must contain a path component".into());
     }
-    Ok(())
+    Ok(parts.join("/"))
 }
 
 pub(super) fn normalize_requested_path(value: &str) -> Result<String, String> {
@@ -429,6 +436,11 @@ pub(super) fn normalize_requested_path(value: &str) -> Result<String, String> {
     for component in value.split('/') {
         match component {
             "" | "." => {}
+            ".." => {
+                if parts.last() == Some(&"..") || parts.pop().is_none() {
+                    parts.push("..");
+                }
+            }
             _ => parts.push(component),
         }
     }
