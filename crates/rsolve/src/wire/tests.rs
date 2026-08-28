@@ -1,8 +1,8 @@
 use super::*;
 use rsolve_core::{
-    ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
-    Distribution, DistributionChannel, DistributionMetadata, EnvironmentId, PackageNamespace,
-    Provenance, RPackageVersion, RegistryId, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+    ArtifactLocator, DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
+    DistributionChannel, DistributionMetadata, EnvironmentId, PackageNamespace, Provenance,
+    RPackageVersion, RegistryId, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
     RepositorySubdir, Sha256Digest, SourceArtifact, SourceScheme, UpstreamChecksum,
     VersionConstraint,
 };
@@ -169,25 +169,28 @@ fn resolution_projection_excludes_artifacts_and_unselected_dependencies() {
         observed_version: release_version,
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: vec![
-            DependencyRequirement::new(
+        declared_dependencies: vec![
+            DeclaredDependency::from_parts(
                 DependencyKind::Depends,
                 package("R"),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            ),
-            DependencyRequirement::new(
+            )
+            .unwrap(),
+            DeclaredDependency::from_parts(
                 DependencyKind::Imports,
                 package("kept"),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            ),
-            DependencyRequirement::new(
+            )
+            .unwrap(),
+            DeclaredDependency::from_parts(
                 DependencyKind::Suggests,
                 package("suggested"),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            ),
+            )
+            .unwrap(),
         ],
         distributions: vec![Distribution {
             registry: RegistryId::new("cran").unwrap(),
@@ -207,6 +210,7 @@ fn resolution_projection_excludes_artifacts_and_unselected_dependencies() {
         vec![rsolve_core::ResolvedPackage::new(
             rsolve_core::SolverKey::InstalledName(package("artifactless")),
             release,
+            Vec::new(),
         )],
     );
     let lock =

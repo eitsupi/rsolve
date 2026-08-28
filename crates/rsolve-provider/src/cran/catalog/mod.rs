@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, Distribution,
+    DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
     DistributionChannel, DistributionMetadata, PackageName, PackageNameError, PackageRelease,
     PackageReleaseError, Provenance, PublicationDate, RPackageVersion, RPackageVersionError,
     RegistryId, RelationOp, ReleaseAggregation, ReleaseIdentity, ReleaseMetadata,
@@ -449,6 +449,7 @@ pub enum CranRecordError {
         diagnostic: String,
     },
     InvalidMetadata(ReleaseMetadataError),
+    InvalidDependency(String),
     Dependency {
         field: &'static str,
         entry: String,
@@ -477,6 +478,7 @@ impl fmt::Display for CranRecordError {
                 write!(f, "invalid Published value {value:?}: {diagnostic}")
             }
             Self::InvalidMetadata(error) => error.fmt(f),
+            Self::InvalidDependency(error) => write!(f, "invalid dependency: {error}"),
             Self::Dependency {
                 field,
                 entry,

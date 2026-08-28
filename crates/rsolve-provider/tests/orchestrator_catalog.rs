@@ -20,22 +20,25 @@ fn r_survives_as_a_real_requirement() {
     let c = catalog();
     let core = only(&c, "rsolvefixture.core");
     let r = core
-        .dependencies()
+        .declared_dependencies()
         .iter()
-        .find(|d| d.name.as_str() == "R")
+        .find(|d| d.package.name().as_str() == "R")
         .expect("Depends: R (>= 4.6.0) must reach the model, not be filtered out");
     assert_eq!(r.kind, DependencyKind::Depends);
     assert!(
-        r.constraint
+        r.package
+            .constraint()
             .satisfies(&RPackageVersion::parse("4.6.0").unwrap())
     );
     assert!(
-        r.constraint
+        r.package
+            .constraint()
             .satisfies(&RPackageVersion::parse("4.6").unwrap()),
         "4.6 == 4.6.0"
     );
     assert!(
-        !r.constraint
+        !r.package
+            .constraint()
             .satisfies(&RPackageVersion::parse("4.5.1").unwrap())
     );
 }
@@ -45,10 +48,10 @@ fn folded_dependency_list_is_split_into_entries() {
     let c = catalog();
     let core = only(&c, "rsolvefixture.core");
     let mut imports: Vec<_> = core
-        .dependencies()
+        .declared_dependencies()
         .iter()
         .filter(|d| d.kind == DependencyKind::Imports)
-        .map(|d| d.name.as_str().to_owned())
+        .map(|d| d.package.name().as_str().to_owned())
         .collect();
     imports.sort();
     assert_eq!(
@@ -70,7 +73,7 @@ fn all_five_dependency_kinds_are_represented() {
         DependencyKind::Enhances,
     ] {
         assert!(
-            core.dependencies().iter().any(|d| d.kind == kind),
+            core.declared_dependencies().iter().any(|d| d.kind == kind),
             "{kind:?} missing from the parsed record"
         );
     }
@@ -81,13 +84,14 @@ fn unconstrained_dependency_accepts_any_version() {
     let c = catalog();
     let core = only(&c, "rsolvefixture.core");
     let base = core
-        .dependencies()
+        .declared_dependencies()
         .iter()
-        .find(|d| d.name.as_str() == "rsolvefixture.base")
+        .find(|d| d.package.name().as_str() == "rsolvefixture.base")
         .expect("bare dependency name must be kept");
     for v in ["0.0.1", "99.0"] {
         assert!(
-            base.constraint
+            base.package
+                .constraint()
                 .satisfies(&RPackageVersion::parse(v).unwrap())
         );
     }

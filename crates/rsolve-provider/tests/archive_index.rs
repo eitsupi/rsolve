@@ -100,17 +100,18 @@ fn archive_reader_looks_up_columns_and_preserves_dependencies_and_utf8() {
     ] {
         assert!(
             release
-                .dependencies()
+                .declared_dependencies()
                 .iter()
-                .any(|dependency| dependency.kind == kind && dependency.name.as_str() == name),
+                .any(|dependency| dependency.kind == kind
+                    && dependency.package.name().as_str() == name),
             "missing {kind:?} dependency {name}"
         );
     }
     assert!(
         release
-            .dependencies()
+            .declared_dependencies()
             .iter()
-            .any(|dependency| dependency.name.as_str() == "rsolvefixture.import.helper")
+            .any(|dependency| dependency.package.name().as_str() == "rsolvefixture.import.helper")
     );
     assert_eq!(
         catalog.candidates_named("rsolvefixture.utf8").unwrap()[0]
@@ -170,18 +171,18 @@ fn archive_root_row_suppresses_matching_recommended_overlay() {
     let release = &catalog.candidates_named("Matrix").unwrap()[0];
     assert_eq!(
         release
-            .dependencies()
+            .declared_dependencies()
             .iter()
-            .find(|dependency| dependency.name.as_str() == "R")
-            .and_then(|dependency| dependency.constraint.clauses.first())
+            .find(|dependency| dependency.package.name().as_str() == "R")
+            .and_then(|dependency| dependency.package.constraint().clauses.first())
             .map(|clause| clause.version.as_str()),
         Some("4.4")
     );
     assert!(
         release
-            .dependencies()
+            .declared_dependencies()
             .iter()
-            .any(|dependency| dependency.name.as_str() == "methods")
+            .any(|dependency| dependency.package.name().as_str() == "methods")
     );
     assert!(!release.metadata().fields().contains_key("Path"));
 }
@@ -194,10 +195,10 @@ fn archive_mismatched_recommended_overlay_does_not_conflict_with_root() {
     let release = &catalog.candidates_named("Matrix").unwrap()[0];
     assert_eq!(
         release
-            .dependencies()
+            .declared_dependencies()
             .iter()
-            .find(|dependency| dependency.name.as_str() == "R")
-            .and_then(|dependency| dependency.constraint.clauses.first())
+            .find(|dependency| dependency.package.name().as_str() == "R")
+            .and_then(|dependency| dependency.package.constraint().clauses.first())
             .map(|clause| clause.version.as_str()),
         Some("4.4")
     );
@@ -232,10 +233,10 @@ fn archive_p3m_overlay_first_without_md5_keeps_the_root_row() {
     assert_eq!(catalog.candidate_count(), 1);
     assert_eq!(
         release
-            .dependencies()
+            .declared_dependencies()
             .iter()
-            .find(|dependency| dependency.name.as_str() == "R")
-            .and_then(|dependency| dependency.constraint.clauses.first())
+            .find(|dependency| dependency.package.name().as_str() == "R")
+            .and_then(|dependency| dependency.package.constraint().clauses.first())
             .map(|clause| clause.version.as_str()),
         Some("4.4")
     );
@@ -273,10 +274,15 @@ fn valid_xz_and_bzip2_archive_indexes_decode_to_the_expected_catalog() {
             releases[1].metadata().fields().get("License"),
             Some(&"RSOLVE Fictional Terms Matrix".to_owned())
         );
-        assert!(releases[1].dependencies().iter().any(|dependency| {
-            dependency.name.as_str() == "methods"
-                && dependency.kind == rsolve_core::DependencyKind::Imports
-        }));
+        assert!(
+            releases[1]
+                .declared_dependencies()
+                .iter()
+                .any(|dependency| {
+                    dependency.package.name().as_str() == "methods"
+                        && dependency.kind == rsolve_core::DependencyKind::Imports
+                })
+        );
     }
 }
 

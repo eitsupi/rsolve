@@ -4,7 +4,7 @@ use crate::snapshot::{
     OccurrenceStateV1, ParseStateV1, PublicationStateV1, SemanticsStateV1, encode_history,
 };
 use rsolve_core::{
-    Artifact, ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
+    Artifact, ArtifactLocator, DeclaredDependency, DependencyKind, DependencySourceConstraint,
     Distribution, DistributionChannel, DistributionMetadata, PackageName, PackageNamespace,
     PackageRelease, RPackageVersion, RegistryId, RelationOp, SourceArtifact, VersionClause,
     VersionConstraint,
@@ -70,19 +70,21 @@ fn release_with_reordered_duplicate_dependencies() -> PackageRelease {
         VersionClause::new(RelationOp::Ge, RPackageVersion::parse("1.0").unwrap()),
         VersionClause::new(RelationOp::Ge, RPackageVersion::parse("2.0").unwrap()),
     ]);
-    observation.dependencies = vec![
-        DependencyRequirement::new(
+    observation.declared_dependencies = vec![
+        DeclaredDependency::from_parts(
             DependencyKind::Depends,
             package.clone(),
             DependencySourceConstraint::Any,
             first,
-        ),
-        DependencyRequirement::new(
+        )
+        .unwrap(),
+        DeclaredDependency::from_parts(
             DependencyKind::Depends,
             package,
             DependencySourceConstraint::Any,
             second,
-        ),
+        )
+        .unwrap(),
     ];
     PackageRelease::try_from(observation).unwrap()
 }
@@ -90,26 +92,35 @@ fn release_with_reordered_duplicate_dependencies() -> PackageRelease {
 fn release_with_non_any_dependency() -> PackageRelease {
     let fields = [("Package", "P3MOverlay"), ("Version", "1.0")];
     let mut observation = super::super::catalog::observation_from_fields(&fields).unwrap();
-    observation.dependencies = vec![DependencyRequirement::new(
-        DependencyKind::Depends,
-        PackageName::new("R").unwrap(),
-        DependencySourceConstraint::Registry {
-            namespace: PackageNamespace::new("cran").unwrap(),
-        },
-        VersionConstraint::unconstrained(),
-    )];
+    observation.declared_dependencies = vec![
+        DeclaredDependency::from_parts(
+            DependencyKind::Depends,
+            PackageName::new("R").unwrap(),
+            DependencySourceConstraint::Registry {
+                namespace: PackageNamespace::new("cran").unwrap(),
+            },
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap(),
+    ];
     PackageRelease::try_from(observation).unwrap()
 }
 
 fn release_with_dependency_version_spelling(spelling: &str) -> PackageRelease {
     let fields = [("Package", "P3MOverlay"), ("Version", "1.0")];
     let mut observation = super::super::catalog::observation_from_fields(&fields).unwrap();
-    observation.dependencies = vec![DependencyRequirement::new(
-        DependencyKind::Depends,
-        PackageName::new("R").unwrap(),
-        DependencySourceConstraint::Any,
-        VersionConstraint::from_clause(RelationOp::Ge, RPackageVersion::parse(spelling).unwrap()),
-    )];
+    observation.declared_dependencies = vec![
+        DeclaredDependency::from_parts(
+            DependencyKind::Depends,
+            PackageName::new("R").unwrap(),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(
+                RelationOp::Ge,
+                RPackageVersion::parse(spelling).unwrap(),
+            ),
+        )
+        .unwrap(),
+    ];
     PackageRelease::try_from(observation).unwrap()
 }
 

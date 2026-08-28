@@ -1,7 +1,6 @@
 use super::*;
 use crate::constraints::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, RelationOp,
-    VersionConstraint,
+    DeclaredDependency, DependencyKind, DependencySourceConstraint, RelationOp, VersionConstraint,
 };
 use crate::identity::{
     Artifact, Distribution, DistributionMetadata, Provenance, ReleaseIdentity, SourceArtifact,
@@ -51,18 +50,19 @@ fn observation(
         observed_version: version(release_version),
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: vec![],
+        declared_dependencies: vec![],
         distributions: vec![distribution],
     }
 }
 
-fn digest_dependency(name: &str, kind: DependencyKind) -> DependencyRequirement {
-    DependencyRequirement::new(
+fn digest_dependency(name: &str, kind: DependencyKind) -> DeclaredDependency {
+    DeclaredDependency::from_parts(
         kind,
         package(name),
         DependencySourceConstraint::Any,
         VersionConstraint::from_clause(RelationOp::Ge, version("1.0")),
     )
+    .unwrap()
 }
 
 mod aggregation;

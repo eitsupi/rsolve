@@ -185,7 +185,7 @@ mod tests {
             release.version(),
             release.metadata().fields(),
             release.publication(),
-            release.dependencies(),
+            release.declared_dependencies(),
             release.distributions(),
             release.metadata_digest(),
         )

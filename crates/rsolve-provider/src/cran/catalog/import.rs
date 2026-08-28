@@ -368,12 +368,15 @@ pub(super) fn observation_from_fields_with_context(
                         source,
                     }
                 })?;
-                dependencies.push(DependencyRequirement::new(
-                    kind,
-                    dependency.name,
-                    DependencySourceConstraint::Any,
-                    dependency.constraint,
-                ));
+                dependencies.push(
+                    DeclaredDependency::from_parts(
+                        kind,
+                        dependency.name,
+                        DependencySourceConstraint::Any,
+                        dependency.constraint,
+                    )
+                    .map_err(|error| CranRecordError::InvalidDependency(error.to_string()))?,
+                );
             }
         }
     }
@@ -405,7 +408,7 @@ pub(super) fn observation_from_fields_with_context(
         observed_version: version,
         metadata,
         publication,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: vec![Distribution {
             registry: RegistryId::new(CRAN_NAMESPACE).expect("the fixed CRAN registry is valid"),
             channel: DistributionChannel::new(SOURCE_CHANNEL)

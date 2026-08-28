@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, PackageName, PackageNamespace,
-    PackageRelease, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
+    DependencyKind, DependencySourceConstraint, PackageName, PackageNamespace, PackageRelease,
+    Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+    ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{
     DefaultCandidatePreference, LockUpdatePolicy, PreferLocked, RBasePackageOverlay, RequireLocked,
@@ -51,7 +51,7 @@ fn package(name: &str) -> PackageName {
 fn registry_release(
     name: &str,
     version: &str,
-    dependencies: Vec<DependencyRequirement>,
+    dependencies: Vec<DeclaredDependency>,
 ) -> PackageRelease {
     let name = package(name);
     let version = RPackageVersion::parse(version).unwrap();
@@ -67,19 +67,27 @@ fn registry_release(
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
 }
 
-fn any_requirement(name: &str) -> DependencyRequirement {
-    DependencyRequirement::new(
+fn any_requirement(name: &str) -> DeclaredDependency {
+    DeclaredDependency::from_parts(
         DependencyKind::Depends,
         package(name),
         DependencySourceConstraint::Any,
         VersionConstraint::unconstrained(),
     )
+    .unwrap()
+}
+
+fn any_root(name: &str) -> rsolve_core::RootRequirement {
+    rsolve_core::RootRequirement {
+        package: any_requirement(name).package,
+        expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+    }
 }
 
 fn matrix_loader() -> FixtureLoader {
@@ -91,7 +99,7 @@ fn matrix_loader() -> FixtureLoader {
                     "Matrix",
                     "1.6-5",
                     vec![
-                        DependencyRequirement::new(
+                        DeclaredDependency::from_parts(
                             DependencyKind::Depends,
                             package("R"),
                             DependencySourceConstraint::Any,
@@ -99,7 +107,8 @@ fn matrix_loader() -> FixtureLoader {
                                 rsolve_core::RelationOp::Ge,
                                 RPackageVersion::parse("3.5.0").unwrap(),
                             ),
-                        ),
+                        )
+                        .unwrap(),
                         any_requirement("methods"),
                     ],
                 ),
@@ -107,7 +116,7 @@ fn matrix_loader() -> FixtureLoader {
                     "Matrix",
                     "1.7-0",
                     vec![
-                        DependencyRequirement::new(
+                        DeclaredDependency::from_parts(
                             DependencyKind::Depends,
                             package("R"),
                             DependencySourceConstraint::Any,
@@ -115,7 +124,8 @@ fn matrix_loader() -> FixtureLoader {
                                 rsolve_core::RelationOp::Ge,
                                 RPackageVersion::parse("4.4.0").unwrap(),
                             ),
-                        ),
+                        )
+                        .unwrap(),
                         any_requirement("methods"),
                     ],
                 ),
@@ -130,7 +140,7 @@ fn matrix_loader() -> FixtureLoader {
 
 fn matrix_request() -> ResolutionRequest {
     ResolutionRequest::without_lock(
-        vec![any_requirement("Matrix")],
+        vec![any_root("Matrix")],
         target("4.3.3"),
         VersionConstraint::unconstrained(),
     )
@@ -211,7 +221,7 @@ fn soft_registry_lock_falls_back_to_environment_base_candidate() {
     let mut locked = HashMap::new();
     locked.insert(SolverKey::InstalledName(methods.clone()), registry_identity);
     let request = ResolutionRequest::new(
-        vec![any_requirement("methods")],
+        vec![any_root("methods")],
         target("4.4.0"),
         VersionConstraint::unconstrained(),
         locked,
@@ -233,7 +243,7 @@ fn frozen_incompatible_registry_lock_fails() {
     let mut locked = HashMap::new();
     locked.insert(SolverKey::InstalledName(methods), registry_identity);
     let request = ResolutionRequest::new(
-        vec![any_requirement("methods")],
+        vec![any_root("methods")],
         target("4.4.0"),
         VersionConstraint::unconstrained(),
         locked,

@@ -7,8 +7,8 @@ use matrix_scenario::regression_support::{
     StrongDependencyCatalog, matrix_identity, require_locked_matrix_resolver, with_locked_matrix,
 };
 use rsolve_core::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl,
-    PackageName, RPackageVersion, RelationOp, SolverKey, VersionConstraint,
+    DependencySourceConstraint, NormalizedGitUrl, PackageName, RPackageVersion, RelationOp,
+    SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{AssignmentBasis, AssignmentDifference, DecisionCandidate, DecisionSubject};
 
@@ -326,14 +326,17 @@ fn require_locked_rejects_a_lock_the_root_constraint_excludes() {
 fn git_scoped_root_requirement_is_a_metadata_failure() {
     let catalog = MatrixCatalog::new();
     let mut request = catalog.request("4.3.3");
-    request.requirements = vec![DependencyRequirement::new(
-        DependencyKind::Depends,
-        PackageName::new("Matrix").unwrap(),
-        DependencySourceConstraint::Git {
-            repository: NormalizedGitUrl::new("https://example.test/matrix.git").unwrap(),
-        },
-        VersionConstraint::unconstrained(),
-    )];
+    request.roots = vec![rsolve_core::RootRequirement {
+        package: rsolve_core::PackageRequirement::new(
+            PackageName::new("Matrix").unwrap(),
+            DependencySourceConstraint::Git {
+                repository: NormalizedGitUrl::new("https://example.test/matrix.git").unwrap(),
+            },
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap(),
+        expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+    }];
 
     let failure = catalog.resolver().resolve(request).unwrap_err();
     match failure {

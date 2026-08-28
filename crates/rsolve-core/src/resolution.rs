@@ -1,7 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::{PackageName, PackageRelease, RPackageVersion, ResolutionTarget, SolverKey};
+use crate::{
+    PackageName, PackageRelease, RPackageVersion, ResolutionTarget, ResolvedDependencyEdge,
+    SolverKey,
+};
 
 /// The stable categories a candidate source may report to the resolver.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -124,6 +127,7 @@ pub trait CandidateLoader {
 pub struct ResolvedPackage {
     subject: SolverKey,
     release: PackageRelease,
+    effective_dependencies: Vec<ResolvedDependencyEdge>,
 }
 
 impl ResolvedPackage {
@@ -143,8 +147,8 @@ impl ResolvedPackage {
         self.release.version()
     }
 
-    pub fn dependencies(&self) -> &[crate::DependencyRequirement] {
-        self.release.dependencies()
+    pub fn effective_dependencies(&self) -> &[ResolvedDependencyEdge] {
+        &self.effective_dependencies
     }
 
     pub fn distributions(&self) -> &[crate::Distribution] {
@@ -164,8 +168,16 @@ impl ResolvedPackage {
     }
 
     #[doc(hidden)]
-    pub fn new(subject: SolverKey, release: PackageRelease) -> Self {
-        Self { subject, release }
+    pub fn new(
+        subject: SolverKey,
+        release: PackageRelease,
+        effective_dependencies: Vec<ResolvedDependencyEdge>,
+    ) -> Self {
+        Self {
+            subject,
+            release,
+            effective_dependencies,
+        }
     }
 }
 
@@ -201,5 +213,65 @@ impl Resolution {
             .iter()
             .find(|package| package.name() == name)
             .map(ResolvedPackage::release)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DeclaredDependency, DependencyKind, DependencySourceConstraint, EffectiveDependencyKind,
+        PackageRequirement, Provenance, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+        VersionConstraint,
+    };
+
+    #[test]
+    fn default_projection_keeps_only_selected_hard_dependency_kinds() {
+        let parent = PackageName::new("parent").unwrap();
+        let child = PackageName::new("child").unwrap();
+        let version = RPackageVersion::parse("1.0.0").unwrap();
+        let requirement = PackageRequirement::new(
+            child,
+            DependencySourceConstraint::Any,
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap();
+        let release = PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                parent.clone(),
+                Provenance::RegistryRelease {
+                    namespace: crate::PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: parent.clone(),
+            observed_version: version.clone(),
+            metadata: ReleaseMetadata::default(),
+            publication: None,
+            declared_dependencies: vec![
+                DeclaredDependency::from_package(DependencyKind::Depends, requirement.clone()),
+                DeclaredDependency::from_package(DependencyKind::Suggests, requirement),
+            ],
+            distributions: Vec::new(),
+        })
+        .unwrap();
+        let resolved = ResolvedPackage::new(
+            SolverKey::InstalledName(parent),
+            release,
+            vec![ResolvedDependencyEdge {
+                kind: EffectiveDependencyKind::Depends,
+                package: PackageRequirement::new(
+                    PackageName::new("child").unwrap(),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                )
+                .unwrap(),
+            }],
+        );
+        assert_eq!(resolved.effective_dependencies().len(), 1);
+        assert_eq!(
+            resolved.effective_dependencies()[0].kind,
+            EffectiveDependencyKind::Depends
+        );
     }
 }

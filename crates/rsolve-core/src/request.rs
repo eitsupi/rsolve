@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::constraints::{DependencyRequirement, VersionConstraint};
+use crate::constraints::{RootRequirement, VersionConstraint};
 use crate::identity::ReleaseIdentity;
-use crate::names::{BioconductorRelease, PackageName, PackageNamespace};
+use crate::names::{BioconductorRelease, PackageName, PackageNamespace, RepositoryId};
 use crate::publication::PublicationCutoff;
 use crate::target::ResolutionTarget;
 
@@ -20,6 +20,10 @@ pub enum SolverKey {
     Bioconductor {
         namespace: PackageNamespace,
         release: BioconductorRelease,
+        name: PackageName,
+    },
+    Repository {
+        repository: RepositoryId,
         name: PackageName,
     },
     Exact(ReleaseIdentity),
@@ -41,7 +45,7 @@ pub type LockedIdentities = HashMap<SolverKey, ReleaseIdentity>;
 /// a previous lock.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionRequest {
-    pub requirements: Vec<DependencyRequirement>,
+    pub roots: Vec<RootRequirement>,
     pub target: ResolutionTarget,
     pub r_requirement: VersionConstraint,
     pub locked: LockedIdentities,
@@ -50,13 +54,13 @@ pub struct ResolutionRequest {
 
 impl ResolutionRequest {
     pub fn new(
-        requirements: Vec<DependencyRequirement>,
+        roots: Vec<RootRequirement>,
         target: ResolutionTarget,
         r_requirement: VersionConstraint,
         locked: LockedIdentities,
     ) -> Self {
         Self {
-            requirements,
+            roots,
             target,
             r_requirement,
             locked,
@@ -65,11 +69,11 @@ impl ResolutionRequest {
     }
 
     pub fn without_lock(
-        requirements: Vec<DependencyRequirement>,
+        roots: Vec<RootRequirement>,
         target: ResolutionTarget,
         r_requirement: VersionConstraint,
     ) -> Self {
-        Self::new(requirements, target, r_requirement, LockedIdentities::new())
+        Self::new(roots, target, r_requirement, LockedIdentities::new())
     }
 
     pub fn with_publication_cutoff(mut self, cutoff: PublicationCutoff) -> Self {

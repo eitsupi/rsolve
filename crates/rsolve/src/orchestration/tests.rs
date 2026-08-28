@@ -2,10 +2,10 @@ use super::*;
 use crate::{LockedPackage, LockedResolution};
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, GitCommitId,
-    NormalizedGitUrl, PackageName, PackageNamespace, PackageRelease, Provenance, RPackageVersion,
-    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ResolutionTarget, Sha256Digest,
-    SolverKey, SourceScheme, VersionConstraint,
+    DeclaredDependency, DependencyKind, DependencySourceConstraint, GitCommitId, NormalizedGitUrl,
+    PackageName, PackageNamespace, PackageRelease, Provenance, RPackageVersion, ReleaseIdentity,
+    ReleaseMetadata, ReleaseObservation, ResolutionTarget, Sha256Digest, SolverKey, SourceScheme,
+    VersionConstraint,
 };
 use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_resolver::R_BASE_PACKAGE_NAMES;
@@ -118,13 +118,14 @@ fn dependency(
     kind: DependencyKind,
     name: &PackageName,
     constraint: VersionConstraint,
-) -> DependencyRequirement {
-    DependencyRequirement::new(
+) -> DeclaredDependency {
+    DeclaredDependency::from_parts(
         kind,
         name.clone(),
         DependencySourceConstraint::Any,
         constraint,
     )
+    .unwrap()
 }
 
 fn ge_version(version: &str) -> VersionConstraint {
@@ -137,7 +138,7 @@ fn ge_version(version: &str) -> VersionConstraint {
 fn release_at_version_with_dependencies(
     name: &PackageName,
     version: &str,
-    dependencies: Vec<DependencyRequirement>,
+    dependencies: Vec<DeclaredDependency>,
 ) -> PackageRelease {
     let version = RPackageVersion::parse(version).unwrap();
     PackageRelease::try_from(ReleaseObservation {
@@ -152,7 +153,7 @@ fn release_at_version_with_dependencies(
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
@@ -267,7 +268,7 @@ fn fixture_loader() -> FixtureLoader {
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     };
     FixtureLoader {
@@ -277,7 +278,7 @@ fn fixture_loader() -> FixtureLoader {
 
 fn release_with_dependencies(
     name: &PackageName,
-    dependencies: Vec<DependencyRequirement>,
+    dependencies: Vec<DeclaredDependency>,
 ) -> PackageRelease {
     let version = RPackageVersion::parse("1.0.0").unwrap();
     let identity = ReleaseIdentity::new(
@@ -293,7 +294,7 @@ fn release_with_dependencies(
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
@@ -313,7 +314,7 @@ fn release_at_version(name: &PackageName, value: &str) -> PackageRelease {
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap()
@@ -326,7 +327,7 @@ fn release_with_identity(identity: ReleaseIdentity, version: RPackageVersion) ->
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         identity,
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap()
@@ -393,12 +394,13 @@ fn cran_dependency_closure_is_deterministic_and_excludes_optional_and_r_base() {
     let r_base = PackageName::new("R").unwrap();
     let optional = PackageName::new("optional").unwrap();
     let required = |kind, name: &PackageName| {
-        DependencyRequirement::new(
+        DeclaredDependency::from_parts(
             kind,
             name.clone(),
             DependencySourceConstraint::Any,
             VersionConstraint::unconstrained(),
         )
+        .unwrap()
     };
     let root_candidates = vec![
         release_with_dependencies(
@@ -487,6 +489,7 @@ fn lock_boundary_uses_prefer_fallback_and_require_exact_policy() {
         vec![rsolve_core::ResolvedPackage::new(
             SolverKey::InstalledName(name.clone()),
             old,
+            Vec::new(),
         )],
     );
     let environment = EnvironmentId::new("default").unwrap();
@@ -521,19 +524,30 @@ fn prefer_policy_updates_a_changed_root_without_consume_precondition() {
     let dependency = PackageName::new("dependency").unwrap();
     let old_root = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            dependency.clone(),
-            DependencySourceConstraint::Any,
-            VersionConstraint::unconstrained(),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                dependency.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+        ],
     );
     let old_dependency = release_with_dependencies(&dependency, Vec::new());
     let old_resolution = Resolution::new(
         ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
         vec![
-            rsolve_core::ResolvedPackage::new(SolverKey::InstalledName(root.clone()), old_root),
-            rsolve_core::ResolvedPackage::new(SolverKey::InstalledName(dependency), old_dependency),
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(root.clone()),
+                old_root,
+                Vec::new(),
+            ),
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(dependency),
+                old_dependency,
+                Vec::new(),
+            ),
         ],
     );
     let environment = EnvironmentId::new("default").unwrap();
@@ -584,18 +598,22 @@ fn require_exact_rejects_new_transitive_identity_from_upstream_metadata() {
         vec![rsolve_core::ResolvedPackage::new(
             SolverKey::InstalledName(root.clone()),
             release_at_version(&root, "1.0.0"),
+            Vec::new(),
         )],
     );
     let environment = EnvironmentId::new("default").unwrap();
     let lock = Lockfile::from_resolution(&old_resolution, environment.clone()).unwrap();
     let refreshed_root = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            extra.clone(),
-            DependencySourceConstraint::Any,
-            VersionConstraint::unconstrained(),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                extra.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+        ],
     );
     let error = resolve_with_lock_policy(
         manifest_for(root),
@@ -628,6 +646,7 @@ fn require_exact_identity_mismatch_diagnostics_are_order_independent() {
             vec![rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(root.clone()),
                 release_at_version(&root, "1.0.0"),
+                Vec::new(),
             )],
         ),
         EnvironmentId::new("default").unwrap(),
@@ -637,18 +656,20 @@ fn require_exact_identity_mismatch_diagnostics_are_order_independent() {
     let refreshed_root = release_with_dependencies(
         &root,
         vec![
-            DependencyRequirement::new(
+            DeclaredDependency::from_parts(
                 DependencyKind::Imports,
                 first.clone(),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            ),
-            DependencyRequirement::new(
+            )
+            .unwrap(),
+            DeclaredDependency::from_parts(
                 DependencyKind::Imports,
                 second.clone(),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            ),
+            )
+            .unwrap(),
         ],
     );
     let first_release = release_with_dependencies(&first, Vec::new());
@@ -769,14 +790,17 @@ fn source_qualified_not_found_is_propagated_without_refresh_retry() {
     let dependency = PackageName::new("fixture.registry").unwrap();
     let root_release = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            dependency,
-            DependencySourceConstraint::Registry {
-                namespace: PackageNamespace::new("cran").unwrap(),
-            },
-            VersionConstraint::unconstrained(),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                dependency,
+                DependencySourceConstraint::Registry {
+                    namespace: PackageNamespace::new("cran").unwrap(),
+                },
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+        ],
     );
     let initial = CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]);
     let error = resolve_with_loader(manifest_for(root), &initial).unwrap_err();
@@ -835,12 +859,15 @@ fn methods_dependency_uses_target_r_base_without_refresh_or_resolution_output() 
     let target = RPackageVersion::parse("4.4.0").unwrap();
     let root_release = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            methods.clone(),
-            DependencySourceConstraint::Any,
-            VersionConstraint::from_clause(rsolve_core::RelationOp::Eq, target.clone()),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                methods.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(rsolve_core::RelationOp::Eq, target.clone()),
+            )
+            .unwrap(),
+        ],
     );
     let resolution = resolve_with_loader(
         manifest_for(root.clone()),
@@ -857,15 +884,18 @@ fn incompatible_methods_constraint_is_no_solution_without_refresh() {
     let methods = PackageName::new("methods").unwrap();
     let root_release = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            methods,
-            DependencySourceConstraint::Any,
-            VersionConstraint::from_clause(
-                rsolve_core::RelationOp::Eq,
-                RPackageVersion::parse("4.3.0").unwrap(),
-            ),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                methods,
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(
+                    rsolve_core::RelationOp::Eq,
+                    RPackageVersion::parse("4.3.0").unwrap(),
+                ),
+            )
+            .unwrap(),
+        ],
     );
     let error = resolve_with_loader(
         manifest_for(root.clone()),
@@ -986,12 +1016,15 @@ fn injected_loader_uses_target_r_base_package_without_loader_candidates() {
     let target = RPackageVersion::parse("4.4.0").unwrap();
     let root_release = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            methods.clone(),
-            DependencySourceConstraint::Any,
-            VersionConstraint::from_clause(rsolve_core::RelationOp::Eq, target.clone()),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                methods.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(rsolve_core::RelationOp::Eq, target.clone()),
+            )
+            .unwrap(),
+        ],
     );
 
     let resolution = resolve_with_loader(
@@ -1012,12 +1045,15 @@ fn injected_loader_does_not_infer_recommended_packages_as_runtime_provided() {
     let matrix = PackageName::new("Matrix").unwrap();
     let root_release = release_with_dependencies(
         &root,
-        vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            matrix,
-            DependencySourceConstraint::Any,
-            VersionConstraint::unconstrained(),
-        )],
+        vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                matrix,
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+        ],
     );
 
     let error = resolve_with_loader(

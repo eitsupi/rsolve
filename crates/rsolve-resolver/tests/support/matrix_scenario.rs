@@ -2,11 +2,12 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, Distribution, DistributionChannel,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
+    DependencyKind, DependencySourceConstraint, Distribution, DistributionChannel,
     DistributionMetadata, PackageName, PackageNamespace, PackageRelease, Provenance,
     RPackageVersion, RelationOp, ReleaseAggregation, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
+    ReleaseObservation, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
+    SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{DefaultCandidatePreference, PreferLocked, Resolver};
 
@@ -74,12 +75,15 @@ impl MatrixCatalog {
     ) -> ResolutionRequest {
         let matrix = PackageName::new("Matrix").unwrap();
         ResolutionRequest::without_lock(
-            vec![DependencyRequirement::new(
-                DependencyKind::Depends,
-                matrix,
-                DependencySourceConstraint::Any,
-                constraint,
-            )],
+            vec![RootRequirement {
+                package: rsolve_core::PackageRequirement::new(
+                    matrix,
+                    DependencySourceConstraint::Any,
+                    constraint,
+                )
+                .unwrap(),
+                expansion: RootExpansionPolicy::HardOnly,
+            }],
             ResolutionTarget::new(RPackageVersion::parse(r_version).unwrap()),
             VersionConstraint::unconstrained(),
         )
@@ -126,19 +130,21 @@ fn matrix_release(version: &str, r_constraint: VersionConstraint) -> ReleaseObse
         observed_version: RPackageVersion::parse(version).unwrap(),
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: vec![
-            DependencyRequirement::new(
+        declared_dependencies: vec![
+            DeclaredDependency::from_parts(
                 DependencyKind::Depends,
                 PackageName::new("R").unwrap(),
                 DependencySourceConstraint::Any,
                 r_constraint,
-            ),
-            DependencyRequirement::new(
+            )
+            .unwrap(),
+            DeclaredDependency::from_parts(
                 DependencyKind::Depends,
                 PackageName::new("methods").unwrap(),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            ),
+            )
+            .unwrap(),
         ],
         distributions: vec![Distribution {
             registry: rsolve_core::RegistryId::new("cran").unwrap(),
@@ -165,7 +171,7 @@ fn plain_release(name: &str, version: &str) -> ReleaseObservation {
         observed_version: parsed_version,
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: vec![Distribution {
             registry: rsolve_core::RegistryId::new("cran").unwrap(),
             channel: DistributionChannel::new("source").unwrap(),
@@ -215,20 +221,26 @@ pub mod regression_support {
             let foo = PackageName::new("Foo").unwrap();
             ResolutionRequest::without_lock(
                 vec![
-                    DependencyRequirement::new(
-                        DependencyKind::Depends,
-                        foo.clone(),
-                        DependencySourceConstraint::Registry {
-                            namespace: PackageNamespace::new("cran").unwrap(),
-                        },
-                        VersionConstraint::unconstrained(),
-                    ),
-                    DependencyRequirement::new(
-                        DependencyKind::Depends,
-                        foo,
-                        DependencySourceConstraint::Any,
-                        VersionConstraint::unconstrained(),
-                    ),
+                    RootRequirement {
+                        package: rsolve_core::PackageRequirement::new(
+                            foo.clone(),
+                            DependencySourceConstraint::Registry {
+                                namespace: PackageNamespace::new("cran").unwrap(),
+                            },
+                            VersionConstraint::unconstrained(),
+                        )
+                        .unwrap(),
+                        expansion: RootExpansionPolicy::HardOnly,
+                    },
+                    RootRequirement {
+                        package: rsolve_core::PackageRequirement::new(
+                            foo,
+                            DependencySourceConstraint::Any,
+                            VersionConstraint::unconstrained(),
+                        )
+                        .unwrap(),
+                        expansion: RootExpansionPolicy::HardOnly,
+                    },
                 ],
                 ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
@@ -292,23 +304,29 @@ pub mod regression_support {
                 "Foo",
                 version,
                 "other",
-                vec![DependencyRequirement::new(
-                    DependencyKind::Depends,
-                    PackageName::new("WrongDep").unwrap(),
-                    DependencySourceConstraint::Any,
-                    VersionConstraint::unconstrained(),
-                )],
+                vec![
+                    DeclaredDependency::from_parts(
+                        DependencyKind::Depends,
+                        PackageName::new("WrongDep").unwrap(),
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    )
+                    .unwrap(),
+                ],
             );
             let preferred = registry_candidate(
                 "Foo",
                 version,
                 "preferred",
-                vec![DependencyRequirement::new(
-                    DependencyKind::Depends,
-                    PackageName::new("PreferredDep").unwrap(),
-                    DependencySourceConstraint::Any,
-                    VersionConstraint::unconstrained(),
-                )],
+                vec![
+                    DeclaredDependency::from_parts(
+                        DependencyKind::Depends,
+                        PackageName::new("PreferredDep").unwrap(),
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    )
+                    .unwrap(),
+                ],
             );
             vec![nonpreferred, preferred]
         }
@@ -407,7 +425,7 @@ pub mod regression_support {
     impl StrongDependencyCatalog {
         pub fn new() -> Self {
             let dependency = registry_candidate("AssignedDep", "1.0.0", "cran", vec![]);
-            let strong = DependencyRequirement::new(
+            let strong = DeclaredDependency::from_parts(
                 DependencyKind::Depends,
                 PackageName::new("AssignedDep").unwrap(),
                 DependencySourceConstraint::Any,
@@ -415,13 +433,15 @@ pub mod regression_support {
                     RelationOp::Ge,
                     RPackageVersion::parse("2.0.0").unwrap(),
                 ),
-            );
-            let available = DependencyRequirement::new(
+            )
+            .unwrap();
+            let available = DeclaredDependency::from_parts(
                 DependencyKind::Depends,
                 PackageName::new("AssignedDep").unwrap(),
                 DependencySourceConstraint::Any,
                 VersionConstraint::unconstrained(),
-            );
+            )
+            .unwrap();
             Self {
                 top: vec![
                     registry_candidate("StrongTop", "1.0.0", "cran", vec![available]),
@@ -439,12 +459,15 @@ pub mod regression_support {
 
         pub fn request(&self) -> ResolutionRequest {
             ResolutionRequest::without_lock(
-                vec![DependencyRequirement::new(
-                    DependencyKind::Depends,
-                    PackageName::new("StrongTop").unwrap(),
-                    DependencySourceConstraint::Any,
-                    VersionConstraint::unconstrained(),
-                )],
+                vec![RootRequirement {
+                    package: rsolve_core::PackageRequirement::new(
+                        PackageName::new("StrongTop").unwrap(),
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    )
+                    .unwrap(),
+                    expansion: RootExpansionPolicy::HardOnly,
+                }],
                 ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
@@ -470,14 +493,15 @@ pub mod regression_support {
 
     impl GitDependencyCatalog {
         pub fn new() -> Self {
-            let git_dependency = DependencyRequirement::new(
+            let git_dependency = DeclaredDependency::from_parts(
                 DependencyKind::Depends,
                 PackageName::new("GitOnly").unwrap(),
                 DependencySourceConstraint::Git {
                     repository: NormalizedGitUrl::new("https://example.test/git-only.git").unwrap(),
                 },
                 VersionConstraint::unconstrained(),
-            );
+            )
+            .unwrap();
             Self {
                 choice: vec![
                     registry_candidate("Choice", "1.0.0", "cran", vec![]),
@@ -494,12 +518,15 @@ pub mod regression_support {
 
         pub fn request(&self) -> ResolutionRequest {
             ResolutionRequest::without_lock(
-                vec![DependencyRequirement::new(
-                    DependencyKind::Depends,
-                    PackageName::new("Choice").unwrap(),
-                    DependencySourceConstraint::Any,
-                    VersionConstraint::unconstrained(),
-                )],
+                vec![RootRequirement {
+                    package: rsolve_core::PackageRequirement::new(
+                        PackageName::new("Choice").unwrap(),
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    )
+                    .unwrap(),
+                    expansion: RootExpansionPolicy::HardOnly,
+                }],
                 ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
@@ -577,12 +604,15 @@ pub mod regression_support {
 
         pub fn request(&self) -> ResolutionRequest {
             ResolutionRequest::without_lock(
-                vec![DependencyRequirement::new(
-                    DependencyKind::Depends,
-                    PackageName::new("Alternatives").unwrap(),
-                    DependencySourceConstraint::Any,
-                    VersionConstraint::unconstrained(),
-                )],
+                vec![RootRequirement {
+                    package: rsolve_core::PackageRequirement::new(
+                        PackageName::new("Alternatives").unwrap(),
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    )
+                    .unwrap(),
+                    expansion: RootExpansionPolicy::HardOnly,
+                }],
                 ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
                 VersionConstraint::unconstrained(),
             )
@@ -608,13 +638,16 @@ pub mod regression_support {
         }
     }
 
-    fn foo_requirement() -> DependencyRequirement {
-        DependencyRequirement::new(
-            DependencyKind::Depends,
-            PackageName::new("Foo").unwrap(),
-            DependencySourceConstraint::Any,
-            VersionConstraint::unconstrained(),
-        )
+    fn foo_requirement() -> RootRequirement {
+        RootRequirement {
+            package: rsolve_core::PackageRequirement::new(
+                PackageName::new("Foo").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        }
     }
 
     fn plain_candidate(name: &str, version: &str) -> PackageRelease {
@@ -625,7 +658,7 @@ pub mod regression_support {
         name: &str,
         version: &str,
         namespace: &str,
-        dependencies: Vec<DependencyRequirement>,
+        dependencies: Vec<DeclaredDependency>,
     ) -> PackageRelease {
         let package = PackageName::new(name).unwrap();
         let parsed_version = RPackageVersion::parse(version).unwrap();
@@ -641,7 +674,7 @@ pub mod regression_support {
             observed_version: parsed_version,
             metadata: ReleaseMetadata::default(),
             publication: None,
-            dependencies,
+            declared_dependencies: dependencies,
             distributions: vec![Distribution {
                 registry: rsolve_core::RegistryId::new("cran").unwrap(),
                 channel: DistributionChannel::new("source").unwrap(),

@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::constraints::{DependencyRequirement, DependencySourceConstraint};
+use crate::constraints::{DeclaredDependency, DependencySourceConstraint};
 use crate::identity::{Distribution, Provenance, ReleaseIdentity};
 use crate::names::{PackageName, Sha256Digest};
 use crate::publication::ReleasePublication;
@@ -85,7 +85,7 @@ pub struct ReleaseObservation {
     pub observed_version: RPackageVersion,
     pub metadata: ReleaseMetadata,
     pub publication: Option<ReleasePublication>,
-    pub dependencies: Vec<DependencyRequirement>,
+    pub declared_dependencies: Vec<DeclaredDependency>,
     pub distributions: Vec<Distribution>,
 }
 
@@ -103,7 +103,7 @@ pub struct PackageRelease {
     pub(super) version: RPackageVersion,
     pub(super) metadata: ReleaseMetadata,
     pub(super) publication: Option<ReleasePublication>,
-    pub(super) dependencies: Vec<DependencyRequirement>,
+    pub(super) declared_dependencies: Vec<DeclaredDependency>,
     pub(super) distributions: Vec<Distribution>,
     pub(super) metadata_digest: Sha256Digest,
 }
@@ -161,12 +161,14 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
             }
         }
 
-        for (index, dependency) in observation.dependencies.iter().enumerate() {
-            let invalid_exact_name = match &dependency.source {
-                DependencySourceConstraint::Exact(identity) => identity.name() != &dependency.name,
+        for (index, dependency) in observation.declared_dependencies.iter().enumerate() {
+            let invalid_exact_name = match dependency.package.source() {
+                DependencySourceConstraint::Exact(identity) => {
+                    identity.name() != dependency.package.name()
+                }
                 _ => false,
             };
-            if dependency.name.as_str().is_empty() || invalid_exact_name {
+            if dependency.package.name().as_str().is_empty() || invalid_exact_name {
                 return Err(PackageReleaseError::InvalidDependency { index });
             }
         }
@@ -182,14 +184,14 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
         let metadata_digest = canonical_metadata_digest(
             &observation.identity,
             &observation.observed_version,
-            &observation.dependencies,
+            &observation.declared_dependencies,
         );
         Ok(Self {
             identity: observation.identity,
             version: observation.observed_version,
             metadata: observation.metadata,
             publication: observation.publication,
-            dependencies: observation.dependencies,
+            declared_dependencies: observation.declared_dependencies,
             distributions: unique_distributions,
             metadata_digest,
         })

@@ -11,12 +11,12 @@ fn metadata_digest_is_canonical_and_excludes_distribution_facts() {
         "1.0",
         source_distribution("a"),
     );
-    first.dependencies = vec![
+    first.declared_dependencies = vec![
         digest_dependency("lattice", DependencyKind::Imports),
         digest_dependency("R", DependencyKind::Depends),
     ];
     let mut reversed = first.clone();
-    reversed.dependencies.reverse();
+    reversed.declared_dependencies.reverse();
     reversed.distributions = vec![source_distribution("different-artifact")];
     let first_release = PackageRelease::try_from(first).unwrap();
     let reversed_release = PackageRelease::try_from(reversed).unwrap();
@@ -26,7 +26,7 @@ fn metadata_digest_is_canonical_and_excludes_distribution_facts() {
     );
 
     let mut changed = observation(identity(provenance), "1.0", source_distribution("a"));
-    changed.dependencies = vec![digest_dependency("lattice", DependencyKind::Suggests)];
+    changed.declared_dependencies = vec![digest_dependency("lattice", DependencyKind::Suggests)];
     assert_ne!(
         first_release.metadata_digest(),
         PackageRelease::try_from(changed).unwrap().metadata_digest()
@@ -35,12 +35,13 @@ fn metadata_digest_is_canonical_and_excludes_distribution_facts() {
 
 #[test]
 fn metadata_digest_uses_semantic_versions_and_logical_sources() {
-    let dependency = DependencyRequirement::new(
+    let dependency = DeclaredDependency::from_parts(
         DependencyKind::Imports,
         package("lattice"),
         DependencySourceConstraint::Any,
         VersionConstraint::from_clause(RelationOp::Ge, version("1.0-0")),
-    );
+    )
+    .unwrap();
     let equivalent_identity = identity(Provenance::RegistryRelease {
         namespace: PackageNamespace::new("cran").unwrap(),
         version: version("1.6.5"),
@@ -50,7 +51,7 @@ fn metadata_digest_uses_semantic_versions_and_logical_sources() {
         "1.6.5",
         source_distribution("equivalent"),
     );
-    equivalent.dependencies = vec![dependency.clone()];
+    equivalent.declared_dependencies = vec![dependency.clone()];
 
     let raw_spelling_identity = identity(Provenance::RegistryRelease {
         namespace: PackageNamespace::new("cran").unwrap(),
@@ -61,12 +62,15 @@ fn metadata_digest_uses_semantic_versions_and_logical_sources() {
         "01.6-5.0",
         source_distribution("different-artifact"),
     );
-    raw_spelling.dependencies = vec![DependencyRequirement::new(
-        DependencyKind::Imports,
-        package("lattice"),
-        DependencySourceConstraint::Any,
-        VersionConstraint::from_clause(RelationOp::Ge, version("1.0.0")),
-    )];
+    raw_spelling.declared_dependencies = vec![
+        DeclaredDependency::from_parts(
+            DependencyKind::Imports,
+            package("lattice"),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(RelationOp::Ge, version("1.0.0")),
+        )
+        .unwrap(),
+    ];
     let equivalent_release = PackageRelease::try_from(equivalent).unwrap();
     let raw_spelling_release = PackageRelease::try_from(raw_spelling).unwrap();
     assert_eq!(
@@ -82,7 +86,7 @@ fn metadata_digest_uses_semantic_versions_and_logical_sources() {
         "1.6.5",
         source_distribution("duplicate"),
     );
-    duplicate.dependencies = vec![dependency.clone(), dependency];
+    duplicate.declared_dependencies = vec![dependency.clone(), dependency];
     assert_eq!(
         equivalent_release.metadata_digest(),
         PackageRelease::try_from(duplicate)
@@ -145,14 +149,17 @@ fn metadata_digest_uses_semantic_versions_and_logical_sources() {
         "1.6.5",
         source_distribution("source-change"),
     );
-    source_observation.dependencies = vec![DependencyRequirement::new(
-        DependencyKind::Imports,
-        package("lattice"),
-        DependencySourceConstraint::Registry {
-            namespace: PackageNamespace::new("cran").unwrap(),
-        },
-        VersionConstraint::from_clause(RelationOp::Gt, version("1.0.0")),
-    )];
+    source_observation.declared_dependencies = vec![
+        DeclaredDependency::from_parts(
+            DependencyKind::Imports,
+            package("lattice"),
+            DependencySourceConstraint::Registry {
+                namespace: PackageNamespace::new("cran").unwrap(),
+            },
+            VersionConstraint::from_clause(RelationOp::Gt, version("1.0.0")),
+        )
+        .unwrap(),
+    ];
     let changed_dependency = PackageRelease::try_from(source_observation).unwrap();
     assert_ne!(
         source_changed.metadata_digest(),
@@ -168,12 +175,15 @@ fn metadata_digest_uses_semantic_versions_and_logical_sources() {
             "1.6.5",
             source_distribution("dependency-variant"),
         );
-        observation.dependencies = vec![DependencyRequirement::new(
-            DependencyKind::Imports,
-            package("lattice"),
-            source,
-            VersionConstraint::from_clause(op, version(dependency_version)),
-        )];
+        observation.declared_dependencies = vec![
+            DeclaredDependency::from_parts(
+                DependencyKind::Imports,
+                package("lattice"),
+                source,
+                VersionConstraint::from_clause(op, version(dependency_version)),
+            )
+            .unwrap(),
+        ];
         PackageRelease::try_from(observation).unwrap()
     };
     assert_ne!(

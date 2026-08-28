@@ -10,11 +10,12 @@ pub(super) fn to_wire_release(
 ) -> Result<EligibleReleaseV1, EvidenceCompositionError> {
     let release = &pending.release;
     let mut dependencies: Vec<DependencyV1> = release
-        .dependencies()
+        .declared_dependencies()
         .iter()
         .map(|dependency| {
             let mut clauses = dependency
-                .constraint
+                .package
+                .constraint()
                 .clauses
                 .iter()
                 .map(|clause| ClauseV1 {
@@ -54,7 +55,7 @@ pub(super) fn to_wire_release(
                     rsolve_core::DependencyKind::Suggests => DependencyKindV1::Suggests,
                     rsolve_core::DependencyKind::Enhances => DependencyKindV1::Enhances,
                 },
-                package: dependency.name.as_str().into(),
+                package: dependency.package.name().as_str().into(),
                 clauses,
             })
         })

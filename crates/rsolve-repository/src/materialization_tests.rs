@@ -2,7 +2,7 @@ use crate::materialization::MaterializationTransaction;
 use crate::*;
 use flate2::{Compression, write::GzEncoder};
 use rsolve_core::{
-    BioconductorRelease, DependencyKind, DependencyRequirement, DependencySourceConstraint,
+    BioconductorRelease, DeclaredDependency, DependencyKind, DependencySourceConstraint,
     PackageName, PackageNamespace, Provenance, RPackageVersion, RelationOp, ReleaseIdentity,
     ReleaseMetadata, ReleasePublication, UpstreamChecksum, VersionConstraint,
 };
@@ -66,12 +66,13 @@ fn packages_are_deterministic_and_preserve_folded_metadata_and_dependencies() {
             digest: cache.sha256.clone(),
         },
     );
-    let dependency = DependencyRequirement::new(
+    let dependency = DeclaredDependency::from_parts(
         DependencyKind::Imports,
         PackageName::new("leaf").unwrap(),
         DependencySourceConstraint::Any,
         VersionConstraint::from_clause(RelationOp::Ge, RPackageVersion::parse("0.1.0").unwrap()),
-    );
+    )
+    .unwrap();
     let metadata = ReleaseMetadata::from_pairs([
         ("Description", "UTF-8 summary\nwith a continuation"),
         ("Encoding", "UTF-8"),
@@ -146,7 +147,7 @@ fn packages_reject_multiple_version_clauses_for_one_dependency() {
             digest: cache.sha256.clone(),
         },
     );
-    let dependency = DependencyRequirement::new(
+    let dependency = DeclaredDependency::from_parts(
         DependencyKind::Imports,
         PackageName::new("leaf").unwrap(),
         DependencySourceConstraint::Any,
@@ -160,7 +161,8 @@ fn packages_reject_multiple_version_clauses_for_one_dependency() {
                 RPackageVersion::parse("0.2.0").unwrap(),
             ),
         ]),
-    );
+    )
+    .unwrap();
     let middle =
         MaterializationArtifact::new(identity, RPackageVersion::parse("0.1.0").unwrap(), cache)
             .with_metadata(
@@ -172,12 +174,13 @@ fn packages_reject_multiple_version_clauses_for_one_dependency() {
         Err(PackagesError::UnsupportedConstraint { .. })
     ));
 
-    let not_equal = DependencyRequirement::new(
+    let not_equal = DeclaredDependency::from_parts(
         DependencyKind::Imports,
         PackageName::new("leaf").unwrap(),
         DependencySourceConstraint::Any,
         VersionConstraint::from_clause(RelationOp::Ne, RPackageVersion::parse("0.1.0").unwrap()),
-    );
+    )
+    .unwrap();
     let middle = MaterializationArtifact::new(
         ReleaseIdentity::new(
             PackageName::new("middle").unwrap(),

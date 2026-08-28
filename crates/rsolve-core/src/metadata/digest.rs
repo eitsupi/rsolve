@@ -6,7 +6,7 @@ const METADATA_DIGEST_DOMAIN: &[u8] = b"rsolve.logical-release-metadata\0v1";
 use sha2::{Digest, Sha256};
 
 use crate::constraints::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, RelationOp,
+    DeclaredDependency, DependencyKind, DependencySourceConstraint, RelationOp,
 };
 use crate::identity::{Provenance, ReleaseIdentity};
 use crate::names::Sha256Digest;
@@ -15,7 +15,7 @@ use crate::r_versions::RPackageVersion;
 pub(super) fn canonical_metadata_digest(
     identity: &ReleaseIdentity,
     observed_version: &RPackageVersion,
-    dependencies: &[DependencyRequirement],
+    dependencies: &[DeclaredDependency],
 ) -> Sha256Digest {
     let mut encoded = Vec::new();
     append_bytes(&mut encoded, METADATA_DIGEST_DOMAIN);
@@ -42,7 +42,7 @@ pub(super) fn canonical_metadata_digest(
     Sha256Digest::new(hex).expect("SHA-256 output is always a valid digest")
 }
 
-fn encode_dependency(dependency: &DependencyRequirement) -> Vec<u8> {
+fn encode_dependency(dependency: &DeclaredDependency) -> Vec<u8> {
     let mut encoded = Vec::new();
     encoded.push(match dependency.kind {
         DependencyKind::Depends => 0,
@@ -51,10 +51,11 @@ fn encode_dependency(dependency: &DependencyRequirement) -> Vec<u8> {
         DependencyKind::Suggests => 3,
         DependencyKind::Enhances => 4,
     });
-    append_string(&mut encoded, dependency.name.as_str());
-    append_source_constraint(&mut encoded, &dependency.source);
+    append_string(&mut encoded, dependency.package.name().as_str());
+    append_source_constraint(&mut encoded, dependency.package.source());
     let mut clauses = dependency
-        .constraint
+        .package
+        .constraint()
         .clauses
         .iter()
         .map(|clause| {
@@ -86,6 +87,10 @@ fn append_source_constraint(encoded: &mut Vec<u8>, source: &DependencySourceCons
         DependencySourceConstraint::Registry { namespace } => {
             encoded.push(1);
             append_string(encoded, namespace.as_str());
+        }
+        DependencySourceConstraint::Repository { repository } => {
+            encoded.push(5);
+            append_string(encoded, repository.as_str());
         }
         DependencySourceConstraint::Bioconductor { namespace, release } => {
             encoded.push(2);

@@ -94,7 +94,7 @@ pub(crate) fn present_input() -> SnapshotBuildInput {
         observed_version: version,
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: vec![],
+        declared_dependencies: vec![],
         distributions: vec![],
     })
     .unwrap();
@@ -132,7 +132,7 @@ pub(crate) fn two_present_input() -> SnapshotBuildInput {
         observed_version: version,
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: vec![],
+        declared_dependencies: vec![],
         distributions: vec![],
     })
     .unwrap();

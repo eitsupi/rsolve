@@ -9,8 +9,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use rsolve_core::{
-    DependencyRequirement, PackageName, Provenance, RPackageVersion, ReleaseIdentity,
-    ReleaseMetadata, ReleasePublication,
+    DeclaredDependency, PackageName, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
+    ReleasePublication,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,7 +43,7 @@ pub struct MaterializationArtifact {
     pub artifact: CachedArtifact,
     pub metadata: ReleaseMetadata,
     pub publication: Option<ReleasePublication>,
-    pub dependencies: Vec<DependencyRequirement>,
+    pub dependencies: Vec<DeclaredDependency>,
 }
 
 impl MaterializationArtifact {
@@ -65,7 +65,7 @@ impl MaterializationArtifact {
     pub fn with_metadata(
         mut self,
         metadata: ReleaseMetadata,
-        dependencies: Vec<DependencyRequirement>,
+        dependencies: Vec<DeclaredDependency>,
     ) -> Self {
         self.metadata = metadata;
         self.dependencies = dependencies;

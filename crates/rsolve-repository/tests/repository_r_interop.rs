@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rsolve_core::{
-    ArtifactLocator, DependencyKind, DependencyRequirement, DependencySourceConstraint,
-    PackageName, Provenance, RPackageVersion, RelationOp, ReleaseIdentity, ReleaseMetadata,
-    SourceArtifact, SourceScheme, VersionConstraint,
+    ArtifactLocator, DeclaredDependency, DependencyKind, DependencySourceConstraint, PackageName,
+    Provenance, RPackageVersion, RelationOp, ReleaseIdentity, ReleaseMetadata, SourceArtifact,
+    SourceScheme, VersionConstraint,
 };
 use rsolve_repository::{
     MaterializationArtifact, MaterializationRequest, commit_source_artifact, materialize,
@@ -38,7 +38,7 @@ fn fixture_manifest(root: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn dependency(kind: DependencyKind, package: &str) -> DependencyRequirement {
+fn dependency(kind: DependencyKind, package: &str) -> DeclaredDependency {
     dependency_with_constraint(kind, package, VersionConstraint::any())
 }
 
@@ -46,13 +46,14 @@ fn dependency_with_constraint(
     kind: DependencyKind,
     package: &str,
     constraint: VersionConstraint,
-) -> DependencyRequirement {
-    DependencyRequirement::new(
+) -> DeclaredDependency {
+    DeclaredDependency::from_parts(
         kind,
         PackageName::new(package).expect("valid fixture package name"),
         DependencySourceConstraint::Any,
         constraint,
     )
+    .unwrap()
 }
 
 fn artifact(
@@ -60,7 +61,7 @@ fn artifact(
     source: &Path,
     package: &str,
     metadata: ReleaseMetadata,
-    dependencies: Vec<DependencyRequirement>,
+    dependencies: Vec<DeclaredDependency>,
 ) -> MaterializationArtifact {
     let bytes = fs::read(source).expect("read fixture source");
     let source_artifact = SourceArtifact {

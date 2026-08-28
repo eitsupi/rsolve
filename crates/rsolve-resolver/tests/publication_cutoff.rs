@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, NormalizedGitUrl, PackageName,
-    PackageRelease, Provenance, PublicationCutoff, PublicationDate, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey,
-    VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
+    DependencyKind, DependencySourceConstraint, NormalizedGitUrl, PackageName, PackageRelease,
+    Provenance, PublicationCutoff, PublicationDate, ReleaseIdentity, ReleaseMetadata,
+    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{
     AssignmentDifference, DefaultCandidatePreference, LockUpdatePolicy, PreferLocked,
@@ -53,7 +52,7 @@ fn release_with_dependencies(
     name: &str,
     version: &str,
     publication: Option<&str>,
-    dependencies: Vec<DependencyRequirement>,
+    dependencies: Vec<DeclaredDependency>,
 ) -> PackageRelease {
     release_with_namespace(name, version, publication, "cran", dependencies)
 }
@@ -63,7 +62,7 @@ fn release_with_namespace(
     version: &str,
     publication: Option<&str>,
     namespace: &str,
-    dependencies: Vec<DependencyRequirement>,
+    dependencies: Vec<DeclaredDependency>,
 ) -> PackageRelease {
     let name = package(name);
     let version = rsolve_core::RPackageVersion::parse(version).unwrap();
@@ -79,7 +78,7 @@ fn release_with_namespace(
         observed_version: version,
         metadata: ReleaseMetadata::default(),
         publication: publication.map(|value| rsolve_core::ReleasePublication::new(date(value))),
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
@@ -95,12 +94,15 @@ fn request_with_constraint(
     locked: HashMap<SolverKey, ReleaseIdentity>,
 ) -> ResolutionRequest {
     ResolutionRequest::new(
-        vec![DependencyRequirement::new(
-            DependencyKind::Depends,
-            package(name),
-            DependencySourceConstraint::Any,
-            constraint,
-        )],
+        vec![rsolve_core::RootRequirement {
+            package: rsolve_core::PackageRequirement::new(
+                package(name),
+                DependencySourceConstraint::Any,
+                constraint,
+            )
+            .unwrap(),
+            expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+        }],
         target(),
         VersionConstraint::unconstrained(),
         locked,
@@ -147,20 +149,21 @@ fn cooldown_excludes_newer_release_and_selects_mature_fallback() {
     );
 }
 
-fn hard_dependency(name: &str) -> DependencyRequirement {
+fn hard_dependency(name: &str) -> DeclaredDependency {
     hard_dependency_with_constraint(name, VersionConstraint::unconstrained())
 }
 
 fn hard_dependency_with_constraint(
     name: &str,
     constraint: VersionConstraint,
-) -> DependencyRequirement {
-    DependencyRequirement::new(
+) -> DeclaredDependency {
+    DeclaredDependency::from_parts(
         DependencyKind::Depends,
         package(name),
         DependencySourceConstraint::Any,
         constraint,
     )
+    .unwrap()
 }
 
 #[test]
@@ -295,14 +298,15 @@ fn mixed_publication_and_missing_proof_remains_generic_no_solution() {
 
 #[test]
 fn publication_and_custom_proof_both_remain_no_solution_with_evidence() {
-    let git_dependency = DependencyRequirement::new(
+    let git_dependency = DeclaredDependency::from_parts(
         DependencyKind::Depends,
         package("gitdep"),
         DependencySourceConstraint::Git {
             repository: NormalizedGitUrl::new("https://example.test/gitdep.git").unwrap(),
         },
         VersionConstraint::unconstrained(),
-    );
+    )
+    .unwrap();
     let loader = FixtureLoader {
         candidates: [
             (

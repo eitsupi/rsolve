@@ -71,15 +71,15 @@ where
         for package in &batch {
             let candidates = snapshot.releases(&SolverKey::InstalledName(package.clone()))?;
             for release in candidates {
-                for dependency in release.dependencies() {
+                for dependency in release.declared_dependencies() {
                     if matches!(
                         dependency.kind,
                         DependencyKind::Depends
                             | DependencyKind::Imports
                             | DependencyKind::LinkingTo
-                    ) && is_remote_cran_package(&dependency.name)
+                    ) && is_remote_cran_package(dependency.package.name())
                     {
-                        closure.insert(dependency.name.clone());
+                        closure.insert(dependency.package.name().clone());
                     }
                 }
             }
@@ -112,15 +112,15 @@ where
             recorder.measure(Phase::ClosureLookup, || {
                 let candidates = snapshot.releases(&SolverKey::InstalledName(package.clone()))?;
                 for release in candidates {
-                    for dependency in release.dependencies() {
+                    for dependency in release.declared_dependencies() {
                         if matches!(
                             dependency.kind,
                             DependencyKind::Depends
                                 | DependencyKind::Imports
                                 | DependencyKind::LinkingTo
-                        ) && is_remote_cran_package(&dependency.name)
+                        ) && is_remote_cran_package(dependency.package.name())
                         {
-                            closure.insert(dependency.name.clone());
+                            closure.insert(dependency.package.name().clone());
                         }
                     }
                 }
@@ -150,15 +150,15 @@ fn collect_cran_dependency_closure_from_loader(
         for package in batch {
             let candidates = loader.releases(&SolverKey::InstalledName(package.clone()))?;
             for release in candidates {
-                for dependency in release.dependencies() {
+                for dependency in release.declared_dependencies() {
                     if matches!(
                         dependency.kind,
                         DependencyKind::Depends
                             | DependencyKind::Imports
                             | DependencyKind::LinkingTo
-                    ) && is_remote_cran_package(&dependency.name)
+                    ) && is_remote_cran_package(dependency.package.name())
                     {
-                        closure.insert(dependency.name.clone());
+                        closure.insert(dependency.package.name().clone());
                     }
                 }
             }
@@ -395,9 +395,9 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         publication_cutoff.map(rsolve_core::PublicationCutoff::new),
     );
     let roots = request
-        .requirements
+        .roots
         .iter()
-        .map(|requirement| requirement.name.clone())
+        .map(|requirement| requirement.package.name().clone())
         .collect::<Vec<_>>();
     if roots.iter().all(|name| !is_remote_cran_package(name)) {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
@@ -618,9 +618,9 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
         publication_cutoff.map(rsolve_core::PublicationCutoff::new),
     );
     let roots = request
-        .requirements
+        .roots
         .iter()
-        .map(|requirement| requirement.name.clone())
+        .map(|requirement| requirement.package.name().clone())
         .collect::<Vec<_>>();
     if roots.iter().all(|name| !is_remote_cran_package(name)) {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
@@ -705,7 +705,7 @@ fn resolve_prepared_snapshot_without_transport_with_metrics(
 mod tests {
     use super::*;
     use rsolve_core::{
-        CandidateLoadErrorCategory, DependencyRequirement, DependencySourceConstraint,
+        CandidateLoadErrorCategory, DeclaredDependency, DependencySourceConstraint,
         PackageNamespace, PackageRelease, Provenance, RPackageVersion, RelationOp, ReleaseIdentity,
         ReleaseMetadata, ReleaseObservation, VersionConstraint,
     };
@@ -714,7 +714,7 @@ mod tests {
 
     fn release_with_dependencies(
         name: &PackageName,
-        dependencies: Vec<DependencyRequirement>,
+        dependencies: Vec<DeclaredDependency>,
     ) -> PackageRelease {
         let version = RPackageVersion::parse("1.0.0").unwrap();
         PackageRelease::try_from(ReleaseObservation {
@@ -729,7 +729,7 @@ mod tests {
             observed_version: version,
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
             publication: None,
-            dependencies,
+            declared_dependencies: dependencies,
             distributions: Vec::new(),
         })
         .unwrap()
@@ -738,7 +738,7 @@ mod tests {
     fn release_at_version_with_dependencies(
         name: &PackageName,
         version: &str,
-        dependencies: Vec<DependencyRequirement>,
+        dependencies: Vec<DeclaredDependency>,
     ) -> PackageRelease {
         let version = RPackageVersion::parse(version).unwrap();
         PackageRelease::try_from(ReleaseObservation {
@@ -753,7 +753,7 @@ mod tests {
             observed_version: version,
             metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
             publication: None,
-            dependencies,
+            declared_dependencies: dependencies,
             distributions: Vec::new(),
         })
         .unwrap()
@@ -771,13 +771,14 @@ mod tests {
         .unwrap()
     }
 
-    fn required_dependency(kind: DependencyKind, name: &PackageName) -> DependencyRequirement {
-        DependencyRequirement::new(
+    fn required_dependency(kind: DependencyKind, name: &PackageName) -> DeclaredDependency {
+        DeclaredDependency::from_parts(
             kind,
             name.clone(),
             DependencySourceConstraint::Any,
             VersionConstraint::unconstrained(),
         )
+        .unwrap()
     }
 
     struct FailingLoader(CandidateLoadError);

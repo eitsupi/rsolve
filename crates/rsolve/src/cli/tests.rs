@@ -2,10 +2,9 @@ use super::*;
 use crate::resolve_with_loader_with_publication_cutoff;
 use clap::Parser;
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencyRequirement, DependencySourceConstraint, PackageNamespace, PackageRelease,
-    Provenance, RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, SolverKey,
-    VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
+    DependencyKind, DependencySourceConstraint, PackageNamespace, PackageRelease, Provenance,
+    RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, SolverKey, VersionConstraint,
 };
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -568,22 +567,28 @@ impl CandidateLoader for MatrixLoader {
 fn matrix_release(version: &str, r_constraint: Option<&str>) -> PackageRelease {
     let matrix = PackageName::new("Matrix").unwrap();
     let version = RPackageVersion::parse(version).unwrap();
-    let mut dependencies = vec![DependencyRequirement::new(
-        DependencyKind::Imports,
-        PackageName::new("lattice").unwrap(),
-        DependencySourceConstraint::Any,
-        VersionConstraint::unconstrained(),
-    )];
-    if let Some(constraint) = r_constraint {
-        dependencies.push(DependencyRequirement::new(
-            DependencyKind::Depends,
-            PackageName::new("R").unwrap(),
+    let mut dependencies = vec![
+        DeclaredDependency::from_parts(
+            DependencyKind::Imports,
+            PackageName::new("lattice").unwrap(),
             DependencySourceConstraint::Any,
-            VersionConstraint::from_clause(
-                RelationOp::Ge,
-                RPackageVersion::parse(constraint).unwrap(),
-            ),
-        ));
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap(),
+    ];
+    if let Some(constraint) = r_constraint {
+        dependencies.push(
+            DeclaredDependency::from_parts(
+                DependencyKind::Depends,
+                PackageName::new("R").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::from_clause(
+                    RelationOp::Ge,
+                    RPackageVersion::parse(constraint).unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
     }
     PackageRelease::try_from(ReleaseObservation {
         identity: ReleaseIdentity::new(
@@ -597,7 +602,7 @@ fn matrix_release(version: &str, r_constraint: Option<&str>) -> PackageRelease {
         observed_version: version,
         metadata: ReleaseMetadata::new(std::collections::BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
@@ -618,7 +623,7 @@ fn lattice_release() -> PackageRelease {
         observed_version: version,
         metadata: ReleaseMetadata::new(std::collections::BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap()

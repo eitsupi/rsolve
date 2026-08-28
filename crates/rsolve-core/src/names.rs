@@ -442,11 +442,31 @@ impl fmt::Display for GitCommitId {
 opaque_identifier!(PackageNamespace);
 opaque_identifier!(BioconductorRelease);
 opaque_identifier!(RepositorySubdir);
+opaque_identifier!(RepositoryId);
 opaque_identifier!(RegistryId);
 opaque_identifier!(SnapshotId);
 opaque_identifier!(ArtifactLocator);
 opaque_identifier!(DistributionChannel);
 opaque_identifier!(SourceScheme);
+
+/// The manifest declaration order of a repository, represented independently
+/// from an external integer field.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryRank(u64);
+
+impl RepositoryRank {
+    pub const fn new(ordinal: u64) -> Self {
+        Self(ordinal)
+    }
+
+    pub const fn ordinal(self) -> u64 {
+        self.0
+    }
+
+    pub fn from_usize(ordinal: usize) -> Option<Self> {
+        u64::try_from(ordinal).ok().map(Self)
+    }
+}
 
 /// A validated lower-case hexadecimal SHA-256 digest.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -563,5 +583,16 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn repository_ids_are_opaque_and_ranks_are_orderable_values() {
+        assert!(RepositoryId::new("").is_err());
+        assert!(RepositoryId::new("primary\n").is_err());
+        let first = RepositoryRank::new(0);
+        let second = RepositoryRank::new(1);
+        assert!(first < second);
+        assert_eq!(first.ordinal(), 0);
+        assert_eq!(RepositoryRank::from_usize(1).unwrap().ordinal(), 1);
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::constraints::DependencyRequirement;
+use crate::constraints::DeclaredDependency;
 use crate::identity::{Distribution, ReleaseIdentity};
 use crate::names::Sha256Digest;
 use crate::publication::ReleasePublication;
@@ -29,8 +29,8 @@ impl PackageRelease {
         self.publication.as_ref()
     }
 
-    pub fn dependencies(&self) -> &[DependencyRequirement] {
-        &self.dependencies
+    pub fn declared_dependencies(&self) -> &[DeclaredDependency] {
+        &self.declared_dependencies
     }
 
     pub fn distributions(&self) -> &[Distribution] {
@@ -90,9 +90,9 @@ impl ReleaseAggregation {
                 (None, Some(publication)) => existing.publication = Some(publication),
                 _ => {}
             }
-            if existing.dependencies != release.dependencies {
+            if existing.declared_dependencies != release.declared_dependencies {
                 return Err(PackageReleaseError::ConflictingMetadata {
-                    field: "dependencies",
+                    field: "declared dependencies",
                 });
             }
             existing.merge_distributions(&release.distributions);

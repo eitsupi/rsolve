@@ -20,12 +20,11 @@ use redb::{
 };
 use rsolve_core::{
     Artifact, ArtifactLocator, CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult,
-    CandidateLoader, DependencyKind, DependencyRequirement, DependencySourceConstraint,
-    Distribution, DistributionChannel, DistributionMetadata, PackageName, PackageNamespace,
-    PackageRelease, Provenance, PublicationDate, QuarantinedCandidate, RPackageVersion, RegistryId,
-    RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ReleasePublication,
-    Sha256Digest, SnapshotId, SolverKey, SourceArtifact, UpstreamChecksum, VersionClause,
-    VersionConstraint,
+    CandidateLoader, DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
+    DistributionChannel, DistributionMetadata, PackageName, PackageNamespace, PackageRelease,
+    Provenance, PublicationDate, QuarantinedCandidate, RPackageVersion, RegistryId, RelationOp,
+    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ReleasePublication, Sha256Digest,
+    SnapshotId, SolverKey, SourceArtifact, UpstreamChecksum, VersionClause, VersionConstraint,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

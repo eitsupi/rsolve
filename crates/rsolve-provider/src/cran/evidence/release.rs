@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::types::*;
 use rsolve_core::{
-    DependencyRequirement, PackageRelease, ReleaseAggregation, ReleaseMetadata, ReleaseObservation,
+    DeclaredDependency, PackageRelease, ReleaseAggregation, ReleaseMetadata, ReleaseObservation,
 };
 
 pub(super) fn merge_release_group(
@@ -30,10 +30,10 @@ pub(super) fn merge_release_group(
             }
         }
     }
-    let dependencies = authoritative[0].1.dependencies().to_vec();
+    let dependencies = authoritative[0].1.declared_dependencies().to_vec();
     let dependency_key = canonical_dependency_semantics(&dependencies)?;
     for (_, release) in authoritative.iter().skip(1) {
-        if canonical_dependency_semantics(release.dependencies())? != dependency_key {
+        if canonical_dependency_semantics(release.declared_dependencies())? != dependency_key {
             return Err(EvidenceCompositionError::Conflict {
                 identity: identity_label,
                 field: "dependencies",
@@ -93,7 +93,7 @@ pub(super) fn merge_release_group(
             EvidenceCompositionError::Invalid(format!("merged metadata is invalid: {error}"))
         })?,
         publication,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: distributions.clone(),
     };
     let merged = PackageRelease::try_from(merged_observation).map_err(|error| {
@@ -149,13 +149,14 @@ fn merge_distribution(
 type DependencySemanticKey = (u8, String, Vec<(u8, Vec<u32>)>);
 
 fn canonical_dependency_semantics(
-    dependencies: &[DependencyRequirement],
+    dependencies: &[DeclaredDependency],
 ) -> Result<Vec<DependencySemanticKey>, EvidenceCompositionError> {
     let mut keys = dependencies
         .iter()
         .map(|dependency| {
             let mut clauses = dependency
-                .constraint
+                .package
+                .constraint()
                 .clauses
                 .iter()
                 .map(|clause| {
@@ -174,7 +175,7 @@ fn canonical_dependency_semantics(
             clauses.dedup();
             Ok((
                 dependency.kind as u8,
-                dependency.name.as_str().to_owned(),
+                dependency.package.name().as_str().to_owned(),
                 clauses,
             ))
         })

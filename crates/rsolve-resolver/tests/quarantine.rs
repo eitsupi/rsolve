@@ -1,11 +1,12 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, PackageName,
-    PackageNamespace, PackageRelease, Provenance, RPackageVersion, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey,
-    VersionConstraint,
+    DeclaredDependency, DependencyKind, DependencySourceConstraint, PackageName, PackageNamespace,
+    PackageRelease, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
+    ReleaseObservation, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
+    SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{
     DefaultCandidatePreference, RequireLocked, ResolutionFailure, Resolver, Unlocked,
@@ -54,7 +55,7 @@ fn package(name: &str) -> PackageName {
     PackageName::new(name).unwrap()
 }
 
-fn release(name: &str, version: &str, dependencies: Vec<DependencyRequirement>) -> PackageRelease {
+fn release(name: &str, version: &str, dependencies: Vec<DeclaredDependency>) -> PackageRelease {
     let name = package(name);
     let version = RPackageVersion::parse(version).unwrap();
     PackageRelease::try_from(ReleaseObservation {
@@ -69,27 +70,34 @@ fn release(name: &str, version: &str, dependencies: Vec<DependencyRequirement>) 
         observed_version: version,
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions: Vec::new(),
     })
     .unwrap()
 }
 
-fn request(requirements: Vec<DependencyRequirement>) -> ResolutionRequest {
+fn request(requirements: Vec<DeclaredDependency>) -> ResolutionRequest {
     ResolutionRequest::without_lock(
-        requirements,
+        requirements
+            .into_iter()
+            .map(|dependency| RootRequirement {
+                package: dependency.package,
+                expansion: RootExpansionPolicy::HardOnly,
+            })
+            .collect(),
         ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
         VersionConstraint::unconstrained(),
     )
 }
 
-fn any_dependency(name: &str, constraint: VersionConstraint) -> DependencyRequirement {
-    DependencyRequirement::new(
+fn any_dependency(name: &str, constraint: VersionConstraint) -> DeclaredDependency {
+    DeclaredDependency::from_parts(
         DependencyKind::Depends,
         package(name),
         DependencySourceConstraint::Any,
         constraint,
     )
+    .unwrap()
 }
 
 fn resolve(
@@ -97,6 +105,48 @@ fn resolve(
     request: ResolutionRequest,
 ) -> Result<rsolve_core::Resolution, ResolutionFailure> {
     Resolver::new(loader, &DefaultCandidatePreference, &Unlocked).resolve(request)
+}
+
+struct NoCallLoader {
+    calls: Cell<usize>,
+}
+
+impl CandidateLoader for NoCallLoader {
+    fn releases(&self, _package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        self.calls.set(self.calls.get() + 1);
+        panic!("candidate loading must not start for unsupported root expansion")
+    }
+}
+
+#[test]
+fn direct_suggests_is_rejected_before_candidate_loading() {
+    let loader = NoCallLoader {
+        calls: Cell::new(0),
+    };
+    let request = ResolutionRequest::without_lock(
+        vec![RootRequirement {
+            package: rsolve_core::PackageRequirement::new(
+                package("foo"),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::DirectSuggests,
+        }],
+        ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        VersionConstraint::unconstrained(),
+    );
+    let error = Resolver::new(&loader, &DefaultCandidatePreference, &Unlocked)
+        .resolve(request)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ResolutionFailure::UnsupportedRootExpansion {
+            package: found,
+            policy: RootExpansionPolicy::DirectSuggests,
+        } if found == package("foo")
+    ));
+    assert_eq!(loader.calls.get(), 0);
 }
 
 #[test]

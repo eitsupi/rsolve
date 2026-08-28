@@ -163,7 +163,7 @@ fn observation(identity: ReleaseIdentity, version: &str) -> ReleaseObservation {
         identity,
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     }
 }

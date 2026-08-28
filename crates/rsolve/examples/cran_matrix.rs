@@ -252,7 +252,7 @@ mod tests {
             observed_version: matrix_version,
             metadata: metadata.clone(),
             publication: None,
-            dependencies: Vec::new(),
+            declared_dependencies: Vec::new(),
             distributions: Vec::new(),
         })
         .unwrap();
@@ -267,7 +267,7 @@ mod tests {
             observed_version: version("4.4.0"),
             metadata,
             publication: None,
-            dependencies: Vec::new(),
+            declared_dependencies: Vec::new(),
             distributions: Vec::new(),
         })
         .unwrap();

@@ -105,12 +105,13 @@ fn canonical_constructor_rejects_name_and_coordinate_mismatches() {
 #[test]
 fn canonical_constructor_preserves_dependencies_as_first_class_data() {
     let matrix = package("Matrix");
-    let dependency = DependencyRequirement::new(
+    let dependency = DeclaredDependency::from_parts(
         DependencyKind::Depends,
         package("R"),
         DependencySourceConstraint::Any,
         VersionConstraint::from_clause(RelationOp::Ge, version("4.4.0")),
-    );
+    )
+    .unwrap();
     let release = PackageRelease::try_from(ReleaseObservation {
         identity: identity(Provenance::RegistryRelease {
             namespace: PackageNamespace::new("cran").unwrap(),
@@ -120,11 +121,11 @@ fn canonical_constructor_preserves_dependencies_as_first_class_data() {
         observed_version: version("1.6-5"),
         metadata: ReleaseMetadata::default(),
         publication: None,
-        dependencies: vec![dependency.clone()],
+        declared_dependencies: vec![dependency.clone()],
         distributions: vec![],
     })
     .unwrap();
-    assert_eq!(release.dependencies(), &[dependency]);
+    assert_eq!(release.declared_dependencies(), &[dependency]);
 }
 
 #[test]
@@ -133,27 +134,14 @@ fn canonical_constructor_rejects_exact_dependency_name_mismatch() {
         namespace: PackageNamespace::new("cran").unwrap(),
         version: version("1.6-5"),
     });
-    let dependency = DependencyRequirement::new(
-        DependencyKind::Depends,
+    let result = crate::PackageRequirement::new(
         package("Other"),
         DependencySourceConstraint::Exact(release_identity),
         VersionConstraint::unconstrained(),
     );
-    let result = PackageRelease::try_from(ReleaseObservation {
-        identity: identity(Provenance::RegistryRelease {
-            namespace: PackageNamespace::new("cran").unwrap(),
-            version: version("1.6-5"),
-        }),
-        observed_package: package("Matrix"),
-        observed_version: version("1.6-5"),
-        metadata: ReleaseMetadata::default(),
-        publication: None,
-        dependencies: vec![dependency],
-        distributions: vec![],
-    });
     assert!(matches!(
         result,
-        Err(PackageReleaseError::InvalidDependency { index: 0 })
+        Err(crate::PackageRequirementError::ExactIdentityNameMismatch { .. })
     ));
 }
 
@@ -173,7 +161,7 @@ fn r_base_provenance_requires_target_version_match() {
         observed_version: target.clone(),
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap();
@@ -186,7 +174,7 @@ fn r_base_provenance_requires_target_version_match() {
         observed_version: version("4.3.0"),
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     });
     assert!(matches!(

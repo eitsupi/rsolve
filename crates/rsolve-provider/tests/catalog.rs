@@ -41,7 +41,7 @@ Unknown-Field: retained\n\n",
         release.publication().map(|publication| publication.date()),
         Some(PublicationDate::parse("2026-06-24").unwrap())
     );
-    assert_eq!(release.dependencies().len(), 10);
+    assert_eq!(release.declared_dependencies().len(), 10);
 
     let expected = [
         (DependencyKind::Depends, "R", Some((RelationOp::Ge, "4.4"))),
@@ -71,20 +71,25 @@ Unknown-Field: retained\n\n",
         ),
         (DependencyKind::Enhances, "bar", None),
     ];
-    for (dependency, (kind, name, constraint)) in release.dependencies().iter().zip(expected) {
+    for (dependency, (kind, name, constraint)) in
+        release.declared_dependencies().iter().zip(expected)
+    {
         assert_eq!(dependency.kind, kind);
-        assert_eq!(dependency.name.as_str(), name);
+        assert_eq!(dependency.package.name().as_str(), name);
         assert!(matches!(
-            (&dependency.source, constraint),
+            (&dependency.package.source(), constraint),
             (DependencySourceConstraint::Any, _)
         ));
         match constraint {
             Some((op, version)) => {
-                assert_eq!(dependency.constraint.clauses.len(), 1);
-                assert_eq!(dependency.constraint.clauses[0].op, op);
-                assert_eq!(dependency.constraint.clauses[0].version.as_str(), version);
+                assert_eq!(dependency.package.constraint().clauses.len(), 1);
+                assert_eq!(dependency.package.constraint().clauses[0].op, op);
+                assert_eq!(
+                    dependency.package.constraint().clauses[0].version.as_str(),
+                    version
+                );
             }
-            None => assert!(dependency.constraint.is_unconstrained()),
+            None => assert!(dependency.package.constraint().is_unconstrained()),
         }
     }
 }
@@ -107,9 +112,9 @@ fn dependency_splitter_matches_r_terminal_empty_segment_rules() {
                 let release = &catalog.candidates_named("dependency.case").unwrap()[0];
                 assert_eq!(
                     release
-                        .dependencies()
+                        .declared_dependencies()
                         .iter()
-                        .map(|dependency| dependency.name.as_str())
+                        .map(|dependency| dependency.package.name().as_str())
                         .collect::<Vec<_>>(),
                     names
                 );
@@ -140,14 +145,15 @@ Package: Matrix\nVersion: 1.7-6\nDepends: R (>= 4.7), methods\nPath: 4.7.0/Recom
     assert_eq!(catalog.candidate_count(), 1);
     assert_eq!(release.version().as_str(), "1.7-6");
     assert!(!release.metadata().fields().contains_key("Path"));
-    assert_eq!(release.dependencies().len(), 2);
+    assert_eq!(release.declared_dependencies().len(), 2);
     assert_eq!(
         release
-            .dependencies()
+            .declared_dependencies()
             .iter()
-            .find(|dependency| dependency.name.as_str() == "R")
+            .find(|dependency| dependency.package.name().as_str() == "R")
             .expect("R dependency")
-            .constraint
+            .package
+            .constraint()
             .clauses[0]
             .version
             .as_str(),
@@ -174,7 +180,10 @@ Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 3.0.0)\n\n",
     let release = &catalog.candidates_named("Matrix").unwrap()[0];
     assert_eq!(catalog.candidate_count(), 1);
     assert_eq!(
-        release.dependencies()[0].constraint.clauses[0]
+        release.declared_dependencies()[0]
+            .package
+            .constraint()
+            .clauses[0]
             .version
             .as_str(),
         "3.0.0"
@@ -189,7 +198,10 @@ Package: Matrix\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\
     let release = &catalog.candidates_named("Matrix").unwrap()[0];
     assert_eq!(catalog.candidate_count(), 1);
     assert_eq!(
-        release.dependencies()[0].constraint.clauses[0]
+        release.declared_dependencies()[0]
+            .package
+            .constraint()
+            .clauses[0]
             .version
             .as_str(),
         "3.0.0"
@@ -257,7 +269,10 @@ Package: boot\nVersion: 1.0.0\nDepends: R (>= 4.7.0)\nPath: 4.7.0/Recommended\n\
         let release = &catalog.candidates_named("boot").unwrap()[0];
         assert_eq!(catalog.candidate_count(), 1);
         assert_eq!(
-            release.dependencies()[0].constraint.clauses[0]
+            release.declared_dependencies()[0]
+                .package
+                .constraint()
+                .clauses[0]
                 .version
                 .as_str(),
             "3.0.0"
@@ -347,18 +362,21 @@ fn folded_dependencies_and_absent_optional_fields_are_handled() {
     let catalog = CranCatalog::from_packages(SYNTHETIC_PACKAGES).unwrap();
     let folded = catalog.candidates_named("rsolvefixture.folded").unwrap();
     assert_eq!(folded.len(), 1);
-    assert_eq!(folded[0].dependencies().len(), 25);
+    assert_eq!(folded[0].declared_dependencies().len(), 25);
     assert_eq!(
-        folded[0].dependencies()[0].name.as_str(),
+        folded[0].declared_dependencies()[0].package.name().as_str(),
         "rsolvefixture.suggest.00"
     );
     assert_eq!(
-        folded[0].dependencies()[24].name.as_str(),
+        folded[0].declared_dependencies()[24]
+            .package
+            .name()
+            .as_str(),
         "rsolvefixture.suggest.24"
     );
 
     let plain = &catalog.candidates_named("rsolvefixture.plain").unwrap()[0];
-    assert!(plain.dependencies().is_empty());
+    assert!(plain.declared_dependencies().is_empty());
     assert!(catalog.candidates_named("missing").unwrap().is_empty());
     assert_eq!(catalog.package_count(), 4);
     assert_eq!(catalog.candidate_count(), 4);

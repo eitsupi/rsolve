@@ -1,9 +1,9 @@
 use super::*;
 use rsolve_core::{
-    Artifact, ArtifactLocator, DependencyRequirement, DependencySourceConstraint, Distribution,
-    DistributionChannel, DistributionMetadata, PackageNamespace, RegistryId, RelationOp,
-    ReleaseMetadata, ReleaseObservation, SnapshotId, SourceArtifact, UpstreamChecksum,
-    VersionConstraint,
+    Artifact, ArtifactLocator, DeclaredDependency, DependencySourceConstraint, Distribution,
+    DistributionChannel, DistributionMetadata, EffectiveDependencyKind, PackageNamespace,
+    PackageRequirement, RegistryId, RelationOp, ReleaseMetadata, ReleaseObservation,
+    ResolvedDependencyEdge, SnapshotId, SourceArtifact, UpstreamChecksum, VersionConstraint,
 };
 use std::collections::BTreeMap;
 
@@ -30,7 +30,7 @@ fn release(name: &str, spelling: &str) -> PackageRelease {
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap()
@@ -146,19 +146,20 @@ fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
 fn projection_is_sorted_and_keeps_logical_fields_only() {
     let mut first = release("zeta", "1.6-5");
     let second = release("alpha", "2.0.0");
-    let dependency = DependencyRequirement::new(
+    let dependency = DeclaredDependency::from_parts(
         DependencyKind::Depends,
         package("alpha"),
         DependencySourceConstraint::Any,
         VersionConstraint::from_clause(RelationOp::Ge, version("1.0")),
-    );
+    )
+    .unwrap();
     first = PackageRelease::try_from(ReleaseObservation {
         identity: first.identity().clone(),
         observed_package: first.identity().name().clone(),
         observed_version: first.version().clone(),
         metadata: first.metadata().clone(),
         publication: first.publication().copied(),
-        dependencies: vec![dependency],
+        declared_dependencies: vec![dependency.clone()],
         distributions: vec![Distribution {
             registry: RegistryId::new("cran").unwrap(),
             channel: DistributionChannel::new("source").unwrap(),
@@ -178,10 +179,15 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(second.identity().name().clone()),
                 second,
+                Vec::new(),
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(first.identity().name().clone()),
                 first,
+                vec![ResolvedDependencyEdge {
+                    kind: EffectiveDependencyKind::Depends,
+                    package: dependency.package,
+                }],
             ),
         ],
     );
@@ -206,6 +212,72 @@ fn canonical_version_preserves_two_components_for_published_spelling() {
 }
 
 #[test]
+fn projection_uses_effective_edges_and_rejects_promoted_suggests() {
+    let root = release("root", "1.0.0");
+    let selected_dependency = release("selected", "1.0.0");
+    let declared_only = release("declared", "1.0.0");
+    let effective = ResolvedDependencyEdge {
+        kind: EffectiveDependencyKind::Depends,
+        package: PackageRequirement::new(
+            package("selected"),
+            DependencySourceConstraint::Any,
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap(),
+    };
+    let resolution = Resolution::new(
+        target(),
+        vec![
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(package("root")),
+                root,
+                vec![effective],
+            ),
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(package("selected")),
+                selected_dependency,
+                Vec::new(),
+            ),
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(package("declared")),
+                declared_only,
+                Vec::new(),
+            ),
+        ],
+    );
+    let lock = Lockfile::from_resolution(&resolution, environment()).unwrap();
+    let root_lock = lock
+        .single_resolution()
+        .unwrap()
+        .packages
+        .iter()
+        .find(|package| package.identity.name().as_str() == "root")
+        .unwrap();
+    assert_eq!(root_lock.dependencies, vec![package("selected")]);
+
+    let promoted = Resolution::new(
+        target(),
+        vec![rsolve_core::ResolvedPackage::new(
+            SolverKey::InstalledName(package("root")),
+            release("root", "1.0.0"),
+            vec![ResolvedDependencyEdge {
+                kind: EffectiveDependencyKind::PromotedSuggests,
+                package: PackageRequirement::new(
+                    package("selected"),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                )
+                .unwrap(),
+            }],
+        )],
+    );
+    assert!(matches!(
+        Lockfile::from_resolution(&promoted, environment()),
+        Err(LockError::UnsupportedDependencyKind { .. })
+    ));
+}
+
+#[test]
 fn downstream_projection_revalidates_mutated_public_lock_state() {
     let name = package("mutable");
     let resolution = Resolution::new(
@@ -213,6 +285,7 @@ fn downstream_projection_revalidates_mutated_public_lock_state() {
         vec![rsolve_core::ResolvedPackage::new(
             SolverKey::InstalledName(name.clone()),
             release("mutable", "1.0.0"),
+            Vec::new(),
         )],
     );
     let mut lock = Lockfile::from_resolution(&resolution, environment()).unwrap();
@@ -438,7 +511,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         observed_version: version.clone(),
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap();
@@ -454,7 +527,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         observed_version: version,
         metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
         publication: None,
-        dependencies: Vec::new(),
+        declared_dependencies: Vec::new(),
         distributions: Vec::new(),
     })
     .unwrap();
@@ -464,8 +537,13 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(name.clone()),
                 first.clone(),
+                Vec::new(),
             ),
-            rsolve_core::ResolvedPackage::new(SolverKey::InstalledName(name), second.clone()),
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(name),
+                second.clone(),
+                Vec::new(),
+            ),
         ],
     );
     assert!(matches!(

@@ -12,9 +12,9 @@ use pubgrub::{
 };
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, PackageRelease,
-    PublicationCutoff, PublicationDate, RPackageVersion, RelationOp, ReleaseIdentity, Resolution,
-    ResolutionRequest, SolverKey, VersionConstraint,
+    DependencyKind, DependencySourceConstraint, PackageRelease, PublicationCutoff, PublicationDate,
+    RPackageVersion, RelationOp, ReleaseIdentity, Resolution, ResolutionRequest,
+    ResolvedDependencyEdge, RootExpansionPolicy, SolverKey, VersionConstraint,
 };
 
 use crate::{CandidatePreference, LockDecision, LockUpdatePolicy, PreferenceContext};
@@ -148,41 +148,45 @@ impl<'a> Provider<'a> {
             .fold(Ranges::full(), |range, clause| range.intersection(&clause))
     }
 
-    fn subject_for_dependency(
+    fn subject_for_package(
         &self,
-        dependency: &DependencyRequirement,
+        package: &rsolve_core::PackageRequirement,
     ) -> Result<SolverKey, Box<AdapterError>> {
         // Root requirements still report unsupported Git scopes as typed metadata
         // failures. Candidate dependencies handle this case in get_dependencies,
         // where PubGrub can reject only the candidate that declared the scope.
-        if let DependencySourceConstraint::Git { .. } = &dependency.source {
+        if let DependencySourceConstraint::Git { .. } = &package.source() {
             return Err(candidate_load_error(
-                SolverKey::InstalledName(dependency.name.clone()),
+                SolverKey::InstalledName(package.name().clone()),
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
                     format!(
                         "Git-sourced dependencies are not supported for package {}",
-                        dependency.name
+                        package.name()
                     ),
                 ),
             ));
         }
-        if dependency.name.as_str() == "R" {
+        if package.name().as_str() == "R" {
             return Ok(SolverKey::R);
         }
-        Ok(match &dependency.source {
-            DependencySourceConstraint::Any => SolverKey::InstalledName(dependency.name.clone()),
+        Ok(match &package.source() {
+            DependencySourceConstraint::Any => SolverKey::InstalledName(package.name().clone()),
             DependencySourceConstraint::Registry { namespace } => SolverKey::Registry {
                 namespace: namespace.clone(),
-                name: dependency.name.clone(),
+                name: package.name().clone(),
             },
             DependencySourceConstraint::Bioconductor { namespace, release } => {
                 SolverKey::Bioconductor {
                     namespace: namespace.clone(),
                     release: release.clone(),
-                    name: dependency.name.clone(),
+                    name: package.name().clone(),
                 }
             }
+            DependencySourceConstraint::Repository { repository } => SolverKey::Repository {
+                repository: repository.clone(),
+                name: package.name().clone(),
+            },
             DependencySourceConstraint::Exact(identity) => SolverKey::Exact(identity.clone()),
             DependencySourceConstraint::Git { .. } => {
                 unreachable!("Git dependencies are rejected by the caller")
@@ -476,10 +480,10 @@ impl DependencyProvider for Provider<'_> {
                     PackageId::Subject(SolverKey::R),
                     self.ranges_for(&self.request.r_requirement),
                 ));
-                for requirement in &self.request.requirements {
+                for requirement in &self.request.roots {
                     dependencies.push((
-                        PackageId::Subject(self.subject_for_dependency(requirement)?),
-                        self.ranges_for(&requirement.constraint),
+                        PackageId::Subject(self.subject_for_package(&requirement.package)?),
+                        self.ranges_for(requirement.package.constraint()),
                     ));
                 }
                 Ok(Dependencies::Available(DependencyConstraints::from_iter(
@@ -498,7 +502,7 @@ impl DependencyProvider for Provider<'_> {
                 }
                 let release = self.candidate_for_version(subject, version)?;
                 let mut dependencies = Vec::new();
-                for dependency in release.dependencies().iter().filter(|dependency| {
+                for dependency in release.declared_dependencies().iter().filter(|dependency| {
                     matches!(
                         dependency.kind,
                         DependencyKind::Depends
@@ -506,15 +510,15 @@ impl DependencyProvider for Provider<'_> {
                             | DependencyKind::LinkingTo
                     )
                 }) {
-                    if let DependencySourceConstraint::Git { .. } = &dependency.source {
+                    if let DependencySourceConstraint::Git { .. } = dependency.package.source() {
                         return Ok(Dependencies::Unavailable(ProviderMessage::Text(format!(
                             "Git-sourced dependencies are not supported for package {}",
-                            dependency.name
+                            dependency.package.name()
                         ))));
                     }
                     dependencies.push((
-                        PackageId::Subject(self.subject_for_dependency(dependency)?),
-                        self.ranges_for(&dependency.constraint),
+                        PackageId::Subject(self.subject_for_package(&dependency.package)?),
+                        self.ranges_for(dependency.package.constraint()),
                     ));
                 }
                 Ok(Dependencies::Available(DependencyConstraints::from_iter(
@@ -575,6 +579,10 @@ fn publication_rejection_cmp(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolutionFailure {
+    UnsupportedRootExpansion {
+        package: rsolve_core::PackageName,
+        policy: RootExpansionPolicy,
+    },
     CandidateLoad {
         package: SolverKey,
         source: Box<CandidateLoadError>,
@@ -629,6 +637,10 @@ impl ResolutionDiagnostic {
 impl fmt::Display for ResolutionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedRootExpansion { package, policy } => write!(
+                f,
+                "root expansion policy {policy:?} for package {package} is not supported",
+            ),
             Self::CandidateLoad { package, source } => {
                 write!(f, "candidate load for {package:?} failed: {source}")
             }
@@ -667,6 +679,16 @@ pub(crate) fn solve(
     lock_policy: &dyn LockUpdatePolicy,
     request: &ResolutionRequest,
 ) -> Result<Resolution, ResolutionFailure> {
+    if let Some(root) = request
+        .roots
+        .iter()
+        .find(|root| root.expansion == RootExpansionPolicy::DirectSuggests)
+    {
+        return Err(ResolutionFailure::UnsupportedRootExpansion {
+            package: root.package.name().clone(),
+            policy: root.expansion,
+        });
+    }
     let provider = Provider {
         loader,
         preference,
@@ -727,7 +749,22 @@ pub(crate) fn solve(
     }
     let mut packages = packages
         .into_values()
-        .map(|(subject, release)| rsolve_core::ResolvedPackage::new(subject, release))
+        .map(|(subject, release)| {
+            let effective_dependencies = release
+                .declared_dependencies()
+                .iter()
+                .filter_map(|dependency| {
+                    dependency
+                        .kind
+                        .effective()
+                        .map(|kind| ResolvedDependencyEdge {
+                            kind,
+                            package: dependency.package.clone(),
+                        })
+                })
+                .collect();
+            rsolve_core::ResolvedPackage::new(subject, release, effective_dependencies)
+        })
         .collect::<Vec<_>>();
     packages.sort_by(|left, right| left.name().cmp(right.name()));
     Ok(Resolution::new(request.target.clone(), packages))
@@ -748,8 +785,9 @@ fn subject_rank(subject: &SolverKey) -> u8 {
         SolverKey::InstalledName(_) => 0,
         SolverKey::Registry { .. } => 1,
         SolverKey::Bioconductor { .. } => 2,
-        SolverKey::Exact(_) => 3,
-        SolverKey::R => 4,
+        SolverKey::Repository { .. } => 3,
+        SolverKey::Exact(_) => 4,
+        SolverKey::R => 5,
     }
 }
 

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-use rsolve_core::{DependencyKind, DependencyRequirement, DependencySourceConstraint, RelationOp};
+use rsolve_core::{DeclaredDependency, DependencyKind, DependencySourceConstraint, RelationOp};
 use thiserror::Error;
 
 use crate::MaterializationArtifact;
@@ -57,7 +57,7 @@ fn write_record(artifact: &MaterializationArtifact) -> Result<String, PackagesEr
     if let Some(publication) = artifact.publication() {
         fields.push(("Published".to_owned(), publication.date().to_string()));
     }
-    let mut grouped: BTreeMap<DependencyKind, Vec<&DependencyRequirement>> = BTreeMap::new();
+    let mut grouped: BTreeMap<DependencyKind, Vec<&DeclaredDependency>> = BTreeMap::new();
     for dependency in &artifact.dependencies {
         grouped.entry(dependency.kind).or_default().push(dependency);
     }
@@ -68,10 +68,10 @@ fn write_record(artifact: &MaterializationArtifact) -> Result<String, PackagesEr
         let mut seen = HashSet::new();
         let mut rendered = Vec::new();
         for dependency in dependencies {
-            if !seen.insert(dependency.name.as_str().to_owned()) {
+            if !seen.insert(dependency.package.name().as_str().to_owned()) {
                 return Err(PackagesError::DuplicateDependency {
                     field: field.to_owned(),
-                    name: dependency.name.to_string(),
+                    name: dependency.package.name().to_string(),
                 });
             }
             rendered.push(render_dependency(dependency, field)?);
@@ -113,17 +113,18 @@ fn write_record(artifact: &MaterializationArtifact) -> Result<String, PackagesEr
 }
 
 fn render_dependency(
-    dependency: &DependencyRequirement,
+    dependency: &DeclaredDependency,
     field: &str,
 ) -> Result<String, PackagesError> {
-    if !matches!(dependency.source, DependencySourceConstraint::Any) {
+    if !matches!(dependency.package.source(), DependencySourceConstraint::Any) {
         return Err(PackagesError::UnsupportedConstraint {
             field: field.to_owned(),
         });
     }
-    if dependency.constraint.clauses.len() > 1
+    if dependency.package.constraint().clauses.len() > 1
         || dependency
-            .constraint
+            .package
+            .constraint()
             .clauses
             .iter()
             .any(|clause| clause.op == RelationOp::Ne)
@@ -132,10 +133,10 @@ fn render_dependency(
             field: field.to_owned(),
         });
     }
-    let mut rendered = dependency.name.to_string();
-    if !dependency.constraint.clauses.is_empty() {
+    let mut rendered = dependency.package.name().to_string();
+    if !dependency.package.constraint().clauses.is_empty() {
         rendered.push_str(" (");
-        for (index, clause) in dependency.constraint.clauses.iter().enumerate() {
+        for (index, clause) in dependency.package.constraint().clauses.iter().enumerate() {
             if index > 0 {
                 rendered.push_str(", ");
             }

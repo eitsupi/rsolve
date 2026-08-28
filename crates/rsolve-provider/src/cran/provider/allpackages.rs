@@ -436,7 +436,7 @@ fn decode_zstd_with_limit(input: &[u8], limit: usize) -> Result<Vec<u8>, String>
 pub(super) fn current_semantics_match(left: &PackageRelease, right: &PackageRelease) -> bool {
     left.identity() == right.identity()
         && left.version() == right.version()
-        && left.dependencies() == right.dependencies()
+        && left.declared_dependencies() == right.declared_dependencies()
         // ALLPACKAGES has no Published column. An absent publication axis is
         // therefore compatible with a dated canonical current row; compare
         // dates strictly only when both observations provide them.
@@ -565,8 +565,10 @@ mod tests {
             with_evidence.observations[0].release().metadata_digest()
         );
         assert_eq!(
-            canonical.observations[0].release().dependencies(),
-            with_evidence.observations[0].release().dependencies()
+            canonical.observations[0].release().declared_dependencies(),
+            with_evidence.observations[0]
+                .release()
+                .declared_dependencies()
         );
     }
 

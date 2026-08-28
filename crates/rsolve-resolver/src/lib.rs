@@ -98,7 +98,7 @@ impl<L> RBasePackageOverlay<L> {
                     )
                 })?,
                 publication: None,
-                dependencies: Vec::new(),
+                declared_dependencies: Vec::new(),
                 distributions: Vec::new(),
             })
             .map_err(|error| {
@@ -522,22 +522,28 @@ fn assignment_basis(
     let statically_compatible = candidates
         .iter()
         .filter(|candidate| {
-            candidate.dependencies().iter().all(|dependency| {
-                dependency.name.as_str() != "R" || dependency.constraint.satisfies(r_version)
+            candidate.declared_dependencies().iter().all(|dependency| {
+                dependency.package.name().as_str() != "R"
+                    || dependency.package.constraint().satisfies(r_version)
             })
         })
         .count();
     if statically_compatible == 1 {
         return AssignmentBasis::OnlyStaticallyCompatible;
     }
-    if request.requirements.iter().any(|requirement| {
-        dependency_key(&requirement.name, &requirement.source)
+    if request.roots.iter().any(|requirement| {
+        dependency_key(requirement.package.name(), requirement.package.source())
             .as_ref()
             .is_some_and(|key| key == subject)
-            && requirement.constraint.clauses.iter().any(|clause| {
-                clause.op == rsolve_core::RelationOp::Eq
-                    && clause.version == *selected.release().version()
-            })
+            && requirement
+                .package
+                .constraint()
+                .clauses
+                .iter()
+                .any(|clause| {
+                    clause.op == rsolve_core::RelationOp::Eq
+                        && clause.version == *selected.release().version()
+                })
     }) {
         return AssignmentBasis::ExactRootRequirement;
     }
@@ -596,46 +602,53 @@ fn difference_for_candidate(
             assigned_to: other.release().identity().clone(),
         });
     }
-    if let Some(requirement) = difference.request.requirements.iter().find(|requirement| {
-        dependency_key(&requirement.name, &requirement.source)
+    if let Some(requirement) = difference.request.roots.iter().find(|requirement| {
+        dependency_key(requirement.package.name(), requirement.package.source())
             .as_ref()
             .is_some_and(|key| key == difference.subject)
-            && !requirement.constraint.satisfies(candidate.version())
+            && !requirement
+                .package
+                .constraint()
+                .satisfies(candidate.version())
     }) {
         return Some(AssignmentDifference::RootRequirementMismatch {
-            requirement: requirement.constraint.clone(),
+            requirement: requirement.package.constraint().clone(),
         });
     }
-    if let Some(dependency) = candidate.dependencies().iter().find(|dependency| {
+    if let Some(dependency) = candidate.declared_dependencies().iter().find(|dependency| {
         matches!(
             dependency.kind,
             DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
-        ) && dependency.name.as_str() == "R"
-            && !dependency.constraint.satisfies(&difference.r_version)
+        ) && dependency.package.name().as_str() == "R"
+            && !dependency
+                .package
+                .constraint()
+                .satisfies(&difference.r_version)
     }) {
         return Some(AssignmentDifference::ConstraintViolatedByAssignment {
             against: DecisionSubject::R,
-            requirement: dependency.constraint.clone(),
+            requirement: dependency.package.constraint().clone(),
             assigned: DecisionCandidate::R(difference.r_version.clone()),
         });
     }
     if let Some((dependency, assigned)) = candidate
-        .dependencies()
+        .declared_dependencies()
         .iter()
         .filter(|dependency| {
             matches!(
                 dependency.kind,
                 DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
-            ) && dependency.name.as_str() != "R"
+            ) && dependency.package.name().as_str() != "R"
         })
         .filter_map(|dependency| {
-            let key = dependency_key(&dependency.name, &dependency.source)?;
+            let key = dependency_key(dependency.package.name(), dependency.package.source())?;
             let assigned = difference
                 .selected_packages
                 .iter()
                 .find(|package| package.subject() == &key)?;
             (!dependency
-                .constraint
+                .package
+                .constraint()
                 .satisfies(assigned.release().version()))
             .then_some((dependency, assigned))
         })
@@ -643,7 +656,7 @@ fn difference_for_candidate(
     {
         return Some(AssignmentDifference::ConstraintViolatedByAssignment {
             against: subject_to_decision_subject(assigned.subject()),
-            requirement: dependency.constraint.clone(),
+            requirement: dependency.package.constraint().clone(),
             assigned: release_candidate(assigned.release()),
         });
     }
@@ -685,15 +698,17 @@ fn subject_to_decision_subject(subject: &SolverKey) -> DecisionSubject {
     match subject {
         SolverKey::InstalledName(name) => DecisionSubject::InstalledName(name.clone()),
         SolverKey::R => DecisionSubject::R,
-        SolverKey::Registry { .. } | SolverKey::Bioconductor { .. } | SolverKey::Exact(_) => {
-            DecisionSubject::Package(subject_name(subject))
-        }
+        SolverKey::Registry { .. }
+        | SolverKey::Repository { .. }
+        | SolverKey::Bioconductor { .. }
+        | SolverKey::Exact(_) => DecisionSubject::Package(subject_name(subject)),
     }
 }
 
 fn subject_name(subject: &SolverKey) -> PackageName {
     match subject {
         SolverKey::Registry { name, .. }
+        | SolverKey::Repository { name, .. }
         | SolverKey::Bioconductor { name, .. }
         | SolverKey::InstalledName(name) => name.clone(),
         SolverKey::Exact(identity) => identity.name().clone(),
@@ -709,6 +724,10 @@ fn dependency_key(name: &PackageName, source: &DependencySourceConstraint) -> Op
         DependencySourceConstraint::Any => SolverKey::InstalledName(name.clone()),
         DependencySourceConstraint::Registry { namespace } => SolverKey::Registry {
             namespace: namespace.clone(),
+            name: name.clone(),
+        },
+        DependencySourceConstraint::Repository { repository } => SolverKey::Repository {
+            repository: repository.clone(),
             name: name.clone(),
         },
         DependencySourceConstraint::Bioconductor { namespace, release } => {

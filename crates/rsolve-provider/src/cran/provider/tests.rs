@@ -338,14 +338,14 @@ fn logical_signature(provider: &CranProvider<FixtureTransport>) -> Vec<String> {
             .into_iter()
             .map(|release| {
                 let dependencies = release
-                    .dependencies()
+                    .declared_dependencies()
                     .iter()
                     .map(|dependency| {
                         (
                             dependency.kind,
-                            dependency.name.as_str(),
-                            &dependency.source,
-                            &dependency.constraint.clauses,
+                            dependency.package.name().as_str(),
+                            dependency.package.source().clone(),
+                            dependency.package.constraint().clauses.clone(),
                         )
                     })
                     .collect::<Vec<_>>();

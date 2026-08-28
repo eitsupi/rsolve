@@ -15,8 +15,10 @@ mod resolution;
 mod target;
 
 pub use constraints::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, RelationOp, VersionClause,
-    VersionConstraint,
+    DeclaredDependency, DependencyKind, DependencySourceConstraint, EffectiveDependencyKind,
+    PackageRequirement, PackageRequirementError, RelationOp, ResolvedDependencyEdge,
+    RootCompositionError, RootExpansionPolicy, RootRequirement, VersionClause, VersionConstraint,
+    combine_root_requirements,
 };
 pub use environment::{EnvironmentId, EnvironmentIdError};
 pub use identity::{
@@ -30,8 +32,8 @@ pub use metadata::{
 pub use names::{
     ArtifactLocator, BioconductorRelease, DigestError, DistributionChannel, GitCommitId,
     GitCommitIdError, GitHashAlgorithm, IdentifierError, NormalizedGitUrl, NormalizedGitUrlError,
-    PackageName, PackageNameError, PackageNamespace, RegistryId, RepositorySubdir, Sha256Digest,
-    SnapshotId, SourceScheme,
+    PackageName, PackageNameError, PackageNamespace, RegistryId, RepositoryId, RepositoryRank,
+    RepositorySubdir, Sha256Digest, SnapshotId, SourceScheme,
 };
 pub use publication::{
     PublicationCutoff, PublicationDate, PublicationDateError, ReleasePublication,

@@ -766,13 +766,14 @@ pub(super) fn release_to_domain(wire: &EligibleReleaseV1) -> Result<PackageRelea
                     ))
                 })
                 .collect::<Result<Vec<_>, SnapshotError>>()?;
-            Ok(DependencyRequirement::new(
+            DeclaredDependency::from_parts(
                 kind,
                 PackageName::new(&dependency.package)
                     .map_err(|e| SnapshotError::Invalid(e.to_string()))?,
                 DependencySourceConstraint::Any,
                 VersionConstraint::new(clauses),
-            ))
+            )
+            .map_err(|error| SnapshotError::Invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, SnapshotError>>()?;
     let distributions = wire
@@ -834,7 +835,7 @@ pub(super) fn release_to_domain(wire: &EligibleReleaseV1) -> Result<PackageRelea
         observed_version: version,
         metadata,
         publication,
-        dependencies,
+        declared_dependencies: dependencies,
         distributions,
     })
     .map_err(|e| SnapshotError::Invalid(e.to_string()))?;

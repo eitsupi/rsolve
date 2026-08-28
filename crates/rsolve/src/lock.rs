@@ -10,10 +10,13 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    DependencyKind, LockedIdentities, PackageName, PackageRelease, Provenance, PublicationCutoff,
+    EffectiveDependencyKind, LockedIdentities, PackageName, Provenance, PublicationCutoff,
     PublicationDate, RPackageVersion, ReleaseIdentity, Resolution, ResolutionRequest,
-    ResolutionTarget, Sha256Digest, SolverKey,
+    ResolutionTarget, ResolvedPackage, Sha256Digest, SolverKey,
 };
+
+#[cfg(test)]
+use rsolve_core::{DependencyKind, PackageRelease};
 
 pub use rsolve_core::{EnvironmentId, EnvironmentIdError};
 
@@ -65,6 +68,44 @@ pub struct LockedPackage {
 }
 
 impl LockedPackage {
+    fn from_resolved(selected: &ResolvedPackage) -> Result<Self, LockError> {
+        let canonical = canonical_version(selected.release().version());
+        let published = match selected.release().identity().provenance() {
+            Provenance::RegistryRelease { version, .. }
+            | Provenance::BioconductorRelease { version, .. } => version.as_str(),
+            _ => selected.release().version().as_str(),
+        };
+        let published_version_spelling = (published != canonical).then(|| published.into());
+        let mut dependencies = Vec::new();
+        for dependency in selected.effective_dependencies() {
+            match dependency.kind {
+                EffectiveDependencyKind::Depends
+                | EffectiveDependencyKind::Imports
+                | EffectiveDependencyKind::LinkingTo => {
+                    if dependency.package.name().as_str() != "R" {
+                        dependencies.push(dependency.package.name().clone());
+                    }
+                }
+                EffectiveDependencyKind::PromotedSuggests => {
+                    return Err(LockError::UnsupportedDependencyKind {
+                        package: selected.name().to_string(),
+                        dependency: dependency.package.name().to_string(),
+                    });
+                }
+            }
+        }
+        dependencies.sort();
+        dependencies.dedup();
+        Ok(Self {
+            identity: selected.release().identity().clone(),
+            version: selected.release().version().clone(),
+            published_version_spelling,
+            dependencies,
+            metadata_sha256: selected.release().metadata_digest().clone(),
+        })
+    }
+
+    #[cfg(test)]
     fn from_release(release: &PackageRelease) -> Self {
         let canonical = canonical_version(release.version());
         let published = match release.identity().provenance() {
@@ -74,15 +115,15 @@ impl LockedPackage {
         };
         let published_version_spelling = (published != canonical).then(|| published.into());
         let mut dependencies = release
-            .dependencies()
+            .declared_dependencies()
             .iter()
             .filter(|dependency| {
                 matches!(
                     dependency.kind,
                     DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
-                ) && dependency.name.as_str() != "R"
+                ) && dependency.package.name().as_str() != "R"
             })
-            .map(|dependency| dependency.name.clone())
+            .map(|dependency| dependency.package.name().clone())
             .collect::<Vec<_>>();
         dependencies.sort();
         dependencies.dedup();
@@ -93,17 +134,6 @@ impl LockedPackage {
             dependencies,
             metadata_sha256: release.metadata_digest().clone(),
         }
-    }
-
-    fn from_release_for_lock(
-        release: &PackageRelease,
-        selected_names: &BTreeSet<PackageName>,
-    ) -> Self {
-        let mut package = Self::from_release(release);
-        package
-            .dependencies
-            .retain(|dependency| selected_names.contains(dependency));
-        package
     }
 
     fn validate(&self) -> Result<(), LockError> {
@@ -183,9 +213,14 @@ impl Lockfile {
             .packages()
             .iter()
             .map(|selected| {
-                LockedPackage::from_release_for_lock(selected.release(), &selected_names)
+                LockedPackage::from_resolved(selected).map(|mut package| {
+                    package
+                        .dependencies
+                        .retain(|dependency| selected_names.contains(dependency));
+                    package
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, LockError>>()?;
         for package in &packages {
             package.validate()?;
         }
@@ -272,7 +307,7 @@ impl Lockfile {
             return Err(LockError::TargetMismatch);
         }
         Ok(ResolutionRequest::new(
-            request.requirements,
+            request.roots,
             request.target,
             request.r_requirement,
             self.locked_identities()?,
@@ -314,11 +349,12 @@ impl Lockfile {
             .map(|package| (package.identity.name().clone(), package))
             .collect::<BTreeMap<_, _>>();
         let mut reachable = BTreeSet::new();
-        for requirement in &request.requirements {
-            let name = &requirement.name;
+        for requirement in &request.roots {
+            let name = &requirement.package.name();
             if is_r_base_name(name) {
                 if !requirement
-                    .constraint
+                    .package
+                    .constraint()
                     .satisfies(&resolution.target.r_version)
                 {
                     return Err(LockError::DirectRootVersionMismatch {
@@ -332,7 +368,7 @@ impl Lockfile {
                 .ok_or_else(|| LockError::DirectRootMissing {
                     name: name.to_string(),
                 })?;
-            if !requirement.constraint.satisfies(&package.version) {
+            if !requirement.package.constraint().satisfies(&package.version) {
                 return Err(LockError::DirectRootVersionMismatch {
                     name: name.to_string(),
                 });
@@ -469,6 +505,10 @@ pub enum LockError {
     UnreachablePackage {
         package: String,
     },
+    UnsupportedDependencyKind {
+        package: String,
+        dependency: String,
+    },
     ExactIdentitySetMismatch {
         missing: Vec<String>,
         extra: Vec<String>,
@@ -530,6 +570,13 @@ impl fmt::Display for LockError {
                     "locked package {package} is unreachable from manifest roots"
                 )
             }
+            Self::UnsupportedDependencyKind {
+                package,
+                dependency,
+            } => write!(
+                f,
+                "locked package {package} has unsupported effective dependency {dependency}"
+            ),
             Self::ExactIdentitySetMismatch { missing, extra } => write!(
                 f,
                 "exact lock identity set mismatch (missing: {missing:?}, extra: {extra:?})"

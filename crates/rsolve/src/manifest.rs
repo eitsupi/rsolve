@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    DependencyKind, DependencyRequirement, DependencySourceConstraint, LockedIdentities,
-    RPackageVersion, ResolutionRequest, ResolutionTarget, VersionConstraint,
+    DependencySourceConstraint, LockedIdentities, PackageRequirement, RPackageVersion,
+    ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement, VersionConstraint,
 };
 
 /// The deliberately small, typed manifest subset used by the first slice.
@@ -94,6 +94,7 @@ impl ManifestTarget {
 pub enum ManifestError {
     RIsNotAPackageRequirement,
     DuplicateRequirement { name: rsolve_core::PackageName },
+    InvalidDependency(String),
 }
 
 impl fmt::Display for ManifestError {
@@ -105,6 +106,7 @@ impl fmt::Display for ManifestError {
             Self::DuplicateRequirement { name } => {
                 write!(f, "manifest has duplicate direct requirement {name}")
             }
+            Self::InvalidDependency(error) => write!(f, "invalid package requirement: {error}"),
         }
     }
 }
@@ -129,20 +131,23 @@ pub fn compose_resolution_request_with_locked(
         requirements,
     } = manifest;
 
-    let requirements = requirements
+    let roots = requirements
         .into_iter()
         .map(|requirement| {
-            DependencyRequirement::new(
-                DependencyKind::Depends,
-                requirement.name,
-                DependencySourceConstraint::Any,
-                requirement.constraint,
-            )
+            Ok(RootRequirement {
+                package: PackageRequirement::new(
+                    requirement.name,
+                    DependencySourceConstraint::Any,
+                    requirement.constraint,
+                )
+                .map_err(|error| ManifestError::InvalidDependency(error.to_string()))?,
+                expansion: RootExpansionPolicy::HardOnly,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ManifestError>>()?;
 
     Ok(ResolutionRequest::new(
-        requirements,
+        roots,
         target.into_resolution_target(),
         r_requirement,
         locked,
@@ -181,12 +186,11 @@ mod tests {
     fn minimal_manifest_composes_to_one_request() {
         let request = compose_resolution_request(minimal_manifest()).unwrap();
 
-        assert_eq!(request.requirements.len(), 1);
-        assert_eq!(request.requirements[0].kind, DependencyKind::Depends);
-        assert_eq!(request.requirements[0].name, package("example"));
+        assert_eq!(request.roots.len(), 1);
+        assert_eq!(request.roots[0].package.name(), &package("example"));
         assert_eq!(
-            request.requirements[0].constraint,
-            VersionConstraint::from_clause(RelationOp::Ge, version("1.2.0"))
+            request.roots[0].package.constraint(),
+            &VersionConstraint::from_clause(RelationOp::Ge, version("1.2.0"))
         );
         assert_eq!(request.target.r_version, version("4.4.0"));
         assert_eq!(

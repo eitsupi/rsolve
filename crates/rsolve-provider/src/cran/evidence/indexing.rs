@@ -196,9 +196,9 @@ fn validate_release_identity(
 
 fn validate_dependency_sources(release: &PackageRelease) -> Result<(), EvidenceCompositionError> {
     if release
-        .dependencies()
+        .declared_dependencies()
         .iter()
-        .any(|dependency| !matches!(dependency.source, DependencySourceConstraint::Any))
+        .any(|dependency| !matches!(dependency.package.source(), DependencySourceConstraint::Any))
     {
         return Err(EvidenceCompositionError::Invalid(
             "CRAN snapshot dependencies must use the any source constraint".into(),
