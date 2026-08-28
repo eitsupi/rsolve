@@ -20,8 +20,11 @@ pub use lock::{
     LockedResolution, Lockfile, consume_locked_graph,
 };
 pub use manifest::{
-    Manifest, ManifestDependency, ManifestError, ManifestTarget, compose_resolution_request,
-    compose_resolution_request_with_locked,
+    DirectUrl, EffectiveRepository, Endpoint, GitSelector, Manifest, ManifestDependency,
+    ManifestDependencySpec, ManifestDocument, ManifestError, ManifestSource, ManifestTarget,
+    RegistryProvenancePolicy, RegistrySpec, RepositorySpec, compose_resolution_request,
+    compose_resolution_request_with_locked, discover_manifest, load_manifest, parse_manifest,
+    read_manifest,
 };
 pub use orchestration::{
     CranResolutionError, CranResolutionOutcome, LockResolutionPolicy, resolve_from_cran,

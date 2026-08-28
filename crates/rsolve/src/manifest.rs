@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 
 use rsolve_core::{
     DependencySourceConstraint, LockedIdentities, PackageRequirement, RPackageVersion,
-    ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement, VersionConstraint,
+    RepositoryId, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
+    VersionConstraint,
 };
 
 /// The deliberately small, typed manifest subset used by the first slice.
@@ -95,6 +97,23 @@ pub enum ManifestError {
     RIsNotAPackageRequirement,
     DuplicateRequirement { name: rsolve_core::PackageName },
     InvalidDependency(String),
+    Toml(String),
+    Io { path: PathBuf, source: String },
+    NotFound { start: PathBuf },
+    UnknownSchema { schema: i64 },
+    MissingField { field: String },
+    InvalidField { field: String, reason: String },
+    UnknownField { field: String },
+    WrongType { field: String, expected: String },
+    UnknownRegistryKind { kind: String },
+    InvalidRegistry { reason: String },
+    InvalidRepository { reason: String },
+    DuplicateRepository { id: RepositoryId },
+    UnknownRepositoryReference { id: RepositoryId, field: String },
+    InvalidIdentifier { kind: String, value: String },
+    InvalidEndpoint { value: String, reason: String },
+    SourceConflict { field: String },
+    InvalidDependencyField { name: String, reason: String },
 }
 
 impl fmt::Display for ManifestError {
@@ -107,6 +126,50 @@ impl fmt::Display for ManifestError {
                 write!(f, "manifest has duplicate direct requirement {name}")
             }
             Self::InvalidDependency(error) => write!(f, "invalid package requirement: {error}"),
+            Self::Toml(error) => write!(f, "invalid manifest TOML: {error}"),
+            Self::Io { path, source } => {
+                write!(f, "failed to read manifest {}: {source}", path.display())
+            }
+            Self::NotFound { start } => write!(
+                f,
+                "no rsolve.toml found from {} to filesystem root",
+                start.display()
+            ),
+            Self::UnknownSchema { schema } => write!(f, "unsupported manifest schema {schema}"),
+            Self::MissingField { field } => {
+                write!(f, "manifest is missing required field `{field}`")
+            }
+            Self::InvalidField { field, reason } => {
+                write!(f, "invalid manifest field `{field}`: {reason}")
+            }
+            Self::UnknownField { field } => write!(f, "unknown manifest field `{field}`"),
+            Self::WrongType { field, expected } => {
+                write!(f, "manifest field `{field}` must be {expected}")
+            }
+            Self::UnknownRegistryKind { kind } => write!(f, "unknown registry kind `{kind}`"),
+            Self::InvalidRegistry { reason } => {
+                write!(f, "invalid registry specification: {reason}")
+            }
+            Self::InvalidRepository { reason } => write!(f, "invalid repository: {reason}"),
+            Self::DuplicateRepository { id } => write!(f, "duplicate repository ID `{id}`"),
+            Self::UnknownRepositoryReference { id, field } => {
+                write!(
+                    f,
+                    "dependency `{field}` references unknown repository `{id}`"
+                )
+            }
+            Self::InvalidIdentifier { kind, value } => {
+                write!(f, "invalid {kind} identifier `{value}`")
+            }
+            Self::InvalidEndpoint { value, reason } => {
+                write!(f, "invalid endpoint `{value}`: {reason}")
+            }
+            Self::SourceConflict { field } => {
+                write!(f, "conflicting or unsupported source fields in `{field}`")
+            }
+            Self::InvalidDependencyField { name, reason } => {
+                write!(f, "invalid dependency `{name}`: {reason}")
+            }
         }
     }
 }
@@ -154,102 +217,16 @@ pub fn compose_resolution_request_with_locked(
     ))
 }
 
+mod repository;
+mod wire;
+
+pub use repository::{
+    EffectiveRepository, Endpoint, RegistryProvenancePolicy, RegistrySpec, RepositorySpec,
+};
+pub use wire::{
+    DirectUrl, GitSelector, ManifestDependencySpec, ManifestDocument, ManifestSource,
+    discover_manifest, load_manifest, parse_manifest, read_manifest,
+};
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsolve_core::{
-        PackageName, PackageNamespace, Provenance, RelationOp, ReleaseIdentity, SolverKey,
-        VersionClause,
-    };
-
-    fn version(value: &str) -> RPackageVersion {
-        RPackageVersion::parse(value).unwrap()
-    }
-
-    fn package(value: &str) -> PackageName {
-        PackageName::new(value).unwrap()
-    }
-
-    fn minimal_manifest() -> Manifest {
-        Manifest::new(
-            VersionConstraint::from_clause(RelationOp::Ge, version("4.3")),
-            ManifestTarget::new(version("4.4.0")),
-            vec![ManifestDependency::new(
-                package("example"),
-                VersionConstraint::new(vec![VersionClause::new(RelationOp::Ge, version("1.2.0"))]),
-            )],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn minimal_manifest_composes_to_one_request() {
-        let request = compose_resolution_request(minimal_manifest()).unwrap();
-
-        assert_eq!(request.roots.len(), 1);
-        assert_eq!(request.roots[0].package.name(), &package("example"));
-        assert_eq!(
-            request.roots[0].package.constraint(),
-            &VersionConstraint::from_clause(RelationOp::Ge, version("1.2.0"))
-        );
-        assert_eq!(request.target.r_version, version("4.4.0"));
-        assert_eq!(
-            request.r_requirement,
-            VersionConstraint::from_clause(RelationOp::Ge, version("4.3"))
-        );
-        assert!(request.locked.is_empty());
-    }
-
-    #[test]
-    fn composition_preserves_owned_lock_identity_mapping() {
-        let key = SolverKey::Registry {
-            namespace: PackageNamespace::new("cran").unwrap(),
-            name: package("example"),
-        };
-        let identity = ReleaseIdentity::new(
-            package("example"),
-            Provenance::RegistryRelease {
-                namespace: PackageNamespace::new("cran").unwrap(),
-                version: version("1.2.3"),
-            },
-        );
-        let mut locked = LockedIdentities::new();
-        locked.insert(key.clone(), identity.clone());
-
-        let request =
-            compose_resolution_request_with_locked(minimal_manifest(), locked.clone()).unwrap();
-        assert_eq!(request.locked, locked);
-        assert_eq!(request.locked.get(&key), Some(&identity));
-    }
-
-    #[test]
-    fn manifest_rejects_r_as_a_regular_requirement() {
-        let result = Manifest::new(
-            VersionConstraint::unconstrained(),
-            ManifestTarget::new(version("4.4.0")),
-            vec![ManifestDependency::new(
-                package("R"),
-                VersionConstraint::unconstrained(),
-            )],
-        );
-        assert_eq!(result, Err(ManifestError::RIsNotAPackageRequirement));
-    }
-
-    #[test]
-    fn manifest_rejects_duplicate_requirements() {
-        let result = Manifest::new(
-            VersionConstraint::unconstrained(),
-            ManifestTarget::new(version("4.4.0")),
-            vec![
-                ManifestDependency::new(package("example"), VersionConstraint::unconstrained()),
-                ManifestDependency::new(package("example"), VersionConstraint::unconstrained()),
-            ],
-        );
-        assert_eq!(
-            result,
-            Err(ManifestError::DuplicateRequirement {
-                name: package("example")
-            })
-        );
-    }
-}
+mod tests;
