@@ -287,6 +287,19 @@ fn source_union_rejects_invalid_combinations_and_preserves_query() {
     assert!(
         matches!(&query.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/a.tar.gz?x=1")
     );
+    let query_only = parse_manifest(&format!(
+        "{base}{{ url='https://example.org?redirect=/../x' }}"
+    ))
+    .unwrap();
+    assert!(
+        matches!(&query_only.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/?redirect=/../x")
+    );
+    assert!(
+        parse_manifest(&format!(
+            "{base}{{ url='https://example.org/../x?redirect=/ok' }}"
+        ))
+        .is_err()
+    );
 }
 
 #[test]

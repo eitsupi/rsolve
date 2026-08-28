@@ -148,6 +148,7 @@ pub(super) fn reject_raw_root_escape(input: &str) -> Result<(), ManifestError> {
     let Some((_, authority_and_path)) = input.split_once("://") else {
         return Ok(());
     };
+    let authority_and_path = authority_and_path.split(['?', '#']).next().unwrap_or("");
     let path = authority_and_path
         .find('/')
         .map(|index| &authority_and_path[index..])
