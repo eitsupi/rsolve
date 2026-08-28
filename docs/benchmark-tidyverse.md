@@ -46,6 +46,9 @@ consumer validation gates, while live timing values and fallback package
 counts/bytes are recorded for comparison rather than used as regression
 thresholds.
 
+Phase timings are not necessarily mutually exclusive: prepared-loader lookup
+is measured inside solve, so phase durations must not be summed as a total.
+
 Historical baseline references include an earlier cold/fresh/offline run at
 13.30s, 0.636s, and 0.338s, respectively, and a later
 projection-inclusive run at 15.334s cold, 306.4ms fresh, 286.9ms offline, and
