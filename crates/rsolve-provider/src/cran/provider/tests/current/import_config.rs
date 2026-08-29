@@ -137,6 +137,7 @@ fn concrete_loader_validates_and_canonicalizes_base_without_requests() {
         "https://cran.invalid/../mirror",
         "https://cran.invalid\\..\\mirror",
         "https://cran.invalid/ordinary\\path",
+        "https://cran.invalid?redirect=\\path",
     ] {
         assert!(matches!(
             CranSnapshotRefresher::new(CranMetadataConfig::for_repository(input)),

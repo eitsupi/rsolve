@@ -145,16 +145,16 @@ pub(super) fn normalize_url_path(path: &str) -> Result<String, ManifestError> {
 /// URL parsers may erase leading dot segments before exposing `path()`. Keep
 /// the fail-closed root-escape check on the manifest spelling as well.
 pub(super) fn reject_raw_root_escape(input: &str) -> Result<(), ManifestError> {
-    if input.contains('\\') {
-        return Err(ManifestError::InvalidEndpoint {
-            value: input.into(),
-            reason: "backslashes are forbidden in HTTP(S) URLs".into(),
-        });
-    }
     let Some((_, authority_and_path)) = input.split_once("://") else {
         return Ok(());
     };
     let authority_and_path = authority_and_path.split(['?', '#']).next().unwrap_or("");
+    if authority_and_path.contains('\\') {
+        return Err(ManifestError::InvalidEndpoint {
+            value: input.into(),
+            reason: "backslashes are forbidden in HTTP(S) URL authority or path".into(),
+        });
+    }
     let path = authority_and_path
         .find('/')
         .map(|index| &authority_and_path[index..])

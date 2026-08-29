@@ -314,6 +314,13 @@ fn source_union_rejects_invalid_combinations_and_preserves_query() {
     assert!(
         matches!(&encoded_query.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/?redirect=%2e%2e/x")
     );
+    let literal_backslash_query = parse_manifest(&format!(
+        "{base}{{ url='https://example.org?redirect=\\path' }}"
+    ))
+    .unwrap();
+    assert!(
+        matches!(&literal_backslash_query.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/?redirect=\\path")
+    );
 }
 
 #[test]
