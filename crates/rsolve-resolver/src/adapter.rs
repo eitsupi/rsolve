@@ -314,6 +314,34 @@ impl<'a> Provider<'a> {
         }
     }
 
+    fn expansion_for_subject(
+        &self,
+        subject: &SolverKey,
+    ) -> Result<RootExpansionPolicy, Box<AdapterError>> {
+        let mut expansion = RootExpansionPolicy::HardOnly;
+        for root in &self.request.roots {
+            if self.subject_for_package(&root.package)? == *subject
+                && root.expansion == RootExpansionPolicy::DirectSuggests
+            {
+                expansion = RootExpansionPolicy::DirectSuggests;
+                break;
+            }
+        }
+        Ok(expansion)
+    }
+
+    fn expansion_for_subjects(
+        &self,
+        subjects: &[SolverKey],
+    ) -> Result<RootExpansionPolicy, Box<AdapterError>> {
+        for subject in subjects {
+            if self.expansion_for_subject(subject)? == RootExpansionPolicy::DirectSuggests {
+                return Ok(RootExpansionPolicy::DirectSuggests);
+            }
+        }
+        Ok(RootExpansionPolicy::HardOnly)
+    }
+
     fn ranges_for_subject(
         &self,
         subject: &SolverKey,
@@ -664,14 +692,8 @@ impl DependencyProvider for Provider<'_> {
                     PackageId::Occupancy(name),
                     Ranges::singleton(SolverVersion::Candidate(*id)),
                 )];
-                for dependency in release.declared_dependencies().iter().filter(|dependency| {
-                    matches!(
-                        dependency.kind,
-                        DependencyKind::Depends
-                            | DependencyKind::Imports
-                            | DependencyKind::LinkingTo
-                    )
-                }) {
+                let expansion = self.expansion_for_subject(subject)?;
+                for dependency in projected_dependency_edges(release, expansion) {
                     if let DependencySourceConstraint::Git { .. } = dependency.package.source() {
                         return Ok(Dependencies::Unavailable(ProviderMessage::Text(format!(
                             "Git-sourced dependencies are not supported for package {}",
@@ -748,10 +770,6 @@ fn publication_rejection_cmp(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolutionFailure {
-    UnsupportedRootExpansion {
-        package: rsolve_core::PackageName,
-        policy: RootExpansionPolicy,
-    },
     CandidateLoad {
         package: SolverKey,
         source: Box<CandidateLoadError>,
@@ -806,10 +824,6 @@ impl ResolutionDiagnostic {
 impl fmt::Display for ResolutionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedRootExpansion { package, policy } => write!(
-                f,
-                "root expansion policy {policy:?} for package {package} is not supported",
-            ),
             Self::CandidateLoad { package, source } => {
                 write!(f, "candidate load for {package:?} failed: {source}")
             }
@@ -848,16 +862,6 @@ pub(crate) fn solve(
     lock_policy: &dyn LockUpdatePolicy,
     request: &ResolutionRequest,
 ) -> Result<Resolution, ResolutionFailure> {
-    if let Some(root) = request
-        .roots
-        .iter()
-        .find(|root| root.expansion == RootExpansionPolicy::DirectSuggests)
-    {
-        return Err(ResolutionFailure::UnsupportedRootExpansion {
-            package: root.package.name().clone(),
-            policy: root.expansion,
-        });
-    }
     let provider = Provider {
         loader,
         preference,
@@ -932,47 +936,64 @@ pub(crate) fn solve(
             }
         }
     }
-    let mut packages = packages
-        .into_values()
-        .map(|(subject, candidate, subjects)| {
-            let release = candidate.release();
-            let effective_dependencies = release
-                .declared_dependencies()
-                .iter()
-                .filter_map(|dependency| {
-                    dependency
-                        .kind
-                        .effective()
-                        .map(|kind| ResolvedDependencyEdge {
-                            kind,
-                            package: dependency.package.clone(),
-                        })
-                })
-                .collect();
-            let mut visible = subjects
-                .iter()
-                .flat_map(|subject| candidate.applicable_occurrences(subject))
-                .map(|occurrence| (occurrence.rank(), occurrence.repository().clone()))
-                .collect::<Vec<_>>();
-            visible.sort();
-            visible.dedup_by(|left, right| left.1 == right.1);
-            rsolve_core::ResolvedPackage::new(
-                subject,
-                release.clone(),
-                effective_dependencies,
-                visible
-                    .into_iter()
-                    .map(|(_, repository)| repository)
-                    .collect(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut projected_packages = Vec::new();
+    for (subject, candidate, subjects) in packages.into_values() {
+        let release = candidate.release();
+        let expansion = provider
+            .expansion_for_subjects(&subjects)
+            .map_err(|error| map_adapter_error(*error))?;
+        let effective_dependencies = projected_dependency_edges(release, expansion);
+        let mut visible = subjects
+            .iter()
+            .flat_map(|subject| candidate.applicable_occurrences(subject))
+            .map(|occurrence| (occurrence.rank(), occurrence.repository().clone()))
+            .collect::<Vec<_>>();
+        visible.sort();
+        visible.dedup_by(|left, right| left.1 == right.1);
+        projected_packages.push(rsolve_core::ResolvedPackage::new(
+            subject,
+            release.clone(),
+            effective_dependencies,
+            visible
+                .into_iter()
+                .map(|(_, repository)| repository)
+                .collect(),
+        ));
+    }
+    let mut packages = projected_packages;
     packages.sort_by(|left, right| left.name().cmp(right.name()));
     Ok(Resolution::new(request.target.clone(), packages))
 }
 
 fn identity_sort_key(identity: &rsolve_core::ReleaseIdentity) -> String {
     format!("{}:{:?}", identity.name(), identity.provenance())
+}
+
+/// Projects DESCRIPTION dependency declarations into the effective graph for
+/// one selected root expansion policy. This projection is shared by the
+/// solver adapter and successful-resolution materialization so optional
+/// dependencies cannot disappear or be invented at either boundary.
+fn projected_dependency_edges(
+    release: &rsolve_core::PackageRelease,
+    expansion: RootExpansionPolicy,
+) -> Vec<ResolvedDependencyEdge> {
+    release
+        .declared_dependencies()
+        .iter()
+        .filter_map(|dependency| {
+            let kind = match dependency.kind {
+                DependencyKind::Suggests if expansion == RootExpansionPolicy::DirectSuggests => {
+                    Some(rsolve_core::EffectiveDependencyKind::PromotedSuggests)
+                }
+                DependencyKind::Suggests | DependencyKind::Enhances => None,
+                kind => kind.effective(),
+            }?;
+            Some(ResolvedDependencyEdge {
+                kind,
+                package: dependency.package.clone(),
+            })
+        })
+        .collect()
 }
 
 fn canonical_subject_cmp(left: &SolverKey, right: &SolverKey) -> Ordering {

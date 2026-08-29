@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use rsolve_core::{
@@ -96,12 +95,19 @@ fn release(name: &str, version: &str, dependencies: Vec<DeclaredDependency>) -> 
 }
 
 fn request(requirements: Vec<DeclaredDependency>) -> ResolutionRequest {
+    request_with_expansion(requirements, RootExpansionPolicy::HardOnly)
+}
+
+fn request_with_expansion(
+    requirements: Vec<DeclaredDependency>,
+    expansion: RootExpansionPolicy,
+) -> ResolutionRequest {
     ResolutionRequest::without_lock(
         requirements
             .into_iter()
             .map(|dependency| RootRequirement {
                 package: dependency.package,
-                expansion: RootExpansionPolicy::HardOnly,
+                expansion,
             })
             .collect(),
         ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
@@ -110,8 +116,16 @@ fn request(requirements: Vec<DeclaredDependency>) -> ResolutionRequest {
 }
 
 fn any_dependency(name: &str, constraint: VersionConstraint) -> DeclaredDependency {
+    dependency(DependencyKind::Depends, name, constraint)
+}
+
+fn dependency(
+    kind: DependencyKind,
+    name: &str,
+    constraint: VersionConstraint,
+) -> DeclaredDependency {
     DeclaredDependency::from_parts(
-        DependencyKind::Depends,
+        kind,
         package(name),
         DependencySourceConstraint::Any,
         constraint,
@@ -123,49 +137,391 @@ fn resolve(
     loader: &FixtureLoader,
     request: ResolutionRequest,
 ) -> Result<rsolve_core::Resolution, ResolutionFailure> {
+    resolve_with_loader(loader, request)
+}
+
+fn resolve_with_loader(
+    loader: &dyn CandidateLoader,
+    request: ResolutionRequest,
+) -> Result<rsolve_core::Resolution, ResolutionFailure> {
     Resolver::new(loader, &DefaultCandidatePreference, &Unlocked).resolve(request)
 }
 
-struct NoCallLoader {
-    calls: Cell<usize>,
-}
-
-impl CandidateLoader for NoCallLoader {
-    fn releases(&self, _package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
-        self.calls.set(self.calls.get() + 1);
-        panic!("candidate loading must not start for unsupported root expansion")
+#[test]
+fn direct_suggests_changes_the_root_candidate_closure() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![
+            release(
+                "foo",
+                "1.0",
+                vec![dependency(
+                    DependencyKind::Suggests,
+                    "optionalone",
+                    VersionConstraint::unconstrained(),
+                )],
+            ),
+            release(
+                "foo",
+                "2.0",
+                vec![
+                    dependency(
+                        DependencyKind::Suggests,
+                        "optionaltwo",
+                        VersionConstraint::unconstrained(),
+                    ),
+                    dependency(
+                        DependencyKind::Enhances,
+                        "optionalignored",
+                        VersionConstraint::unconstrained(),
+                    ),
+                ],
+            ),
+        ],
+    );
+    for name in ["optionalone", "optionaltwo", "optionalignored"] {
+        loader
+            .candidates
+            .insert(package(name), vec![release(name, "1.0", Vec::new())]);
     }
+
+    let hard_only = resolve(
+        &loader,
+        request(vec![any_dependency(
+            "foo",
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Eq,
+                RPackageVersion::parse("2.0").unwrap(),
+            ),
+        )]),
+    )
+    .unwrap();
+    assert!(hard_only.selected(&package("optionaltwo")).is_none());
+    assert!(
+        hard_only
+            .packages()
+            .iter()
+            .find(|candidate| candidate.name() == &package("foo"))
+            .unwrap()
+            .effective_dependencies()
+            .is_empty()
+    );
+
+    let direct_v1 = resolve(
+        &loader,
+        request_with_expansion(
+            vec![any_dependency(
+                "foo",
+                VersionConstraint::from_clause(
+                    rsolve_core::RelationOp::Eq,
+                    RPackageVersion::parse("1.0").unwrap(),
+                ),
+            )],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        direct_v1
+            .selected(&package("optionalone"))
+            .unwrap()
+            .version()
+            .as_str(),
+        "1.0"
+    );
+    assert_eq!(
+        direct_v1
+            .packages()
+            .iter()
+            .find(|candidate| candidate.name() == &package("foo"))
+            .unwrap()
+            .effective_dependencies()[0]
+            .kind,
+        rsolve_core::EffectiveDependencyKind::PromotedSuggests
+    );
+
+    let direct_v2 = resolve(
+        &loader,
+        request_with_expansion(
+            vec![any_dependency(
+                "foo",
+                VersionConstraint::from_clause(
+                    rsolve_core::RelationOp::Eq,
+                    RPackageVersion::parse("2.0").unwrap(),
+                ),
+            )],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap();
+    assert!(direct_v2.selected(&package("optionalone")).is_none());
+    assert!(direct_v2.selected(&package("optionalignored")).is_none());
+    assert_eq!(
+        direct_v2
+            .selected(&package("optionaltwo"))
+            .unwrap()
+            .version()
+            .as_str(),
+        "1.0"
+    );
+    let v2_reasons = direct_v2
+        .packages()
+        .iter()
+        .find(|candidate| candidate.name() == &package("foo"))
+        .unwrap()
+        .effective_dependencies();
+    assert_eq!(v2_reasons.len(), 1);
+    assert_eq!(
+        v2_reasons[0].kind,
+        rsolve_core::EffectiveDependencyKind::PromotedSuggests
+    );
 }
 
 #[test]
-fn direct_suggests_is_rejected_before_candidate_loading() {
-    let loader = NoCallLoader {
-        calls: Cell::new(0),
-    };
-    let request = ResolutionRequest::without_lock(
-        vec![RootRequirement {
-            package: rsolve_core::PackageRequirement::new(
-                package("foo"),
-                DependencySourceConstraint::Any,
+fn promoted_suggests_are_not_recursive() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![release(
+            "foo",
+            "1.0",
+            vec![dependency(
+                DependencyKind::Suggests,
+                "bar",
                 VersionConstraint::unconstrained(),
-            )
-            .unwrap(),
-            expansion: RootExpansionPolicy::DirectSuggests,
-        }],
-        ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
-        VersionConstraint::unconstrained(),
+            )],
+        )],
     );
-    let error = Resolver::new(&loader, &DefaultCandidatePreference, &Unlocked)
-        .resolve(request)
-        .unwrap_err();
+    loader.candidates.insert(
+        package("bar"),
+        vec![release(
+            "bar",
+            "1.0",
+            vec![dependency(
+                DependencyKind::Suggests,
+                "baz",
+                VersionConstraint::unconstrained(),
+            )],
+        )],
+    );
+    loader
+        .candidates
+        .insert(package("baz"), vec![release("baz", "1.0", Vec::new())]);
+
+    let resolution = resolve_with_loader(
+        &loader,
+        request_with_expansion(
+            vec![any_dependency("foo", VersionConstraint::unconstrained())],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap();
+    assert!(resolution.selected(&package("bar")).is_some());
+    assert!(resolution.selected(&package("baz")).is_none());
+}
+
+#[test]
+fn hard_and_promoted_suggests_keep_both_reasons_and_constraints() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![release(
+            "foo",
+            "1.0",
+            vec![
+                dependency(
+                    DependencyKind::Depends,
+                    "target",
+                    VersionConstraint::from_clause(
+                        rsolve_core::RelationOp::Ge,
+                        RPackageVersion::parse("2.0").unwrap(),
+                    ),
+                ),
+                dependency(
+                    DependencyKind::Suggests,
+                    "target",
+                    VersionConstraint::from_clause(
+                        rsolve_core::RelationOp::Lt,
+                        RPackageVersion::parse("3.0").unwrap(),
+                    ),
+                ),
+            ],
+        )],
+    );
+    loader.candidates.insert(
+        package("target"),
+        vec![
+            release("target", "1.0", Vec::new()),
+            release("target", "2.0", Vec::new()),
+            release("target", "3.0", Vec::new()),
+        ],
+    );
+
+    let resolution = resolve_with_loader(
+        &loader,
+        request_with_expansion(
+            vec![any_dependency("foo", VersionConstraint::unconstrained())],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        resolution
+            .selected(&package("target"))
+            .unwrap()
+            .version()
+            .as_str(),
+        "2.0"
+    );
+    let reasons = resolution
+        .packages()
+        .iter()
+        .find(|candidate| candidate.name() == &package("foo"))
+        .unwrap()
+        .effective_dependencies();
+    assert_eq!(reasons.len(), 2);
+    assert_eq!(
+        reasons[0].kind,
+        rsolve_core::EffectiveDependencyKind::Depends
+    );
+    assert_eq!(
+        reasons[1].kind,
+        rsolve_core::EffectiveDependencyKind::PromotedSuggests
+    );
+}
+
+#[test]
+fn direct_suggests_cycles_are_solved_when_each_root_opts_in() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![release(
+            "foo",
+            "1.0",
+            vec![dependency(
+                DependencyKind::Suggests,
+                "bar",
+                VersionConstraint::unconstrained(),
+            )],
+        )],
+    );
+    loader.candidates.insert(
+        package("bar"),
+        vec![release(
+            "bar",
+            "1.0",
+            vec![dependency(
+                DependencyKind::Suggests,
+                "foo",
+                VersionConstraint::unconstrained(),
+            )],
+        )],
+    );
+
+    let resolution = resolve_with_loader(
+        &loader,
+        request_with_expansion(
+            vec![
+                any_dependency("foo", VersionConstraint::unconstrained()),
+                any_dependency("bar", VersionConstraint::unconstrained()),
+            ],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap();
+    assert!(resolution.selected(&package("foo")).is_some());
+    assert!(resolution.selected(&package("bar")).is_some());
+}
+
+#[test]
+fn promoted_r_base_is_not_installable_and_recommended_package_remains_normal() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![release(
+            "foo",
+            "1.0",
+            vec![
+                dependency(
+                    DependencyKind::Suggests,
+                    "base",
+                    VersionConstraint::unconstrained(),
+                ),
+                dependency(
+                    DependencyKind::Suggests,
+                    "Matrix",
+                    VersionConstraint::unconstrained(),
+                ),
+            ],
+        )],
+    );
+    loader.candidates.insert(
+        package("Matrix"),
+        vec![release("Matrix", "1.0", Vec::new())],
+    );
+    let overlay =
+        rsolve_resolver::RBasePackageOverlay::new(loader, RPackageVersion::parse("4.4.0").unwrap())
+            .unwrap();
+    let resolution = resolve_with_loader(
+        &overlay,
+        request_with_expansion(
+            vec![any_dependency("foo", VersionConstraint::unconstrained())],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap();
+    assert!(resolution.selected(&package("base")).is_none());
+    assert_eq!(
+        resolution
+            .selected(&package("Matrix"))
+            .unwrap()
+            .version()
+            .as_str(),
+        "1.0"
+    );
+}
+
+#[test]
+fn quarantined_promoted_suggests_fail_closed() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![release(
+            "foo",
+            "1.0",
+            vec![dependency(
+                DependencyKind::Suggests,
+                "optional",
+                VersionConstraint::from_clause(
+                    rsolve_core::RelationOp::Ge,
+                    RPackageVersion::parse("2.0").unwrap(),
+                ),
+            )],
+        )],
+    );
+    loader.candidates.insert(
+        package("optional"),
+        vec![release("optional", "1.0", Vec::new())],
+    );
+    loader.quarantined.insert(
+        package("optional"),
+        vec![RPackageVersion::parse("2.0").unwrap()],
+    );
+
+    let error = resolve_with_loader(
+        &loader,
+        request_with_expansion(
+            vec![any_dependency("foo", VersionConstraint::unconstrained())],
+            RootExpansionPolicy::DirectSuggests,
+        ),
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
-        ResolutionFailure::UnsupportedRootExpansion {
-            package: found,
-            policy: RootExpansionPolicy::DirectSuggests,
-        } if found == package("foo")
+        ResolutionFailure::CandidateLoad { source, .. }
+            if source.category() == CandidateLoadErrorCategory::MetadataInvalid
     ));
-    assert_eq!(loader.calls.get(), 0);
 }
 
 #[test]
