@@ -192,14 +192,16 @@ pub mod regression_support {
 
     pub struct MultiSourceCatalog {
         source_qualified: PackageRelease,
-        installed_name: PackageRelease,
+        installed_name: Vec<PackageRelease>,
+        reverse_installed: bool,
     }
 
     impl MultiSourceCatalog {
         pub fn conflicting() -> Self {
             Self {
                 source_qualified: registry_candidate("Foo", "1.0.0", "cran", vec![]),
-                installed_name: registry_candidate("Foo", "1.0.0", "private", vec![]),
+                installed_name: vec![registry_candidate("Foo", "1.0.0", "private", vec![])],
+                reverse_installed: false,
             }
         }
 
@@ -207,8 +209,27 @@ pub mod regression_support {
             let release = registry_candidate("Foo", "1.0.0", "cran", vec![]);
             Self {
                 source_qualified: release.clone(),
-                installed_name: release,
+                installed_name: vec![release],
+                reverse_installed: false,
             }
+        }
+
+        pub fn common_with_conflicting_installed() -> Self {
+            let common = registry_candidate("Foo", "1.0.0", "cran", vec![]);
+            Self {
+                source_qualified: common.clone(),
+                installed_name: vec![
+                    registry_candidate("Foo", "1.0.0", "private", vec![]),
+                    common,
+                ],
+                reverse_installed: false,
+            }
+        }
+
+        pub fn common_with_conflicting_installed_reversed() -> Self {
+            let mut catalog = Self::common_with_conflicting_installed();
+            catalog.reverse_installed = true;
+            catalog
         }
 
         pub fn resolver(&self) -> Resolver<'_> {
@@ -247,12 +268,35 @@ pub mod regression_support {
             )
         }
 
+        pub fn installed_name_request(&self) -> ResolutionRequest {
+            let foo = PackageName::new("Foo").unwrap();
+            ResolutionRequest::without_lock(
+                vec![RootRequirement {
+                    package: rsolve_core::PackageRequirement::new(
+                        foo,
+                        DependencySourceConstraint::Any,
+                        VersionConstraint::unconstrained(),
+                    )
+                    .unwrap(),
+                    expansion: RootExpansionPolicy::HardOnly,
+                }],
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+                VersionConstraint::unconstrained(),
+            )
+        }
+
+        pub fn reversed_request(&self) -> ResolutionRequest {
+            let mut request = self.request();
+            request.roots.reverse();
+            request
+        }
+
         pub fn source_qualified_identity(&self) -> ReleaseIdentity {
             self.source_qualified.identity().clone()
         }
 
         pub fn installed_name_identity(&self) -> ReleaseIdentity {
-            self.installed_name.identity().clone()
+            self.installed_name[0].identity().clone()
         }
     }
 
@@ -265,7 +309,11 @@ pub mod regression_support {
                     Ok(vec![self.source_qualified.clone()])
                 }
                 SolverKey::InstalledName(name) if name.as_str() == "Foo" => {
-                    Ok(vec![self.installed_name.clone()])
+                    let mut releases = self.installed_name.clone();
+                    if self.reverse_installed {
+                        releases.reverse();
+                    }
+                    Ok(releases)
                 }
                 _ => Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::NotFound,
@@ -408,6 +456,73 @@ pub mod regression_support {
                 _ => Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::NotFound,
                     format!("same-version fixture has no package {name}"),
+                )),
+            }
+        }
+    }
+
+    pub struct BacktrackingCatalog {
+        foo: Vec<PackageRelease>,
+        good_dependency: PackageRelease,
+    }
+
+    impl BacktrackingCatalog {
+        pub fn new() -> Self {
+            let bad_dependency = DeclaredDependency::from_parts(
+                DependencyKind::Depends,
+                PackageName::new("MissingDependency").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap();
+            let good_dependency = DeclaredDependency::from_parts(
+                DependencyKind::Depends,
+                PackageName::new("GoodDependency").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap();
+            Self {
+                foo: vec![
+                    registry_candidate("Foo", "1.0.0", "zbad", vec![bad_dependency]),
+                    registry_candidate("Foo", "1.0.0", "agood", vec![good_dependency]),
+                ],
+                good_dependency: plain_candidate("GoodDependency", "1.0.0"),
+            }
+        }
+
+        pub fn resolver(&self) -> Resolver<'_> {
+            static PREFERENCE: DefaultCandidatePreference = DefaultCandidatePreference;
+            static LOCK_POLICY: PreferLocked = PreferLocked;
+            Resolver::new(self, &PREFERENCE, &LOCK_POLICY)
+        }
+
+        pub fn request(&self) -> ResolutionRequest {
+            ResolutionRequest::without_lock(
+                vec![foo_requirement()],
+                ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+                VersionConstraint::unconstrained(),
+            )
+        }
+
+        pub fn selected_namespace(&self) -> &'static str {
+            "agood"
+        }
+    }
+
+    impl CandidateLoader for BacktrackingCatalog {
+        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+            match package {
+                SolverKey::InstalledName(name) if name.as_str() == "Foo" => Ok(self.foo.clone()),
+                SolverKey::InstalledName(name) if name.as_str() == "GoodDependency" => {
+                    Ok(vec![self.good_dependency.clone()])
+                }
+                SolverKey::InstalledName(name) if name.as_str() == "MissingDependency" => {
+                    Ok(Vec::new())
+                }
+                _ => Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("backtracking fixture has no candidates for {package:?}"),
                 )),
             }
         }

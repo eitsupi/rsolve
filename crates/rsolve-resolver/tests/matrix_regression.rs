@@ -3,8 +3,9 @@ mod matrix_scenario;
 
 use matrix_scenario::MatrixCatalog;
 use matrix_scenario::regression_support::{
-    AlternativeCatalog, GitDependencyCatalog, MultiSourceCatalog, SameVersionCatalog,
-    StrongDependencyCatalog, matrix_identity, require_locked_matrix_resolver, with_locked_matrix,
+    AlternativeCatalog, BacktrackingCatalog, GitDependencyCatalog, MultiSourceCatalog,
+    SameVersionCatalog, StrongDependencyCatalog, matrix_identity, require_locked_matrix_resolver,
+    with_locked_matrix,
 };
 use rsolve_core::{
     DependencySourceConstraint, NormalizedGitUrl, PackageName, RPackageVersion, RelationOp,
@@ -34,19 +35,10 @@ fn matrix_selects_the_last_compatible_release_for_each_r_version() {
 fn source_qualified_and_installed_name_identities_fail_closed() {
     let catalog = MultiSourceCatalog::conflicting();
     let failure = catalog.resolver().resolve(catalog.request()).unwrap_err();
-
-    match failure {
-        rsolve_resolver::ResolutionFailure::InstalledNameConflict {
-            name,
-            first_identity,
-            second_identity,
-        } => {
-            assert_eq!(name, PackageName::new("Foo").unwrap());
-            assert_eq!(*first_identity, catalog.source_qualified_identity());
-            assert_eq!(*second_identity, catalog.installed_name_identity());
-        }
-        other => panic!("expected installed-name conflict, got {other:?}"),
-    }
+    assert!(matches!(
+        failure,
+        rsolve_resolver::ResolutionFailure::NoSolution { .. }
+    ));
 }
 
 #[test]
@@ -63,6 +55,50 @@ fn same_identity_from_multiple_subjects_uses_installed_name_canonical_subject() 
         resolution.packages()[0].identity(),
         &catalog.source_qualified_identity()
     );
+}
+
+#[test]
+fn common_identity_backtracks_across_source_subjects_and_is_canonicalized() {
+    let catalog = MultiSourceCatalog::common_with_conflicting_installed();
+    let installed_only = catalog
+        .resolver()
+        .resolve(catalog.installed_name_request())
+        .unwrap();
+    assert_eq!(
+        installed_only.packages()[0].identity(),
+        &catalog.installed_name_identity()
+    );
+
+    let resolution = catalog.resolver().resolve(catalog.request()).unwrap();
+
+    assert_eq!(resolution.packages().len(), 1);
+    assert_eq!(
+        resolution.packages()[0].subject(),
+        &SolverKey::InstalledName(PackageName::new("Foo").unwrap())
+    );
+    assert_eq!(
+        resolution.packages()[0].identity(),
+        &catalog.source_qualified_identity()
+    );
+}
+
+#[test]
+fn common_identity_selection_is_stable_across_root_and_loader_order() {
+    let ascending = MultiSourceCatalog::common_with_conflicting_installed();
+    let descending = MultiSourceCatalog::common_with_conflicting_installed_reversed();
+    let first = ascending.resolver().resolve(ascending.request()).unwrap();
+    let second = descending
+        .resolver()
+        .resolve(descending.reversed_request())
+        .unwrap();
+
+    assert_eq!(first.target(), second.target());
+    assert_eq!(first.packages().len(), second.packages().len());
+    for (left, right) in first.packages().iter().zip(second.packages()) {
+        assert_eq!(left.subject(), right.subject());
+        assert_eq!(left.identity(), right.identity());
+        assert_eq!(left.version(), right.version());
+    }
 }
 
 #[test]
@@ -250,6 +286,20 @@ fn same_version_candidates_keep_the_policy_selected_identity_and_dependencies() 
             .is_none(),
         "the non-preferred same-version release must not supply dependencies"
     );
+}
+
+#[test]
+fn same_version_identity_backtracks_when_the_first_identity_has_incompatible_dependencies() {
+    let catalog = BacktrackingCatalog::new();
+    let foo = PackageName::new("Foo").unwrap();
+    let resolution = catalog.resolver().resolve(catalog.request()).unwrap();
+    let selected = resolution.selected(&foo).unwrap();
+    let rsolve_core::Provenance::RegistryRelease { namespace, .. } =
+        selected.identity().provenance()
+    else {
+        panic!("fixture must provide registry provenance");
+    };
+    assert_eq!(namespace.as_str(), catalog.selected_namespace());
 }
 
 #[test]

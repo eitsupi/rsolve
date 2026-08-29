@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -11,18 +11,75 @@ use pubgrub::{
     PackageResolutionStatistics, PubGrubError, Ranges, resolve,
 };
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DependencyKind, DependencySourceConstraint, PackageRelease, PublicationCutoff, PublicationDate,
-    RPackageVersion, RelationOp, ReleaseIdentity, Resolution, ResolutionRequest,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
+    DependencySourceConstraint, PackageRelease, PublicationCutoff, PublicationDate,
+    RPackageVersion, ReleaseAggregation, ReleaseIdentity, Resolution, ResolutionRequest,
     ResolvedDependencyEdge, RootExpansionPolicy, SolverKey, VersionConstraint,
 };
 
 use crate::{CandidatePreference, LockDecision, LockUpdatePolicy, PreferenceContext};
 
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct CandidateId(usize);
+
+impl fmt::Debug for CandidateId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("candidate")
+    }
+}
+
+impl fmt::Display for CandidateId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("candidate")
+    }
+}
+
+/// The solve-local PubGrub version domain. Candidate IDs are opaque and their
+/// ordinal is never used as a preference or release ordering signal.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum SolverVersion {
+    Root,
+    R(RPackageVersion),
+    Candidate(CandidateId),
+}
+
+impl fmt::Debug for SolverVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_display(formatter)
+    }
+}
+
+impl fmt::Display for SolverVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_display(formatter)
+    }
+}
+
+impl SolverVersion {
+    fn fmt_display(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => formatter.write_str("root"),
+            Self::R(version) => write!(formatter, "R {version}"),
+            Self::Candidate(_) => formatter.write_str("candidate"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum PackageId {
     Root,
     Subject(SolverKey),
+    Occupancy(rsolve_core::PackageName),
+}
+
+impl fmt::Display for PackageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => formatter.write_str("root"),
+            Self::Subject(subject) => write!(formatter, "{subject:?}"),
+            Self::Occupancy(name) => write!(formatter, "occupancy({name})"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,25 +91,16 @@ enum ProviderMessage {
 }
 
 impl fmt::Display for ProviderMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Text(message) => f.write_str(message),
+            Self::Text(message) => formatter.write_str(message),
             Self::Publication { rejections, .. } => {
                 write!(
-                    f,
+                    formatter,
                     "{} publication-ineligible candidate(s)",
                     rejections.len()
                 )
             }
-        }
-    }
-}
-
-impl fmt::Display for PackageId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Root => f.write_str("root"),
-            Self::Subject(subject) => write!(f, "{subject:?}"),
         }
     }
 }
@@ -64,8 +112,8 @@ struct AdapterError {
 }
 
 impl fmt::Display for AdapterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "loading {:#?}: {}", self.package, self.source)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "loading {:#?}: {}", self.package, self.source)
     }
 }
 
@@ -82,30 +130,186 @@ fn candidate_load_error(package: SolverKey, source: CandidateLoadError) -> Box<A
     })
 }
 
+#[derive(Clone, Debug)]
+struct LoadedSubject {
+    ids: Vec<CandidateId>,
+    quarantined: Vec<rsolve_core::QuarantinedCandidate>,
+}
+
+#[derive(Default)]
+struct CandidateInterner {
+    next: usize,
+    by_identity: HashMap<ReleaseIdentity, CandidateId>,
+    releases: HashMap<CandidateId, PackageRelease>,
+    exposed: HashSet<CandidateId>,
+}
+
+impl CandidateInterner {
+    fn intern(&mut self, release: PackageRelease) -> Result<CandidateId, CandidateLoadError> {
+        let identity = release.identity().clone();
+        if let Some(id) = self.by_identity.get(&identity).copied() {
+            let existing = self.releases.get(&id).cloned().ok_or_else(|| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    "candidate interner lost the release for an interned identity",
+                )
+            })?;
+            let mut aggregation = ReleaseAggregation::new();
+            aggregation
+                .observe_release(existing.clone())
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        format!("interned candidate metadata is invalid: {error}"),
+                    )
+                })?;
+            aggregation.observe_release(release).map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("conflicting metadata for interned candidate: {error}"),
+                )
+            })?;
+            let merged = aggregation.get(&identity).cloned().ok_or_else(|| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    "candidate interner failed to retrieve merged release",
+                )
+            })?;
+            if self.exposed.contains(&id) && !release_facts_equal(&existing, &merged) {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    "candidate metadata changed after the candidate was exposed to the solver",
+                ));
+            }
+            self.releases.insert(id, merged);
+            return Ok(id);
+        }
+        let id = CandidateId(self.next);
+        self.next = self.next.checked_add(1).ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::MetadataInvalid,
+                "candidate interner exhausted its solve-local identifier space",
+            )
+        })?;
+        self.by_identity.insert(identity, id);
+        self.releases.insert(id, release);
+        Ok(id)
+    }
+
+    fn ids_for_name(&self, name: &rsolve_core::PackageName) -> Vec<CandidateId> {
+        let mut ids = self
+            .releases
+            .iter()
+            .filter_map(|(id, release)| (release.identity().name() == name).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.sort_by(|left, right| {
+            identity_sort_key(self.releases[left].identity())
+                .cmp(&identity_sort_key(self.releases[right].identity()))
+        });
+        ids
+    }
+}
+
+fn release_facts_equal(left: &PackageRelease, right: &PackageRelease) -> bool {
+    left.identity() == right.identity()
+        && left.version() == right.version()
+        && left.metadata() == right.metadata()
+        && left.publication() == right.publication()
+        && left.declared_dependencies() == right.declared_dependencies()
+        && left.distributions() == right.distributions()
+}
+
 struct Provider<'a> {
     loader: &'a dyn CandidateLoader,
     preference: &'a dyn CandidatePreference,
     lock_policy: &'a dyn LockUpdatePolicy,
     request: &'a ResolutionRequest,
-    cache: RefCell<HashMap<SolverKey, Result<CandidateLoadResult, CandidateLoadError>>>,
+    cache: RefCell<HashMap<SolverKey, Result<LoadedSubject, CandidateLoadError>>>,
+    interner: RefCell<CandidateInterner>,
 }
 
 impl<'a> Provider<'a> {
-    fn loaded(&self, subject: &SolverKey) -> Result<CandidateLoadResult, Box<AdapterError>> {
+    fn loaded(&self, subject: &SolverKey) -> Result<LoadedSubject, Box<AdapterError>> {
         if let Some(cached) = self.cache.borrow().get(subject) {
             return cached
                 .clone()
                 .map_err(|source| candidate_load_error(subject.clone(), source));
         }
-        let result = self.loader.load(subject);
+        let loaded: Result<LoadedSubject, CandidateLoadError> = match self.loader.load(subject) {
+            Ok(result) => {
+                let (mut releases, quarantined) = result.into_parts();
+                releases.sort_by(|left, right| {
+                    identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
+                });
+                let ids = releases
+                    .into_iter()
+                    .map(|release| self.interner.borrow_mut().intern(release))
+                    .collect::<Result<Vec<_>, _>>();
+                ids.map(|mut ids| {
+                    ids.dedup();
+                    LoadedSubject { ids, quarantined }
+                })
+            }
+            Err(error) => Err(error),
+        };
         self.cache
             .borrow_mut()
-            .insert(subject.clone(), result.clone());
-        result.map_err(|source| candidate_load_error(subject.clone(), source))
+            .insert(subject.clone(), loaded.clone());
+        loaded.map_err(|source| candidate_load_error(subject.clone(), source))
     }
 
-    fn candidates(&self, subject: &SolverKey) -> Result<Vec<PackageRelease>, Box<AdapterError>> {
-        Ok(self.loaded(subject)?.into_parts().0)
+    fn candidates(
+        &self,
+        subject: &SolverKey,
+    ) -> Result<Vec<(CandidateId, PackageRelease)>, Box<AdapterError>> {
+        let loaded = self.loaded(subject)?;
+        Ok(self.candidates_from_loaded(&loaded))
+    }
+
+    fn candidates_from_loaded(&self, loaded: &LoadedSubject) -> Vec<(CandidateId, PackageRelease)> {
+        let mut interner = self.interner.borrow_mut();
+        loaded
+            .ids
+            .iter()
+            .filter_map(|id| {
+                interner.exposed.insert(*id);
+                interner
+                    .releases
+                    .get(id)
+                    .cloned()
+                    .map(|release| (*id, release))
+            })
+            .collect()
+    }
+
+    fn candidate_for_id(
+        &self,
+        subject: &SolverKey,
+        id: CandidateId,
+    ) -> Result<PackageRelease, Box<AdapterError>> {
+        let loaded = self.loaded(subject)?;
+        if !loaded.ids.contains(&id) {
+            return Err(candidate_load_error(
+                subject.clone(),
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    "selected candidate is not visible in this subject",
+                ),
+            ));
+        }
+        let release = self.interner.borrow().releases.get(&id).cloned();
+        if release.is_some() {
+            self.interner.borrow_mut().exposed.insert(id);
+        }
+        release.ok_or_else(|| {
+            candidate_load_error(
+                subject.clone(),
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    "selected candidate was not interned",
+                ),
+            )
+        })
     }
 
     fn r_version(&self) -> &RPackageVersion {
@@ -117,44 +321,90 @@ impl<'a> Provider<'a> {
             .decision(subject, self.request.locked.get(subject))
     }
 
-    fn current<'b>(&self, candidates: &'b [PackageRelease]) -> Option<&'b PackageRelease> {
+    fn current<'b>(
+        &self,
+        candidates: &'b [(CandidateId, PackageRelease)],
+    ) -> Option<&'b PackageRelease> {
         candidates
             .iter()
+            .map(|(_, candidate)| candidate)
             .filter(|candidate| {
                 candidate
                     .distributions()
                     .iter()
-                    .any(|d| d.snapshot.is_none())
+                    .any(|distribution| distribution.snapshot.is_none())
             })
             .max_by(|left, right| {
                 left.version().cmp(right.version()).then_with(|| {
-                    format!("{:?}", left.identity()).cmp(&format!("{:?}", right.identity()))
+                    identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
                 })
             })
     }
 
-    fn ranges_for(&self, constraint: &VersionConstraint) -> Ranges<RPackageVersion> {
-        constraint
-            .clauses
-            .iter()
-            .map(|clause| match clause.op {
-                RelationOp::Lt => Ranges::strictly_lower_than(clause.version.clone()),
-                RelationOp::Le => Ranges::lower_than(clause.version.clone()),
-                RelationOp::Eq => Ranges::singleton(clause.version.clone()),
-                RelationOp::Ne => Ranges::singleton(clause.version.clone()).complement(),
-                RelationOp::Ge => Ranges::higher_than(clause.version.clone()),
-                RelationOp::Gt => Ranges::strictly_higher_than(clause.version.clone()),
-            })
-            .fold(Ranges::full(), |range, clause| range.intersection(&clause))
+    fn r_range(&self, constraint: &VersionConstraint) -> Ranges<SolverVersion> {
+        if constraint.satisfies(self.r_version()) {
+            Ranges::singleton(SolverVersion::R(self.r_version().clone()))
+        } else {
+            Ranges::empty()
+        }
+    }
+
+    fn ranges_for_subject(
+        &self,
+        subject: &SolverKey,
+        constraint: &VersionConstraint,
+    ) -> Result<Ranges<SolverVersion>, Box<AdapterError>> {
+        if matches!(subject, SolverKey::R) {
+            Ok(self.r_range(constraint))
+        } else {
+            self.candidate_ranges(subject, constraint)
+        }
+    }
+
+    fn candidate_ranges(
+        &self,
+        subject: &SolverKey,
+        constraint: &VersionConstraint,
+    ) -> Result<Ranges<SolverVersion>, Box<AdapterError>> {
+        let loaded = self.loaded(subject)?;
+        let candidates = self.candidates_from_loaded(&loaded);
+        let mut range = Ranges::empty();
+        for (id, release) in candidates {
+            if constraint.satisfies(release.version()) {
+                range = range.union(&Ranges::singleton(SolverVersion::Candidate(id)));
+            }
+        }
+        if !matches!(self.lock_decision(subject), LockDecision::Require(_))
+            && range == Ranges::empty()
+            && loaded
+                .quarantined
+                .iter()
+                .any(|candidate| constraint.satisfies(candidate.version()))
+        {
+            let versions = loaded
+                .quarantined
+                .iter()
+                .filter(|candidate| constraint.satisfies(candidate.version()))
+                .map(|candidate| candidate.version().to_string())
+                .collect::<Vec<_>>();
+            return Err(candidate_load_error(
+                subject.clone(),
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!(
+                        "all candidates matching the requested range were quarantined: {}",
+                        versions.join(", ")
+                    ),
+                ),
+            ));
+        }
+        Ok(range)
     }
 
     fn subject_for_package(
         &self,
         package: &rsolve_core::PackageRequirement,
     ) -> Result<SolverKey, Box<AdapterError>> {
-        // Root requirements still report unsupported Git scopes as typed metadata
-        // failures. Candidate dependencies handle this case in get_dependencies,
-        // where PubGrub can reject only the candidate that declared the scope.
         if let DependencySourceConstraint::Git { .. } = &package.source() {
             return Err(candidate_load_error(
                 SolverKey::InstalledName(package.name().clone()),
@@ -197,11 +447,13 @@ impl<'a> Provider<'a> {
     fn with_eligible_candidates<T>(
         &self,
         subject: &SolverKey,
-        range: Option<&Ranges<RPackageVersion>>,
-        use_candidates: impl FnOnce(&mut Vec<PackageRelease>, &PreferenceContext<'_>) -> T,
+        range: Option<&Ranges<SolverVersion>>,
+        use_candidates: impl FnOnce(
+            &mut Vec<(CandidateId, PackageRelease)>,
+            &PreferenceContext<'_>,
+        ) -> T,
     ) -> Result<T, Box<AdapterError>> {
-        let loaded = self.loaded(subject)?;
-        let candidates = loaded.candidates().to_vec();
+        let candidates = self.candidates(subject)?;
         let decision = self.lock_decision(subject);
         let required = match &decision {
             LockDecision::Require(identity) => Some(identity),
@@ -220,23 +472,20 @@ impl<'a> Provider<'a> {
             locked: locked.as_ref(),
             repository_current: current.as_ref(),
         };
-        let mut eligible: Vec<PackageRelease> = candidates
+        let mut eligible = candidates
             .into_iter()
-            .filter(|candidate| {
-                if !required
+            .filter(|(id, candidate)| {
+                required
                     .as_ref()
                     .is_none_or(|identity| candidate.identity() == *identity)
-                {
-                    return false;
-                }
-                range.is_none_or(|range| range.contains(candidate.version()))
+                    && range.is_none_or(|range| range.contains(&SolverVersion::Candidate(*id)))
             })
-            .collect();
+            .collect::<Vec<_>>();
         if self.request.publication_cutoff.is_some() {
             let candidates_before_policy = eligible.clone();
-            let rejections = self.publication_rejections(&eligible, locked.as_ref());
+            let rejections = self.publication_rejections(subject, &eligible, locked.as_ref());
             if !rejections.is_empty() {
-                eligible.retain(|candidate| {
+                eligible.retain(|(_, candidate)| {
                     !rejections.iter().any(|rejection| match rejection {
                         PublicationRejection::PublicationCooldown { identity, .. }
                         | PublicationRejection::PublicationUnknown { identity } => {
@@ -244,45 +493,18 @@ impl<'a> Provider<'a> {
                         }
                     })
                 });
-                // PubGrub must be allowed to inspect one rejected version so that
-                // the rejection becomes an incompatibility and can backtrack.
                 if eligible.is_empty() {
                     eligible = candidates_before_policy;
                 }
             }
-        }
-        if required.is_none()
-            && eligible.is_empty()
-            && range.is_some_and(|range| {
-                loaded
-                    .quarantined()
-                    .iter()
-                    .any(|candidate| range.contains(candidate.version()))
-            })
-        {
-            let versions = loaded
-                .quarantined()
-                .iter()
-                .filter(|candidate| range.is_none_or(|range| range.contains(candidate.version())))
-                .map(|candidate| candidate.version().to_string())
-                .collect::<Vec<_>>();
-            return Err(candidate_load_error(
-                subject.clone(),
-                CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    format!(
-                        "all candidates matching the requested range were quarantined: {}",
-                        versions.join(", ")
-                    ),
-                ),
-            ));
         }
         Ok(use_candidates(&mut eligible, &context))
     }
 
     fn publication_rejections(
         &self,
-        candidates: &[PackageRelease],
+        _subject: &SolverKey,
+        candidates: &[(CandidateId, PackageRelease)],
         locked: Option<&ReleaseIdentity>,
     ) -> Vec<PublicationRejection> {
         let Some(cutoff) = self.request.publication_cutoff.map(|cutoff| cutoff.date()) else {
@@ -290,7 +512,7 @@ impl<'a> Provider<'a> {
         };
         let mut rejections = candidates
             .iter()
-            .filter_map(|candidate| {
+            .filter_map(|(_, candidate)| {
                 if candidate.is_r_base_package()
                     || locked.is_some_and(|identity| candidate.identity() == identity)
                 {
@@ -316,10 +538,10 @@ impl<'a> Provider<'a> {
         rejections
     }
 
-    fn publication_rejections_for_version(
+    fn publication_rejections_for_candidate(
         &self,
         subject: &SolverKey,
-        version: &RPackageVersion,
+        id: CandidateId,
     ) -> Result<Vec<PublicationRejection>, Box<AdapterError>> {
         let decision = self.lock_decision(subject);
         let required = match &decision {
@@ -332,31 +554,11 @@ impl<'a> Provider<'a> {
             }
             LockDecision::Unlocked => None,
         };
-        let candidates = self.loaded(subject)?.candidates().to_vec();
-        let matching = candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.version() == version
-                    && required
-                        .as_ref()
-                        .is_none_or(|identity| candidate.identity() == *identity)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let rejections = self.publication_rejections(&matching, locked.as_ref());
-        if rejections.is_empty() {
-            return Ok(rejections);
-        }
-        if matching.iter().any(|candidate| {
-            !rejections.iter().any(|rejection| match rejection {
-                PublicationRejection::PublicationCooldown { identity, .. }
-                | PublicationRejection::PublicationUnknown { identity } => {
-                    candidate.identity() == identity
-                }
-            })
-        }) {
+        let release = self.candidate_for_id(subject, id)?;
+        if required.is_some_and(|identity| release.identity() != identity) {
             return Ok(Vec::new());
         }
+        let rejections = self.publication_rejections(subject, &[(id, release)], locked.as_ref());
         Ok(rejections)
     }
 
@@ -370,51 +572,27 @@ impl<'a> Provider<'a> {
         self.preference
             .compare(subject, left, right, context)
             .then_with(|| left.version().cmp(right.version()))
-            .then_with(|| format!("{:?}", left.identity()).cmp(&format!("{:?}", right.identity())))
+            .then_with(|| {
+                identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
+            })
     }
 
     fn sort_candidates(
         &self,
         subject: &SolverKey,
-        candidates: &mut [PackageRelease],
+        candidates: &mut [(CandidateId, PackageRelease)],
         context: &PreferenceContext<'_>,
     ) {
-        candidates.sort_by(|left, right| self.compare_candidates(subject, left, right, context));
-    }
-
-    // Candidate identity is currently canonicalized per (subject, version), so a same-version
-    // alternative from a different provenance is not independently selectable within one subject.
-    // A source-qualified subject and an installed-name subject can still select different
-    // identities; solve() enforces installed-name occupancy after PubGrub returns and fails
-    // closed without trying an alternative. Making candidate identity a first-class part of the
-    // solver package/version domain remains a future solver design question.
-    fn candidate_for_version(
-        &self,
-        subject: &SolverKey,
-        version: &RPackageVersion,
-    ) -> Result<PackageRelease, Box<AdapterError>> {
-        let range = Ranges::singleton(version.clone());
-        let candidate =
-            self.with_eligible_candidates(subject, Some(&range), |eligible, context| {
-                self.sort_candidates(subject, eligible, context);
-                eligible.pop()
-            })?;
-        candidate.ok_or_else(|| {
-            Box::new(AdapterError {
-                package: subject.clone(),
-                source: Box::new(CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("selected version {version} was not in the loaded catalog"),
-                )),
-            })
-        })
+        candidates.sort_by(|(_, left), (_, right)| {
+            self.compare_candidates(subject, left, right, context)
+        });
     }
 }
 
 impl DependencyProvider for Provider<'_> {
     type P = PackageId;
-    type V = RPackageVersion;
-    type VS = Ranges<RPackageVersion>;
+    type V = SolverVersion;
+    type VS = Ranges<SolverVersion>;
     type Priority = (Reverse<usize>, String);
     type M = ProviderMessage;
     type Err = Box<AdapterError>;
@@ -427,16 +605,19 @@ impl DependencyProvider for Provider<'_> {
     ) -> Self::Priority {
         let count = match package {
             PackageId::Root => 1,
-            PackageId::Subject(SolverKey::R) => usize::from(range.contains(self.r_version())),
+            PackageId::Subject(SolverKey::R) => {
+                usize::from(range.contains(&SolverVersion::R(self.r_version().clone())))
+            }
             PackageId::Subject(subject) => self
                 .candidates(subject)
                 .map(|candidates| {
                     candidates
                         .iter()
-                        .filter(|candidate| range.contains(candidate.version()))
+                        .filter(|(id, _)| range.contains(&SolverVersion::Candidate(*id)))
                         .count()
                 })
                 .unwrap_or(usize::MAX),
+            PackageId::Occupancy(_) => 1,
         };
         (Reverse(count), format!("{package:?}"))
     }
@@ -448,16 +629,31 @@ impl DependencyProvider for Provider<'_> {
     ) -> Result<Option<Self::V>, Self::Err> {
         match package {
             PackageId::Root => Ok(range
-                .contains(&RPackageVersion::parse("0.0").expect("root version"))
-                .then(|| RPackageVersion::parse("0.0").expect("root version"))),
+                .contains(&SolverVersion::Root)
+                .then_some(SolverVersion::Root)),
             PackageId::Subject(SolverKey::R) => Ok(range
-                .contains(self.r_version())
-                .then(|| self.r_version().clone())),
+                .contains(&SolverVersion::R(self.r_version().clone()))
+                .then_some(SolverVersion::R(self.r_version().clone()))),
             PackageId::Subject(subject) => {
                 self.with_eligible_candidates(subject, Some(range), |eligible, context| {
                     self.sort_candidates(subject, eligible, context);
-                    eligible.pop().map(|candidate| candidate.version().clone())
+                    eligible.pop().map(|(id, _)| SolverVersion::Candidate(id))
                 })
+            }
+            PackageId::Occupancy(_) => {
+                // Occupancy is constrained by exact singleton ranges emitted
+                // by source subjects. Resolve those opaque IDs from the
+                // solve-local interner rather than retaining selection state.
+                let PackageId::Occupancy(name) = package else {
+                    unreachable!()
+                };
+                Ok(self
+                    .interner
+                    .borrow()
+                    .ids_for_name(name)
+                    .into_iter()
+                    .find(|id| range.contains(&SolverVersion::Candidate(*id)))
+                    .map(SolverVersion::Candidate))
             }
         }
     }
@@ -469,8 +665,7 @@ impl DependencyProvider for Provider<'_> {
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
         match package {
             PackageId::Root => {
-                let root_version = RPackageVersion::parse("0.0").expect("root version");
-                if version != &root_version {
+                if version != &SolverVersion::Root {
                     return Ok(Dependencies::Unavailable(ProviderMessage::Text(
                         "unknown root version".to_owned(),
                     )));
@@ -478,12 +673,13 @@ impl DependencyProvider for Provider<'_> {
                 let mut dependencies = Vec::new();
                 dependencies.push((
                     PackageId::Subject(SolverKey::R),
-                    self.ranges_for(&self.request.r_requirement),
+                    self.r_range(&self.request.r_requirement),
                 ));
                 for requirement in &self.request.roots {
+                    let subject = self.subject_for_package(&requirement.package)?;
                     dependencies.push((
-                        PackageId::Subject(self.subject_for_package(&requirement.package)?),
-                        self.ranges_for(requirement.package.constraint()),
+                        PackageId::Subject(subject.clone()),
+                        self.ranges_for_subject(&subject, requirement.package.constraint())?,
                     ));
                 }
                 Ok(Dependencies::Available(DependencyConstraints::from_iter(
@@ -494,14 +690,23 @@ impl DependencyProvider for Provider<'_> {
                 Ok(Dependencies::Available(DependencyConstraints::default()))
             }
             PackageId::Subject(subject) => {
-                let rejections = self.publication_rejections_for_version(subject, version)?;
+                let SolverVersion::Candidate(id) = version else {
+                    return Ok(Dependencies::Unavailable(ProviderMessage::Text(
+                        "unknown candidate version".to_owned(),
+                    )));
+                };
+                let rejections = self.publication_rejections_for_candidate(subject, *id)?;
                 if !rejections.is_empty() {
                     return Ok(Dependencies::Unavailable(ProviderMessage::Publication {
                         rejections,
                     }));
                 }
-                let release = self.candidate_for_version(subject, version)?;
-                let mut dependencies = Vec::new();
+                let release = self.candidate_for_id(subject, *id)?;
+                let name = release.identity().name().clone();
+                let mut dependencies = vec![(
+                    PackageId::Occupancy(name),
+                    Ranges::singleton(SolverVersion::Candidate(*id)),
+                )];
                 for dependency in release.declared_dependencies().iter().filter(|dependency| {
                     matches!(
                         dependency.kind,
@@ -516,14 +721,21 @@ impl DependencyProvider for Provider<'_> {
                             dependency.package.name()
                         ))));
                     }
+                    let dependency_subject = self.subject_for_package(&dependency.package)?;
                     dependencies.push((
-                        PackageId::Subject(self.subject_for_package(&dependency.package)?),
-                        self.ranges_for(dependency.package.constraint()),
+                        PackageId::Subject(dependency_subject.clone()),
+                        self.ranges_for_subject(
+                            &dependency_subject,
+                            dependency.package.constraint(),
+                        )?,
                     ));
                 }
                 Ok(Dependencies::Available(DependencyConstraints::from_iter(
                     dependencies,
                 )))
+            }
+            PackageId::Occupancy(_) => {
+                Ok(Dependencies::Available(DependencyConstraints::default()))
             }
         }
     }
@@ -695,9 +907,9 @@ pub(crate) fn solve(
         lock_policy,
         request,
         cache: RefCell::new(HashMap::new()),
+        interner: RefCell::new(CandidateInterner::default()),
     };
-    let root_version = RPackageVersion::parse("0.0").expect("root version");
-    let selected = resolve(&provider, PackageId::Root, root_version)
+    let selected = resolve(&provider, PackageId::Root, SolverVersion::Root)
         .map_err(|error| map_error(error, request.publication_cutoff))?;
 
     let mut packages = BTreeMap::<rsolve_core::PackageName, (SolverKey, PackageRelease)>::new();
@@ -706,8 +918,11 @@ pub(crate) fn solve(
             if subject == SolverKey::R {
                 continue;
             }
+            let SolverVersion::Candidate(id) = version else {
+                continue;
+            };
             let release = provider
-                .candidate_for_version(&subject, &version)
+                .candidate_for_id(&subject, id)
                 .map_err(|error| map_adapter_error(*error))?;
             if release.is_r_base_package() {
                 continue;
@@ -814,7 +1029,7 @@ fn map_error(
 }
 
 fn publication_policy_diagnostic(
-    tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
+    tree: &DerivationTree<PackageId, Ranges<SolverVersion>, ProviderMessage>,
     cutoff: Option<PublicationCutoff>,
 ) -> Option<PublicationPolicyDiagnostic> {
     let cutoff = cutoff?;
@@ -832,7 +1047,7 @@ fn publication_policy_diagnostic(
 }
 
 fn collect_publication_leaves(
-    tree: &DerivationTree<PackageId, Ranges<RPackageVersion>, ProviderMessage>,
+    tree: &DerivationTree<PackageId, Ranges<SolverVersion>, ProviderMessage>,
     rejections: &mut Vec<PublicationRejection>,
 ) {
     match tree {
@@ -875,7 +1090,7 @@ mod tests {
         let rejection = PublicationRejection::PublicationUnknown { identity };
         let leaf = DerivationTree::External(External::Custom(
             PackageId::Subject(SolverKey::InstalledName(package)),
-            Ranges::singleton(version),
+            Ranges::singleton(SolverVersion::R(version)),
             ProviderMessage::Publication {
                 rejections: vec![rejection.clone()],
             },
@@ -969,5 +1184,64 @@ mod tests {
             .expect("publication leaf evidence");
         assert_eq!(evidence.cutoff, cutoff);
         assert_eq!(evidence.rejections.as_ref(), [rejection]);
+    }
+
+    fn intern_fixture_release(
+        metadata: rsolve_core::ReleaseMetadata,
+        channel: &str,
+    ) -> PackageRelease {
+        let package = rsolve_core::PackageName::new("fixture").unwrap();
+        let version = RPackageVersion::parse("1.0.0").unwrap();
+        PackageRelease::try_from(rsolve_core::ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                package.clone(),
+                rsolve_core::Provenance::RegistryRelease {
+                    namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: package,
+            observed_version: version,
+            metadata,
+            publication: None,
+            declared_dependencies: Vec::new(),
+            distributions: vec![rsolve_core::Distribution {
+                registry: rsolve_core::RegistryId::new("cran").unwrap(),
+                channel: rsolve_core::DistributionChannel::new(channel).unwrap(),
+                snapshot: None,
+                artifacts: Vec::new(),
+                observed_metadata: rsolve_core::DistributionMetadata::default(),
+            }],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn interning_rejects_conflicting_metadata_for_one_identity() {
+        let mut interner = CandidateInterner::default();
+        let first = intern_fixture_release(
+            rsolve_core::ReleaseMetadata::from_pairs([("Title", "first")]).unwrap(),
+            "source",
+        );
+        let second = intern_fixture_release(
+            rsolve_core::ReleaseMetadata::from_pairs([("Title", "second")]).unwrap(),
+            "source",
+        );
+        interner.intern(first).unwrap();
+        let error = interner.intern(second).unwrap_err();
+        assert_eq!(
+            error.category(),
+            CandidateLoadErrorCategory::MetadataInvalid
+        );
+    }
+
+    #[test]
+    fn interning_merges_consistent_duplicate_distributions() {
+        let mut interner = CandidateInterner::default();
+        let first = intern_fixture_release(rsolve_core::ReleaseMetadata::default(), "source");
+        let second = intern_fixture_release(rsolve_core::ReleaseMetadata::default(), "binary");
+        let id = interner.intern(first).unwrap();
+        assert_eq!(interner.intern(second).unwrap(), id);
+        assert_eq!(interner.releases[&id].distributions().len(), 2);
     }
 }
