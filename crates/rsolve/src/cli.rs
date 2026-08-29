@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, RegistryId, VersionConstraint};
 
 use crate::filesystem::ExistingPathIdentity;
+use crate::lock::canonical_lock_basename;
 use crate::manifest::{ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, load_manifest};
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::ResolutionMetrics;
@@ -64,9 +65,10 @@ pub struct LockCommand {
     /// Fixed publication cutoff in YYYY-MM-DD form.
     #[arg(long)]
     pub publication_cutoff: Option<String>,
-    /// Lockfile destination. Defaults to rsolve.lock.
-    #[arg(long, default_value = DEFAULT_OUTPUT)]
-    pub output: PathBuf,
+    /// Lockfile destination in legacy package mode. Manifest mode derives this
+    /// from the manifest project root and rejects explicit output paths.
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
     /// Metadata cache root. Defaults to the platform cache directory.
     #[arg(long, value_name = "ROOT")]
     pub metadata_cache: Option<PathBuf>,
@@ -497,11 +499,15 @@ fn run_lock_with_backend_progress(
             .as_deref()
             .unwrap_or(DEFAULT_CRAN_MIRROR),
     )?;
-    validate_output_path(&command.output)?;
+    let output = command
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT));
+    validate_output_path(&output)?;
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
-        if destination_paths_equal(&command.output, metrics_output)?
-            || existing_destinations_share_identity(&command.output, metrics_output)?
+        if destination_paths_equal(&output, metrics_output)?
+            || existing_destinations_share_identity(&output, metrics_output)?
         {
             return Err(CliError::Value(
                 "--metrics-output must differ from --output".into(),
@@ -565,13 +571,13 @@ fn run_lock_with_backend_progress(
     let reserialization_ns = elapsed_ns(reserialization_started)?;
 
     let write_started = Instant::now();
-    let changed = write_lockfile(&command.output, bytes.as_bytes())?;
+    let changed = write_lockfile(&output, bytes.as_bytes())?;
     let write_ns = elapsed_ns(write_started)?;
     // Recheck after publishing the primary lock: this catches aliases that
     // were both missing during preflight. A report failure leaves that lock
     // published and valid.
     let lock_identity = if command.metrics_output.is_some() {
-        Some(lock_output_identity(&command.output)?)
+        Some(lock_output_identity(&output)?)
     } else {
         None
     };
@@ -608,7 +614,7 @@ fn run_lock_with_backend_progress(
             "target R {}; {} direct package(s); output {}; {}",
             command.r_version,
             requested_package_count,
-            command.output.display(),
+            output.display(),
             status
         ),
         warnings: resolved.warnings,
@@ -678,17 +684,24 @@ fn run_manifest_lock_with_backend_progress_at(
                 "environment selection ({environment_source}={environment_name:?}) failed: {error}"
             ))
         })?;
+    if command.output.is_some() {
+        return Err(value_error(
+            "--output cannot be used with manifest-backed resolution; output is derived from the manifest project root"
+                .into(),
+        ));
+    }
+    let output = manifest_output_path(&manifest_path, &composed.environment)?;
     // Direct sources are not acquired by this slice. Check them before any
     // cache setup or provider operation so unsupported input fails closed.
     composed
         .clone()
         .into_resolution_request()
         .map_err(|error| value_error(format!("manifest composition failed: {error}")))?;
-    validate_output_path(&command.output)?;
+    validate_output_path(&output)?;
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
-        if destination_paths_equal(&command.output, metrics_output)?
-            || existing_destinations_share_identity(&command.output, metrics_output)?
+        if destination_paths_equal(&output, metrics_output)?
+            || existing_destinations_share_identity(&output, metrics_output)?
         {
             return Err(CliError::Value(
                 "--metrics-output must differ from --output".into(),
@@ -748,10 +761,10 @@ fn run_manifest_lock_with_backend_progress_at(
         .map_err(|error| CliError::Operational(format!("lock re-serialization failed: {error}")))?;
     let reserialization_ns = elapsed_ns(reserialization_started)?;
     let write_started = Instant::now();
-    let changed = write_lockfile(&command.output, bytes.as_bytes())?;
+    let changed = write_lockfile(&output, bytes.as_bytes())?;
     let write_ns = elapsed_ns(write_started)?;
     let lock_identity = if command.metrics_output.is_some() {
-        Some(lock_output_identity(&command.output)?)
+        Some(lock_output_identity(&output)?)
     } else {
         None
     };
@@ -789,7 +802,7 @@ fn run_manifest_lock_with_backend_progress_at(
             command.r_version,
             composed.environment,
             manifest_path.display(),
-            command.output.display(),
+            output.display(),
             status
         ),
         warnings: resolved.warnings,
@@ -808,6 +821,23 @@ fn select_environment<'a>(
     } else {
         ("default", "default")
     }
+}
+
+fn manifest_output_path(
+    manifest_path: &Path,
+    environment: &EnvironmentId,
+) -> Result<PathBuf, CliError> {
+    let parent = manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let project_root = fs::canonicalize(parent).map_err(|error| {
+        CliError::Operational(format!(
+            "cannot canonicalize manifest project root {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(project_root.join(canonical_lock_basename(environment)))
 }
 
 fn environment_variable_for<F>(explicit: Option<&str>, read: F) -> Result<Option<String>, CliError>

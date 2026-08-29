@@ -11,6 +11,18 @@ fn version(value: &str) -> RPackageVersion {
     RPackageVersion::parse(value).unwrap()
 }
 
+#[test]
+fn canonical_lock_basename_uses_reserved_default_name() {
+    assert_eq!(
+        canonical_lock_basename(&EnvironmentId::new("default").unwrap()),
+        "rsolve.lock"
+    );
+    assert_eq!(
+        canonical_lock_basename(&EnvironmentId::new("test").unwrap()),
+        "rsolve.test.lock"
+    );
+}
+
 fn package(value: &str) -> PackageName {
     PackageName::new(value).unwrap()
 }

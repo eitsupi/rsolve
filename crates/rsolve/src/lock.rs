@@ -215,6 +215,16 @@ pub struct Lockfile {
     pub resolutions: Vec<LockedResolution>,
 }
 
+/// Return the canonical primary lock basename for one selected environment.
+/// The default environment intentionally has no environment suffix.
+pub(crate) fn canonical_lock_basename(environment: &EnvironmentId) -> String {
+    if environment.as_str() == "default" {
+        "rsolve.lock".into()
+    } else {
+        format!("rsolve.{}.lock", environment.as_str())
+    }
+}
+
 impl Lockfile {
     /// Project one successful logical resolution into a deterministic lock.
     pub fn from_resolution(
