@@ -176,6 +176,50 @@ fn fixture_transport_observes_conditional_validators() {
     assert_eq!(transport.requests.borrow()[0].validators, validators);
 }
 
+#[test]
+fn endpoint_paths_preserve_trailing_slashes_and_insert_one_separator() {
+    for (base, expected) in [
+        (
+            "https://cran.invalid/cran",
+            "https://cran.invalid/cran/src/contrib/PACKAGES",
+        ),
+        (
+            "https://cran.invalid/cran/",
+            "https://cran.invalid/cran/src/contrib/PACKAGES",
+        ),
+        (
+            "https://cran.invalid/cran///",
+            "https://cran.invalid/cran///src/contrib/PACKAGES",
+        ),
+    ] {
+        assert_eq!(
+            super::join_endpoint_path(base, "src/contrib/PACKAGES"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn cran_provider_refresh_preserves_configured_endpoint_slashes() {
+    let mut transport = FixtureTransport::fallback(FAST.to_vec(), 200);
+    transport.responses.insert(
+        "https://cran.invalid/cran///src/contrib/Archive/Matrix/PACKAGES.rds".into(),
+        TransportResponse::new(200, FAST.to_vec()),
+    );
+    let requests = Rc::clone(&transport.requests);
+    let package = PackageName::new("Matrix").unwrap();
+    let provider =
+        CranProvider::refresh(transport, "https://cran.invalid/cran///", package).unwrap();
+    assert_eq!(
+        requests.borrow()[0].url,
+        "https://cran.invalid/cran///src/contrib/Archive/Matrix/PACKAGES.rds"
+    );
+    assert_eq!(
+        provider.diagnostics()[0].endpoint,
+        "https://cran.invalid/cran///src/contrib/Archive/Matrix/PACKAGES.rds".into()
+    );
+}
+
 fn fast_url() -> String {
     "https://cran.invalid/src/contrib/Archive/Matrix/PACKAGES.rds".to_owned()
 }

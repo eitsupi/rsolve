@@ -80,6 +80,17 @@ pub(crate) use transport::{TransportResponse, TransportResponseHeaders, Transpor
 // This is a CRAN transport defense limit, not a generic artifact-size contract.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Append a provider-relative resource path without changing the endpoint's
+/// canonical spelling. A run of trailing slashes is part of endpoint
+/// identity and is therefore preserved verbatim.
+pub(super) fn join_endpoint_path(base: &str, relative: &str) -> String {
+    if base.ends_with('/') {
+        format!("{base}{relative}")
+    } else {
+        format!("{base}/{relative}")
+    }
+}
+
 /// A failure before a provider snapshot can be constructed.
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]

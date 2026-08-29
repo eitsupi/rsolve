@@ -30,7 +30,8 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
             return result.clone();
         }
         self.emit_progress(CranRefreshProgress::ArchiveHistoryStarted);
-        let endpoint = format!("{}/src/contrib/Meta/archive.rds", self.base_url);
+        let endpoint =
+            super::super::join_endpoint_path(&self.base_url, "src/contrib/Meta/archive.rds");
         let result = match self.acquire_metadata(
             &endpoint,
             RawCacheRepresentation::ArchiveHistoryRds,

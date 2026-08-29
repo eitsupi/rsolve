@@ -134,10 +134,12 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
             }
             let row = rows[0];
             staged_releases.push(row.release().clone());
-            let locator = format!(
-                "{}/src/contrib/Archive/{}",
-                self.base_url,
-                entry.source_archive_relative_path()
+            let locator = super::super::join_endpoint_path(
+                &self.base_url,
+                &format!(
+                    "src/contrib/Archive/{}",
+                    entry.source_archive_relative_path()
+                ),
             );
             staged_evidence.push(allpackages_record_to_evidence(
                 row,
@@ -196,10 +198,9 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
             return Ok(result.candidates);
         }
         self.emit_package_local_fallback();
-        let endpoint = format!(
-            "{}/src/contrib/Archive/{}/PACKAGES.rds",
-            self.base_url,
-            package.as_str()
+        let endpoint = super::super::join_endpoint_path(
+            &self.base_url,
+            &format!("src/contrib/Archive/{}/PACKAGES.rds", package.as_str()),
         );
         let mut package_diagnostics = Vec::new();
         let fast_result = match self.acquire_metadata(

@@ -885,11 +885,8 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
     ) -> Self {
         let metrics = Rc::new(RefCell::new(CranRefreshMetrics::default()));
         Self {
-            base_url: config.repository_endpoint.trim_end_matches('/').into(),
-            allpackages_feed_endpoint: config
-                .allpackages_feed_endpoint
-                .trim_end_matches('/')
-                .into(),
+            base_url: config.repository_endpoint,
+            allpackages_feed_endpoint: config.allpackages_feed_endpoint,
             refresh_metadata: config.refresh_metadata,
             allow_allpackages_history: config.allow_allpackages_history,
             transport: Rc::new(MeasuredTransport::new(transport, Rc::clone(&metrics))),

@@ -126,7 +126,10 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
         let mut failures = Vec::new();
         let mut saw_metadata_invalid = false;
         for (representation, filename) in representations {
-            let endpoint = format!("{}/src/contrib/{filename}", self.base_url);
+            let endpoint = super::super::join_endpoint_path(
+                &self.base_url,
+                &format!("src/contrib/{filename}"),
+            );
             let cache_key = self
                 .raw_cache
                 .as_ref()

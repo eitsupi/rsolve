@@ -90,11 +90,12 @@ pub(super) fn index_record_to_evidence(
     let version = record.release().version();
     let locator = match record.scope() {
         CranCatalogRecordScope::Root if current => {
-            format!("{base_url}/src/contrib/{package}_{version}.tar.gz")
+            super::join_endpoint_path(base_url, &format!("src/contrib/{package}_{version}.tar.gz"))
         }
-        CranCatalogRecordScope::Root => {
-            format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
-        }
+        CranCatalogRecordScope::Root => super::join_endpoint_path(
+            base_url,
+            &format!("src/contrib/Archive/{package}/{package}_{version}.tar.gz"),
+        ),
         CranCatalogRecordScope::RecommendedOverlay { .. } => {
             let path = record
                 .fields()
@@ -102,7 +103,10 @@ pub(super) fn index_record_to_evidence(
                 .find(|(name, _)| name.eq_ignore_ascii_case("Path"))
                 .map(|(_, value)| value.as_str())
                 .expect("validated Recommended overlay must retain Path");
-            format!("{base_url}/src/contrib/{path}/{package}_{version}.tar.gz")
+            super::join_endpoint_path(
+                base_url,
+                &format!("src/contrib/{path}/{package}_{version}.tar.gz"),
+            )
         }
     };
     record_to_evidence(
@@ -178,9 +182,10 @@ pub(super) fn archive_rejection_to_evidence(
         .scope()
         .expect("release-local archive rejection must identify a scope");
     let locator = rejection.version().map(|version| match scope {
-        CranCatalogRecordScope::Root => {
-            format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
-        }
+        CranCatalogRecordScope::Root => super::join_endpoint_path(
+            base_url,
+            &format!("src/contrib/Archive/{package}/{package}_{version}.tar.gz"),
+        ),
         CranCatalogRecordScope::RecommendedOverlay { .. } => {
             let path = rejection
                 .fields()
@@ -188,7 +193,10 @@ pub(super) fn archive_rejection_to_evidence(
                 .find(|(name, _)| name.eq_ignore_ascii_case("Path"))
                 .map(|(_, value)| value.as_str())
                 .expect("validated Recommended overlay must retain Path");
-            format!("{base_url}/src/contrib/{path}/{package}_{version}.tar.gz")
+            super::join_endpoint_path(
+                base_url,
+                &format!("src/contrib/{path}/{package}_{version}.tar.gz"),
+            )
         }
     });
     let occurrence = if locator.is_some() {
@@ -555,6 +563,41 @@ mod tests {
             7,
         );
         assert!(evidence.artifact.unwrap().checksums.is_empty());
+    }
+
+    #[test]
+    fn evidence_locator_preserves_configured_endpoint_slashes() {
+        let package = PackageName::new("Matrix").unwrap();
+        let projection = provider_observations_from_fields(
+            vec![(
+                0,
+                Some(package.to_string()),
+                vec![
+                    ("Package".into(), "Matrix".into()),
+                    ("Version".into(), "1.7-0".into()),
+                    ("License".into(), "BSD-3-Clause".into()),
+                ],
+            )],
+            CranCatalogRecordContext::PackagesIndex,
+            Some(&package),
+        );
+        let record = projection.observations.first().expect("valid observation");
+        let evidence = index_record_to_evidence(
+            record,
+            source_input(
+                "cran-current-index",
+                "rds",
+                "https://cran.invalid/cran///src/contrib/PACKAGES.rds",
+                b"index",
+            ),
+            "https://cran.invalid/cran///",
+            true,
+            FreshnessStateV1::CurrentGeneration,
+        );
+        assert_eq!(
+            evidence.artifact.unwrap().locator,
+            "https://cran.invalid/cran///src/contrib/Matrix_1.7-0.tar.gz"
+        );
     }
 
     #[test]

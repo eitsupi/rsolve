@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt;
 
-use rsolve::{Manifest, ManifestDependency, ManifestTarget, resolve_from_cran};
+use rsolve::{
+    Endpoint, Manifest, ManifestDependency, ManifestError, ManifestTarget, resolve_from_cran,
+};
 use rsolve_core::{PackageName, PackageRelease, RPackageVersion, Resolution, VersionConstraint};
 
 const DEFAULT_CRAN_MIRROR: &str = "https://cloud.r-project.org";
@@ -68,37 +70,24 @@ fn canonical_mirror(input: &str) -> Result<Box<str>, ConfigError> {
     if input.is_empty() {
         return Err(ConfigError::EmptyMirror);
     }
-    let mut url = url::Url::parse(input).map_err(|error| ConfigError::InvalidMirror {
-        diagnostic: error.to_string().into(),
-    })?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(ConfigError::InvalidMirror {
-            diagnostic: "mirror URL must not include userinfo".into(),
-        });
-    }
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(ConfigError::InvalidMirror {
-            diagnostic: "mirror must use HTTP or HTTPS".into(),
-        });
-    }
-    if url.host_str().is_none() || url.cannot_be_a_base() {
-        return Err(ConfigError::InvalidMirror {
-            diagnostic: "mirror must be hierarchical and include a host".into(),
-        });
-    }
-    if url.query().is_some() {
-        return Err(ConfigError::InvalidMirror {
-            diagnostic: "mirror must not include a query".into(),
-        });
-    }
-    if url.fragment().is_some() {
-        return Err(ConfigError::InvalidMirror {
-            diagnostic: "mirror must not include a fragment".into(),
-        });
-    }
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(if path.is_empty() { "/" } else { &path });
-    Ok(url.to_string().trim_end_matches('/').into())
+    Endpoint::parse(input)
+        .map(|endpoint| endpoint.as_str().into())
+        .map_err(|error| {
+            let diagnostic = match &error {
+                ManifestError::InvalidEndpoint { reason, .. }
+                    if reason == "credentials are forbidden" =>
+                {
+                    "mirror URL must not include userinfo".into()
+                }
+                ManifestError::InvalidEndpoint { reason, .. }
+                    if reason == "query and fragment are forbidden" =>
+                {
+                    "mirror must not include a query or fragment".into()
+                }
+                _ => error.to_string().into(),
+            };
+            ConfigError::InvalidMirror { diagnostic }
+        })
 }
 
 fn config_from_environment(version_args: &[&str]) -> Result<Config, ConfigError> {
@@ -195,8 +184,22 @@ mod tests {
     #[test]
     fn defaults_are_explicit_and_mirror_is_canonicalized() {
         let config = parse_config(Some(" https://cloud.r-project.org/// "), &[]).unwrap();
-        assert_eq!(config.mirror, DEFAULT_CRAN_MIRROR.into());
+        assert_eq!(config.mirror, "https://cloud.r-project.org///".into());
         assert_eq!(config.r_versions, [version("4.3.3"), version("4.4.0")]);
+    }
+
+    #[test]
+    fn mirror_canonicalization_preserves_trailing_and_repeated_slashes() {
+        for (input, expected) in [
+            ("https://example.test/cran", "https://example.test/cran"),
+            ("https://example.test/cran/", "https://example.test/cran/"),
+            (
+                "https://example.test/cran///",
+                "https://example.test/cran///",
+            ),
+        ] {
+            assert_eq!(canonical_mirror(input).unwrap(), expected.into());
+        }
     }
 
     #[test]

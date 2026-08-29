@@ -349,6 +349,7 @@ pub(super) fn canonical_base_url(input: &str) -> Result<Box<str>, CranSnapshotRe
             diagnostic: "CRAN base URL must not be empty".into(),
         });
     }
+    reject_raw_root_escape(input)?;
     let mut url =
         url::Url::parse(input).map_err(|error| CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: format!("invalid CRAN base URL: {error}").into(),
@@ -363,6 +364,11 @@ pub(super) fn canonical_base_url(input: &str) -> Result<Box<str>, CranSnapshotRe
             diagnostic: "CRAN base URL must be hierarchical and include a host".into(),
         });
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must not include credentials".into(),
+        });
+    }
     if url.query().is_some() {
         return Err(CranSnapshotRefresherError::InvalidBaseUrl {
             diagnostic: "CRAN base URL must not include a query".into(),
@@ -373,9 +379,63 @@ pub(super) fn canonical_base_url(input: &str) -> Result<Box<str>, CranSnapshotRe
             diagnostic: "CRAN base URL must not include a fragment".into(),
         });
     }
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(if path.is_empty() { "/" } else { &path });
-    Ok(url.to_string().trim_end_matches('/').into())
+    if url.port() == Some(0) {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must not use port zero".into(),
+        });
+    }
+    if (url.scheme() == "http" && url.port() == Some(80))
+        || (url.scheme() == "https" && url.port() == Some(443))
+    {
+        url.set_port(None)
+            .map_err(|_| CranSnapshotRefresherError::InvalidBaseUrl {
+                diagnostic: "CRAN base URL has an invalid default port".into(),
+            })?;
+    }
+    // Keep trailing and repeated slashes: they are part of the configured
+    // endpoint identity and affect the request URL contract.
+    let path = url.path().to_owned();
+    url.set_path(&path);
+    Ok(url.to_string().into())
+}
+
+fn reject_raw_root_escape(input: &str) -> Result<(), CranSnapshotRefresherError> {
+    let Some((_, authority_and_path)) = input.split_once("://") else {
+        return Ok(());
+    };
+    let authority_and_path = authority_and_path.split(['?', '#']).next().unwrap_or("");
+    let Some(index) = authority_and_path.find('/') else {
+        return Ok(());
+    };
+    let path = &authority_and_path[index..];
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        if is_current_segment(segment) {
+            continue;
+        }
+        if is_parent_segment(segment) {
+            if segments.len() <= 1 {
+                return Err(CranSnapshotRefresherError::InvalidBaseUrl {
+                    diagnostic: "CRAN base URL path escapes the URL root".into(),
+                });
+            }
+            segments.pop();
+        } else {
+            segments.push(segment);
+        }
+    }
+    Ok(())
+}
+
+fn is_current_segment(segment: &str) -> bool {
+    segment == "." || segment.eq_ignore_ascii_case("%2e")
+}
+
+fn is_parent_segment(segment: &str) -> bool {
+    segment == ".."
+        || segment.eq_ignore_ascii_case("%2e%2e")
+        || segment.eq_ignore_ascii_case(".%2e")
+        || segment.eq_ignore_ascii_case("%2e.")
 }
 
 pub(super) fn decode_gzip(input: &[u8]) -> Result<Vec<u8>, String> {

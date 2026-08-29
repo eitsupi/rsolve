@@ -54,10 +54,10 @@ impl<T: Transport> CranProvider<T> {
         base_url: impl AsRef<str>,
         package: PackageName,
     ) -> Result<Self, CranProviderError> {
-        let base_url = base_url.as_ref().trim_end_matches('/').to_owned();
-        let endpoint = format!(
-            "{base_url}/src/contrib/Archive/{}/PACKAGES.rds",
-            package.as_str()
+        let base_url = base_url.as_ref().to_owned();
+        let endpoint = super::join_endpoint_path(
+            &base_url,
+            &format!("src/contrib/Archive/{}/PACKAGES.rds", package.as_str()),
         );
         let response = transport
             .get(&endpoint)
@@ -143,7 +143,7 @@ impl<T: Transport> CranProvider<T> {
         Self {
             package,
             transport: RefCell::new(transport),
-            base_url: base_url.as_ref().trim_end_matches('/').into(),
+            base_url: base_url.as_ref().into(),
             source,
             diagnostics,
             loaded: RefCell::new(None),
@@ -157,7 +157,7 @@ impl<T: Transport> CranProvider<T> {
         transport: &T,
         base_url: &str,
     ) -> Result<CandidateSource, CranProviderError> {
-        let endpoint = format!("{base_url}/src/contrib/Meta/archive.rds");
+        let endpoint = super::join_endpoint_path(base_url, "src/contrib/Meta/archive.rds");
         let response = transport
             .get(&endpoint)
             .map_err(|source| CranProviderError::Transport {
@@ -195,10 +195,12 @@ impl<T: Transport> CranProvider<T> {
             .iter()
             .filter(|entry| entry.package() == &self.package)
         {
-            let url = format!(
-                "{}/src/contrib/Archive/{}",
-                self.base_url,
-                entry.source_archive_relative_path()
+            let url = super::join_endpoint_path(
+                &self.base_url,
+                &format!(
+                    "src/contrib/Archive/{}",
+                    entry.source_archive_relative_path()
+                ),
             );
             let transport = self.transport.borrow();
             let response = if let Some(get) = &self.tarball_get {
@@ -390,7 +392,7 @@ pub(crate) struct CranRuntimeLoader<T> {
 impl<T: Transport> CranRuntimeLoader<T> {
     pub(crate) fn new(transport: T, base_url: impl AsRef<str>) -> Self {
         Self {
-            base_url: base_url.as_ref().trim_end_matches('/').into(),
+            base_url: base_url.as_ref().into(),
             transport: Rc::new(transport),
             providers: RefCell::new(HashMap::new()),
             diagnostics: RefCell::new(HashMap::new()),

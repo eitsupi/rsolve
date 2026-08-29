@@ -37,16 +37,12 @@ impl CranSnapshotCachePolicy {
     }
 
     pub fn with_expected_endpoint(mut self, endpoint: impl AsRef<str>) -> Self {
-        self.expected_endpoint = Some(endpoint.as_ref().trim_end_matches('/').to_owned().into());
+        self.expected_endpoint = Some(endpoint.as_ref().to_owned().into());
         self
     }
 
     pub fn with_allowed_auxiliary_endpoint(mut self, endpoint: impl AsRef<str>) -> Self {
-        let endpoint = endpoint
-            .as_ref()
-            .trim_end_matches('/')
-            .to_owned()
-            .into_boxed_str();
+        let endpoint = endpoint.as_ref().to_owned().into_boxed_str();
         self.allowed_auxiliary_endpoint = Some(endpoint);
         self
     }
@@ -385,10 +381,21 @@ fn inspect_cran_snapshot_cache_from_reads(
 }
 
 fn endpoint_belongs_to(endpoint: &str, base: &str) -> bool {
-    endpoint == base
-        || endpoint
+    if endpoint == base {
+        return true;
+    }
+    if base.ends_with('/') {
+        // The configured endpoint already supplies the separator. Preserve
+        // every trailing slash in its identity, then accept a non-empty
+        // provider-relative suffix without requiring another slash.
+        endpoint
+            .strip_prefix(base)
+            .is_some_and(|suffix| !suffix.is_empty())
+    } else {
+        endpoint
             .strip_prefix(base)
             .is_some_and(|suffix| suffix.starts_with('/'))
+    }
 }
 
 fn canonical_endpoints(header: &crate::snapshot::SnapshotHeaderV1) -> Vec<Box<str>> {
@@ -414,4 +421,37 @@ fn canonical_validation_endpoints(record: &crate::snapshot::CurrentValidationV2)
     endpoints.sort();
     endpoints.dedup();
     endpoints.into_iter().map(String::into_boxed_str).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CranSnapshotCachePolicy;
+    use super::endpoint_belongs_to;
+
+    #[test]
+    fn endpoint_provenance_accepts_children_of_slash_terminated_bases() {
+        for base in ["https://cran.invalid/cran/", "https://cran.invalid/cran///"] {
+            let child = format!("{base}src/contrib/PACKAGES.rds");
+            assert!(endpoint_belongs_to(&child, base));
+            assert!(!endpoint_belongs_to("https://cran.invalid/cran", base));
+        }
+        assert!(endpoint_belongs_to(
+            "https://cran.invalid/cran/src/contrib/PACKAGES.rds",
+            "https://cran.invalid/cran"
+        ));
+        assert!(!endpoint_belongs_to(
+            "https://cran.invalid/crane/src/contrib/PACKAGES.rds",
+            "https://cran.invalid/cran"
+        ));
+    }
+
+    #[test]
+    fn cache_policy_keeps_distinct_endpoint_spellings() {
+        let timestamp = "2026-08-29T00:00:00Z".parse().unwrap();
+        let one = CranSnapshotCachePolicy::at(timestamp)
+            .with_expected_endpoint("https://cran.invalid/cran/");
+        let many = CranSnapshotCachePolicy::at(timestamp)
+            .with_expected_endpoint("https://cran.invalid/cran///");
+        assert_ne!(one.expected_endpoint, many.expected_endpoint);
+    }
 }

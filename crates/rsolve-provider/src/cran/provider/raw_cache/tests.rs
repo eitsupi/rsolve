@@ -150,6 +150,26 @@ fn raw_cache_key_separates_endpoint_and_representation_and_rejects_unsafe_urls()
 }
 
 #[test]
+fn raw_cache_key_preserves_endpoint_trailing_slashes() {
+    let store = store();
+    let one = RawCacheKey::new(
+        store.registry_id(),
+        "https://cran.invalid/cran/",
+        RawCacheRepresentation::CurrentRds,
+    )
+    .unwrap();
+    let many = RawCacheKey::new(
+        store.registry_id(),
+        "https://cran.invalid/cran///",
+        RawCacheRepresentation::CurrentRds,
+    )
+    .unwrap();
+    assert_eq!(one.endpoint(), "https://cran.invalid/cran/");
+    assert_eq!(many.endpoint(), "https://cran.invalid/cran///");
+    assert_ne!(one.digest(), many.digest());
+}
+
+#[test]
 fn raw_cache_no_store_evicts_existing_entry() {
     let store = store();
     let cache = RawCache::open(&store).unwrap();

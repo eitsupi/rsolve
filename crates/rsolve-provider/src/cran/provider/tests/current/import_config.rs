@@ -104,10 +104,22 @@ fn current_rds_provider_path_rejects_invalid_native_utf8() {
 
 #[test]
 fn concrete_loader_validates_and_canonicalizes_base_without_requests() {
-    assert_eq!(
-        canonical_base_url(" https://cran.invalid/mirror/// ").unwrap(),
-        "https://cran.invalid/mirror".into()
-    );
+    for (input, expected) in [
+        (
+            " https://cran.invalid/mirror ",
+            "https://cran.invalid/mirror",
+        ),
+        (
+            "https://cran.invalid/mirror/",
+            "https://cran.invalid/mirror/",
+        ),
+        (
+            " https://cran.invalid/mirror/// ",
+            "https://cran.invalid/mirror///",
+        ),
+    ] {
+        assert_eq!(canonical_base_url(input).unwrap(), expected.into());
+    }
     assert!(
         CranSnapshotRefresher::new(CranMetadataConfig::for_repository(
             "https://cran.invalid/mirror///",
@@ -120,6 +132,9 @@ fn concrete_loader_validates_and_canonicalizes_base_without_requests() {
         "https://",
         "https://cran.invalid?mirror=1",
         "https://cran.invalid/#mirror",
+        "https://user:pass@cran.invalid",
+        "https://cran.invalid:0",
+        "https://cran.invalid/../mirror",
     ] {
         assert!(matches!(
             CranSnapshotRefresher::new(CranMetadataConfig::for_repository(input)),
