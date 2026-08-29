@@ -400,6 +400,11 @@ pub(super) fn canonical_base_url(input: &str) -> Result<Box<str>, CranSnapshotRe
 }
 
 fn reject_raw_root_escape(input: &str) -> Result<(), CranSnapshotRefresherError> {
+    if input.contains('\\') {
+        return Err(CranSnapshotRefresherError::InvalidBaseUrl {
+            diagnostic: "CRAN base URL must not contain backslashes".into(),
+        });
+    }
     let Some((_, authority_and_path)) = input.split_once("://") else {
         return Ok(());
     };

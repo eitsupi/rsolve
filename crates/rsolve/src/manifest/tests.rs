@@ -269,6 +269,12 @@ fn source_union_rejects_invalid_combinations_and_preserves_query() {
         ));
     }
     assert!(parse_manifest(&format!("{base}{{ url='http://example.org/a.tar.gz' }}")).is_err());
+    for url in [
+        "https://example.org\\..\\mirror",
+        "https://example.org/ordinary\\path/a.tar.gz",
+    ] {
+        assert!(parse_manifest(&format!("{base}{{ url='{url}' }}")).is_err());
+    }
     assert!(
         parse_manifest(&format!(
             "{base}{{ url='https://user@example.org/a.tar.gz' }}"
@@ -346,6 +352,7 @@ fn url_normalization_preserves_repeated_slashes() {
         "https://example.org/repo/path"
     );
     assert!(parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/%2e%2e/path'\nregistry='cran'\n").is_err());
+    assert!(parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://example.org/ordinary\\path'\nregistry='cran'\n").is_err());
     let encoded_direct = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={url='https://example.org/repo/%2e%2e/pkg.tar.gz?x=1'}\n").unwrap();
     assert!(
         matches!(&encoded_direct.dependencies[&package("foo")].source, ManifestSource::Url { url, .. } if url.as_str() == "https://example.org/pkg.tar.gz?x=1")
