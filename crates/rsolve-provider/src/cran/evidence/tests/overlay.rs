@@ -1,7 +1,9 @@
 use super::*;
 
 use crate::cran::catalog::CranCatalogRecordScope;
-use crate::snapshot::{FreshnessStateV1, LookupStateV1, PublicationStateV1, SemanticsStateV1};
+use crate::snapshot::{
+    CandidateCurrentnessV1, FreshnessStateV1, LookupStateV1, PublicationStateV1, SemanticsStateV1,
+};
 use rsolve_core::RPackageVersion;
 
 #[test]
@@ -38,6 +40,7 @@ fn recommended_overlay_is_raw_evidence_but_never_eligible_or_distributed() {
             PublicationStateV1::Unknown,
             FreshnessStateV1::CurrentGeneration,
         ),
+        currentness: CandidateCurrentnessV1::Current,
         release: Some(release(&overlay_fields)),
         distribution_registry: DistributionRegistryBinding::ConfiguredContext,
         scope: CranCatalogRecordScope::RecommendedOverlay {
@@ -139,6 +142,7 @@ fn overlay_only_history_is_incomplete_without_eligible_release() {
                 PublicationStateV1::Unknown,
                 FreshnessStateV1::CurrentGeneration,
             ),
+            currentness: CandidateCurrentnessV1::Current,
             release: Some(release(&fields)),
             distribution_registry: DistributionRegistryBinding::ConfiguredContext,
             scope: CranCatalogRecordScope::RecommendedOverlay {

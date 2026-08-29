@@ -13,7 +13,7 @@ fn build_reopens_and_is_deterministic() {
         .unwrap();
     assert_eq!(
         a.generation(),
-        "ded689a69565bad94a30d2d90d88fd770b08a6620a1fad283d9bdd4bd3fee6e5"
+        "46782d0d0b28075b68402556aa8449f656d4423cda0a89ff2c42e1b0babd900c"
     );
     assert_eq!(a.generation(), b.generation());
     assert_eq!(a.header_bytes(), b.header_bytes());

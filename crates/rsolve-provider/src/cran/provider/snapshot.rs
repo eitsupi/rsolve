@@ -11,8 +11,9 @@ use super::{CranCurrentIndexRepresentation, CranRefreshSession, Transport};
 #[cfg(test)]
 use super::{CranMetadataConfig, CranRefreshProgress, CranRefreshProgressCallback};
 use crate::snapshot::{
-    ChecksumV1, EvidenceAxesV1, FieldV1, FreshnessStateV1, NamespaceStateV1, OccurrenceArtifactV1,
-    OccurrenceStateV1, ParseStateV1, PublicationStateV1, SemanticsStateV1, SourceInput,
+    CandidateCurrentnessV1, ChecksumV1, EvidenceAxesV1, FieldV1, FreshnessStateV1,
+    NamespaceStateV1, OccurrenceArtifactV1, OccurrenceStateV1, ParseStateV1, PublicationStateV1,
+    SemanticsStateV1, SourceInput,
 };
 use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageName};
 
@@ -113,6 +114,11 @@ pub(super) fn index_record_to_evidence(
         record,
         source,
         OccurrenceStateV1::ArtifactBound,
+        if current {
+            CandidateCurrentnessV1::Current
+        } else {
+            CandidateCurrentnessV1::Historical
+        },
         freshness,
         Some(OccurrenceArtifactV1 {
             locator,
@@ -132,6 +138,7 @@ pub(super) fn tarball_record_to_evidence(
         record,
         source,
         OccurrenceStateV1::ArtifactBound,
+        CandidateCurrentnessV1::Historical,
         FreshnessStateV1::BulkGeneration,
         Some(OccurrenceArtifactV1 {
             locator,
@@ -157,6 +164,7 @@ pub(super) fn allpackages_record_to_evidence(
         record,
         source,
         OccurrenceStateV1::ArtifactBound,
+        CandidateCurrentnessV1::Historical,
         FreshnessStateV1::BulkGeneration,
         Some(OccurrenceArtifactV1 {
             locator,
@@ -234,6 +242,7 @@ pub(super) fn archive_rejection_to_evidence(
             publication: PublicationStateV1::Unknown,
             freshness,
         },
+        currentness: CandidateCurrentnessV1::Historical,
         release: None,
         distribution_registry: DistributionRegistryBinding::ConfiguredContext,
         scope: scope.clone(),
@@ -244,6 +253,7 @@ fn record_to_evidence(
     record: &CranCatalogObservation,
     source: SourceInput,
     occurrence: OccurrenceStateV1,
+    currentness: CandidateCurrentnessV1,
     freshness: FreshnessStateV1,
     artifact: Option<OccurrenceArtifactV1>,
 ) -> CranEvidenceObservation {
@@ -261,6 +271,7 @@ fn record_to_evidence(
             .collect(),
         artifact,
         axes: evidence_axes(record.release(), occurrence, freshness),
+        currentness,
         release: Some(record.release().clone()),
         distribution_registry: DistributionRegistryBinding::ConfiguredContext,
         scope: record.scope().clone(),

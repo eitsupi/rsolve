@@ -1,5 +1,6 @@
 use super::*;
 use crate::{RawCandidateLoadResult, RawCandidateObservation};
+use rsolve_core::CandidateCurrentness;
 
 pub struct ValidatedGeneration {
     path: PathBuf,
@@ -140,20 +141,19 @@ impl ReadOnlySnapshotCandidateLoader {
         let candidates = history
             .eligible_releases
             .iter()
-            .map(release_to_domain)
+            .map(|wire| {
+                release_to_domain(wire).map(|release| RawCandidateObservation {
+                    release,
+                    currentness: match wire.currentness {
+                        CandidateCurrentnessV1::Current => CandidateCurrentness::Current,
+                        CandidateCurrentnessV1::Historical => CandidateCurrentness::Historical,
+                    },
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(package_metadata_invalid)?;
         let quarantined = quarantined_candidates(&history);
-        Ok(RawCandidateLoadResult::new(
-            candidates
-                .into_iter()
-                .map(|release| RawCandidateObservation {
-                    currentness: crate::currentness_for_release(&release),
-                    release,
-                })
-                .collect(),
-            quarantined,
-        ))
+        Ok(RawCandidateLoadResult::new(candidates, quarantined))
     }
 }
 

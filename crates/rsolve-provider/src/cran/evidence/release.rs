@@ -85,6 +85,14 @@ pub(super) fn merge_release_group(
         roles.dedup();
         evidence.push((*index, roles));
     }
+    let currentness = if entries
+        .iter()
+        .any(|(index, _)| observations[*index].currentness == CandidateCurrentnessV1::Current)
+    {
+        CandidateCurrentnessV1::Current
+    } else {
+        CandidateCurrentnessV1::Historical
+    };
     let merged_observation = ReleaseObservation {
         identity,
         observed_package: first.identity().name().clone(),
@@ -107,6 +115,7 @@ pub(super) fn merge_release_group(
         release: merged,
         distributions,
         observations: evidence,
+        currentness,
     })
 }
 

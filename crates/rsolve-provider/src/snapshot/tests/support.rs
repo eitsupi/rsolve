@@ -103,6 +103,7 @@ pub(crate) fn present_input() -> SnapshotBuildInput {
         package: "foo".into(),
         version: "1.0".into(),
         namespace: "cran".into(),
+        currentness: CandidateCurrentnessV1::Current,
         metadata: vec![],
         publication: None,
         dependencies: vec![],

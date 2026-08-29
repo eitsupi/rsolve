@@ -1,7 +1,8 @@
 use super::*;
 use crate::snapshot::{
-    ChecksumV1, CoverageV1, FreshnessStateV1, NamespaceStateV1, OccurrenceArtifactV1,
-    OccurrenceStateV1, ParseStateV1, PublicationStateV1, SemanticsStateV1, encode_history,
+    CandidateCurrentnessV1, ChecksumV1, CoverageV1, FreshnessStateV1, NamespaceStateV1,
+    OccurrenceArtifactV1, OccurrenceStateV1, ParseStateV1, PublicationStateV1, SemanticsStateV1,
+    encode_history,
 };
 use rsolve_core::{
     Artifact, ArtifactLocator, DeclaredDependency, DependencyKind, DependencySourceConstraint,
@@ -219,6 +220,7 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
                 PublicationStateV1::Unknown,
                 FreshnessStateV1::CurrentGeneration,
             ),
+            currentness: CandidateCurrentnessV1::Current,
             release: Some(release(&current_fields)),
             distribution_registry: DistributionRegistryBinding::Explicit(
                 RegistryId::new("p3m").unwrap(),
@@ -236,6 +238,7 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
                 PublicationStateV1::Dated,
                 FreshnessStateV1::BulkGeneration,
             ),
+            currentness: CandidateCurrentnessV1::Historical,
             release: Some(release(&history_fields)),
             distribution_registry: DistributionRegistryBinding::Explicit(
                 RegistryId::new("cran").unwrap(),
@@ -253,6 +256,7 @@ pub(crate) fn fixture_observations() -> Vec<CranEvidenceObservation> {
                 PublicationStateV1::Dated,
                 FreshnessStateV1::BulkGeneration,
             ),
+            currentness: CandidateCurrentnessV1::Historical,
             release: Some(release(&old_fields)),
             distribution_registry: DistributionRegistryBinding::Explicit(
                 RegistryId::new("cran").unwrap(),
@@ -274,6 +278,7 @@ fn composes_source_scoped_occurrences_and_canonical_only_history_release() {
     assert_eq!(history.eligible_releases[0].version, "0.9");
     assert_eq!(history.eligible_releases[1].version, "1.0");
     let old = &history.eligible_releases[0];
+    assert_eq!(old.currentness, CandidateCurrentnessV1::Historical);
     assert_eq!(old.distributions.len(), 1);
     assert_eq!(old.distributions[0].registry, "cran");
     assert_eq!(old.distributions[0].artifacts.len(), 1);
@@ -304,6 +309,7 @@ fn composes_source_scoped_occurrences_and_canonical_only_history_release() {
     assert_eq!(old.publication.as_deref(), Some("2025-08-20"));
     assert!(old.evidence[0].roles.contains(&EvidenceRoleV1::Publication));
     let merged = &history.eligible_releases[1];
+    assert_eq!(merged.currentness, CandidateCurrentnessV1::Current);
     assert_eq!(merged.distributions.len(), 2);
     assert!(
         merged
@@ -382,6 +388,25 @@ fn composes_source_scoped_occurrences_and_canonical_only_history_release() {
         merged.metadata.len()
     );
     assert!(encode_history(history).is_ok());
+}
+
+#[test]
+fn candidate_currentness_is_not_inferred_from_evidence_freshness() {
+    let mut observations = fixture_observations();
+    observations[0].axes.freshness = FreshnessStateV1::BulkGeneration;
+
+    let input = compose_snapshot(context(), observations).unwrap();
+    let history = input
+        .histories
+        .iter()
+        .find(|history| history.package == "P3MOverlay")
+        .unwrap();
+    let current = history
+        .eligible_releases
+        .iter()
+        .find(|release| release.version == "1.0")
+        .unwrap();
+    assert_eq!(current.currentness, CandidateCurrentnessV1::Current);
 }
 
 #[test]

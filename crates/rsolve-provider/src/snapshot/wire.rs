@@ -13,8 +13,8 @@ pub const SNAPSHOT_HEADER: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const PACKAGE_HISTORIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("package_histories");
 pub(super) const HEADER_KEY: &str = "header";
-pub(super) const HISTORY_ENCODING: u32 = 2;
-pub(super) const HISTORY_MAGIC: &[u8; 8] = b"RSLVHST2";
+pub(super) const HISTORY_ENCODING: u32 = 3;
+pub(super) const HISTORY_MAGIC: &[u8; 8] = b"RSLVHST3";
 pub(super) const HISTORY_PREFIX_LEN: usize = 48;
 
 #[derive(Debug)]
@@ -313,6 +313,11 @@ pub struct DistributionV1 {
     pub metadata: Vec<FieldV1>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CandidateCurrentnessV1 {
+    Current,
+    Historical,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EvidenceRoleV1 {
     Artifact,
     Identity,
@@ -329,6 +334,7 @@ pub struct EligibleReleaseV1 {
     pub package: String,
     pub version: String,
     pub namespace: String,
+    pub currentness: CandidateCurrentnessV1,
     pub metadata: Vec<FieldV1>,
     pub publication: Option<String>,
     pub dependencies: Vec<DependencyV1>,

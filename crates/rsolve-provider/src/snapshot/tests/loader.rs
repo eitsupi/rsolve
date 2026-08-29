@@ -1,4 +1,5 @@
 use super::*;
+use rsolve_core::CandidateCurrentness;
 
 #[test]
 fn read_only_loader_maps_present_and_missing_states_without_io() {
@@ -20,6 +21,56 @@ fn read_only_loader_maps_present_and_missing_states_without_io() {
     assert_eq!(missing.category(), CandidateLoadErrorCategory::NotFound);
     let unsupported = loader.releases(&SolverKey::R).unwrap_err();
     assert_eq!(unsupported.category(), CandidateLoadErrorCategory::NotFound);
+}
+
+#[test]
+fn read_only_loader_preserves_currentness_across_snapshot_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("currentness.redb");
+    let mut input = present_input();
+    let mut historical = input.histories[0].eligible_releases[0].clone();
+    historical.version = "2.0".into();
+    historical.currentness = CandidateCurrentnessV1::Historical;
+    let package = PackageName::new("foo").unwrap();
+    let version = RPackageVersion::parse("2.0").unwrap();
+    let release = PackageRelease::try_from(ReleaseObservation {
+        identity: ReleaseIdentity::new(
+            package.clone(),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version.clone(),
+            },
+        ),
+        observed_package: package,
+        observed_version: version,
+        metadata: ReleaseMetadata::default(),
+        publication: None,
+        declared_dependencies: Vec::new(),
+        distributions: Vec::new(),
+    })
+    .unwrap();
+    historical.metadata_sha256 = parse_hex_32(release.metadata_digest().as_str()).unwrap();
+    input.histories[0].eligible_releases.push(historical);
+
+    SnapshotGenerationBuilder::new(input, &path)
+        .build()
+        .unwrap();
+    let loader =
+        ReadOnlySnapshotCandidateLoader::open(&path, RegistryId::new("cran").unwrap()).unwrap();
+    let loaded = loader
+        .load(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
+        .unwrap();
+    assert_eq!(loaded.observations().len(), 2);
+    assert_eq!(
+        loaded.observations()[0].currentness(),
+        CandidateCurrentness::Current
+    );
+    assert_eq!(
+        loaded.observations()[1].currentness(),
+        CandidateCurrentness::Historical
+    );
+    assert_eq!(loaded.observations()[0].release().version().as_str(), "1.0");
+    assert_eq!(loaded.observations()[1].release().version().as_str(), "2.0");
 }
 
 #[test]

@@ -5,10 +5,10 @@ use rsolve_core::{PackageName, PackageRelease, RPackageVersion};
 pub(super) use super::super::catalog::CranCatalogRecordScope;
 
 pub(super) use crate::snapshot::{
-    ArtifactV1, ChecksumV1, ClauseV1, CoverageV1, DecisionV1, DependencyKindV1, DependencyV1,
-    DistributionV1, EligibleReleaseV1, EvidenceAxesV1, EvidenceReferenceV1, EvidenceRoleV1,
-    FieldV1, LookupStateV1, OccurrenceArtifactV1, PackageHistoryV1, RawObservationV1, RelationOpV1,
-    SnapshotBuildInput, SourceInput,
+    ArtifactV1, CandidateCurrentnessV1, ChecksumV1, ClauseV1, CoverageV1, DecisionV1,
+    DependencyKindV1, DependencyV1, DistributionV1, EligibleReleaseV1, EvidenceAxesV1,
+    EvidenceReferenceV1, EvidenceRoleV1, FieldV1, LookupStateV1, OccurrenceArtifactV1,
+    PackageHistoryV1, RawObservationV1, RelationOpV1, SnapshotBuildInput, SourceInput,
 };
 
 #[derive(Clone, Debug)]
@@ -19,6 +19,10 @@ pub(crate) struct CranEvidenceObservation {
     pub(crate) fields: Vec<FieldV1>,
     pub(crate) artifact: Option<OccurrenceArtifactV1>,
     pub(crate) axes: EvidenceAxesV1,
+    /// Candidate currentness is distinct from evidence freshness. Freshness
+    /// describes when a source was observed, while this fact describes
+    /// whether the release belongs to the current candidate set.
+    pub(crate) currentness: CandidateCurrentnessV1,
     pub(crate) release: Option<PackageRelease>,
     pub(crate) distribution_registry: DistributionRegistryBinding,
     pub(crate) scope: CranCatalogRecordScope,
@@ -85,6 +89,7 @@ pub(super) struct IndexedObservation {
     pub(super) fields: Vec<FieldV1>,
     pub(super) artifact: Option<OccurrenceArtifactV1>,
     pub(super) axes: EvidenceAxesV1,
+    pub(super) currentness: CandidateCurrentnessV1,
     pub(super) release: Option<PackageRelease>,
     pub(super) distribution_registry: DistributionRegistryBinding,
     pub(super) scope: CranCatalogRecordScope,
@@ -95,6 +100,7 @@ pub(super) struct PendingRelease {
     pub(super) release: PackageRelease,
     pub(super) distributions: Vec<rsolve_core::Distribution>,
     pub(super) observations: Vec<(usize, Vec<EvidenceRoleV1>)>,
+    pub(super) currentness: CandidateCurrentnessV1,
 }
 
 pub(super) type IdentityKey = (PackageName, RPackageVersion);

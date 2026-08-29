@@ -138,6 +138,7 @@ pub(super) fn to_wire_release(
         package: release.identity().name().as_str().into(),
         version: release.version().to_string(),
         namespace: "cran".into(),
+        currentness: pending.currentness,
         metadata,
         publication: release
             .publication()

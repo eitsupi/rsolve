@@ -62,6 +62,7 @@ pub(super) fn index_observations(
                 fields: observation.fields,
                 artifact: observation.artifact,
                 axes: observation.axes,
+                currentness: observation.currentness,
                 release: observation.release,
                 distribution_registry: observation.distribution_registry,
                 scope: observation.scope,
