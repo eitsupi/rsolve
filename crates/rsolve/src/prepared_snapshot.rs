@@ -18,7 +18,8 @@ use crate::progress::{ProgressCallback, ProgressEvent};
 use rsolve_core::PreparedCandidate;
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind, PackageName,
-    PackageRelease, PublicationDate, RegistryId, RepositoryId, RepositoryRank, SolverKey,
+    PackageRelease, PublicationDate, RegistryId, RepositoryId, RepositoryRank, RootExpansionPolicy,
+    RootRequirement, SolverKey,
 };
 use rsolve_provider::SnapshotStore;
 use rsolve_provider::cran::{
@@ -75,9 +76,9 @@ fn configured_repository_loader<L: crate::orchestration::RawCandidateLoader>(
     RepositoryCandidateLoader::new(raw, repository, registry, RepositoryRank::new(0))
 }
 
-/// Collect the transitive CRAN dependency closure without making resolver-time
-/// transport calls. Only Depends, Imports, and LinkingTo participate in the
-/// current resolver policy; Suggests and Enhances remain optional metadata.
+/// Collect the hard CRAN dependency closure for package-name test inputs
+/// without making resolver-time transport calls. Optional dependency expansion
+/// is covered by the policy-aware production helper below.
 #[cfg(test)]
 pub(crate) fn collect_cran_dependency_closure<F>(
     roots: &[PackageName],
@@ -120,17 +121,23 @@ where
 }
 
 fn collect_cran_dependency_closure_with_metrics<F>(
-    roots: &[PackageName],
+    root_requirements: &[RootRequirement],
     mut refresh: F,
     recorder: &Recorder,
 ) -> Result<Vec<PackageName>, CandidateLoadError>
 where
     F: FnMut(&[PackageName]) -> Result<CranCandidateSnapshot, CandidateLoadError>,
 {
-    let mut closure = roots
+    let mut closure = root_requirements
         .iter()
+        .map(|requirement| requirement.package.name())
         .filter(|name| is_remote_cran_package(name))
         .cloned()
+        .collect::<BTreeSet<_>>();
+    let direct_suggest_roots = root_requirements
+        .iter()
+        .filter(|requirement| requirement.expansion == RootExpansionPolicy::DirectSuggests)
+        .map(|requirement| requirement.package.name().clone())
         .collect::<BTreeSet<_>>();
     let mut refreshed = BTreeSet::new();
     loop {
@@ -145,13 +152,15 @@ where
                     snapshot_releases(&snapshot, &SolverKey::InstalledName(package.clone()))?;
                 for release in candidates {
                     for dependency in release.declared_dependencies() {
-                        if matches!(
+                        let hard = matches!(
                             dependency.kind,
                             DependencyKind::Depends
                                 | DependencyKind::Imports
                                 | DependencyKind::LinkingTo
-                        ) && is_remote_cran_package(dependency.package.name())
-                        {
+                        );
+                        let promoted = direct_suggest_roots.contains(package)
+                            && dependency.kind == DependencyKind::Suggests;
+                        if (hard || promoted) && is_remote_cran_package(dependency.package.name()) {
                             closure.insert(dependency.package.name().clone());
                         }
                     }
@@ -561,7 +570,7 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         |batch| {
             refreshed.set(true);
             let closure = collect_cran_dependency_closure_with_metrics(
-                batch,
+                &request.roots,
                 |batch| {
                     recorder.measure(Phase::RefreshAcquisition, || {
                         transaction.refresh_packages(batch)
@@ -759,8 +768,9 @@ mod tests {
     use super::*;
     use rsolve_core::{
         CandidateLoadErrorCategory, DeclaredDependency, DependencySourceConstraint,
-        PackageNamespace, PackageRelease, Provenance, RPackageVersion, RelationOp, ReleaseIdentity,
-        ReleaseMetadata, ReleaseObservation, VersionConstraint,
+        PackageNamespace, PackageRelease, PackageRequirement, Provenance, RPackageVersion,
+        RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RootExpansionPolicy,
+        RootRequirement, VersionConstraint,
     };
     use std::collections::BTreeMap;
     use tempfile::tempdir;
@@ -996,6 +1006,104 @@ mod tests {
         .unwrap();
         assert_eq!(closure, vec![dependency, PackageName::new("root").unwrap()]);
         assert_eq!(refresh_calls, 2, "fallback refreshes the full closure");
+    }
+
+    #[test]
+    fn direct_suggests_closure_uses_root_candidates_without_recursive_suggests() {
+        let root = PackageName::new("root").unwrap();
+        let optional_one = PackageName::new("optionalone").unwrap();
+        let optional_two = PackageName::new("optionaltwo").unwrap();
+        let nested = PackageName::new("nested").unwrap();
+        let hard_nested = PackageName::new("hardnested").unwrap();
+        let matrix = PackageName::new("Matrix").unwrap();
+        let enhanced = PackageName::new("enhanced").unwrap();
+        let direct_requirement = RootRequirement {
+            package: PackageRequirement::new(
+                root.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::DirectSuggests,
+        };
+        let root_v1 = release_at_version_with_dependencies(
+            &root,
+            "1.0.0",
+            vec![
+                required_dependency(DependencyKind::Suggests, &optional_one),
+                required_dependency(
+                    DependencyKind::Suggests,
+                    &rsolve_core::PackageName::new("base").unwrap(),
+                ),
+                required_dependency(DependencyKind::Enhances, &enhanced),
+            ],
+        );
+        let root_v2 = release_at_version_with_dependencies(
+            &root,
+            "2.0.0",
+            vec![
+                required_dependency(DependencyKind::Suggests, &optional_two),
+                required_dependency(DependencyKind::Suggests, &matrix),
+            ],
+        );
+        let optional_one_release = release_with_dependencies(
+            &optional_one,
+            vec![
+                required_dependency(DependencyKind::Depends, &hard_nested),
+                required_dependency(DependencyKind::Suggests, &nested),
+            ],
+        );
+        let snapshot = CranCandidateSnapshot::from_candidates([
+            (root.clone(), vec![root_v1, root_v2]),
+            (optional_one.clone(), vec![optional_one_release]),
+            (
+                optional_two.clone(),
+                vec![release_with_dependencies(&optional_two, Vec::new())],
+            ),
+            (
+                matrix.clone(),
+                vec![release_with_dependencies(&matrix, Vec::new())],
+            ),
+            (
+                nested.clone(),
+                vec![release_with_dependencies(&nested, Vec::new())],
+            ),
+            (
+                hard_nested.clone(),
+                vec![release_with_dependencies(&hard_nested, Vec::new())],
+            ),
+            (
+                enhanced.clone(),
+                vec![release_with_dependencies(&enhanced, Vec::new())],
+            ),
+        ]);
+        let recorder = Recorder::new();
+        let closure = collect_cran_dependency_closure_with_metrics(
+            std::slice::from_ref(&direct_requirement),
+            |_| Ok(snapshot.clone()),
+            &recorder,
+        )
+        .unwrap();
+        assert!(closure.contains(&root));
+        assert!(closure.contains(&optional_one));
+        assert!(closure.contains(&optional_two));
+        assert!(closure.contains(&matrix));
+        assert!(closure.contains(&hard_nested));
+        assert!(!closure.contains(&nested));
+        assert!(!closure.contains(&PackageName::new("base").unwrap()));
+        assert!(!closure.contains(&enhanced));
+
+        let hard_only = RootRequirement {
+            expansion: RootExpansionPolicy::HardOnly,
+            ..direct_requirement
+        };
+        let hard_closure = collect_cran_dependency_closure_with_metrics(
+            std::slice::from_ref(&hard_only),
+            |_| Ok(snapshot.clone()),
+            &recorder,
+        )
+        .unwrap();
+        assert_eq!(hard_closure, vec![root]);
     }
 
     fn cache_diagnostic(

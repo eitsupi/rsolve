@@ -13,13 +13,40 @@ use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
     DependencyKind, DependencySourceConstraint, NonRepositoryExposure, PackageName, PackageRelease,
     PreparedCandidate, Provenance, PublicationDate, RPackageVersion, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, Resolution, ResolutionRequest, SolverKey,
-    VersionConstraint,
+    ReleaseMetadata, ReleaseObservation, Resolution, ResolutionRequest, ResolvedDependencyEdge,
+    RootExpansionPolicy, SolverKey, VersionConstraint,
 };
 
 pub use adapter::{
     PublicationPolicyDiagnostic, PublicationRejection, ResolutionDiagnostic, ResolutionFailure,
 };
+
+/// Projects DESCRIPTION declarations into the effective dependency graph for
+/// one root expansion policy. The adapter and assignment comparison use this
+/// single projection so optional dependencies have identical semantics in
+/// solving, materialization, and diagnostics.
+pub(crate) fn project_dependency_edges(
+    release: &PackageRelease,
+    expansion: RootExpansionPolicy,
+) -> Vec<ResolvedDependencyEdge> {
+    release
+        .declared_dependencies()
+        .iter()
+        .filter_map(|dependency| {
+            let kind = match dependency.kind {
+                DependencyKind::Suggests if expansion == RootExpansionPolicy::DirectSuggests => {
+                    Some(rsolve_core::EffectiveDependencyKind::PromotedSuggests)
+                }
+                DependencyKind::Suggests | DependencyKind::Enhances => None,
+                kind => kind.effective(),
+            }?;
+            Some(ResolvedDependencyEdge {
+                kind,
+                package: dependency.package.clone(),
+            })
+        })
+        .collect()
+}
 
 // These are R base packages only. Recommended packages such as Matrix are
 // intentionally absent; without runtime inventory, the resolver must not
@@ -459,6 +486,7 @@ impl<'a> Resolver<'a> {
                 LockDecision::Unlocked => None,
             };
             let context = PreferenceContext { locked };
+            let expansion = root_expansion_for_subject(request, &subject);
             let basis = assignment_basis(
                 package,
                 &candidates,
@@ -466,6 +494,7 @@ impl<'a> Resolver<'a> {
                 request,
                 &subject,
                 &resolution.target().r_version,
+                expansion,
             );
             let assigned = candidate_for_subject(&subject, package.release());
             let difference_context = DifferenceContext {
@@ -477,6 +506,7 @@ impl<'a> Resolver<'a> {
                 subject: &subject,
                 selected_packages: &selected,
                 request,
+                expansion,
             };
             // The loader's iteration order must not reach the public
             // comparison, so each alternative carries the candidate's own
@@ -537,6 +567,7 @@ fn assignment_basis(
     request: &ResolutionRequest,
     subject: &SolverKey,
     r_version: &RPackageVersion,
+    expansion: RootExpansionPolicy,
 ) -> AssignmentBasis {
     if matches!(subject, SolverKey::InstalledName(_)) {
         return AssignmentBasis::InstalledNameReservation;
@@ -569,9 +600,7 @@ fn assignment_basis(
     let statically_compatible = candidates
         .iter()
         .filter(|candidate| {
-            candidate
-                .release()
-                .declared_dependencies()
+            project_dependency_edges(candidate.release(), expansion)
                 .iter()
                 .all(|dependency| {
                     dependency.package.name().as_str() != "R"
@@ -611,6 +640,7 @@ struct DifferenceContext<'a> {
     subject: &'a SolverKey,
     selected_packages: &'a [rsolve_core::ResolvedPackage],
     request: &'a ResolutionRequest,
+    expansion: RootExpansionPolicy,
 }
 
 fn difference_for_candidate(
@@ -668,38 +698,24 @@ fn difference_for_candidate(
             requirement: requirement.package.constraint().clone(),
         });
     }
-    if let Some(dependency) =
-        candidate
-            .release()
-            .declared_dependencies()
-            .iter()
-            .find(|dependency| {
-                matches!(
-                    dependency.kind,
-                    DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
-                ) && dependency.package.name().as_str() == "R"
-                    && !dependency
-                        .package
-                        .constraint()
-                        .satisfies(&difference.r_version)
-            })
-    {
+    let projected_dependencies =
+        project_dependency_edges(candidate.release(), difference.expansion);
+    if let Some(dependency) = projected_dependencies.iter().find(|dependency| {
+        dependency.package.name().as_str() == "R"
+            && !dependency
+                .package
+                .constraint()
+                .satisfies(&difference.r_version)
+    }) {
         return Some(AssignmentDifference::ConstraintViolatedByAssignment {
             against: DecisionSubject::R,
             requirement: dependency.package.constraint().clone(),
             assigned: DecisionCandidate::R(difference.r_version.clone()),
         });
     }
-    if let Some((dependency, assigned)) = candidate
-        .release()
-        .declared_dependencies()
+    if let Some((dependency, assigned)) = projected_dependencies
         .iter()
-        .filter(|dependency| {
-            matches!(
-                dependency.kind,
-                DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
-            ) && dependency.package.name().as_str() != "R"
-        })
+        .filter(|dependency| dependency.package.name().as_str() != "R")
         .filter_map(|dependency| {
             let key = dependency_key(dependency.package.name(), dependency.package.source())?;
             let assigned = difference
@@ -777,6 +793,22 @@ fn subject_name(subject: &SolverKey) -> PackageName {
         SolverKey::Exact(identity) => identity.name().clone(),
         SolverKey::R => PackageName::new("R").expect("R is a valid package name"),
     }
+}
+
+fn root_expansion_for_subject(
+    request: &ResolutionRequest,
+    subject: &SolverKey,
+) -> RootExpansionPolicy {
+    request
+        .roots
+        .iter()
+        .filter_map(|requirement| {
+            dependency_key(requirement.package.name(), requirement.package.source())
+                .filter(|key| key == subject)
+                .map(|_| requirement.expansion)
+        })
+        .find(|expansion| *expansion == RootExpansionPolicy::DirectSuggests)
+        .unwrap_or(RootExpansionPolicy::HardOnly)
 }
 
 fn dependency_key(name: &PackageName, source: &DependencySourceConstraint) -> Option<SolverKey> {

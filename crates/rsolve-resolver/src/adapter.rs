@@ -11,10 +11,9 @@ use pubgrub::{
     PackageResolutionStatistics, PubGrubError, Ranges, resolve,
 };
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencyKind,
-    DependencySourceConstraint, PreparedCandidate, PublicationCutoff, PublicationDate,
-    RPackageVersion, ReleaseIdentity, Resolution, ResolutionRequest, ResolvedDependencyEdge,
-    RootExpansionPolicy, SolverKey, VersionConstraint,
+    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DependencySourceConstraint,
+    PreparedCandidate, PublicationCutoff, PublicationDate, RPackageVersion, ReleaseIdentity,
+    Resolution, ResolutionRequest, RootExpansionPolicy, SolverKey, VersionConstraint,
 };
 
 use crate::{
@@ -693,7 +692,7 @@ impl DependencyProvider for Provider<'_> {
                     Ranges::singleton(SolverVersion::Candidate(*id)),
                 )];
                 let expansion = self.expansion_for_subject(subject)?;
-                for dependency in projected_dependency_edges(release, expansion) {
+                for dependency in super::project_dependency_edges(release, expansion) {
                     if let DependencySourceConstraint::Git { .. } = dependency.package.source() {
                         return Ok(Dependencies::Unavailable(ProviderMessage::Text(format!(
                             "Git-sourced dependencies are not supported for package {}",
@@ -942,7 +941,7 @@ pub(crate) fn solve(
         let expansion = provider
             .expansion_for_subjects(&subjects)
             .map_err(|error| map_adapter_error(*error))?;
-        let effective_dependencies = projected_dependency_edges(release, expansion);
+        let effective_dependencies = super::project_dependency_edges(release, expansion);
         let mut visible = subjects
             .iter()
             .flat_map(|subject| candidate.applicable_occurrences(subject))
@@ -967,33 +966,6 @@ pub(crate) fn solve(
 
 fn identity_sort_key(identity: &rsolve_core::ReleaseIdentity) -> String {
     format!("{}:{:?}", identity.name(), identity.provenance())
-}
-
-/// Projects DESCRIPTION dependency declarations into the effective graph for
-/// one selected root expansion policy. This projection is shared by the
-/// solver adapter and successful-resolution materialization so optional
-/// dependencies cannot disappear or be invented at either boundary.
-fn projected_dependency_edges(
-    release: &rsolve_core::PackageRelease,
-    expansion: RootExpansionPolicy,
-) -> Vec<ResolvedDependencyEdge> {
-    release
-        .declared_dependencies()
-        .iter()
-        .filter_map(|dependency| {
-            let kind = match dependency.kind {
-                DependencyKind::Suggests if expansion == RootExpansionPolicy::DirectSuggests => {
-                    Some(rsolve_core::EffectiveDependencyKind::PromotedSuggests)
-                }
-                DependencyKind::Suggests | DependencyKind::Enhances => None,
-                kind => kind.effective(),
-            }?;
-            Some(ResolvedDependencyEdge {
-                kind,
-                package: dependency.package.clone(),
-            })
-        })
-        .collect()
 }
 
 fn canonical_subject_cmp(left: &SolverKey, right: &SolverKey) -> Ordering {

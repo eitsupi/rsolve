@@ -4,21 +4,28 @@ use rsolve_core::{
     CandidateAvailability, CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory,
     CandidateLoadResult, CandidateLoader, DeclaredDependency, DependencyKind,
     DependencySourceConstraint, NonRepositoryExposure, PackageName, PackageNamespace,
-    PackageRelease, PreparedCandidate, Provenance, RPackageVersion, RegistryId, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence, RepositoryRank,
-    ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement, SolverKey,
-    VersionConstraint,
+    PackageRelease, PackageRequirement, PreparedCandidate, Provenance, RPackageVersion, RegistryId,
+    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence,
+    RepositoryRank, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
+    SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{
     DefaultCandidatePreference, RequireLocked, ResolutionFailure, Resolver, Unlocked,
 };
 
 fn prepared(release: PackageRelease) -> PreparedCandidate {
+    prepared_with_currentness(release, CandidateCurrentness::Current)
+}
+
+fn prepared_with_currentness(
+    release: PackageRelease,
+    currentness: CandidateCurrentness,
+) -> PreparedCandidate {
     let occurrence = RepositoryOccurrence::new(
         RepositoryId::new("cran").unwrap(),
         RegistryId::new("cran").unwrap(),
         CandidateAvailability::Available,
-        CandidateCurrentness::Current,
+        currentness,
         RepositoryRank::new(0),
         release.distributions().to_vec(),
     )
@@ -34,11 +41,16 @@ struct FixtureLoader {
 
 impl CandidateLoader for FixtureLoader {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
-        let SolverKey::InstalledName(name) = package else {
-            return Err(CandidateLoadError::new(
-                CandidateLoadErrorCategory::NotFound,
-                format!("fixture has no candidates for {package:?}"),
-            ));
+        let name = match package {
+            SolverKey::InstalledName(name)
+            | SolverKey::Registry { name, .. }
+            | SolverKey::Repository { name, .. } => name,
+            _ => {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("fixture has no candidates for {package:?}"),
+                ));
+            }
         };
         self.candidates
             .get(name)
@@ -54,8 +66,11 @@ impl CandidateLoader for FixtureLoader {
 
     fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
         let candidates = self.releases(package)?;
-        let SolverKey::InstalledName(name) = package else {
-            unreachable!("releases already rejects non-installed names")
+        let name = match package {
+            SolverKey::InstalledName(name)
+            | SolverKey::Registry { name, .. }
+            | SolverKey::Repository { name, .. } => name,
+            _ => unreachable!("releases already rejects this subject"),
         };
         let quarantined = self
             .quarantined
@@ -69,18 +84,54 @@ impl CandidateLoader for FixtureLoader {
     }
 }
 
+#[derive(Default)]
+struct PreparedFixtureLoader {
+    candidates: BTreeMap<PackageName, Vec<PreparedCandidate>>,
+}
+
+impl CandidateLoader for PreparedFixtureLoader {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
+        let name = match package {
+            SolverKey::InstalledName(name)
+            | SolverKey::Registry { name, .. }
+            | SolverKey::Repository { name, .. } => name,
+            _ => {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("fixture has no candidates for {package:?}"),
+                ));
+            }
+        };
+        self.candidates.get(name).cloned().ok_or_else(|| {
+            CandidateLoadError::new(
+                CandidateLoadErrorCategory::NotFound,
+                format!("fixture has no candidates for {name}"),
+            )
+        })
+    }
+}
+
 fn package(name: &str) -> PackageName {
     PackageName::new(name).unwrap()
 }
 
 fn release(name: &str, version: &str, dependencies: Vec<DeclaredDependency>) -> PackageRelease {
+    release_with_namespace(name, version, "cran", dependencies)
+}
+
+fn release_with_namespace(
+    name: &str,
+    version: &str,
+    namespace: &str,
+    dependencies: Vec<DeclaredDependency>,
+) -> PackageRelease {
     let name = package(name);
     let version = RPackageVersion::parse(version).unwrap();
     PackageRelease::try_from(ReleaseObservation {
         identity: ReleaseIdentity::new(
             name.clone(),
             Provenance::RegistryRelease {
-                namespace: PackageNamespace::new("cran").unwrap(),
+                namespace: PackageNamespace::new(namespace).unwrap(),
                 version: version.clone(),
             },
         ),
@@ -275,6 +326,134 @@ fn direct_suggests_changes_the_root_candidate_closure() {
     assert_eq!(
         v2_reasons[0].kind,
         rsolve_core::EffectiveDependencyKind::PromotedSuggests
+    );
+}
+
+#[test]
+fn assignment_comparison_reports_promoted_suggests_constraint_violation() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("foo"),
+        vec![
+            release(
+                "foo",
+                "1.0",
+                vec![dependency(
+                    DependencyKind::Suggests,
+                    "child",
+                    VersionConstraint::from_clause(
+                        rsolve_core::RelationOp::Ge,
+                        RPackageVersion::parse("2.0").unwrap(),
+                    ),
+                )],
+            ),
+            release(
+                "foo",
+                "2.0",
+                vec![any_dependency(
+                    "child",
+                    VersionConstraint::from_clause(
+                        rsolve_core::RelationOp::Eq,
+                        RPackageVersion::parse("1.0").unwrap(),
+                    ),
+                )],
+            ),
+        ],
+    );
+    loader
+        .candidates
+        .insert(package("child"), vec![release("child", "1.0", Vec::new())]);
+    let request = request_with_expansion(
+        vec![any_dependency("foo", VersionConstraint::unconstrained())],
+        RootExpansionPolicy::DirectSuggests,
+    );
+    let compared = Resolver::new(&loader, &DefaultCandidatePreference, &Unlocked)
+        .resolve_with_assignment_comparison(request)
+        .unwrap();
+    let foo = compared
+        .comparison
+        .assignments
+        .iter()
+        .find(|assignment| {
+            assignment.subject == rsolve_resolver::DecisionSubject::InstalledName(package("foo"))
+        })
+        .unwrap();
+    assert!(foo.alternatives.iter().any(|alternative| {
+        matches!(
+            alternative.differs_by,
+            rsolve_resolver::AssignmentDifference::ConstraintViolatedByAssignment {
+                against: rsolve_resolver::DecisionSubject::InstalledName(ref name),
+                ..
+            } if name == &package("child")
+        )
+    }));
+}
+
+#[test]
+fn source_qualified_direct_suggests_can_be_only_statically_compatible() {
+    let mut loader = PreparedFixtureLoader::default();
+    let compatible = release_with_namespace(
+        "foo",
+        "1.0",
+        "cran",
+        vec![dependency(
+            DependencyKind::Suggests,
+            "R",
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Ge,
+                RPackageVersion::parse("4.0").unwrap(),
+            ),
+        )],
+    );
+    let incompatible = release_with_namespace(
+        "foo",
+        "1.0",
+        "other",
+        vec![dependency(
+            DependencyKind::Suggests,
+            "R",
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Ge,
+                RPackageVersion::parse("5.0").unwrap(),
+            ),
+        )],
+    );
+    loader.candidates.insert(
+        package("foo"),
+        vec![
+            prepared_with_currentness(incompatible, CandidateCurrentness::Historical),
+            prepared_with_currentness(compatible, CandidateCurrentness::Historical),
+        ],
+    );
+    let request = ResolutionRequest::without_lock(
+        vec![RootRequirement {
+            package: PackageRequirement::new(
+                package("foo"),
+                DependencySourceConstraint::Repository {
+                    repository: RepositoryId::new("cran").unwrap(),
+                },
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::DirectSuggests,
+        }],
+        ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        VersionConstraint::unconstrained(),
+    );
+    let compared = Resolver::new(&loader, &DefaultCandidatePreference, &Unlocked)
+        .resolve_with_assignment_comparison(request)
+        .unwrap();
+    let foo = compared
+        .comparison
+        .assignments
+        .iter()
+        .find(|assignment| {
+            assignment.subject == rsolve_resolver::DecisionSubject::Package(package("foo"))
+        })
+        .unwrap();
+    assert_eq!(
+        foo.basis,
+        rsolve_resolver::AssignmentBasis::OnlyStaticallyCompatible
     );
 }
 
