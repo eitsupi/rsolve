@@ -211,6 +211,7 @@ fn resolution_projection_excludes_artifacts_and_unselected_dependencies() {
             rsolve_core::SolverKey::InstalledName(package("artifactless")),
             release,
             Vec::new(),
+            Vec::new(),
         )],
     );
     let lock =

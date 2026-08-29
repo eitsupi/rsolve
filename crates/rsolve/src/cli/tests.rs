@@ -2,9 +2,11 @@ use super::*;
 use crate::resolve_with_loader_with_publication_cutoff;
 use clap::Parser;
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
-    DependencyKind, DependencySourceConstraint, PackageNamespace, PackageRelease, Provenance,
-    RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, SolverKey, VersionConstraint,
+    CandidateAvailability, CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory,
+    CandidateLoader, DeclaredDependency, DependencyKind, DependencySourceConstraint,
+    PackageNamespace, PackageRelease, PreparedCandidate, Provenance, RegistryId, RelationOp,
+    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence,
+    RepositoryRank, SolverKey, VersionConstraint,
 };
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -552,13 +554,30 @@ struct MatrixLoader {
 }
 
 impl CandidateLoader for MatrixLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         match package {
             SolverKey::InstalledName(name) => Ok(self
                 .releases
                 .iter()
                 .filter(|release| release.identity().name() == name)
                 .cloned()
+                .map(|release| {
+                    let occurrence = RepositoryOccurrence::new(
+                        RepositoryId::new("cran").unwrap(),
+                        RegistryId::new("cran").unwrap(),
+                        CandidateAvailability::Available,
+                        CandidateCurrentness::Current,
+                        RepositoryRank::new(0),
+                        release.distributions().to_vec(),
+                    )
+                    .unwrap();
+                    PreparedCandidate::new(
+                        release,
+                        rsolve_core::NonRepositoryExposure::None,
+                        vec![occurrence],
+                    )
+                    .unwrap()
+                })
                 .collect()),
             _ => Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,

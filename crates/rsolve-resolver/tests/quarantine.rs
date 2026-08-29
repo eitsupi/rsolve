@@ -2,15 +2,30 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DeclaredDependency, DependencyKind, DependencySourceConstraint, PackageName, PackageNamespace,
-    PackageRelease, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
-    SolverKey, VersionConstraint,
+    CandidateAvailability, CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory,
+    CandidateLoadResult, CandidateLoader, DeclaredDependency, DependencyKind,
+    DependencySourceConstraint, NonRepositoryExposure, PackageName, PackageNamespace,
+    PackageRelease, PreparedCandidate, Provenance, RPackageVersion, RegistryId, ReleaseIdentity,
+    ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence, RepositoryRank,
+    ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement, SolverKey,
+    VersionConstraint,
 };
 use rsolve_resolver::{
     DefaultCandidatePreference, RequireLocked, ResolutionFailure, Resolver, Unlocked,
 };
+
+fn prepared(release: PackageRelease) -> PreparedCandidate {
+    let occurrence = RepositoryOccurrence::new(
+        RepositoryId::new("cran").unwrap(),
+        RegistryId::new("cran").unwrap(),
+        CandidateAvailability::Available,
+        CandidateCurrentness::Current,
+        RepositoryRank::new(0),
+        release.distributions().to_vec(),
+    )
+    .unwrap();
+    PreparedCandidate::new(release, NonRepositoryExposure::None, vec![occurrence]).unwrap()
+}
 
 #[derive(Default)]
 struct FixtureLoader {
@@ -19,19 +34,23 @@ struct FixtureLoader {
 }
 
 impl CandidateLoader for FixtureLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
                 format!("fixture has no candidates for {package:?}"),
             ));
         };
-        self.candidates.get(name).cloned().ok_or_else(|| {
-            CandidateLoadError::new(
-                CandidateLoadErrorCategory::NotFound,
-                format!("fixture has no candidates for {name}"),
-            )
-        })
+        self.candidates
+            .get(name)
+            .cloned()
+            .map(|releases| releases.into_iter().map(prepared).collect())
+            .ok_or_else(|| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("fixture has no candidates for {name}"),
+                )
+            })
     }
 
     fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
@@ -112,7 +131,7 @@ struct NoCallLoader {
 }
 
 impl CandidateLoader for NoCallLoader {
-    fn releases(&self, _package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, _package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         self.calls.set(self.calls.get() + 1);
         panic!("candidate loading must not start for unsupported root expansion")
     }

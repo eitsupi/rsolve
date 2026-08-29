@@ -11,9 +11,10 @@ use std::fmt;
 
 use rsolve_core::{
     CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DependencyKind, DependencySourceConstraint, PackageName, PackageRelease, Provenance,
-    PublicationDate, RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
-    Resolution, ResolutionRequest, SolverKey, VersionConstraint,
+    DependencyKind, DependencySourceConstraint, NonRepositoryExposure, PackageName, PackageRelease,
+    PreparedCandidate, Provenance, PublicationDate, RPackageVersion, ReleaseIdentity,
+    ReleaseMetadata, ReleaseObservation, Resolution, ResolutionRequest, SolverKey,
+    VersionConstraint,
 };
 
 pub use adapter::{
@@ -128,11 +129,22 @@ impl<L> RBasePackageOverlay<L> {
 }
 
 impl<L: CandidateLoader> CandidateLoader for RBasePackageOverlay<L> {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         if let SolverKey::InstalledName(name) = package
             && let Some(release) = self.base.get(name)
         {
-            return Ok(vec![release.clone()]);
+            return PreparedCandidate::new(
+                release.clone(),
+                NonRepositoryExposure::RuntimeInstalled,
+                Vec::new(),
+            )
+            .map(|candidate| vec![candidate])
+            .map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("invalid R base candidate: {error}"),
+                )
+            });
         }
         self.loader.releases(package)
     }
@@ -141,7 +153,18 @@ impl<L: CandidateLoader> CandidateLoader for RBasePackageOverlay<L> {
         if let SolverKey::InstalledName(name) = package
             && let Some(release) = self.base.get(name)
         {
-            return Ok(CandidateLoadResult::new(vec![release.clone()], Vec::new()));
+            let candidate = PreparedCandidate::new(
+                release.clone(),
+                NonRepositoryExposure::RuntimeInstalled,
+                Vec::new(),
+            )
+            .map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("invalid R base candidate: {error}"),
+                )
+            })?;
+            return Ok(CandidateLoadResult::new(vec![candidate], Vec::new()));
         }
         self.loader.load(package)
     }
@@ -150,7 +173,6 @@ impl<L: CandidateLoader> CandidateLoader for RBasePackageOverlay<L> {
 /// Information available to a candidate ordering policy for one solve.
 pub struct PreferenceContext<'a> {
     pub locked: Option<&'a ReleaseIdentity>,
-    pub repository_current: Option<&'a ReleaseIdentity>,
 }
 
 /// Stable trial ordering.  It affects which compatible candidate PubGrub
@@ -159,37 +181,64 @@ pub trait CandidatePreference {
     fn compare(
         &self,
         package: &SolverKey,
-        left: &PackageRelease,
-        right: &PackageRelease,
+        left: &PreparedCandidate,
+        right: &PreparedCandidate,
         context: &PreferenceContext<'_>,
     ) -> Ordering;
 }
 
-/// The minimal rsolve ordering: locked, then current repository, then newest.
+pub(crate) fn compare_prepared_candidates(
+    preference: &dyn CandidatePreference,
+    package: &SolverKey,
+    left: &PreparedCandidate,
+    right: &PreparedCandidate,
+    context: &PreferenceContext<'_>,
+) -> Ordering {
+    preference
+        .compare(package, left, right, context)
+        .then_with(|| left.release().version().cmp(right.release().version()))
+        .then_with(|| identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity())))
+}
+
+/// The default ordering is locked, then applicable current/history status,
+/// then version, scoped repository rank, and canonical identity.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultCandidatePreference;
 
 impl CandidatePreference for DefaultCandidatePreference {
     fn compare(
         &self,
-        _package: &SolverKey,
-        left: &PackageRelease,
-        right: &PackageRelease,
+        package: &SolverKey,
+        left: &PreparedCandidate,
+        right: &PreparedCandidate,
         context: &PreferenceContext<'_>,
     ) -> Ordering {
-        preference_rank(left, context)
-            .cmp(&preference_rank(right, context))
-            .then_with(|| left.version().cmp(right.version()))
+        preference_rank(left, package, context)
+            .cmp(&preference_rank(right, package, context))
+            .then_with(|| left.release().version().cmp(right.release().version()))
+            .then_with(|| {
+                right
+                    .repository_rank_for(package)
+                    .cmp(&left.repository_rank_for(package))
+            })
             .then_with(|| {
                 identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
             })
     }
 }
 
-fn preference_rank(release: &PackageRelease, context: &PreferenceContext<'_>) -> u8 {
-    if context.locked == Some(release.identity()) {
+fn preference_rank(
+    candidate: &PreparedCandidate,
+    package: &SolverKey,
+    context: &PreferenceContext<'_>,
+) -> u8 {
+    if context.locked == Some(candidate.identity()) {
         3
-    } else if context.repository_current == Some(release.identity()) {
+    } else if candidate
+        .applicable_occurrences(package)
+        .iter()
+        .any(|occurrence| occurrence.currentness() == rsolve_core::CandidateCurrentness::Current)
+    {
         2
     } else {
         1
@@ -391,21 +440,28 @@ impl<'a> Resolver<'a> {
         for package in &selected {
             let subject = package.subject().clone();
             let candidates = self.load_candidates(&subject)?;
-            let current = repository_current(&candidates);
+            let Some(selected_candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.identity() == package.release().identity())
+            else {
+                return Err(ResolutionFailure::CandidateLoad {
+                    package: subject,
+                    source: Box::new(CandidateLoadError::new(
+                        CandidateLoadErrorCategory::MetadataInvalid,
+                        "selected release is absent from its prepared subject view",
+                    )),
+                });
+            };
             let previous = request.locked.get(&subject);
             let decision = self.lock_policy.decision(&subject, previous);
             let locked = match &decision {
                 LockDecision::Prefer(identity) | LockDecision::Require(identity) => Some(identity),
                 LockDecision::Unlocked => None,
             };
-            let context = PreferenceContext {
-                locked,
-                repository_current: current.as_ref().map(PackageRelease::identity),
-            };
+            let context = PreferenceContext { locked };
             let basis = assignment_basis(
                 package,
                 &candidates,
-                &context,
                 &decision,
                 request,
                 &subject,
@@ -414,6 +470,7 @@ impl<'a> Resolver<'a> {
             let assigned = candidate_for_subject(&subject, package.release());
             let difference_context = DifferenceContext {
                 selected: package.release(),
+                selected_candidate,
                 r_version: resolution.target().r_version.clone(),
                 decision: &decision,
                 preference: &context,
@@ -428,18 +485,20 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .filter(|candidate| candidate.identity() != package.release().identity())
                 .filter_map(|candidate| {
-                    difference_for_candidate(candidate, &difference_context).map(|differs_by| {
-                        (
+                    difference_for_candidate(self.preference, candidate, &difference_context).map(
+                        |differs_by| {
                             (
-                                candidate.version().clone(),
-                                identity_sort_key(candidate.identity()),
-                            ),
-                            AlternativeComparison {
-                                candidate: candidate_for_subject(&subject, candidate),
-                                differs_by,
-                            },
-                        )
-                    })
+                                (
+                                    candidate.release().version().clone(),
+                                    identity_sort_key(candidate.identity()),
+                                ),
+                                AlternativeComparison {
+                                    candidate: candidate_for_subject(&subject, candidate.release()),
+                                    differs_by,
+                                },
+                            )
+                        },
+                    )
                 })
                 .collect();
             keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -461,7 +520,7 @@ impl<'a> Resolver<'a> {
     fn load_candidates(
         &self,
         subject: &SolverKey,
-    ) -> Result<Vec<PackageRelease>, ResolutionFailure> {
+    ) -> Result<Vec<PreparedCandidate>, ResolutionFailure> {
         self.loader
             .releases(subject)
             .map_err(|source| ResolutionFailure::CandidateLoad {
@@ -471,27 +530,9 @@ impl<'a> Resolver<'a> {
     }
 }
 
-fn repository_current(candidates: &[PackageRelease]) -> Option<PackageRelease> {
-    candidates
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .distributions()
-                .iter()
-                .any(|d| d.snapshot.is_none())
-        })
-        .max_by(|left, right| {
-            left.version().cmp(right.version()).then_with(|| {
-                identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
-            })
-        })
-        .cloned()
-}
-
 fn assignment_basis(
     selected: &rsolve_core::ResolvedPackage,
-    candidates: &[PackageRelease],
-    context: &PreferenceContext<'_>,
+    candidates: &[PreparedCandidate],
     decision: &LockDecision,
     request: &ResolutionRequest,
     subject: &SolverKey,
@@ -514,18 +555,28 @@ fn assignment_basis(
             identity: identity.clone(),
         };
     }
-    if let Some(current) = context.repository_current
-        && current == selected.release().identity()
-    {
+    if candidates.iter().any(|candidate| {
+        candidate.identity() == selected.release().identity()
+            && candidate
+                .applicable_occurrences(subject)
+                .iter()
+                .any(|occurrence| {
+                    occurrence.currentness() == rsolve_core::CandidateCurrentness::Current
+                })
+    }) {
         return AssignmentBasis::RepositoryCurrent;
     }
     let statically_compatible = candidates
         .iter()
         .filter(|candidate| {
-            candidate.declared_dependencies().iter().all(|dependency| {
-                dependency.package.name().as_str() != "R"
-                    || dependency.package.constraint().satisfies(r_version)
-            })
+            candidate
+                .release()
+                .declared_dependencies()
+                .iter()
+                .all(|dependency| {
+                    dependency.package.name().as_str() != "R"
+                        || dependency.package.constraint().satisfies(r_version)
+                })
         })
         .count();
     if statically_compatible == 1 {
@@ -553,6 +604,7 @@ fn assignment_basis(
 
 struct DifferenceContext<'a> {
     selected: &'a PackageRelease,
+    selected_candidate: &'a PreparedCandidate,
     r_version: RPackageVersion,
     decision: &'a LockDecision,
     preference: &'a PreferenceContext<'a>,
@@ -562,7 +614,8 @@ struct DifferenceContext<'a> {
 }
 
 fn difference_for_candidate(
-    candidate: &PackageRelease,
+    preference: &dyn CandidatePreference,
+    candidate: &PreparedCandidate,
     difference: &DifferenceContext<'_>,
 ) -> Option<AssignmentDifference> {
     if let LockDecision::Require(required) = difference.decision
@@ -579,10 +632,10 @@ fn difference_for_candidate(
         LockDecision::Unlocked => false,
     };
     if let Some(cutoff) = difference.request.publication_cutoff
-        && !candidate.is_r_base_package()
+        && !candidate.release().is_r_base_package()
         && !locked
     {
-        match candidate.publication() {
+        match candidate.release().publication() {
             Some(publication) if publication.date() > cutoff.date() => {
                 return Some(AssignmentDifference::PublicationCooldown {
                     cutoff: cutoff.date(),
@@ -609,22 +662,28 @@ fn difference_for_candidate(
             && !requirement
                 .package
                 .constraint()
-                .satisfies(candidate.version())
+                .satisfies(candidate.release().version())
     }) {
         return Some(AssignmentDifference::RootRequirementMismatch {
             requirement: requirement.package.constraint().clone(),
         });
     }
-    if let Some(dependency) = candidate.declared_dependencies().iter().find(|dependency| {
-        matches!(
-            dependency.kind,
-            DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
-        ) && dependency.package.name().as_str() == "R"
-            && !dependency
-                .package
-                .constraint()
-                .satisfies(&difference.r_version)
-    }) {
+    if let Some(dependency) =
+        candidate
+            .release()
+            .declared_dependencies()
+            .iter()
+            .find(|dependency| {
+                matches!(
+                    dependency.kind,
+                    DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
+                ) && dependency.package.name().as_str() == "R"
+                    && !dependency
+                        .package
+                        .constraint()
+                        .satisfies(&difference.r_version)
+            })
+    {
         return Some(AssignmentDifference::ConstraintViolatedByAssignment {
             against: DecisionSubject::R,
             requirement: dependency.package.constraint().clone(),
@@ -632,6 +691,7 @@ fn difference_for_candidate(
         });
     }
     if let Some((dependency, assigned)) = candidate
+        .release()
         .declared_dependencies()
         .iter()
         .filter(|dependency| {
@@ -660,15 +720,18 @@ fn difference_for_candidate(
             assigned: release_candidate(assigned.release()),
         });
     }
+    let preference_order = compare_prepared_candidates(
+        preference,
+        difference.subject,
+        difference.selected_candidate,
+        candidate,
+        difference.preference,
+    );
     if difference
         .preference
         .locked
         .is_some_and(|locked| candidate.identity() != locked)
-        || difference
-            .preference
-            .repository_current
-            .is_some_and(|current| candidate.identity() != current)
-        || candidate.version() < difference.selected.version()
+        || preference_order == Ordering::Greater
     {
         return Some(AssignmentDifference::LowerPreference {
             assigned: candidate_for_subject(difference.subject, difference.selected),

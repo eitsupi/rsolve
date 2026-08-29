@@ -18,16 +18,17 @@ use super::{
     archive_rejection_to_evidence, index_record_to_evidence,
 };
 use crate::snapshot::FreshnessStateV1;
+use crate::{RawCandidateLoadResult, RawCandidateObservation, currentness_for_release};
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    PackageName, PackageRelease, ReleaseAggregation, SolverKey,
+    CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory, PackageName,
+    PackageRelease, ReleaseAggregation, SolverKey,
 };
 
 impl<T: Transport + 'static> CranRefreshSession<T> {
     pub(in crate::cran::provider) fn refresh_package(
         &mut self,
         package: &PackageName,
-    ) -> Result<CandidateLoadResult, CandidateLoadError> {
+    ) -> Result<RawCandidateLoadResult, CandidateLoadError> {
         if let Some(result) = self.packages.get(package) {
             return result.clone();
         }
@@ -158,7 +159,20 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
         let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
         Ok(Some(BulkCandidateResult {
-            candidates: CandidateLoadResult::new(candidates, Vec::new()),
+            candidates: RawCandidateLoadResult::new(
+                candidates
+                    .into_iter()
+                    .map(|release| RawCandidateObservation {
+                        currentness: if current_versions.contains(release.version()) {
+                            CandidateCurrentness::Current
+                        } else {
+                            CandidateCurrentness::Historical
+                        },
+                        release,
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
             evidence: staged_evidence,
         }))
     }
@@ -166,7 +180,7 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
     fn refresh_package_uncached(
         &mut self,
         package: &PackageName,
-    ) -> Result<CandidateLoadResult, CandidateLoadError> {
+    ) -> Result<RawCandidateLoadResult, CandidateLoadError> {
         self.metrics.borrow_mut().package_history_lookups += 1;
         let current_projection = self.ensure_current()?;
         let current = current_projection.candidates(package)?;
@@ -337,7 +351,18 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
             Err(failure) => {
                 match self.resolve_fast_path_failure(package, package_diagnostics, failure)? {
                     Some(source) => source,
-                    None => return Ok(CandidateLoadResult::new(current, Vec::new())),
+                    None => {
+                        return Ok(RawCandidateLoadResult::new(
+                            current
+                                .into_iter()
+                                .map(|release| RawCandidateObservation {
+                                    currentness: currentness_for_release(&release),
+                                    release,
+                                })
+                                .collect(),
+                            Vec::new(),
+                        ));
+                    }
                 }
             }
         };
@@ -374,8 +399,9 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
                 })?;
         }
         for release in archived
-            .candidates()
+            .observations()
             .iter()
+            .map(RawCandidateObservation::release)
             .filter(|release| !current_versions.contains(release.version()))
         {
             aggregation
@@ -389,8 +415,18 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
         }
         let mut candidates = aggregation.releases().cloned().collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.version().cmp(right.version()));
-        Ok(CandidateLoadResult::new(
-            candidates,
+        Ok(RawCandidateLoadResult::new(
+            candidates
+                .into_iter()
+                .map(|release| RawCandidateObservation {
+                    currentness: if current_versions.contains(release.version()) {
+                        CandidateCurrentness::Current
+                    } else {
+                        CandidateCurrentness::Historical
+                    },
+                    release,
+                })
+                .collect(),
             archived.quarantined().to_vec(),
         ))
     }
@@ -410,7 +446,7 @@ impl<T: Transport + 'static> CranRefreshSession<T> {
                     result
                         .as_ref()
                         .ok()
-                        .map(|result| (package.clone(), result.candidates().to_vec()))
+                        .map(|result| (package.clone(), result.observations().to_vec()))
                 })
                 .collect(),
             quarantined: self

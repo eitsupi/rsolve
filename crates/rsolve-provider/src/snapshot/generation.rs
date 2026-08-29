@@ -1,4 +1,5 @@
 use super::*;
+use crate::{RawCandidateLoadResult, RawCandidateObservation};
 
 pub struct ValidatedGeneration {
     path: PathBuf,
@@ -47,6 +48,13 @@ pub struct ReadOnlySnapshotCandidateLoader {
 }
 
 impl ReadOnlySnapshotCandidateLoader {
+    /// Returns the registry identity validated against this immutable
+    /// generation's header.
+    pub fn registry_id(&self) -> RegistryId {
+        RegistryId::new(&self.header.registry_id)
+            .expect("validated snapshot headers contain a valid registry id")
+    }
+
     /// Opens and validates the generation-global coordinates for a configured
     /// registry.  Package histories remain lazy and are validated when looked
     /// up.  The configured registry identity is checked against the immutable
@@ -100,7 +108,7 @@ impl ReadOnlySnapshotCandidateLoader {
     fn releases_for_name(
         &self,
         name: &PackageName,
-    ) -> Result<CandidateLoadResult, CandidateLoadError> {
+    ) -> Result<RawCandidateLoadResult, CandidateLoadError> {
         let read = self.database.begin_read().map_err(snapshot_invalid)?;
         let table = read
             .open_table(PACKAGE_HISTORIES)
@@ -136,22 +144,32 @@ impl ReadOnlySnapshotCandidateLoader {
             .collect::<Result<Vec<_>, _>>()
             .map_err(package_metadata_invalid)?;
         let quarantined = quarantined_candidates(&history);
-        Ok(CandidateLoadResult::new(candidates, quarantined))
+        Ok(RawCandidateLoadResult::new(
+            candidates
+                .into_iter()
+                .map(|release| RawCandidateObservation {
+                    currentness: crate::currentness_for_release(&release),
+                    release,
+                })
+                .collect(),
+            quarantined,
+        ))
     }
 }
 
-impl CandidateLoader for ReadOnlySnapshotCandidateLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+impl ReadOnlySnapshotCandidateLoader {
+    #[cfg(test)]
+    pub fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
         let result = self.load(package)?;
         if result.candidates().is_empty() && !result.quarantined().is_empty() {
             return Err(package_metadata_invalid(
                 "package history has no eligible release",
             ));
         }
-        Ok(result.into_parts().0)
+        Ok(result.candidates())
     }
 
-    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+    pub fn load(&self, package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,

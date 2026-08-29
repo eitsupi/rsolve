@@ -2,14 +2,33 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
-    DependencyKind, DependencySourceConstraint, Distribution, DistributionChannel,
-    DistributionMetadata, PackageName, PackageNamespace, PackageRelease, Provenance,
-    RPackageVersion, RelationOp, ReleaseAggregation, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
+    CandidateAvailability, CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory,
+    CandidateLoader, DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
+    DistributionChannel, DistributionMetadata, PackageName, PackageNamespace, PackageRelease,
+    PreparedCandidate, Provenance, RPackageVersion, RegistryId, RelationOp, ReleaseAggregation,
+    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence,
+    RepositoryRank, ResolutionRequest, ResolutionTarget, RootExpansionPolicy, RootRequirement,
     SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{DefaultCandidatePreference, PreferLocked, Resolver};
+
+fn prepared(release: PackageRelease) -> PreparedCandidate {
+    let occurrence = RepositoryOccurrence::new(
+        RepositoryId::new("cran").unwrap(),
+        RegistryId::new("cran").unwrap(),
+        CandidateAvailability::Available,
+        CandidateCurrentness::Current,
+        RepositoryRank::new(0),
+        release.distributions().to_vec(),
+    )
+    .unwrap();
+    PreparedCandidate::new(
+        release,
+        rsolve_core::NonRepositoryExposure::None,
+        vec![occurrence],
+    )
+    .unwrap()
+}
 
 pub struct MatrixCatalog {
     candidates: BTreeMap<PackageName, Vec<PackageRelease>>,
@@ -91,7 +110,7 @@ impl MatrixCatalog {
 }
 
 impl CandidateLoader for MatrixCatalog {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         let name = match package {
             SolverKey::InstalledName(name) => name,
             _ => {
@@ -112,7 +131,7 @@ impl CandidateLoader for MatrixCatalog {
         if reverse {
             releases.reverse();
         }
-        Ok(releases)
+        Ok(releases.into_iter().map(prepared).collect())
     }
 }
 
@@ -215,11 +234,11 @@ pub mod regression_support {
         }
 
         pub fn same_identity_with_disjoint_distributions() -> Self {
+            let release =
+                registry_candidate_with_channels("Foo", "1.0.0", "cran", &["source", "binary"]);
             Self {
-                source_qualified: registry_candidate_with_channel("Foo", "1.0.0", "cran", "source"),
-                installed_name: vec![registry_candidate_with_channel(
-                    "Foo", "1.0.0", "cran", "binary",
-                )],
+                source_qualified: release.clone(),
+                installed_name: vec![release],
                 reverse_installed: false,
             }
         }
@@ -311,19 +330,22 @@ pub mod regression_support {
     }
 
     impl CandidateLoader for MultiSourceCatalog {
-        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        fn releases(
+            &self,
+            package: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
             match package {
                 SolverKey::Registry { namespace, name }
                     if namespace.as_str() == "cran" && name.as_str() == "Foo" =>
                 {
-                    Ok(vec![self.source_qualified.clone()])
+                    Ok(vec![prepared(self.source_qualified.clone())])
                 }
                 SolverKey::InstalledName(name) if name.as_str() == "Foo" => {
                     let mut releases = self.installed_name.clone();
                     if self.reverse_installed {
                         releases.reverse();
                     }
-                    Ok(releases)
+                    Ok(releases.into_iter().map(prepared).collect())
                 }
                 _ => Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::NotFound,
@@ -450,7 +472,10 @@ pub mod regression_support {
     }
 
     impl CandidateLoader for SameVersionCatalog {
-        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        fn releases(
+            &self,
+            package: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
             let name = match package {
                 SolverKey::InstalledName(name) => name.as_str(),
                 _ => {
@@ -461,8 +486,8 @@ pub mod regression_support {
                 }
             };
             match name {
-                "Foo" => Ok(self.foo.clone()),
-                "PreferredDep" | "WrongDep" => Ok(vec![plain_candidate(name, "1.0.0")]),
+                "Foo" => Ok(self.foo.clone().into_iter().map(prepared).collect()),
+                "PreferredDep" | "WrongDep" => Ok(vec![prepared(plain_candidate(name, "1.0.0"))]),
                 _ => Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::NotFound,
                     format!("same-version fixture has no package {name}"),
@@ -521,11 +546,16 @@ pub mod regression_support {
     }
 
     impl CandidateLoader for BacktrackingCatalog {
-        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        fn releases(
+            &self,
+            package: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
             match package {
-                SolverKey::InstalledName(name) if name.as_str() == "Foo" => Ok(self.foo.clone()),
+                SolverKey::InstalledName(name) if name.as_str() == "Foo" => {
+                    Ok(self.foo.clone().into_iter().map(prepared).collect())
+                }
                 SolverKey::InstalledName(name) if name.as_str() == "GoodDependency" => {
-                    Ok(vec![self.good_dependency.clone()])
+                    Ok(vec![prepared(self.good_dependency.clone())])
                 }
                 SolverKey::InstalledName(name) if name.as_str() == "MissingDependency" => {
                     Ok(Vec::new())
@@ -600,13 +630,16 @@ pub mod regression_support {
     }
 
     impl CandidateLoader for StrongDependencyCatalog {
-        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        fn releases(
+            &self,
+            package: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
             match package {
                 SolverKey::InstalledName(name) if name.as_str() == "StrongTop" => {
-                    Ok(self.top.clone())
+                    Ok(self.top.clone().into_iter().map(prepared).collect())
                 }
                 SolverKey::InstalledName(name) if name.as_str() == "AssignedDep" => {
-                    Ok(vec![self.dependency.clone()])
+                    Ok(vec![prepared(self.dependency.clone())])
                 }
                 _ => Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::NotFound,
@@ -659,12 +692,15 @@ pub mod regression_support {
     }
 
     impl CandidateLoader for GitDependencyCatalog {
-        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        fn releases(
+            &self,
+            package: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
             if matches!(
                 package,
                 SolverKey::InstalledName(name) if name.as_str() == "Choice"
             ) {
-                return Ok(self.choice.clone());
+                return Ok(self.choice.clone().into_iter().map(prepared).collect());
             }
             Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
@@ -745,7 +781,10 @@ pub mod regression_support {
     }
 
     impl CandidateLoader for AlternativeCatalog {
-        fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+        fn releases(
+            &self,
+            package: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
             if matches!(
                 package,
                 SolverKey::InstalledName(name) if name.as_str() == "Alternatives"
@@ -754,7 +793,7 @@ pub mod regression_support {
                 if self.reverse {
                     releases.reverse();
                 }
-                return Ok(releases);
+                return Ok(releases.into_iter().map(prepared).collect());
             }
             Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
@@ -801,6 +840,41 @@ pub mod regression_support {
         channel: &str,
     ) -> PackageRelease {
         registry_candidate_with_channel_and_dependencies(name, version, namespace, channel, vec![])
+    }
+
+    fn registry_candidate_with_channels(
+        name: &str,
+        version: &str,
+        namespace: &str,
+        channels: &[&str],
+    ) -> PackageRelease {
+        let package = PackageName::new(name).unwrap();
+        let parsed_version = RPackageVersion::parse(version).unwrap();
+        PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                package.clone(),
+                Provenance::RegistryRelease {
+                    namespace: PackageNamespace::new(namespace).unwrap(),
+                    version: parsed_version.clone(),
+                },
+            ),
+            observed_package: package,
+            observed_version: parsed_version,
+            metadata: ReleaseMetadata::default(),
+            publication: None,
+            declared_dependencies: Vec::new(),
+            distributions: channels
+                .iter()
+                .map(|channel| Distribution {
+                    registry: rsolve_core::RegistryId::new("cran").unwrap(),
+                    channel: DistributionChannel::new(channel).unwrap(),
+                    snapshot: None,
+                    artifacts: Vec::new(),
+                    observed_metadata: DistributionMetadata::default(),
+                })
+                .collect(),
+        })
+        .unwrap()
     }
 
     fn registry_candidate_with_channel_and_dependencies(

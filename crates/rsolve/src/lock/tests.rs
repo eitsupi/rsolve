@@ -180,6 +180,7 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
                 SolverKey::InstalledName(second.identity().name().clone()),
                 second,
                 Vec::new(),
+                Vec::new(),
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(first.identity().name().clone()),
@@ -188,6 +189,7 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
                     kind: EffectiveDependencyKind::Depends,
                     package: dependency.package,
                 }],
+                Vec::new(),
             ),
         ],
     );
@@ -232,15 +234,18 @@ fn projection_uses_effective_edges_and_rejects_promoted_suggests() {
                 SolverKey::InstalledName(package("root")),
                 root,
                 vec![effective],
+                Vec::new(),
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(package("selected")),
                 selected_dependency,
                 Vec::new(),
+                Vec::new(),
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(package("declared")),
                 declared_only,
+                Vec::new(),
                 Vec::new(),
             ),
         ],
@@ -269,6 +274,7 @@ fn projection_uses_effective_edges_and_rejects_promoted_suggests() {
                 )
                 .unwrap(),
             }],
+            Vec::new(),
         )],
     );
     assert!(matches!(
@@ -285,6 +291,7 @@ fn downstream_projection_revalidates_mutated_public_lock_state() {
         vec![rsolve_core::ResolvedPackage::new(
             SolverKey::InstalledName(name.clone()),
             release("mutable", "1.0.0"),
+            Vec::new(),
             Vec::new(),
         )],
     );
@@ -538,10 +545,12 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
                 SolverKey::InstalledName(name.clone()),
                 first.clone(),
                 Vec::new(),
+                Vec::new(),
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(name),
                 second.clone(),
+                Vec::new(),
                 Vec::new(),
             ),
         ],

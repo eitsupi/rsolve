@@ -277,10 +277,16 @@ mod tests {
         let resolution = Resolution::new(
             target,
             vec![
-                ResolvedPackage::new(SolverKey::InstalledName(matrix), matrix_release, Vec::new()),
+                ResolvedPackage::new(
+                    SolverKey::InstalledName(matrix),
+                    matrix_release,
+                    Vec::new(),
+                    Vec::new(),
+                ),
                 ResolvedPackage::new(
                     SolverKey::InstalledName(PackageName::new("methods").unwrap()),
                     methods_release,
+                    Vec::new(),
                     Vec::new(),
                 ),
             ],

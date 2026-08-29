@@ -25,9 +25,8 @@ use super::{
     allpackages_record_to_evidence, archive_rejection_to_evidence, import_current_index,
     index_record_to_evidence, source_input_with_metadata,
 };
-use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, PackageName,
-};
+use crate::RawCandidateLoadResult;
+use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageName};
 
 mod acquisition;
 mod allpackages;
@@ -199,7 +198,7 @@ pub(super) struct CranRefreshSession<T> {
     history: Option<Result<HistorySource, CandidateLoadError>>,
     history_surface_digest: Option<Box<str>>,
     allpackages: Option<Result<Rc<AllPackagesSource>, CandidateLoadError>>,
-    packages: HashMap<PackageName, Result<CandidateLoadResult, CandidateLoadError>>,
+    packages: HashMap<PackageName, Result<RawCandidateLoadResult, CandidateLoadError>>,
     package_local_fallback_reported: bool,
     pub(in crate::cran::provider) diagnostics: Vec<CranRefreshDiagnostic>,
     pub(in crate::cran::provider) evidence: Rc<RefCell<Vec<CranEvidenceObservation>>>,
@@ -380,7 +379,7 @@ impl AllPackagesSource {
 }
 
 pub(super) struct BulkCandidateResult {
-    pub(super) candidates: CandidateLoadResult,
+    pub(super) candidates: RawCandidateLoadResult,
     pub(super) evidence: Vec<CranEvidenceObservation>,
 }
 

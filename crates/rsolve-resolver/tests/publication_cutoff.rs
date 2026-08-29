@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, DeclaredDependency,
-    DependencyKind, DependencySourceConstraint, NormalizedGitUrl, PackageName, PackageRelease,
-    Provenance, PublicationCutoff, PublicationDate, ReleaseIdentity, ReleaseMetadata,
-    ReleaseObservation, ResolutionRequest, ResolutionTarget, SolverKey, VersionConstraint,
+    CandidateAvailability, CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory,
+    CandidateLoader, DeclaredDependency, DependencyKind, DependencySourceConstraint,
+    NonRepositoryExposure, NormalizedGitUrl, PackageName, PackageRelease, PreparedCandidate,
+    Provenance, PublicationCutoff, PublicationDate, RegistryId, ReleaseIdentity, ReleaseMetadata,
+    ReleaseObservation, RepositoryId, RepositoryOccurrence, RepositoryRank, ResolutionRequest,
+    ResolutionTarget, SolverKey, VersionConstraint,
 };
 use rsolve_resolver::{
     AssignmentDifference, DefaultCandidatePreference, LockUpdatePolicy, PreferLocked,
@@ -15,20 +17,37 @@ struct FixtureLoader {
     candidates: BTreeMap<PackageName, Vec<PackageRelease>>,
 }
 
+fn prepared(release: PackageRelease) -> PreparedCandidate {
+    let occurrence = RepositoryOccurrence::new(
+        RepositoryId::new("cran").unwrap(),
+        RegistryId::new("cran").unwrap(),
+        CandidateAvailability::Available,
+        CandidateCurrentness::Current,
+        RepositoryRank::new(0),
+        release.distributions().to_vec(),
+    )
+    .unwrap();
+    PreparedCandidate::new(release, NonRepositoryExposure::None, vec![occurrence]).unwrap()
+}
+
 impl CandidateLoader for FixtureLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
                 "fixture has no source-qualified candidates",
             ));
         };
-        self.candidates.get(name).cloned().ok_or_else(|| {
-            CandidateLoadError::new(
-                CandidateLoadErrorCategory::NotFound,
-                format!("fixture has no candidates for {name}"),
-            )
-        })
+        self.candidates
+            .get(name)
+            .cloned()
+            .map(|releases| releases.into_iter().map(prepared).collect())
+            .ok_or_else(|| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    format!("fixture has no candidates for {name}"),
+                )
+            })
     }
 }
 

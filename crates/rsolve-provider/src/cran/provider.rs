@@ -8,9 +8,7 @@ use super::history::ArchiveEntry;
 use super::history::CranHistoryError;
 use crate::SnapshotStore;
 #[cfg(test)]
-use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoader, PackageRelease,
-};
+use rsolve_core::{CandidateLoadError, CandidateLoadErrorCategory, PackageRelease};
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]

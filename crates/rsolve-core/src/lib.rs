@@ -16,8 +16,8 @@ mod resolution;
 mod target;
 
 pub use candidates::{
-    CandidateAvailability, CandidateCurrentness, PreparedCandidate, PreparedCandidateError,
-    PreparedCandidateSet, PreparedCandidateSetError, RepositoryOccurrence,
+    CandidateAvailability, CandidateCurrentness, NonRepositoryExposure, PreparedCandidate,
+    PreparedCandidateError, PreparedCandidateSet, PreparedCandidateSetError, RepositoryOccurrence,
     RepositoryOccurrenceError,
 };
 pub use constraints::{

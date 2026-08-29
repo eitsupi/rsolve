@@ -122,10 +122,17 @@ impl RepositoryOccurrence {
 
 /// A validated release together with the repository observations that make it
 /// visible to a source-scoped resolver view.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NonRepositoryExposure {
+    None,
+    ExactOnly,
+    RuntimeInstalled,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedCandidate {
     release: PackageRelease,
-    direct: bool,
+    exposure: NonRepositoryExposure,
     occurrences: Vec<RepositoryOccurrence>,
 }
 
@@ -139,6 +146,7 @@ pub enum PreparedCandidateError {
     DistributionNotInRelease { repository: RepositoryId },
     ReleaseDistributionWithoutOccurrence,
     MissingRepositoryOccurrence,
+    InvalidNonRepositoryExposure,
 }
 
 impl fmt::Display for PreparedCandidateError {
@@ -165,8 +173,12 @@ impl fmt::Display for PreparedCandidateError {
             Self::ReleaseDistributionWithoutOccurrence => formatter.write_str(
                 "prepared release contains a distribution absent from its repository occurrences",
             ),
-            Self::MissingRepositoryOccurrence => formatter
-                .write_str("a non-direct prepared candidate requires a repository occurrence"),
+            Self::MissingRepositoryOccurrence => formatter.write_str(
+                "a repository-backed prepared candidate requires a repository occurrence",
+            ),
+            Self::InvalidNonRepositoryExposure => {
+                formatter.write_str("runtime-installed exposure is only valid for R base packages")
+            }
         }
     }
 }
@@ -188,12 +200,12 @@ impl From<RepositoryOccurrenceError> for PreparedCandidateError {
 impl PreparedCandidate {
     pub fn new(
         release: PackageRelease,
-        direct: bool,
+        exposure: NonRepositoryExposure,
         occurrences: Vec<RepositoryOccurrence>,
     ) -> Result<Self, PreparedCandidateError> {
         let mut candidate = Self {
             release,
-            direct,
+            exposure,
             occurrences,
         };
         candidate.normalize_and_validate()?;
@@ -204,8 +216,8 @@ impl PreparedCandidate {
         &self.release
     }
 
-    pub fn direct(&self) -> bool {
-        self.direct
+    pub fn non_repository_exposure(&self) -> NonRepositoryExposure {
+        self.exposure
     }
 
     pub fn occurrences(&self) -> &[RepositoryOccurrence] {
@@ -257,7 +269,13 @@ impl PreparedCandidate {
         }
         if let SolverKey::Exact(identity) = subject {
             return self.identity() == identity
-                && (self.direct || self.available_occurrences().next().is_some());
+                && (self.exposure != NonRepositoryExposure::None
+                    || self.available_occurrences().next().is_some());
+        }
+        if matches!(self.exposure, NonRepositoryExposure::RuntimeInstalled)
+            && matches!(subject, SolverKey::InstalledName(_))
+        {
+            return true;
         }
         !self.applicable_occurrences(subject).is_empty()
     }
@@ -273,6 +291,20 @@ impl PreparedCandidate {
         self.release.identity()
     }
 
+    /// Returns whether two prepared views contain the same immutable facts.
+    /// Repository occurrences and distributions are included because this is
+    /// intended for callers that have already composed a complete view.
+    pub fn same_facts(&self, other: &Self) -> bool {
+        self.exposure == other.exposure
+            && self.release.identity() == other.release.identity()
+            && self.release.version() == other.release.version()
+            && self.release.metadata() == other.release.metadata()
+            && self.release.publication() == other.release.publication()
+            && self.release.declared_dependencies() == other.release.declared_dependencies()
+            && self.release.distributions() == other.release.distributions()
+            && self.occurrences == other.occurrences
+    }
+
     /// Merges observations of one identity without promoting metadata-only
     /// occurrences or copying distributions between repository entries.
     pub fn merge(mut self, incoming: Self) -> Result<Self, PreparedCandidateError> {
@@ -282,13 +314,27 @@ impl PreparedCandidate {
         self.release
             .merge_consistent(&incoming.release)
             .map_err(map_release_merge_error)?;
-        self.direct |= incoming.direct;
+        self.exposure = match (self.exposure, incoming.exposure) {
+            (NonRepositoryExposure::RuntimeInstalled, _)
+            | (_, NonRepositoryExposure::RuntimeInstalled) => {
+                NonRepositoryExposure::RuntimeInstalled
+            }
+            (NonRepositoryExposure::ExactOnly, _) | (_, NonRepositoryExposure::ExactOnly) => {
+                NonRepositoryExposure::ExactOnly
+            }
+            _ => NonRepositoryExposure::None,
+        };
         self.occurrences.extend(incoming.occurrences);
         self.normalize_and_validate()?;
         Ok(self)
     }
 
     fn normalize_and_validate(&mut self) -> Result<(), PreparedCandidateError> {
+        if self.exposure == NonRepositoryExposure::RuntimeInstalled
+            && !self.release.is_r_base_package()
+        {
+            return Err(PreparedCandidateError::InvalidNonRepositoryExposure);
+        }
         self.occurrences.sort_by(|left, right| {
             left.repository
                 .cmp(&right.repository)
@@ -327,7 +373,7 @@ impl PreparedCandidate {
         });
         self.occurrences = normalized;
 
-        if !self.direct && self.occurrences.is_empty() {
+        if self.exposure == NonRepositoryExposure::None && self.occurrences.is_empty() {
             return Err(PreparedCandidateError::MissingRepositoryOccurrence);
         }
 
@@ -346,7 +392,7 @@ impl PreparedCandidate {
                 });
             }
         }
-        if !self.direct
+        if self.exposure == NonRepositoryExposure::None
             && self.release.distributions().iter().any(|distribution| {
                 !occurrence_distributions
                     .clone()

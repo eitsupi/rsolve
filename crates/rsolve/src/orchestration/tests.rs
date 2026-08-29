@@ -2,11 +2,12 @@ use super::*;
 use crate::manifest::{Endpoint, RegistrySpec, RepositorySpec};
 use crate::{LockedPackage, LockedResolution};
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult, CandidateLoader,
-    DeclaredDependency, DependencyKind, DependencySourceConstraint, GitCommitId, NormalizedGitUrl,
-    PackageName, PackageNamespace, PackageRelease, Provenance, RPackageVersion, ReleaseIdentity,
-    ReleaseMetadata, ReleaseObservation, RepositoryId, ResolutionTarget, Sha256Digest, SolverKey,
-    SourceScheme, VersionConstraint,
+    CandidateAvailability, CandidateCurrentness, CandidateLoadError, CandidateLoadErrorCategory,
+    CandidateLoadResult, CandidateLoader, DeclaredDependency, DependencyKind,
+    DependencySourceConstraint, GitCommitId, NormalizedGitUrl, PackageName, PackageNamespace,
+    PackageRelease, PreparedCandidate, Provenance, RPackageVersion, RegistryId, ReleaseIdentity,
+    ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence, ResolutionTarget,
+    Sha256Digest, SolverKey, SourceScheme, VersionConstraint,
 };
 use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_resolver::R_BASE_PACKAGE_NAMES;
@@ -24,8 +25,26 @@ struct TidyverseFixtureLoader {
     quarantined: BTreeMap<PackageName, Vec<RPackageVersion>>,
 }
 
+fn prepared(release: PackageRelease) -> PreparedCandidate {
+    let occurrence = RepositoryOccurrence::new(
+        RepositoryId::new("cran").unwrap(),
+        RegistryId::new("cran").unwrap(),
+        CandidateAvailability::Available,
+        CandidateCurrentness::Current,
+        rsolve_core::RepositoryRank::new(0),
+        release.distributions().to_vec(),
+    )
+    .unwrap();
+    PreparedCandidate::new(
+        release,
+        rsolve_core::NonRepositoryExposure::None,
+        vec![occurrence],
+    )
+    .unwrap()
+}
+
 impl CandidateLoader for TidyverseFixtureLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         let result = self.load(package)?;
         if result.candidates().is_empty() && !result.quarantined().is_empty() {
             return Err(CandidateLoadError::new(
@@ -59,7 +78,10 @@ impl CandidateLoader for TidyverseFixtureLoader {
                 rsolve_core::QuarantinedCandidate::new(version, "invalid CRAN archive release")
             })
             .collect();
-        Ok(CandidateLoadResult::new(candidates, quarantined))
+        Ok(CandidateLoadResult::new(
+            candidates.into_iter().map(prepared).collect(),
+            quarantined,
+        ))
     }
 }
 
@@ -194,7 +216,7 @@ struct ChoiceLoader {
 }
 
 impl CandidateLoader for ChoiceLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         match package {
             SolverKey::InstalledName(name)
                 if self
@@ -207,6 +229,7 @@ impl CandidateLoader for ChoiceLoader {
                     .iter()
                     .filter(|release| release.identity().name() == name)
                     .cloned()
+                    .map(prepared)
                     .collect())
             }
             SolverKey::InstalledName(_) | SolverKey::R => Ok(Vec::new()),
@@ -219,10 +242,10 @@ impl CandidateLoader for ChoiceLoader {
 }
 
 impl CandidateLoader for FixtureLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         match package {
             SolverKey::InstalledName(name) if name == self.package.identity().name() => {
-                Ok(vec![self.package.clone()])
+                Ok(vec![prepared(self.package.clone())])
             }
             SolverKey::InstalledName(_) => Ok(Vec::new()),
             SolverKey::R => Ok(Vec::new()),
@@ -235,7 +258,7 @@ impl CandidateLoader for FixtureLoader {
 }
 
 impl CandidateLoader for QuarantinedFixtureLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         FixtureLoader {
             package: self.package.clone(),
         }
@@ -510,6 +533,7 @@ fn lock_boundary_uses_prefer_fallback_and_require_exact_policy() {
             SolverKey::InstalledName(name.clone()),
             old,
             Vec::new(),
+            Vec::new(),
         )],
     );
     let environment = EnvironmentId::new("default").unwrap();
@@ -562,10 +586,12 @@ fn prefer_policy_updates_a_changed_root_without_consume_precondition() {
                 SolverKey::InstalledName(root.clone()),
                 old_root,
                 Vec::new(),
+                Vec::new(),
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(dependency),
                 old_dependency,
+                Vec::new(),
                 Vec::new(),
             ),
         ],
@@ -619,6 +645,7 @@ fn require_exact_rejects_new_transitive_identity_from_upstream_metadata() {
             SolverKey::InstalledName(root.clone()),
             release_at_version(&root, "1.0.0"),
             Vec::new(),
+            Vec::new(),
         )],
     );
     let environment = EnvironmentId::new("default").unwrap();
@@ -666,6 +693,7 @@ fn require_exact_identity_mismatch_diagnostics_are_order_independent() {
             vec![rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(root.clone()),
                 release_at_version(&root, "1.0.0"),
+                Vec::new(),
                 Vec::new(),
             )],
         ),
@@ -805,6 +833,30 @@ fn require_exact_treats_trailing_zero_versions_as_semantically_equal() {
 }
 
 #[test]
+fn repository_loader_routes_source_qualified_lookups_without_provider_keys() {
+    let package = PackageName::new("fixture").unwrap();
+    let snapshot = CranCandidateSnapshot::from_candidates([(
+        package.clone(),
+        vec![release_with_dependencies(&package, Vec::new())],
+    )]);
+    let loader = cran_snapshot_loader(&snapshot);
+    let matching = loader
+        .releases(&SolverKey::Repository {
+            repository: RepositoryId::new("cran").unwrap(),
+            name: package.clone(),
+        })
+        .unwrap();
+    assert_eq!(matching.len(), 1);
+    let mismatching = loader
+        .releases(&SolverKey::Repository {
+            repository: RepositoryId::new("other").unwrap(),
+            name: package,
+        })
+        .unwrap();
+    assert!(mismatching.is_empty());
+}
+
+#[test]
 fn source_qualified_not_found_is_propagated_without_refresh_retry() {
     let root = PackageName::new("fixture").unwrap();
     let dependency = PackageName::new("fixture.registry").unwrap();
@@ -823,7 +875,8 @@ fn source_qualified_not_found_is_propagated_without_refresh_retry() {
         ],
     );
     let initial = CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]);
-    let error = resolve_with_loader(manifest_for(root), &initial).unwrap_err();
+    let initial_loader = cran_snapshot_loader(&initial);
+    let error = resolve_with_loader(manifest_for(root), &initial_loader).unwrap_err();
     assert!(matches!(
         error,
         CranResolutionError::Resolution(ResolutionFailure::CandidateLoad {
@@ -848,7 +901,9 @@ fn r_base_overlay_shadows_cran_base_names_but_not_matrix() {
             vec![release_with_dependencies(&matrix, Vec::new())],
         ),
     ]);
-    let overlay = RBasePackageOverlay::new(CandidateLoaderRef(&cran), target.clone()).unwrap();
+    let cran_loader = cran_snapshot_loader(&cran);
+    let overlay =
+        RBasePackageOverlay::new(CandidateLoaderRef(&cran_loader), target.clone()).unwrap();
     assert_eq!(R_BASE_PACKAGE_NAMES.len(), 14);
     assert_eq!(
         R_BASE_PACKAGE_NAMES
@@ -862,10 +917,14 @@ fn r_base_overlay_shadows_cran_base_names_but_not_matrix() {
         .releases(&SolverKey::InstalledName(methods.clone()))
         .unwrap();
     assert_eq!(base_release.len(), 1);
-    assert!(base_release[0].is_r_base_package());
-    assert_eq!(base_release[0].version(), &target);
+    assert!(base_release[0].release().is_r_base_package());
+    assert_eq!(base_release[0].release().version(), &target);
     assert!(!cran.needs_refresh(&SolverKey::InstalledName(methods)));
-    assert!(!overlay.releases(&SolverKey::InstalledName(matrix)).unwrap()[0].is_r_base_package());
+    assert!(
+        !overlay.releases(&SolverKey::InstalledName(matrix)).unwrap()[0]
+            .release()
+            .is_r_base_package()
+    );
     let empty = CranCandidateSnapshot::from_candidates([]);
     assert!(empty.needs_refresh(&SolverKey::InstalledName(
         PackageName::new("Matrix").unwrap()
@@ -889,11 +948,9 @@ fn methods_dependency_uses_target_r_base_without_refresh_or_resolution_output() 
             .unwrap(),
         ],
     );
-    let resolution = resolve_with_loader(
-        manifest_for(root.clone()),
-        &CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]),
-    )
-    .unwrap();
+    let snapshot = CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]);
+    let loader = cran_snapshot_loader(&snapshot);
+    let resolution = resolve_with_loader(manifest_for(root.clone()), &loader).unwrap();
     assert!(resolution.selected(&root).is_some());
     assert!(resolution.selected(&methods).is_none());
 }
@@ -917,11 +974,9 @@ fn incompatible_methods_constraint_is_no_solution_without_refresh() {
             .unwrap(),
         ],
     );
-    let error = resolve_with_loader(
-        manifest_for(root.clone()),
-        &CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]),
-    )
-    .unwrap_err();
+    let snapshot = CranCandidateSnapshot::from_candidates([(root.clone(), vec![root_release])]);
+    let loader = cran_snapshot_loader(&snapshot);
+    let error = resolve_with_loader(manifest_for(root.clone()), &loader).unwrap_err();
     assert!(matches!(
         error,
         CranResolutionError::Resolution(ResolutionFailure::NoSolution { .. })

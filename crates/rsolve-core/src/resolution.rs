@@ -2,8 +2,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    PackageName, PackageRelease, RPackageVersion, ResolutionTarget, ResolvedDependencyEdge,
-    SolverKey,
+    PackageName, PackageRelease, PreparedCandidate, RPackageVersion, ResolutionTarget,
+    ResolvedDependencyEdge, SolverKey,
 };
 
 /// The stable categories a candidate source may report to the resolver.
@@ -82,19 +82,19 @@ impl QuarantinedCandidate {
 /// The provider-neutral result of loading one solver subject's candidates.
 #[derive(Clone, Debug)]
 pub struct CandidateLoadResult {
-    candidates: Vec<PackageRelease>,
+    candidates: Vec<PreparedCandidate>,
     quarantined: Vec<QuarantinedCandidate>,
 }
 
 impl CandidateLoadResult {
-    pub fn new(candidates: Vec<PackageRelease>, quarantined: Vec<QuarantinedCandidate>) -> Self {
+    pub fn new(candidates: Vec<PreparedCandidate>, quarantined: Vec<QuarantinedCandidate>) -> Self {
         Self {
             candidates,
             quarantined,
         }
     }
 
-    pub fn candidates(&self) -> &[PackageRelease] {
+    pub fn candidates(&self) -> &[PreparedCandidate] {
         &self.candidates
     }
 
@@ -102,16 +102,20 @@ impl CandidateLoadResult {
         &self.quarantined
     }
 
-    pub fn into_parts(self) -> (Vec<PackageRelease>, Vec<QuarantinedCandidate>) {
+    pub fn into_parts(self) -> (Vec<PreparedCandidate>, Vec<QuarantinedCandidate>) {
         (self.candidates, self.quarantined)
     }
 }
 
-/// The resolver's candidate-loading port.  Implementations own their catalog
-/// and any provider-specific conversion; the solver only sees validated
-/// domain releases.
+/// The resolver's candidate-loading port.
+///
+/// Implementations own provider conversion and must return immutable,
+/// fully-prepared candidate views.  Repository occurrences, currentness,
+/// publication facts, distributions, and logical release metadata are final
+/// before the solver sees a candidate; the solver may validate identity
+/// consistency but must not enrich or mutate these facts while solving.
 pub trait CandidateLoader {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError>;
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError>;
 
     /// Loads validated candidates together with coordinates that were
     /// deliberately quarantined by the provider.  Existing loaders that have
@@ -128,6 +132,7 @@ pub struct ResolvedPackage {
     subject: SolverKey,
     release: PackageRelease,
     effective_dependencies: Vec<ResolvedDependencyEdge>,
+    visible_repository_ids: Vec<crate::RepositoryId>,
 }
 
 impl ResolvedPackage {
@@ -151,6 +156,13 @@ impl ResolvedPackage {
         &self.effective_dependencies
     }
 
+    /// Repository identities that made the selected release visible in the
+    /// selected subject. Artifact distributions are intentionally separate
+    /// evidence and are exposed through `distributions()`.
+    pub fn visible_repository_ids(&self) -> &[crate::RepositoryId] {
+        &self.visible_repository_ids
+    }
+
     pub fn distributions(&self) -> &[crate::Distribution] {
         self.release.distributions()
     }
@@ -172,11 +184,13 @@ impl ResolvedPackage {
         subject: SolverKey,
         release: PackageRelease,
         effective_dependencies: Vec<ResolvedDependencyEdge>,
+        visible_repository_ids: Vec<crate::RepositoryId>,
     ) -> Self {
         Self {
             subject,
             release,
             effective_dependencies,
+            visible_repository_ids,
         }
     }
 }
@@ -267,6 +281,7 @@ mod tests {
                 )
                 .unwrap(),
             }],
+            Vec::new(),
         );
         assert_eq!(resolved.effective_dependencies().len(), 1);
         assert_eq!(

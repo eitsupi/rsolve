@@ -229,10 +229,12 @@ pub(in crate::cran::provider::tests) fn all_semantic_invalid_archive_index() -> 
     encoder.finish().unwrap()
 }
 
-pub(in crate::cran::provider::tests) fn release_signature(
-    releases: &[PackageRelease],
-) -> Vec<String> {
+pub(in crate::cran::provider::tests) fn release_signature<R>(releases: R) -> Vec<String>
+where
+    R: AsRef<[PackageRelease]>,
+{
     releases
+        .as_ref()
         .iter()
         .map(|release| release.version().to_string())
         .collect()

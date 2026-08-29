@@ -19,10 +19,10 @@ use redb::{
     ReadableTableMetadata, TableDefinition,
 };
 use rsolve_core::{
-    Artifact, ArtifactLocator, CandidateLoadError, CandidateLoadErrorCategory, CandidateLoadResult,
-    CandidateLoader, DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
-    DistributionChannel, DistributionMetadata, PackageName, PackageNamespace, PackageRelease,
-    Provenance, PublicationDate, QuarantinedCandidate, RPackageVersion, RegistryId, RelationOp,
+    Artifact, ArtifactLocator, CandidateLoadError, CandidateLoadErrorCategory, DeclaredDependency,
+    DependencyKind, DependencySourceConstraint, Distribution, DistributionChannel,
+    DistributionMetadata, PackageName, PackageNamespace, PackageRelease, Provenance,
+    PublicationDate, QuarantinedCandidate, RPackageVersion, RegistryId, RelationOp,
     ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ReleasePublication, Sha256Digest,
     SnapshotId, SolverKey, SourceArtifact, UpstreamChecksum, VersionClause, VersionConstraint,
 };

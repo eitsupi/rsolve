@@ -143,7 +143,7 @@ mod tests {
         inspect_cran_snapshot_cache,
     };
     use crate::snapshot::SnapshotGenerationBuilder;
-    use rsolve_core::{CandidateLoader, PackageName, PackageRelease, RegistryId, SolverKey};
+    use rsolve_core::{PackageName, PackageRelease, RegistryId, SolverKey};
     use tempfile::tempdir;
 
     fn observations_from_endpoint(endpoint: &str) -> Vec<CranEvidenceObservation> {

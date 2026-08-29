@@ -3,13 +3,16 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    CandidateLoadError, CandidateLoadResult, CandidateLoader, PackageRelease, PublicationCutoff,
-    PublicationDate, Resolution, SolverKey,
+    CandidateAvailability, CandidateLoadError, CandidateLoadResult, CandidateLoader,
+    PreparedCandidate, PublicationCutoff, PublicationDate, RegistryId, RepositoryId,
+    RepositoryOccurrence, RepositoryRank, Resolution, SolverKey,
 };
+use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_provider::cran::{
     CranRefreshDiagnostic, CranSnapshotCacheDiagnostic, CranSnapshotPublishError,
     CranSnapshotRefresherError,
 };
+use rsolve_provider::{RawCandidateLoadResult, ReadOnlySnapshotCandidateLoader};
 use rsolve_provider::{SnapshotStore, SnapshotStoreError};
 use rsolve_resolver::{
     DefaultCandidatePreference, PreferLocked, RBasePackageOverlay, RequireLocked,
@@ -22,6 +25,150 @@ use crate::metrics::{Phase, Recorder, ResolutionMetrics};
 use std::io;
 use tempfile::tempdir;
 
+/// Provider observations are deliberately adapted to resolver candidates only
+/// after the consumer has supplied repository provenance. Providers do not
+/// invent repository identifiers or ranks.
+pub(crate) trait RawCandidateLoader {
+    fn load_raw(&self, package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError>;
+
+    #[cfg(test)]
+    fn contains_package(&self, _package: &rsolve_core::PackageName) -> bool {
+        false
+    }
+}
+
+impl RawCandidateLoader for CranCandidateSnapshot {
+    fn load_raw(&self, package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
+        self.load(package)
+    }
+
+    #[cfg(test)]
+    fn contains_package(&self, package: &rsolve_core::PackageName) -> bool {
+        self.contains_package(package)
+    }
+}
+
+impl RawCandidateLoader for ReadOnlySnapshotCandidateLoader {
+    fn load_raw(&self, package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
+        self.load(package)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RepositoryCandidateLoader<L: RawCandidateLoader> {
+    raw: L,
+    repository: RepositoryId,
+    registry: RegistryId,
+    rank: RepositoryRank,
+}
+
+#[cfg(test)]
+pub(crate) fn cran_snapshot_loader(
+    snapshot: &CranCandidateSnapshot,
+) -> RepositoryCandidateLoader<&CranCandidateSnapshot> {
+    RepositoryCandidateLoader::new(
+        snapshot,
+        RepositoryId::new("cran").expect("the built-in CRAN repository id is valid"),
+        RegistryId::new("cran").expect("the test CRAN registry id is valid"),
+        RepositoryRank::new(0),
+    )
+}
+
+impl<L: RawCandidateLoader> RepositoryCandidateLoader<L> {
+    pub(crate) fn new(
+        raw: L,
+        repository: RepositoryId,
+        registry: RegistryId,
+        rank: RepositoryRank,
+    ) -> Self {
+        Self {
+            raw,
+            repository,
+            registry,
+            rank,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_package(&self, package: &rsolve_core::PackageName) -> bool {
+        self.raw.contains_package(package)
+    }
+}
+
+impl<T: RawCandidateLoader + ?Sized> RawCandidateLoader for &T {
+    fn load_raw(&self, package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
+        (*self).load_raw(package)
+    }
+
+    #[cfg(test)]
+    fn contains_package(&self, package: &rsolve_core::PackageName) -> bool {
+        (*self).contains_package(package)
+    }
+}
+
+impl<L: RawCandidateLoader> CandidateLoader for RepositoryCandidateLoader<L> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
+        let result = self.load(package)?;
+        Ok(result.into_parts().0)
+    }
+
+    fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
+        let lookup = match package {
+            SolverKey::InstalledName(name) => SolverKey::InstalledName(name.clone()),
+            SolverKey::Repository { repository, name } => {
+                if repository != &self.repository {
+                    return Ok(CandidateLoadResult::new(Vec::new(), Vec::new()));
+                }
+                SolverKey::InstalledName(name.clone())
+            }
+            SolverKey::Registry { name, .. } | SolverKey::Bioconductor { name, .. } => {
+                SolverKey::InstalledName(name.clone())
+            }
+            SolverKey::Exact(identity) => SolverKey::InstalledName(identity.name().clone()),
+            SolverKey::R => {
+                return Ok(CandidateLoadResult::new(Vec::new(), Vec::new()));
+            }
+        };
+        let raw = self.raw.load_raw(&lookup)?;
+        let (observations, quarantined) = raw.into_parts();
+        let candidates = observations
+            .into_iter()
+            .map(|observation| {
+                let occurrence = RepositoryOccurrence::new(
+                    self.repository.clone(),
+                    self.registry.clone(),
+                    CandidateAvailability::Available,
+                    observation.currentness(),
+                    self.rank,
+                    observation.release().distributions().to_vec(),
+                )
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        rsolve_core::CandidateLoadErrorCategory::MetadataInvalid,
+                        format!("invalid provider occurrence: {error}"),
+                    )
+                })?;
+                PreparedCandidate::new(
+                    observation.release().clone(),
+                    rsolve_core::NonRepositoryExposure::None,
+                    vec![occurrence],
+                )
+                .map_err(|error| {
+                    CandidateLoadError::new(
+                        rsolve_core::CandidateLoadErrorCategory::MetadataInvalid,
+                        format!("invalid prepared candidate: {error}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let candidates = candidates
+            .into_iter()
+            .filter(|candidate| candidate.is_eligible_for(package))
+            .collect();
+        Ok(CandidateLoadResult::new(candidates, quarantined))
+    }
+}
+
 #[cfg(test)]
 pub(crate) use crate::prepared_snapshot::collect_cran_dependency_closure;
 pub(crate) use crate::prepared_snapshot::{cran_registry_id, resolve_from_cran_with_store};
@@ -29,7 +176,7 @@ pub(crate) use crate::prepared_snapshot::{cran_registry_id, resolve_from_cran_wi
 pub(super) struct CandidateLoaderRef<'a>(pub(super) &'a dyn CandidateLoader);
 
 impl CandidateLoader for CandidateLoaderRef<'_> {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         self.0.releases(package)
     }
 
@@ -44,7 +191,7 @@ pub(super) struct MeasuredCandidateLoaderRef<'a> {
 }
 
 impl CandidateLoader for MeasuredCandidateLoaderRef<'_> {
-    fn releases(&self, package: &SolverKey) -> Result<Vec<PackageRelease>, CandidateLoadError> {
+    fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         self.metrics.measure(Phase::PreparedLoaderLookup, || {
             self.metrics.observe_lookup(package);
             self.loader.releases(package)
