@@ -309,7 +309,7 @@ fn unknown_and_machine_local_fields_are_rejected_and_not_emitted() {
 }
 
 #[test]
-fn non_default_environment_cannot_be_silently_dropped() {
+fn non_default_environment_round_trips_without_being_dropped() {
     let lock = Lockfile::new(vec![LockedResolution {
         target: rsolve_core::ResolutionTarget::new(version("4.4")),
         environment: EnvironmentId::new("other").unwrap(),
@@ -317,10 +317,9 @@ fn non_default_environment_cannot_be_silently_dropped() {
         packages: Vec::new(),
     }])
     .unwrap();
-    assert!(matches!(
-        to_toml(&lock),
-        Err(LockWireError::InvalidField { field, .. }) if field == "environment"
-    ));
+    let text = to_toml(&lock).unwrap();
+    assert!(text.contains("environment = \"other\""));
+    assert_eq!(from_toml(&text).unwrap(), lock);
 }
 
 #[test]

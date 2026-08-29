@@ -12,10 +12,10 @@ use std::rc::Rc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 
-use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
+use rsolve_core::{PackageName, PublicationDate, RPackageVersion, RegistryId, VersionConstraint};
 
 use crate::filesystem::ExistingPathIdentity;
-use crate::manifest::{Endpoint, ManifestError};
+use crate::manifest::{ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, load_manifest};
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::ResolutionMetrics;
 use crate::orchestration::cran_registry_id;
@@ -49,12 +49,18 @@ pub struct LockCommand {
     /// Exact target R version.
     #[arg(long, value_name = "EXACT")]
     pub r_version: String,
+    /// Path to a manifest. If omitted, discover the nearest rsolve.toml.
+    #[arg(long, conflicts_with = "package")]
+    pub manifest: Option<PathBuf>,
+    /// Select a named manifest environment.
+    #[arg(long, conflicts_with = "package", value_name = "NAME")]
+    pub environment: Option<String>,
     /// One direct package name. Repeat this flag for multiple packages.
-    #[arg(long, value_name = "NAME", action = clap::ArgAction::Append, required = true)]
+    #[arg(long, value_name = "NAME", action = clap::ArgAction::Append)]
     pub package: Vec<String>,
     /// CRAN mirror base URL.
-    #[arg(long, default_value = DEFAULT_CRAN_MIRROR)]
-    pub cran_mirror: String,
+    #[arg(long, value_name = "URL")]
+    pub cran_mirror: Option<String>,
     /// Fixed publication cutoff in YYYY-MM-DD form.
     #[arg(long)]
     pub publication_cutoff: Option<String>,
@@ -142,6 +148,19 @@ trait ResolutionBackend {
             refresh_metadata,
         )
     }
+
+    fn resolve_composed(
+        &self,
+        _composed: ComposedEnvironment,
+        _metadata_cache: &MetadataCache,
+        _offline: bool,
+        _refresh_metadata: bool,
+        _progress: Option<ProgressCallback>,
+    ) -> Result<ResolvedData, CliError> {
+        Err(CliError::Operational(
+            "manifest-backed resolution is unavailable for this backend".into(),
+        ))
+    }
 }
 
 struct CranBackend;
@@ -225,6 +244,85 @@ impl ResolutionBackend for CranBackend {
                     progress,
                 )
             }
+        }
+        .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
+        let warnings: Vec<String> = outcome
+            .diagnostics()
+            .iter()
+            .filter_map(|diagnostic| match diagnostic.status_detail() {
+                rsolve_provider::cran::CranFastPathStatus::Available => None,
+                status => Some(format!(
+                    "CRAN refresh diagnostic at {}: {status:?}",
+                    diagnostic.endpoint()
+                )),
+            })
+            .collect();
+        let mut warnings = warnings;
+        warnings.extend(render_cache_warnings(outcome.cache_diagnostics()));
+        Ok(ResolvedData {
+            resolution: outcome.resolution().clone(),
+            warnings,
+            metrics: outcome.metrics().clone(),
+        })
+    }
+
+    fn resolve_composed(
+        &self,
+        composed: ComposedEnvironment,
+        metadata_cache: &MetadataCache,
+        offline: bool,
+        refresh_metadata: bool,
+        progress: Option<ProgressCallback>,
+    ) -> Result<ResolvedData, CliError> {
+        // Validate all manifest-only constraints before opening the provider
+        // cache or attempting network access.
+        composed
+            .clone()
+            .into_resolution_request()
+            .map_err(|error| value_error(format!("invalid manifest environment: {error}")))?;
+        if composed.repositories.len() > 1
+            || (composed.repositories.len() == 1
+                && !matches!(composed.repositories[0].registry(), RegistrySpec::Cran))
+            || (composed.repositories.is_empty()
+                && composed.roots.iter().any(|root| {
+                    root.name.as_str() != "R"
+                        && !rsolve_resolver::is_r_base_package_name(&root.name)
+                }))
+        {
+            return Err(value_error(
+                "manifest must configure exactly one repository with registry = \"cran\" for remote roots"
+                    .into(),
+            ));
+        }
+        let registry_id = composed
+            .repositories
+            .first()
+            .map(|repository| repository.configured_registry_id())
+            .transpose()
+            .map_err(|error| value_error(format!("invalid manifest repository: {error}")))?
+            .unwrap_or_else(|| RegistryId::new("cran").expect("cran is a valid registry ID"));
+        let store = metadata_cache
+            .open_store(registry_id)
+            .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
+        let outcome = if offline {
+            crate::prepared_snapshot::resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
+                composed,
+                &store,
+                CranSnapshotCachePolicy::default(),
+                progress,
+            )
+        } else {
+            let policy = if refresh_metadata {
+                CranSnapshotCachePolicy::default().with_refresh_metadata()
+            } else {
+                CranSnapshotCachePolicy::default()
+            };
+            crate::prepared_snapshot::resolve_composed_from_cran_with_store_at_policy_with_progress(
+                composed,
+                &store,
+                policy,
+                progress,
+            )
         }
         .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
         let warnings: Vec<String> = outcome
@@ -376,6 +474,9 @@ fn run_lock_with_backend_progress(
 ) -> Result<CommandResult, CliError> {
     let target_r = RPackageVersion::parse(&command.r_version)
         .map_err(|error| value_error(format!("invalid --r-version: {error}")))?;
+    if command.manifest.is_some() || command.package.is_empty() {
+        return run_manifest_lock_with_backend_progress(command, target_r, backend, progress);
+    }
     let package_names = command
         .package
         .iter()
@@ -390,7 +491,12 @@ fn run_lock_with_backend_progress(
         .map(PublicationDate::parse)
         .transpose()
         .map_err(|error| value_error(format!("invalid --publication-cutoff: {error}")))?;
-    let mirror = canonical_mirror(&command.cran_mirror)?;
+    let mirror = canonical_mirror(
+        command
+            .cran_mirror
+            .as_deref()
+            .unwrap_or(DEFAULT_CRAN_MIRROR),
+    )?;
     validate_output_path(&command.output)?;
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
@@ -508,6 +614,216 @@ fn run_lock_with_backend_progress(
         warnings: resolved.warnings,
         metrics,
     })
+}
+
+fn run_manifest_lock_with_backend_progress(
+    command: LockCommand,
+    target_r: RPackageVersion,
+    backend: &dyn ResolutionBackend,
+    progress: Option<ProgressCallback>,
+) -> Result<CommandResult, CliError> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        CliError::Operational(format!("cannot determine current directory: {error}"))
+    })?;
+    let environment_variable = environment_variable_for(command.environment.as_deref(), || {
+        std::env::var("RSOLVE_ENVIRONMENT")
+    })?;
+    run_manifest_lock_with_backend_progress_at(
+        command,
+        target_r,
+        backend,
+        progress,
+        &cwd,
+        environment_variable.as_deref(),
+    )
+}
+
+fn run_manifest_lock_with_backend_progress_at(
+    command: LockCommand,
+    target_r: RPackageVersion,
+    backend: &dyn ResolutionBackend,
+    progress: Option<ProgressCallback>,
+    cwd: &Path,
+    environment_variable: Option<&str>,
+) -> Result<CommandResult, CliError> {
+    if command.cran_mirror.is_some() {
+        return Err(value_error(
+            "--cran-mirror cannot be combined with manifest-backed resolution".into(),
+        ));
+    }
+    if command.publication_cutoff.is_some() {
+        return Err(value_error(
+            "--publication-cutoff cannot be combined with --manifest; use resolution.published-before"
+                .into(),
+        ));
+    }
+    let (manifest_path, document) =
+        load_manifest(command.manifest.as_deref(), cwd).map_err(|error| {
+            let source = command
+                .manifest
+                .as_deref()
+                .map(|path| format!("--manifest {}", path.display()))
+                .unwrap_or_else(|| format!("cwd {}", cwd.display()));
+            value_error(format!("manifest selection ({source}) failed: {error}"))
+        })?;
+    let (environment_name, environment_source) =
+        select_environment(command.environment.as_deref(), environment_variable);
+    let composed = document
+        .compose_environment(
+            environment_name,
+            rsolve_core::ResolutionTarget::new(target_r),
+        )
+        .map_err(|error| {
+            value_error(format!(
+                "environment selection ({environment_source}={environment_name:?}) failed: {error}"
+            ))
+        })?;
+    // Direct sources are not acquired by this slice. Check them before any
+    // cache setup or provider operation so unsupported input fails closed.
+    composed
+        .clone()
+        .into_resolution_request()
+        .map_err(|error| value_error(format!("manifest composition failed: {error}")))?;
+    validate_output_path(&command.output)?;
+    if let Some(metrics_output) = &command.metrics_output {
+        validate_output_path(metrics_output)?;
+        if destination_paths_equal(&command.output, metrics_output)?
+            || existing_destinations_share_identity(&command.output, metrics_output)?
+        {
+            return Err(CliError::Value(
+                "--metrics-output must differ from --output".into(),
+            ));
+        }
+    }
+    if composed.repositories.len() > 1
+        || (composed.repositories.len() == 1
+            && !matches!(composed.repositories[0].registry(), RegistrySpec::Cran))
+        || (composed.repositories.is_empty()
+            && composed.roots.iter().any(|root| {
+                root.name.as_str() != "R" && !rsolve_resolver::is_r_base_package_name(&root.name)
+            }))
+    {
+        return Err(value_error(
+            "manifest must configure exactly one repository with registry = \"cran\" for remote roots"
+                .into(),
+        ));
+    }
+    let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
+        .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
+    let resolved = backend.resolve_composed(
+        composed.clone(),
+        &metadata_cache,
+        command.offline,
+        command.refresh_metadata,
+        progress,
+    )?;
+    if command.metrics_output.is_some() && resolved.metrics.metrics_overflow {
+        return Err(CliError::Operational(
+            "metrics overflow; refusing to write report".into(),
+        ));
+    }
+    let projection_started = Instant::now();
+    let lock = Lockfile::from_resolution_with_publication_cutoff(
+        &resolved.resolution,
+        composed.environment.clone(),
+        composed.published_before,
+    )
+    .map_err(|error| CliError::Operational(format!("lock projection failed: {error}")))?;
+    let projection_ns = elapsed_ns(projection_started)?;
+    let serialization_started = Instant::now();
+    let serialized = to_toml(&lock)
+        .map_err(|error| CliError::Operational(format!("lock serialization failed: {error}")))?;
+    let serialization_ns = elapsed_ns(serialization_started)?;
+    let round_trip_started = Instant::now();
+    let reparsed = from_toml(&serialized)
+        .map_err(|error| CliError::Operational(format!("lock round-trip failed: {error}")))?;
+    if reparsed != lock {
+        return Err(CliError::Operational(
+            "lock round-trip changed the logical lock domain".into(),
+        ));
+    }
+    let round_trip_ns = elapsed_ns(round_trip_started)?;
+    let reserialization_started = Instant::now();
+    let bytes = to_toml(&reparsed)
+        .map_err(|error| CliError::Operational(format!("lock re-serialization failed: {error}")))?;
+    let reserialization_ns = elapsed_ns(reserialization_started)?;
+    let write_started = Instant::now();
+    let changed = write_lockfile(&command.output, bytes.as_bytes())?;
+    let write_ns = elapsed_ns(write_started)?;
+    let lock_identity = if command.metrics_output.is_some() {
+        Some(lock_output_identity(&command.output)?)
+    } else {
+        None
+    };
+    let mut metrics = resolved.metrics;
+    metrics.phases.lock_projection_ns = Some(projection_ns);
+    metrics.phases.lock_serialization_ns = Some(
+        serialization_ns
+            .checked_add(reserialization_ns)
+            .ok_or_else(|| CliError::Operational("metrics overflow".into()))?,
+    );
+    metrics.phases.lock_round_trip_ns = Some(round_trip_ns);
+    metrics.phases.atomic_lock_write_ns = changed.then_some(write_ns);
+    if let Some(path) = command.metrics_output {
+        let report_identity = path_identity(&path, "metrics output")?;
+        if same_existing_identity(lock_identity.as_ref(), report_identity.as_ref()) {
+            return Err(CliError::Value(
+                "--metrics-output must differ from --output".into(),
+            ));
+        }
+        let report = MetricsSuccessReport {
+            schema_version: 1,
+            metrics: metrics.clone(),
+            lock_byte_count: u64::try_from(bytes.len())
+                .map_err(|_| CliError::Operational("lock byte count overflow".into()))?,
+        };
+        let encoded = serde_json::to_vec_pretty(&report).map_err(|error| {
+            CliError::Operational(format!("metrics report serialization failed: {error}"))
+        })?;
+        write_report(&path, &encoded)?;
+    }
+    let status = if changed { "updated" } else { "up-to-date" };
+    Ok(CommandResult {
+        summary: format!(
+            "target R {}; environment {} ({environment_source}); manifest {}; output {}; {}",
+            command.r_version,
+            composed.environment,
+            manifest_path.display(),
+            command.output.display(),
+            status
+        ),
+        warnings: resolved.warnings,
+        metrics,
+    })
+}
+
+fn select_environment<'a>(
+    explicit: Option<&'a str>,
+    variable: Option<&'a str>,
+) -> (&'a str, &'static str) {
+    if let Some(value) = explicit {
+        (value, "--environment")
+    } else if let Some(value) = variable {
+        (value, "RSOLVE_ENVIRONMENT")
+    } else {
+        ("default", "default")
+    }
+}
+
+fn environment_variable_for<F>(explicit: Option<&str>, read: F) -> Result<Option<String>, CliError>
+where
+    F: FnOnce() -> Result<String, std::env::VarError>,
+{
+    if explicit.is_some() {
+        return Ok(None);
+    }
+    match read() {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(value_error(
+            "RSOLVE_ENVIRONMENT is not valid UTF-8; refusing environment fallback".into(),
+        )),
+    }
 }
 
 fn elapsed_ns(started: Instant) -> Result<u64, CliError> {

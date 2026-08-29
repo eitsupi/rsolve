@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use crate::Manifest;
-use crate::manifest::{Endpoint, ManifestError, RegistrySpec, configured_registry_id_for};
+use crate::manifest::{
+    ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, RepositorySpec,
+    configured_registry_id_for,
+};
 use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
 #[cfg(test)]
 use crate::orchestration::cran_snapshot_loader;
@@ -62,18 +65,49 @@ pub(crate) fn cran_registry_id(canonical_endpoint: &str) -> Result<RegistryId, M
 
 fn configured_cran_loader<L: crate::orchestration::RawCandidateLoader>(
     raw: L,
-    endpoint: &str,
+    repository: &CranRepositoryConfig,
 ) -> Result<RepositoryCandidateLoader<L>, CranResolutionError> {
-    let registry = cran_registry_id(endpoint).map_err(CranResolutionError::Composition)?;
-    Ok(configured_repository_loader(raw, registry))
+    Ok(RepositoryCandidateLoader::new(
+        raw,
+        repository.repository.clone(),
+        repository.registry.clone(),
+        RepositoryRank::new(repository.rank),
+    ))
 }
 
-fn configured_repository_loader<L: crate::orchestration::RawCandidateLoader>(
-    raw: L,
-    registry: RegistryId,
-) -> RepositoryCandidateLoader<L> {
-    let repository = RepositoryId::new("cran").expect("the built-in CRAN repository id is valid");
-    RepositoryCandidateLoader::new(raw, repository, registry, RepositoryRank::new(0))
+/// The one CRAN repository binding supported by the first manifest-backed
+/// command slice. The manifest repository ID is retained for lock visibility,
+/// while the configured registry ID remains derived from the endpoint.
+#[derive(Clone, Debug)]
+pub(crate) struct CranRepositoryConfig {
+    pub repository: RepositoryId,
+    pub registry: RegistryId,
+    pub endpoint: Box<str>,
+    pub rank: u64,
+}
+
+pub(crate) fn cran_repository_config(
+    repository: &RepositorySpec,
+) -> Result<CranRepositoryConfig, CranResolutionError> {
+    if !matches!(repository.registry(), RegistrySpec::Cran) {
+        return Err(CranResolutionError::Composition(
+            ManifestError::InvalidRegistry {
+                reason: format!(
+                    "repository `{}` uses a registry unsupported by the CRAN provider",
+                    repository.id()
+                ),
+            },
+        ));
+    }
+    let registry = repository
+        .configured_registry_id()
+        .map_err(CranResolutionError::Composition)?;
+    Ok(CranRepositoryConfig {
+        repository: repository.id().clone(),
+        registry,
+        endpoint: repository.manifest_endpoint().as_str().into(),
+        rank: 0,
+    })
 }
 
 /// Collect the hard CRAN dependency closure for package-name test inputs
@@ -435,6 +469,87 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
     let request = request.with_optional_publication_cutoff(
         publication_cutoff.map(rsolve_core::PublicationCutoff::new),
     );
+    let repository = default_cran_repository_config(base_url.as_ref())?;
+    resolve_request_from_cran_with_store_at_policy_with_progress(
+        request,
+        repository,
+        publication_cutoff,
+        store,
+        cache_policy,
+        progress,
+    )
+}
+
+/// Resolve one selected manifest environment through the persistent CRAN
+/// snapshot path. Unlike the legacy entry point, this preserves the manifest
+/// repository ID in candidate provenance and lock visibility.
+pub(crate) fn resolve_composed_from_cran_with_store_at_policy_with_progress(
+    composed: ComposedEnvironment,
+    store: &SnapshotStore,
+    cache_policy: CranSnapshotCachePolicy,
+    progress: Option<ProgressCallback>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
+    let repository = match composed.repositories.as_slice() {
+        [] if composed
+            .roots
+            .iter()
+            .all(|root| !is_remote_cran_package(&root.name)) =>
+        {
+            default_cran_repository_config("not-a-provider-endpoint")?
+        }
+        [repository] => cran_repository_config(repository)?,
+        [] => {
+            return Err(CranResolutionError::Composition(
+                ManifestError::InvalidRegistry {
+                    reason: "manifest must configure one CRAN repository for remote roots".into(),
+                },
+            ));
+        }
+        _ => {
+            return Err(CranResolutionError::Composition(
+                ManifestError::InvalidRegistry {
+                    reason: "the CRAN provider currently supports exactly one manifest repository"
+                        .into(),
+                },
+            ));
+        }
+    };
+    let publication_cutoff = composed.published_before;
+    let request = composed
+        .into_resolution_request()
+        .map_err(CranResolutionError::Composition)?;
+    resolve_request_from_cran_with_store_at_policy_with_progress(
+        request,
+        repository,
+        publication_cutoff,
+        store,
+        cache_policy,
+        progress,
+    )
+}
+
+fn default_cran_repository_config(
+    base_url: &str,
+) -> Result<CranRepositoryConfig, CranResolutionError> {
+    Ok(CranRepositoryConfig {
+        repository: RepositoryId::new("cran").expect("the built-in CRAN repository id is valid"),
+        // Base-package-only requests intentionally do not consume or validate
+        // the provider endpoint. The values are canonicalized on the remote
+        // path below.
+        registry: RegistryId::new("cran").expect("the built-in CRAN registry id is valid"),
+        endpoint: base_url.into(),
+        rank: 0,
+    })
+}
+
+fn resolve_request_from_cran_with_store_at_policy_with_progress(
+    request: rsolve_core::ResolutionRequest,
+    repository: CranRepositoryConfig,
+    publication_cutoff: Option<PublicationDate>,
+    store: &SnapshotStore,
+    cache_policy: CranSnapshotCachePolicy,
+    progress: Option<ProgressCallback>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
     let roots = request
         .roots
         .iter()
@@ -450,9 +565,9 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         // intentionally independent of CRAN transport configuration.
         let loader = RepositoryCandidateLoader::new(
             &snapshot,
-            RepositoryId::new("cran").expect("the built-in CRAN repository id is valid"),
-            RegistryId::new("cran").expect("the built-in CRAN registry id is valid"),
-            RepositoryRank::new(0),
+            repository.repository.clone(),
+            repository.registry.clone(),
+            RepositoryRank::new(repository.rank),
         );
         let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
             request,
@@ -472,8 +587,13 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
             metrics: recorder.snapshot(),
         });
     }
-    let metadata_config =
-        CranMetadataConfig::for_repository(base_url.as_ref().to_owned().into_boxed_str());
+    let endpoint =
+        Endpoint::parse(repository.endpoint.as_ref()).map_err(CranResolutionError::Composition)?;
+    let mut repository = repository;
+    repository.endpoint = endpoint.as_str().into();
+    repository.registry =
+        cran_registry_id(endpoint.as_str()).map_err(CranResolutionError::Composition)?;
+    let metadata_config = CranMetadataConfig::for_repository(repository.endpoint.clone());
     let metadata_config = if publication_cutoff.is_some() {
         metadata_config.without_allpackages_history()
     } else {
@@ -509,7 +629,9 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
         && diagnostic.status() == CranSnapshotCacheStatus::Fresh
     {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
-        let configured = configured_cran_loader(loader.as_ref(), &refresher.canonical_endpoint())?;
+        let mut repository = repository.clone();
+        repository.endpoint = refresher.canonical_endpoint();
+        let configured = configured_cran_loader(loader.as_ref(), &repository)?;
         if let Ok(resolution) = resolve_prepared_snapshot_without_transport_with_metrics(
             request.clone(),
             &configured,
@@ -556,7 +678,7 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
     } else {
         match locked_cache {
             CranSnapshotCacheResult::Compatible { loader, diagnostic } => CacheProbe::Compatible {
-                loader: configured_cran_loader(*loader, &refresher.canonical_endpoint())?,
+                loader: configured_cran_loader(*loader, &repository)?,
                 diagnostic,
             },
             CranSnapshotCacheResult::Rejected(diagnostic) => CacheProbe::Rejected(diagnostic),
@@ -593,7 +715,7 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
                     transaction.refresh_and_publish_snapshot(&closure)
                 })
                 .map_err(CranResolutionError::Publish)
-                .and_then(|loader| configured_cran_loader(loader, &refresher.canonical_endpoint()))
+                .and_then(|loader| configured_cran_loader(loader, &repository))
         },
         Some(recorder.clone()),
     )?;
@@ -670,6 +792,70 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
     let request = request.with_optional_publication_cutoff(
         publication_cutoff.map(rsolve_core::PublicationCutoff::new),
     );
+    let repository = default_cran_repository_config("https://cran.r-project.org")?;
+    resolve_request_from_cran_offline_with_store_at_policy_with_progress(
+        request,
+        repository,
+        publication_cutoff,
+        store,
+        cache_policy,
+        progress,
+    )
+}
+
+pub(crate) fn resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
+    composed: ComposedEnvironment,
+    store: &SnapshotStore,
+    cache_policy: CranSnapshotCachePolicy,
+    progress: Option<ProgressCallback>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
+    let repository = match composed.repositories.as_slice() {
+        [] if composed
+            .roots
+            .iter()
+            .all(|root| !is_remote_cran_package(&root.name)) =>
+        {
+            default_cran_repository_config("not-a-provider-endpoint")?
+        }
+        [repository] => cran_repository_config(repository)?,
+        [] => {
+            return Err(CranResolutionError::Composition(
+                ManifestError::InvalidRegistry {
+                    reason: "manifest must configure one CRAN repository for remote roots".into(),
+                },
+            ));
+        }
+        _ => {
+            return Err(CranResolutionError::Composition(
+                ManifestError::InvalidRegistry {
+                    reason: "the CRAN provider currently supports exactly one manifest repository"
+                        .into(),
+                },
+            ));
+        }
+    };
+    let publication_cutoff = composed.published_before;
+    let request = composed
+        .into_resolution_request()
+        .map_err(CranResolutionError::Composition)?;
+    resolve_request_from_cran_offline_with_store_at_policy_with_progress(
+        request,
+        repository,
+        publication_cutoff,
+        store,
+        cache_policy,
+        progress,
+    )
+}
+
+fn resolve_request_from_cran_offline_with_store_at_policy_with_progress(
+    request: rsolve_core::ResolutionRequest,
+    repository: CranRepositoryConfig,
+    _publication_cutoff: Option<PublicationDate>,
+    store: &SnapshotStore,
+    cache_policy: CranSnapshotCachePolicy,
+    progress: Option<ProgressCallback>,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
     let roots = request
         .roots
         .iter()
@@ -680,11 +866,7 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
         let recorder = Recorder::new();
         recorder.set_cache_decision(classify_cache_decision(false, false, false));
         let snapshot = CranCandidateSnapshot::default();
-        let loader = configured_repository_loader(
-            &snapshot,
-            cran_registry_id("https://cran.r-project.org")
-                .map_err(CranResolutionError::Composition)?,
-        );
+        let loader = configured_cran_loader(&snapshot, &repository)?;
         let resolution = resolve_prepared_snapshot_without_transport_with_metrics(
             request,
             &loader,
@@ -709,9 +891,14 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
     });
     let probe = match cache {
         CranSnapshotCacheResult::Compatible { loader, diagnostic } => {
-            let registry = loader.registry_id();
+            // Legacy offline callers historically use the registry identity
+            // carried by the published loader. Keep that identity rather than
+            // replacing it with the built-in placeholder; manifest callers
+            // pass their configured identity explicitly.
+            let mut repository = repository.clone();
+            repository.registry = loader.registry_id().clone();
             CacheProbe::Compatible {
-                loader: configured_repository_loader(*loader, registry),
+                loader: configured_cran_loader(*loader, &repository)?,
                 diagnostic,
             }
         }
@@ -832,6 +1019,33 @@ mod tests {
             )],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn configured_manifest_repository_id_is_retained_in_candidate_visibility() {
+        let package = PackageName::new("Matrix").unwrap();
+        let repository = RepositorySpec::new(
+            RepositoryId::new("mirror").unwrap(),
+            RegistrySpec::Cran,
+            Endpoint::parse("https://example.test/cran").unwrap(),
+        )
+        .unwrap();
+        let config = cran_repository_config(&repository).unwrap();
+        let snapshot = CranCandidateSnapshot::from_candidates([(
+            package.clone(),
+            vec![release_with_dependencies(&package, Vec::new())],
+        )]);
+        let loader = configured_cran_loader(&snapshot, &config).unwrap();
+        let candidates = loader.releases(&SolverKey::InstalledName(package)).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0]
+                .occurrences()
+                .iter()
+                .map(|occurrence| occurrence.repository().clone())
+                .collect::<Vec<_>>(),
+            vec![RepositoryId::new("mirror").unwrap()]
+        );
     }
 
     fn required_dependency(kind: DependencyKind, name: &PackageName) -> DeclaredDependency {

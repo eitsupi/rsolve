@@ -69,6 +69,11 @@ impl Error for LockWireError {
 struct WireLockfile {
     version: u32,
     r_version: String,
+    #[serde(
+        default = "default_environment",
+        skip_serializing_if = "is_default_environment"
+    )]
+    environment: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     publication_cutoff: Option<String>,
     packages: Vec<WirePackage>,
@@ -136,15 +141,10 @@ pub fn to_toml(lockfile: &Lockfile) -> Result<String, LockWireError> {
     let resolution = normalized
         .single_resolution()
         .map_err(LockWireError::Domain)?;
-    if resolution.environment.as_str() != "default" {
-        return Err(invalid_field(
-            "environment",
-            "only the default logical environment can be serialized",
-        ));
-    }
     let wire = WireLockfile {
         version: SCHEMA_VERSION,
         r_version: canonical_version(&resolution.target.r_version),
+        environment: resolution.environment.to_string(),
         publication_cutoff: resolution.publication_cutoff.map(|date| date.to_string()),
         packages: {
             let selected_names = resolution
@@ -186,12 +186,22 @@ fn decode_resolution(wire: WireLockfile) -> Result<LockedResolution, LockWireErr
                 .map_err(|error| invalid_field("publication-cutoff", error.to_string()))
         })
         .transpose()?;
+    let environment = EnvironmentId::new(wire.environment)
+        .map_err(|error| invalid_field("environment", error.to_string()))?;
     Ok(LockedResolution {
         target: rsolve_core::ResolutionTarget::new(r_version),
-        environment: EnvironmentId::new("default").expect("default environment is canonical"),
+        environment,
         publication_cutoff,
         packages,
     })
+}
+
+fn is_default_environment(environment: &str) -> bool {
+    environment == "default"
+}
+
+fn default_environment() -> String {
+    "default".into()
 }
 
 fn decode_package(wire: WirePackage) -> Result<LockedPackage, LockWireError> {
@@ -270,6 +280,12 @@ fn serialize_wire(wire: &WireLockfile) -> Result<String, LockWireError> {
         wire.version,
         toml_string(&wire.r_version)?,
     );
+    if !is_default_environment(&wire.environment) {
+        output.push_str(&format!(
+            "environment = {}\n",
+            toml_string(&wire.environment)?
+        ));
+    }
     if let Some(cutoff) = &wire.publication_cutoff {
         output.push_str(&format!("publication-cutoff = {}\n", toml_string(cutoff)?));
     }

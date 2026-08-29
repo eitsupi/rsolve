@@ -363,6 +363,217 @@ fn lock_arguments_parse_explicit_values() {
 }
 
 #[test]
+fn manifest_input_is_explicit_and_conflicts_with_legacy_packages() {
+    let parsed = CommandLine::try_parse_from([
+        "rsolve",
+        "lock",
+        "--r-version",
+        "4.4.0",
+        "--manifest",
+        "project.toml",
+        "--environment",
+        "ci",
+    ])
+    .unwrap();
+    let Command::Lock(lock) = parsed.command;
+    assert_eq!(lock.manifest, Some(PathBuf::from("project.toml")));
+    assert_eq!(lock.environment.as_deref(), Some("ci"));
+    assert!(lock.package.is_empty());
+
+    let conflict = CommandLine::try_parse_from([
+        "rsolve",
+        "lock",
+        "--r-version",
+        "4.4.0",
+        "--manifest",
+        "project.toml",
+        "--package",
+        "Matrix",
+    ])
+    .unwrap_err();
+    assert_eq!(conflict.exit_code(), 2);
+
+    let discovered =
+        CommandLine::try_parse_from(["rsolve", "lock", "--r-version", "4.4.0"]).unwrap();
+    let Command::Lock(discovered) = discovered.command;
+    assert!(discovered.manifest.is_none());
+    assert!(discovered.package.is_empty());
+
+    let discovered_environment = CommandLine::try_parse_from([
+        "rsolve",
+        "lock",
+        "--r-version",
+        "4.4.0",
+        "--environment",
+        "ci",
+    ])
+    .unwrap();
+    let Command::Lock(discovered_environment) = discovered_environment.command;
+    assert_eq!(discovered_environment.environment.as_deref(), Some("ci"));
+
+    let package_environment = CommandLine::try_parse_from([
+        "rsolve",
+        "lock",
+        "--r-version",
+        "4.4.0",
+        "--package",
+        "Matrix",
+        "--environment",
+        "ci",
+    ])
+    .unwrap_err();
+    assert_eq!(package_environment.exit_code(), 2);
+}
+
+#[test]
+fn environment_selection_uses_explicit_then_variable_then_default() {
+    assert_eq!(
+        select_environment(Some("ci"), Some("test")),
+        ("ci", "--environment")
+    );
+    assert_eq!(
+        select_environment(None, Some("test")),
+        ("test", "RSOLVE_ENVIRONMENT")
+    );
+    assert_eq!(select_environment(None, None), ("default", "default"));
+    let called = std::cell::Cell::new(false);
+    let value = environment_variable_for(Some("ci"), || {
+        called.set(true);
+        Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+            "ignored",
+        )))
+    })
+    .unwrap();
+    assert_eq!(value, None);
+    assert!(!called.get());
+}
+
+#[test]
+fn discovered_manifest_uses_nearest_parent_and_rejects_explicit_mirror() {
+    let directory = tempfile::tempdir().unwrap();
+    let nested = directory.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(
+        directory.path().join("rsolve.toml"),
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.test'\nregistry='cran'\n[dependencies]\nMatrix='*'\n",
+    )
+    .unwrap();
+    let output = nested.join("rsolve.lock");
+    let command = LockCommand {
+        r_version: "4.4.0".into(),
+        manifest: None,
+        environment: None,
+        package: Vec::new(),
+        cran_mirror: None,
+        publication_cutoff: None,
+        output: output.clone(),
+        metadata_cache: Some(nested.join("cache")),
+        offline: false,
+        refresh_metadata: false,
+        metrics_output: None,
+    };
+    let result = run_manifest_lock_with_backend_progress_at(
+        command,
+        RPackageVersion::parse("4.4.0").unwrap(),
+        &MatrixBackend,
+        None,
+        &nested,
+        None,
+    )
+    .unwrap();
+    assert!(result.summary.contains("rsolve.toml"));
+    assert!(output.is_file());
+
+    let mut explicit_mirror = matrix_command("4.4.0", nested.join("mirror.lock"));
+    explicit_mirror.manifest = Some(directory.path().join("rsolve.toml"));
+    explicit_mirror.package.clear();
+    let error = run_lock_with_backend(explicit_mirror, &PanicBackend).unwrap_err();
+    assert!(matches!(error, CliError::Value(message) if message.contains("--cran-mirror")));
+}
+
+#[test]
+fn manifest_without_repositories_supports_provider_free_resolution() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("rsolve.toml");
+    fs::write(&manifest, "[rsolve]\nschema=1\n[r]\nversion='*'\n").unwrap();
+    let command = LockCommand {
+        r_version: "4.4.0".into(),
+        manifest: Some(manifest),
+        environment: None,
+        package: Vec::new(),
+        cran_mirror: None,
+        publication_cutoff: None,
+        output: directory.path().join("rsolve.lock"),
+        metadata_cache: Some(directory.path().join("cache")),
+        offline: false,
+        refresh_metadata: false,
+        metrics_output: None,
+    };
+    run_lock_with_backend(command, &MatrixBackend).unwrap();
+}
+
+#[test]
+fn manifest_direct_source_fails_before_backend() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("rsolve.toml");
+    fs::write(
+        &manifest,
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.test'\nregistry='cran'\n[dependencies]\nfoo={url='https://example.test/foo.tar.gz'}\n",
+    )
+    .unwrap();
+    let command = LockCommand {
+        r_version: "4.4.0".into(),
+        manifest: Some(manifest),
+        environment: None,
+        package: Vec::new(),
+        cran_mirror: None,
+        publication_cutoff: None,
+        output: directory.path().join("rsolve.lock"),
+        metadata_cache: Some(directory.path().join("cache")),
+        offline: false,
+        refresh_metadata: false,
+        metrics_output: None,
+    };
+    let result = run_lock_with_backend(command, &PanicBackend);
+    assert!(
+        matches!(result, Err(CliError::Value(message)) if message.contains("requires acquisition"))
+    );
+}
+
+#[test]
+fn manifest_environment_is_projected_into_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("rsolve.toml");
+    fs::write(
+        &manifest,
+        "[rsolve]\nschema=1\n[r]\nversion='>= 4.0, < 5.0'\n[resolution]\npublished-before='2026-06-24'\n[[repositories]]\nid='cran'\nurl='https://example.test'\nregistry='cran'\n[groups.ci.dependencies]\nMatrix='*'\n[environments]\nci=['ci']\n",
+    )
+    .unwrap();
+    let command = LockCommand {
+        r_version: "4.4.0".into(),
+        manifest: Some(manifest),
+        environment: Some("ci".into()),
+        package: Vec::new(),
+        cran_mirror: None,
+        publication_cutoff: None,
+        output: directory.path().join("rsolve.lock"),
+        metadata_cache: Some(directory.path().join("cache")),
+        offline: false,
+        refresh_metadata: false,
+        metrics_output: None,
+    };
+    run_lock_with_backend(command, &MatrixBackend).unwrap();
+    let lock =
+        from_toml(&fs::read_to_string(directory.path().join("rsolve.lock")).unwrap()).unwrap();
+    let resolution = lock.single_resolution().unwrap();
+    assert_eq!(resolution.environment.as_str(), "ci");
+    assert_eq!(
+        resolution.publication_cutoff,
+        Some(PublicationDate::parse("2026-06-24").unwrap())
+    );
+}
+
+#[test]
 fn invalid_output_forms_are_value_errors() {
     assert!(matches!(
         validate_output_path(Path::new("")),
@@ -454,8 +665,10 @@ fn commit_failure_preserves_existing_bytes_and_owned_temp_cleanup() {
 fn mirror_and_output_validation_happen_before_resolution() {
     let command = LockCommand {
         r_version: "4.4.0".into(),
+        manifest: None,
+        environment: None,
         package: vec!["Matrix".into()],
-        cran_mirror: "https://user:password@example.test".into(),
+        cran_mirror: Some("https://user:password@example.test".into()),
         publication_cutoff: None,
         output: temp_path("missing-parent").join("parent").join("lock"),
         metadata_cache: None,
@@ -750,6 +963,34 @@ impl ResolutionBackend for MatrixBackend {
             metrics,
         })
     }
+
+    fn resolve_composed(
+        &self,
+        composed: ComposedEnvironment,
+        metadata_cache: &MetadataCache,
+        offline: bool,
+        refresh_metadata: bool,
+        _progress: Option<ProgressCallback>,
+    ) -> Result<ResolvedData, CliError> {
+        let manifest = Manifest::new(
+            composed.r_requirement.clone(),
+            ManifestTarget::new(composed.target.r_version.clone()),
+            composed
+                .roots
+                .into_iter()
+                .map(|root| ManifestDependency::new(root.name, root.constraint))
+                .collect(),
+        )
+        .map_err(|error| CliError::Value(error.to_string()))?;
+        self.resolve(
+            manifest,
+            DEFAULT_CRAN_MIRROR,
+            None,
+            metadata_cache,
+            offline,
+            refresh_metadata,
+        )
+    }
 }
 
 struct ModeBackend<'a> {
@@ -781,8 +1022,10 @@ impl ResolutionBackend for ModeBackend<'_> {
 fn matrix_command(r_version: &str, output: PathBuf) -> LockCommand {
     LockCommand {
         r_version: r_version.into(),
+        manifest: None,
+        environment: None,
         package: vec!["Matrix".into()],
-        cran_mirror: DEFAULT_CRAN_MIRROR.into(),
+        cran_mirror: Some(DEFAULT_CRAN_MIRROR.into()),
         publication_cutoff: None,
         output,
         metadata_cache: Some(temp_path("matrix-metadata-cache")),
