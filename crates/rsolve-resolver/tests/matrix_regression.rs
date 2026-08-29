@@ -58,6 +58,19 @@ fn same_identity_from_multiple_subjects_uses_installed_name_canonical_subject() 
 }
 
 #[test]
+fn cross_subject_distribution_evidence_stays_subject_local() {
+    let catalog = MultiSourceCatalog::same_identity_with_disjoint_distributions();
+    let resolution = catalog.resolver().resolve(catalog.request()).unwrap();
+
+    assert_eq!(resolution.packages().len(), 1);
+    assert_eq!(resolution.packages()[0].distributions().len(), 1);
+    assert_eq!(
+        resolution.packages()[0].distributions()[0].channel.as_str(),
+        "binary"
+    );
+}
+
+#[test]
 fn common_identity_backtracks_across_source_subjects_and_is_canonicalized() {
     let catalog = MultiSourceCatalog::common_with_conflicting_installed();
     let installed_only = catalog

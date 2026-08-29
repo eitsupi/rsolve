@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -132,7 +132,7 @@ fn candidate_load_error(package: SolverKey, source: CandidateLoadError) -> Box<A
 
 #[derive(Clone, Debug)]
 struct LoadedSubject {
-    ids: Vec<CandidateId>,
+    candidates: Vec<(CandidateId, PackageRelease)>,
     quarantined: Vec<rsolve_core::QuarantinedCandidate>,
 }
 
@@ -141,7 +141,6 @@ struct CandidateInterner {
     next: usize,
     by_identity: HashMap<ReleaseIdentity, CandidateId>,
     releases: HashMap<CandidateId, PackageRelease>,
-    exposed: HashSet<CandidateId>,
 }
 
 impl CandidateInterner {
@@ -154,15 +153,19 @@ impl CandidateInterner {
                     "candidate interner lost the release for an interned identity",
                 )
             })?;
+            if !logical_facts_equal(&existing, &release) {
+                return Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    "conflicting logical metadata for interned candidate",
+                ));
+            };
             let mut aggregation = ReleaseAggregation::new();
-            aggregation
-                .observe_release(existing.clone())
-                .map_err(|error| {
-                    CandidateLoadError::new(
-                        CandidateLoadErrorCategory::MetadataInvalid,
-                        format!("interned candidate metadata is invalid: {error}"),
-                    )
-                })?;
+            aggregation.observe_release(existing).map_err(|error| {
+                CandidateLoadError::new(
+                    CandidateLoadErrorCategory::MetadataInvalid,
+                    format!("interned candidate metadata is invalid: {error}"),
+                )
+            })?;
             aggregation.observe_release(release).map_err(|error| {
                 CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
@@ -175,12 +178,6 @@ impl CandidateInterner {
                     "candidate interner failed to retrieve merged release",
                 )
             })?;
-            if self.exposed.contains(&id) && !release_facts_equal(&existing, &merged) {
-                return Err(CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    "candidate metadata changed after the candidate was exposed to the solver",
-                ));
-            }
             self.releases.insert(id, merged);
             return Ok(id);
         }
@@ -210,13 +207,12 @@ impl CandidateInterner {
     }
 }
 
-fn release_facts_equal(left: &PackageRelease, right: &PackageRelease) -> bool {
+fn logical_facts_equal(left: &PackageRelease, right: &PackageRelease) -> bool {
     left.identity() == right.identity()
         && left.version() == right.version()
         && left.metadata() == right.metadata()
         && left.publication() == right.publication()
         && left.declared_dependencies() == right.declared_dependencies()
-        && left.distributions() == right.distributions()
 }
 
 struct Provider<'a> {
@@ -236,20 +232,38 @@ impl<'a> Provider<'a> {
                 .map_err(|source| candidate_load_error(subject.clone(), source));
         }
         let loaded: Result<LoadedSubject, CandidateLoadError> = match self.loader.load(subject) {
-            Ok(result) => {
+            Ok(result) => (|| -> Result<LoadedSubject, CandidateLoadError> {
                 let (mut releases, quarantined) = result.into_parts();
                 releases.sort_by(|left, right| {
                     identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
                 });
-                let ids = releases
-                    .into_iter()
-                    .map(|release| self.interner.borrow_mut().intern(release))
-                    .collect::<Result<Vec<_>, _>>();
-                ids.map(|mut ids| {
-                    ids.dedup();
-                    LoadedSubject { ids, quarantined }
+                let mut aggregation = ReleaseAggregation::new();
+                for release in releases {
+                    aggregation.observe_release(release).map_err(|error| {
+                        CandidateLoadError::new(
+                            CandidateLoadErrorCategory::MetadataInvalid,
+                            format!("conflicting metadata within subject: {error}"),
+                        )
+                    })?;
+                }
+                let mut candidates = aggregation
+                    .releases()
+                    .map(|release| {
+                        let local_release = release.clone();
+                        self.interner
+                            .borrow_mut()
+                            .intern(release.clone())
+                            .map(|id| (id, local_release))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                candidates.sort_by(|(_, left), (_, right)| {
+                    identity_sort_key(left.identity()).cmp(&identity_sort_key(right.identity()))
+                });
+                Ok(LoadedSubject {
+                    candidates,
+                    quarantined,
                 })
-            }
+            })(),
             Err(error) => Err(error),
         };
         self.cache
@@ -267,19 +281,7 @@ impl<'a> Provider<'a> {
     }
 
     fn candidates_from_loaded(&self, loaded: &LoadedSubject) -> Vec<(CandidateId, PackageRelease)> {
-        let mut interner = self.interner.borrow_mut();
-        loaded
-            .ids
-            .iter()
-            .filter_map(|id| {
-                interner.exposed.insert(*id);
-                interner
-                    .releases
-                    .get(id)
-                    .cloned()
-                    .map(|release| (*id, release))
-            })
-            .collect()
+        loaded.candidates.clone()
     }
 
     fn candidate_for_id(
@@ -288,7 +290,11 @@ impl<'a> Provider<'a> {
         id: CandidateId,
     ) -> Result<PackageRelease, Box<AdapterError>> {
         let loaded = self.loaded(subject)?;
-        if !loaded.ids.contains(&id) {
+        let Some((_, release)) = loaded
+            .candidates
+            .iter()
+            .find(|(candidate_id, _)| *candidate_id == id)
+        else {
             return Err(candidate_load_error(
                 subject.clone(),
                 CandidateLoadError::new(
@@ -296,20 +302,8 @@ impl<'a> Provider<'a> {
                     "selected candidate is not visible in this subject",
                 ),
             ));
-        }
-        let release = self.interner.borrow().releases.get(&id).cloned();
-        if release.is_some() {
-            self.interner.borrow_mut().exposed.insert(id);
-        }
-        release.ok_or_else(|| {
-            candidate_load_error(
-                subject.clone(),
-                CandidateLoadError::new(
-                    CandidateLoadErrorCategory::MetadataInvalid,
-                    "selected candidate was not interned",
-                ),
-            )
-        })
+        };
+        Ok(release.clone())
     }
 
     fn r_version(&self) -> &RPackageVersion {

@@ -214,6 +214,16 @@ pub mod regression_support {
             }
         }
 
+        pub fn same_identity_with_disjoint_distributions() -> Self {
+            Self {
+                source_qualified: registry_candidate_with_channel("Foo", "1.0.0", "cran", "source"),
+                installed_name: vec![registry_candidate_with_channel(
+                    "Foo", "1.0.0", "cran", "binary",
+                )],
+                reverse_installed: false,
+            }
+        }
+
         pub fn common_with_conflicting_installed() -> Self {
             let common = registry_candidate("Foo", "1.0.0", "cran", vec![]);
             Self {
@@ -775,6 +785,31 @@ pub mod regression_support {
         namespace: &str,
         dependencies: Vec<DeclaredDependency>,
     ) -> PackageRelease {
+        registry_candidate_with_channel_and_dependencies(
+            name,
+            version,
+            namespace,
+            "source",
+            dependencies,
+        )
+    }
+
+    fn registry_candidate_with_channel(
+        name: &str,
+        version: &str,
+        namespace: &str,
+        channel: &str,
+    ) -> PackageRelease {
+        registry_candidate_with_channel_and_dependencies(name, version, namespace, channel, vec![])
+    }
+
+    fn registry_candidate_with_channel_and_dependencies(
+        name: &str,
+        version: &str,
+        namespace: &str,
+        channel: &str,
+        dependencies: Vec<DeclaredDependency>,
+    ) -> PackageRelease {
         let package = PackageName::new(name).unwrap();
         let parsed_version = RPackageVersion::parse(version).unwrap();
         PackageRelease::try_from(ReleaseObservation {
@@ -792,7 +827,7 @@ pub mod regression_support {
             declared_dependencies: dependencies,
             distributions: vec![Distribution {
                 registry: rsolve_core::RegistryId::new("cran").unwrap(),
-                channel: DistributionChannel::new("source").unwrap(),
+                channel: DistributionChannel::new(channel).unwrap(),
                 snapshot: None,
                 artifacts: Vec::new(),
                 observed_metadata: DistributionMetadata::default(),
