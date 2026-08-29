@@ -10,9 +10,9 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    EffectiveDependencyKind, LockedIdentities, PackageName, Provenance, PublicationCutoff,
-    PublicationDate, RPackageVersion, ReleaseIdentity, Resolution, ResolutionRequest,
-    ResolutionTarget, ResolvedPackage, Sha256Digest, SolverKey,
+    DependencySourceConstraint, EffectiveDependencyKind, LockedIdentities, PackageName, Provenance,
+    PublicationCutoff, PublicationDate, RPackageVersion, ReleaseIdentity, Resolution,
+    ResolutionRequest, ResolutionTarget, ResolvedPackage, Sha256Digest, SolverKey,
 };
 
 #[cfg(test)]
@@ -20,7 +20,7 @@ use rsolve_core::{DependencyKind, PackageRelease};
 
 pub use rsolve_core::{EnvironmentId, EnvironmentIdError};
 
-use crate::manifest::{Manifest, ManifestError};
+use crate::manifest::{ComposedEnvironment, Manifest, ManifestError, ManifestSource};
 
 /// An immutable, validated projection of a lockfile for direct consumption.
 ///
@@ -358,14 +358,122 @@ impl Lockfile {
         manifest: Manifest,
         environment: &EnvironmentId,
     ) -> Result<ConsumedLockedGraph, LockError> {
+        let request = self.resolution_request(manifest.clone(), environment)?;
+        let roots = request
+            .roots
+            .iter()
+            .map(|root| RootCheck {
+                name: root.package.name().clone(),
+                constraint: root.package.constraint().clone(),
+                repository: match root.package.source() {
+                    DependencySourceConstraint::Repository { repository } => {
+                        Some(repository.clone())
+                    }
+                    DependencySourceConstraint::Any
+                    | DependencySourceConstraint::Registry { .. }
+                    | DependencySourceConstraint::Bioconductor { .. }
+                    | DependencySourceConstraint::Git { .. }
+                    | DependencySourceConstraint::Exact(_) => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        self.consume_roots(
+            &request.target,
+            environment,
+            &manifest.r_requirement,
+            &roots,
+            None,
+        )
+    }
+
+    /// Consume a lock against a composed environment without candidate
+    /// generation. Direct source roots are checked for graph applicability
+    /// only; their acquisition-specific source facts remain out of scope.
+    pub fn consume_composed_environment(
+        &self,
+        composed: &ComposedEnvironment,
+    ) -> Result<ConsumedLockedGraph, LockError> {
+        let roots = composed
+            .roots
+            .iter()
+            .map(|root| RootCheck {
+                name: root.name.clone(),
+                constraint: root.constraint.clone(),
+                repository: match &root.source {
+                    ManifestSource::Registry { repository } => repository.clone(),
+                    ManifestSource::Git { .. }
+                    | ManifestSource::Url { .. }
+                    | ManifestSource::Path { .. } => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        self.consume_roots(
+            &composed.target,
+            &composed.environment,
+            &composed.r_requirement,
+            &roots,
+            Some(&composed.repositories),
+        )
+    }
+
+    fn consume_roots(
+        &self,
+        target: &ResolutionTarget,
+        environment: &EnvironmentId,
+        r_requirement: &rsolve_core::VersionConstraint,
+        roots: &[RootCheck],
+        configured_repositories: Option<&[crate::manifest::RepositorySpec]>,
+    ) -> Result<ConsumedLockedGraph, LockError> {
         let resolution = self.single_resolution()?;
         validate_canonical_resolution(resolution)?;
-        let request = self.resolution_request(manifest.clone(), environment)?;
-        if !manifest
-            .r_requirement
-            .satisfies(&resolution.target.r_version)
-        {
+        if &resolution.target != target {
+            return Err(LockError::TargetMismatch);
+        }
+        if &resolution.environment != environment {
+            return Err(LockError::EnvironmentMismatch {
+                expected: resolution.environment.to_string(),
+                found: environment.to_string(),
+            });
+        }
+        if !r_requirement.satisfies(&resolution.target.r_version) {
             return Err(LockError::RRequirementMismatch);
+        }
+        let configured_ids = configured_repositories.map(|repositories| {
+            repositories
+                .iter()
+                .map(|repository| repository.id())
+                .collect::<BTreeSet<_>>()
+        });
+        let configured_ranks = configured_repositories.map(|repositories| {
+            repositories
+                .iter()
+                .enumerate()
+                .map(|(rank, repository)| (repository.id(), rank))
+                .collect::<BTreeMap<_, _>>()
+        });
+        for package in &resolution.packages {
+            if let Some(configured_ids) = &configured_ids {
+                for repository in &package.visible_repository_ids {
+                    if !configured_ids.contains(repository) {
+                        return Err(LockError::UnknownVisibleRepository {
+                            package: package.identity.name().to_string(),
+                            repository: repository.to_string(),
+                        });
+                    }
+                }
+            }
+            if let Some(configured_ranks) = &configured_ranks {
+                let mut previous_rank = None;
+                for repository in &package.visible_repository_ids {
+                    let rank = configured_ranks[repository];
+                    if previous_rank.is_some_and(|previous| previous >= rank) {
+                        return Err(LockError::VisibleRepositoryOrderMismatch {
+                            package: package.identity.name().to_string(),
+                        });
+                    }
+                    previous_rank = Some(rank);
+                }
+            }
         }
 
         let by_name = resolution
@@ -374,14 +482,10 @@ impl Lockfile {
             .map(|package| (package.identity.name().clone(), package))
             .collect::<BTreeMap<_, _>>();
         let mut reachable = BTreeSet::new();
-        for requirement in &request.roots {
-            let name = &requirement.package.name();
+        for root in roots {
+            let name = &root.name;
             if is_r_base_name(name) {
-                if !requirement
-                    .package
-                    .constraint()
-                    .satisfies(&resolution.target.r_version)
-                {
+                if !root.constraint.satisfies(&resolution.target.r_version) {
                     return Err(LockError::DirectRootVersionMismatch {
                         name: name.to_string(),
                     });
@@ -393,9 +497,17 @@ impl Lockfile {
                 .ok_or_else(|| LockError::DirectRootMissing {
                     name: name.to_string(),
                 })?;
-            if !requirement.package.constraint().satisfies(&package.version) {
+            if !root.constraint.satisfies(&package.version) {
                 return Err(LockError::DirectRootVersionMismatch {
                     name: name.to_string(),
+                });
+            }
+            if let Some(repository) = &root.repository
+                && !package.visible_repository_ids.contains(repository)
+            {
+                return Err(LockError::RootRepositoryNotVisible {
+                    name: name.to_string(),
+                    repository: repository.to_string(),
                 });
             }
             mark_reachable(package, &by_name, &mut reachable)?;
@@ -473,6 +585,12 @@ impl Lockfile {
     }
 }
 
+struct RootCheck {
+    name: PackageName,
+    constraint: rsolve_core::VersionConstraint,
+    repository: Option<rsolve_core::RepositoryId>,
+}
+
 /// Consume a lockfile as an immutable graph without exposing any resolver or
 /// candidate-loading capability.
 pub fn consume_locked_graph(
@@ -534,6 +652,17 @@ pub enum LockError {
     DuplicateVisibleRepository {
         package: String,
         repository: String,
+    },
+    UnknownVisibleRepository {
+        package: String,
+        repository: String,
+    },
+    RootRepositoryNotVisible {
+        name: String,
+        repository: String,
+    },
+    VisibleRepositoryOrderMismatch {
+        package: String,
     },
     ExactIdentitySetMismatch {
         missing: Vec<String>,
@@ -602,6 +731,21 @@ impl fmt::Display for LockError {
             } => write!(
                 f,
                 "locked package {package} lists duplicate visible repository {repository}"
+            ),
+            Self::UnknownVisibleRepository {
+                package,
+                repository,
+            } => write!(
+                f,
+                "locked package {package} references unknown configured repository {repository}"
+            ),
+            Self::RootRepositoryNotVisible { name, repository } => write!(
+                f,
+                "locked root {name} is not visible from repository {repository}"
+            ),
+            Self::VisibleRepositoryOrderMismatch { package } => write!(
+                f,
+                "locked package {package} visible repositories are not in manifest order"
             ),
             Self::ExactIdentitySetMismatch { missing, extra } => write!(
                 f,

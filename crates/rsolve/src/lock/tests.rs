@@ -67,6 +67,42 @@ fn digest() -> Sha256Digest {
     Sha256Digest::new("0".repeat(64)).unwrap()
 }
 
+fn composed_repository(id: &str) -> crate::manifest::RepositorySpec {
+    crate::manifest::RepositorySpec::new(
+        rsolve_core::RepositoryId::new(id).unwrap(),
+        crate::manifest::RegistrySpec::Cran,
+        crate::manifest::Endpoint::new("https://example.org/cran").unwrap(),
+    )
+    .unwrap()
+}
+
+fn composed_environment(
+    repositories: Vec<crate::manifest::RepositorySpec>,
+    roots: Vec<crate::manifest::ComposedRootIntent>,
+) -> crate::manifest::ComposedEnvironment {
+    crate::manifest::ComposedEnvironment {
+        environment: environment(),
+        r_requirement: VersionConstraint::unconstrained(),
+        published_before: None,
+        target: target(),
+        repositories,
+        roots,
+        locked: rsolve_core::LockedIdentities::new(),
+    }
+}
+
+fn composed_root(
+    name: &str,
+    source: crate::manifest::ManifestSource,
+) -> crate::manifest::ComposedRootIntent {
+    crate::manifest::ComposedRootIntent {
+        name: package(name),
+        constraint: VersionConstraint::unconstrained(),
+        source,
+        expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+    }
+}
+
 #[test]
 fn v1_requires_exactly_one_resolution() {
     assert_eq!(
@@ -83,6 +119,170 @@ fn v1_requires_exactly_one_resolution() {
         Lockfile::new(vec![empty.clone(), empty]),
         Err(LockError::UnsupportedResolutionCount { found: 2 })
     );
+}
+
+#[test]
+fn composed_consumption_accepts_configured_visible_repository() {
+    let repository = rsolve_core::RepositoryId::new("main").unwrap();
+    let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
+    locked.visible_repository_ids = vec![repository.clone()];
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![locked.clone()],
+    }])
+    .unwrap();
+    let composed = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(repository),
+            },
+        )],
+    );
+    assert!(lock.consume_composed_environment(&composed).is_ok());
+}
+
+#[test]
+fn composed_consumption_rejects_unknown_visible_repository_and_root_mismatch() {
+    let unknown = rsolve_core::RepositoryId::new("unknown").unwrap();
+    let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
+    locked.visible_repository_ids = vec![unknown.clone()];
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![locked.clone()],
+    }])
+    .unwrap();
+    let composed = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(rsolve_core::RepositoryId::new("main").unwrap()),
+            },
+        )],
+    );
+    assert!(matches!(
+        lock.consume_composed_environment(&composed),
+        Err(LockError::UnknownVisibleRepository { repository, .. }) if repository == "unknown"
+    ));
+
+    locked.visible_repository_ids = vec![rsolve_core::RepositoryId::new("other").unwrap()];
+    let mismatch_lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![locked],
+    }])
+    .unwrap();
+    let mismatch = composed_environment(
+        vec![composed_repository("main"), composed_repository("other")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(rsolve_core::RepositoryId::new("main").unwrap()),
+            },
+        )],
+    );
+    assert!(matches!(
+        mismatch_lock.consume_composed_environment(&mismatch),
+        Err(LockError::RootRepositoryNotVisible { repository, .. }) if repository == "main"
+    ));
+}
+
+#[test]
+fn composed_consumption_neutral_and_direct_roots_do_not_require_visibility() {
+    let locked = LockedPackage::from_release(&release("root", "1.0.0"));
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![locked],
+    }])
+    .unwrap();
+    let neutral = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry { repository: None },
+        )],
+    );
+    assert!(lock.consume_composed_environment(&neutral).is_ok());
+    let direct = composed_environment(
+        Vec::new(),
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Url {
+                url: crate::manifest::DirectUrl::parse("https://example.org/root.tar.gz").unwrap(),
+                sha256: None,
+            },
+        )],
+    );
+    assert!(lock.consume_composed_environment(&direct).is_ok());
+}
+
+#[test]
+fn composed_consumption_checks_transitive_visible_repositories() {
+    let main = rsolve_core::RepositoryId::new("main").unwrap();
+    let unknown = rsolve_core::RepositoryId::new("unknown").unwrap();
+    let mut root = LockedPackage::from_release(&release("root", "1.0.0"));
+    root.dependencies = vec![edge("child")];
+    root.visible_repository_ids = vec![main];
+    let mut child = LockedPackage::from_release(&release("child", "1.0.0"));
+    child.visible_repository_ids = vec![unknown];
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![root, child],
+    }])
+    .unwrap();
+    let composed = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(rsolve_core::RepositoryId::new("main").unwrap()),
+            },
+        )],
+    );
+    assert!(matches!(
+        lock.consume_composed_environment(&composed),
+        Err(LockError::UnknownVisibleRepository { package, repository })
+            if package == "child" && repository == "unknown"
+    ));
+}
+
+#[test]
+fn composed_consumption_rejects_visible_repositories_out_of_manifest_order() {
+    let first = rsolve_core::RepositoryId::new("first").unwrap();
+    let second = rsolve_core::RepositoryId::new("second").unwrap();
+    let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
+    locked.visible_repository_ids = vec![second.clone(), first.clone()];
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![locked],
+    }])
+    .unwrap();
+    let composed = composed_environment(
+        vec![composed_repository("first"), composed_repository("second")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(first),
+            },
+        )],
+    );
+    assert!(matches!(
+        lock.consume_composed_environment(&composed),
+        Err(LockError::VisibleRepositoryOrderMismatch { package }) if package == "root"
+    ));
 }
 
 #[test]
