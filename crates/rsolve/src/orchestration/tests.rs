@@ -367,6 +367,7 @@ fn lock_for_identity(identity: ReleaseIdentity, version: RPackageVersion) -> Loc
             version,
             published_version_spelling: None,
             dependencies: Vec::new(),
+            visible_repository_ids: Vec::new(),
             metadata_sha256: Sha256Digest::new("0".repeat(64)).unwrap(),
         }],
     }])

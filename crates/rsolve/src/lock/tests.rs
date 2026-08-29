@@ -15,6 +15,13 @@ fn package(value: &str) -> PackageName {
     PackageName::new(value).unwrap()
 }
 
+fn edge(value: &str) -> LockedDependencyEdge {
+    LockedDependencyEdge {
+        kind: EffectiveDependencyKind::Depends,
+        package: package(value),
+    }
+}
+
 fn release(name: &str, spelling: &str) -> PackageRelease {
     let name = package(name);
     let version = version(spelling);
@@ -92,6 +99,7 @@ fn reader_rejects_registry_record_version_mismatch() {
         version: version("2.0.0"),
         published_version_spelling: None,
         dependencies: Vec::new(),
+        visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
     };
     assert!(matches!(
@@ -119,7 +127,8 @@ fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
         ),
         version: version("1.0.0"),
         published_version_spelling: None,
-        dependencies: vec![beta.clone(), alpha.clone()],
+        dependencies: vec![edge("beta"), edge("alpha")],
+        visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
     };
     let mut reversed = make(alpha.clone());
@@ -214,7 +223,7 @@ fn canonical_version_preserves_two_components_for_published_spelling() {
 }
 
 #[test]
-fn projection_uses_effective_edges_and_rejects_promoted_suggests() {
+fn projection_preserves_effective_dependency_reasons_and_visibility() {
     let root = release("root", "1.0.0");
     let selected_dependency = release("selected", "1.0.0");
     let declared_only = release("declared", "1.0.0");
@@ -234,7 +243,10 @@ fn projection_uses_effective_edges_and_rejects_promoted_suggests() {
                 SolverKey::InstalledName(package("root")),
                 root,
                 vec![effective],
-                Vec::new(),
+                vec![
+                    rsolve_core::RepositoryId::new("secondary").unwrap(),
+                    rsolve_core::RepositoryId::new("primary").unwrap(),
+                ],
             ),
             rsolve_core::ResolvedPackage::new(
                 SolverKey::InstalledName(package("selected")),
@@ -258,29 +270,65 @@ fn projection_uses_effective_edges_and_rejects_promoted_suggests() {
         .iter()
         .find(|package| package.identity.name().as_str() == "root")
         .unwrap();
-    assert_eq!(root_lock.dependencies, vec![package("selected")]);
+    assert_eq!(root_lock.dependencies, vec![edge("selected")]);
+    assert_eq!(
+        root_lock.visible_repository_ids,
+        vec![
+            rsolve_core::RepositoryId::new("secondary").unwrap(),
+            rsolve_core::RepositoryId::new("primary").unwrap(),
+        ]
+    );
 
     let promoted = Resolution::new(
         target(),
-        vec![rsolve_core::ResolvedPackage::new(
-            SolverKey::InstalledName(package("root")),
-            release("root", "1.0.0"),
-            vec![ResolvedDependencyEdge {
-                kind: EffectiveDependencyKind::PromotedSuggests,
-                package: PackageRequirement::new(
-                    package("selected"),
-                    DependencySourceConstraint::Any,
-                    VersionConstraint::unconstrained(),
-                )
-                .unwrap(),
-            }],
-            Vec::new(),
-        )],
+        vec![
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(package("root")),
+                release("root", "1.0.0"),
+                vec![
+                    ResolvedDependencyEdge {
+                        kind: EffectiveDependencyKind::Depends,
+                        package: PackageRequirement::new(
+                            package("selected"),
+                            DependencySourceConstraint::Any,
+                            VersionConstraint::unconstrained(),
+                        )
+                        .unwrap(),
+                    },
+                    ResolvedDependencyEdge {
+                        kind: EffectiveDependencyKind::PromotedSuggests,
+                        package: PackageRequirement::new(
+                            package("selected"),
+                            DependencySourceConstraint::Any,
+                            VersionConstraint::unconstrained(),
+                        )
+                        .unwrap(),
+                    },
+                ],
+                Vec::new(),
+            ),
+            rsolve_core::ResolvedPackage::new(
+                SolverKey::InstalledName(package("selected")),
+                release("selected", "1.0.0"),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
     );
-    assert!(matches!(
-        Lockfile::from_resolution(&promoted, environment()),
-        Err(LockError::UnsupportedDependencyKind { .. })
-    ));
+    let promoted_lock = Lockfile::from_resolution(&promoted, environment()).unwrap();
+    assert_eq!(
+        promoted_lock.single_resolution().unwrap().packages[0].dependencies,
+        vec![
+            LockedDependencyEdge {
+                kind: EffectiveDependencyKind::Depends,
+                package: package("selected"),
+            },
+            LockedDependencyEdge {
+                kind: EffectiveDependencyKind::PromotedSuggests,
+                package: package("selected"),
+            },
+        ]
+    );
 }
 
 #[test]
@@ -350,7 +398,7 @@ fn consume_locked_graph_preserves_locked_records_without_a_loader() {
     let root = release("root", "1.0.0");
     let dependency = release("dependency", "2.0.0");
     let mut root_package = LockedPackage::from_release(&root);
-    root_package.dependencies = vec![package("dependency")];
+    root_package.dependencies = vec![edge("dependency")];
     let lock = Lockfile::new(vec![LockedResolution {
         target: target(),
         environment: environment(),
@@ -376,7 +424,7 @@ fn consume_locked_graph_preserves_locked_records_without_a_loader() {
         .iter()
         .find(|locked| locked.identity.name() == &package("root"))
         .unwrap();
-    assert_eq!(root_package.dependencies, vec![package("dependency")]);
+    assert_eq!(root_package.dependencies, vec![edge("dependency")]);
 }
 
 #[test]
@@ -564,6 +612,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         version: first.version().clone(),
         published_version_spelling: None,
         dependencies: Vec::new(),
+        visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
     };
     let second_lock = LockedPackage {
@@ -571,6 +620,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         version: second.version().clone(),
         published_version_spelling: None,
         dependencies: Vec::new(),
+        visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
     };
     assert!(matches!(
@@ -611,6 +661,7 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
                 version: version("1.0.0"),
                 published_version_spelling: None,
                 dependencies: Vec::new(),
+                visible_repository_ids: Vec::new(),
                 metadata_sha256: digest(),
             },
             LockedPackage {
@@ -618,6 +669,7 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
                 version: version("2.0.0"),
                 published_version_spelling: None,
                 dependencies: Vec::new(),
+                visible_repository_ids: Vec::new(),
                 metadata_sha256: digest(),
             },
         ],
@@ -656,5 +708,45 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
     assert_eq!(
         identities.get(&SolverKey::Exact(bioconductor.clone())),
         Some(&bioconductor)
+    );
+}
+
+#[test]
+fn visible_repository_ids_restore_repository_solver_keys_in_order() {
+    let repository = rsolve_core::RepositoryId::new("mirror").unwrap();
+    let locked = LockedPackage {
+        identity: ReleaseIdentity::new(
+            package("scoped"),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.0.0"),
+            },
+        ),
+        version: version("1.0.0"),
+        published_version_spelling: None,
+        dependencies: Vec::new(),
+        visible_repository_ids: vec![repository.clone()],
+        metadata_sha256: digest(),
+    };
+    let lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![locked],
+    }])
+    .unwrap();
+    let identities = lock.locked_identities().unwrap();
+    assert_eq!(
+        identities.get(&SolverKey::Repository {
+            repository,
+            name: package("scoped"),
+        }),
+        Some(&ReleaseIdentity::new(
+            package("scoped"),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran").unwrap(),
+                version: version("1.0.0"),
+            },
+        ))
     );
 }

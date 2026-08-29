@@ -905,7 +905,10 @@ fn hermetic_matrix_versions_produce_distinct_canonical_locks() {
         .unwrap();
     assert_eq!(
         matrix.dependencies,
-        vec![PackageName::new("lattice").unwrap()]
+        vec![crate::LockedDependencyEdge {
+            kind: rsolve_core::EffectiveDependencyKind::Imports,
+            package: PackageName::new("lattice").unwrap(),
+        }]
     );
     assert_eq!(second_lock.resolutions[0].packages.len(), 2);
     assert!(

@@ -16,8 +16,8 @@ pub mod progress;
 pub mod wire;
 
 pub use lock::{
-    ConsumedLockedGraph, EnvironmentId, EnvironmentIdError, LockError, LockedPackage,
-    LockedResolution, Lockfile, consume_locked_graph,
+    ConsumedLockedGraph, EnvironmentId, EnvironmentIdError, LockError, LockedDependencyEdge,
+    LockedPackage, LockedResolution, Lockfile, consume_locked_graph,
 };
 pub use manifest::{
     ComposedEnvironment, ComposedRootIntent, DirectUrl, EffectiveRepository, Endpoint, GitSelector,

@@ -25,11 +25,24 @@ fn package_record(name: &str, provenance: Provenance) -> LockedPackage {
         version: version("1.0"),
         published_version_spelling: None,
         dependencies: vec![
-            package("registry"),
-            package("bioc"),
-            package("git"),
-            package("immutable"),
+            LockedDependencyEdge {
+                kind: EffectiveDependencyKind::Depends,
+                package: package("registry"),
+            },
+            LockedDependencyEdge {
+                kind: EffectiveDependencyKind::Imports,
+                package: package("bioc"),
+            },
+            LockedDependencyEdge {
+                kind: EffectiveDependencyKind::LinkingTo,
+                package: package("git"),
+            },
+            LockedDependencyEdge {
+                kind: EffectiveDependencyKind::PromotedSuggests,
+                package: package("immutable"),
+            },
         ],
+        visible_repository_ids: Vec::new(),
         metadata_sha256: Sha256Digest::new("a".repeat(64)).unwrap(),
     }
 }
@@ -250,7 +263,7 @@ fn reader_requires_version_one_and_rejects_removed_headers_and_wrappers() {
 
 #[test]
 fn dangling_dependency_is_rejected_at_the_lock_boundary() {
-    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [\"missing\"]\n";
+    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [{ kind = \"depends\", package = \"missing\" }]\nvisible-repository-ids = []\n";
     assert!(matches!(
         from_toml(input),
         Err(LockWireError::Domain(LockError::DanglingDependency { package, dependency }))
@@ -260,7 +273,7 @@ fn dangling_dependency_is_rejected_at_the_lock_boundary() {
 
 #[test]
 fn metadata_digest_is_required_on_wire_packages() {
-    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\ndependencies = []\n";
+    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\ndependencies = []\nvisible-repository-ids = []\n";
     assert!(matches!(from_toml(input), Err(LockWireError::Parse(_))));
 }
 
@@ -271,7 +284,7 @@ fn unknown_and_machine_local_fields_are_rejected_and_not_emitted() {
     let platform =
         "version = 1\nr-version = \"4.4\"\nos = \"linux\"\narch = \"x86_64\"\npackages = []\n";
     assert!(matches!(from_toml(platform), Err(LockWireError::Parse(_))));
-    let package_machine_local = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\ndependencies = []\nartifact-url = \"/tmp/a\"\n";
+    let package_machine_local = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\ndependencies = []\nvisible-repository-ids = []\nartifact-url = \"/tmp/a\"\n";
     assert!(matches!(
         from_toml(package_machine_local),
         Err(LockWireError::Parse(_))
@@ -320,4 +333,100 @@ fn reversed_logical_input_has_identical_wire_bytes() {
     }
     let second = Lockfile::new(vec![resolution]).unwrap();
     assert_eq!(to_toml(&first).unwrap(), to_toml(&second).unwrap());
+}
+
+#[test]
+fn structured_edges_and_visible_repository_ids_round_trip() {
+    let mut lock = logical_lock();
+    lock.resolutions[0].packages[0].visible_repository_ids = vec![
+        rsolve_core::RepositoryId::new("secondary").unwrap(),
+        rsolve_core::RepositoryId::new("primary").unwrap(),
+    ];
+    let text = to_toml(&lock).unwrap();
+    assert!(text.contains("kind = \"promoted-suggests\""));
+    assert!(text.contains("visible-repository-ids = [\"secondary\", \"primary\"]"));
+    assert_eq!(from_toml(&text).unwrap(), lock);
+}
+
+#[test]
+fn unknown_dependency_kind_and_duplicate_visible_repository_are_rejected() {
+    let unknown = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [{ kind = \"optional\", package = \"bar\" }]\nvisible-repository-ids = []\n";
+    assert!(matches!(
+        from_toml(unknown),
+        Err(LockWireError::InvalidField { field, .. }) if field == "package.dependencies.kind"
+    ));
+    let duplicate = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = []\nvisible-repository-ids = [\"main\", \"main\"]\n";
+    assert!(matches!(
+        from_toml(duplicate),
+        Err(LockWireError::Domain(
+            LockError::DuplicateVisibleRepository { .. }
+        ))
+    ));
+}
+
+#[test]
+fn wire_rejects_noncanonical_structured_edges_and_duplicate_packages() {
+    let base = "version = 1\nr-version = \"4.4\"\n";
+    let bar = format!(
+        "[[packages]]\nname = \"bar\"\nversion = \"1.0\"\nsource = {{ kind = \"registry\", namespace = \"cran\" }}\nmetadata-sha256 = \"{}\"\ndependencies = []\nvisible-repository-ids = []\n",
+        "0".repeat(64),
+    );
+    let foo = |dependencies: &str| {
+        format!(
+            "[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = {{ kind = \"registry\", namespace = \"cran\" }}\nmetadata-sha256 = \"{}\"\ndependencies = {dependencies}\nvisible-repository-ids = []\n",
+            "0".repeat(64),
+        )
+    };
+    let noncanonical_edges = format!(
+        "{base}{bar}{foo}",
+        foo = foo(
+            "[{ kind = \"imports\", package = \"bar\" }, { kind = \"depends\", package = \"bar\" }]"
+        )
+    );
+    assert!(matches!(
+        from_toml(&noncanonical_edges),
+        Err(LockWireError::Domain(LockError::NonCanonical))
+    ));
+
+    let duplicate_edge = format!(
+        "{base}{bar}{foo}",
+        foo = foo(
+            "[{ kind = \"depends\", package = \"bar\" }, { kind = \"depends\", package = \"bar\" }]"
+        )
+    );
+    assert!(matches!(
+        from_toml(&duplicate_edge),
+        Err(LockWireError::Domain(LockError::NonCanonical))
+    ));
+
+    let reversed_packages = format!(
+        "{base}{foo}{bar}",
+        foo = foo(
+            "[{ kind = \"depends\", package = \"bar\" }, { kind = \"imports\", package = \"bar\" }]"
+        )
+    );
+    assert!(matches!(
+        from_toml(&reversed_packages),
+        Err(LockWireError::Domain(LockError::NonCanonical))
+    ));
+
+    let duplicate_package = format!(
+        "{base}[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = {{ kind = \"registry\", namespace = \"cran\" }}\nmetadata-sha256 = \"{}\"\ndependencies = []\nvisible-repository-ids = []\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = {{ kind = \"registry\", namespace = \"cran\" }}\nmetadata-sha256 = \"{}\"\ndependencies = []\nvisible-repository-ids = []\n",
+        "0".repeat(64),
+        "0".repeat(64),
+    );
+    assert!(matches!(
+        from_toml(&duplicate_package),
+        Err(LockWireError::Domain(LockError::NonCanonical))
+    ));
+}
+
+#[test]
+fn wire_rejects_invalid_visible_repository_id() {
+    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = []\nvisible-repository-ids = [\"\"]\n";
+    assert!(matches!(
+        from_toml(input),
+        Err(LockWireError::InvalidField { field, .. })
+            if field == "package.visible-repository-ids"
+    ));
 }

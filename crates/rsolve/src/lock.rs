@@ -63,8 +63,22 @@ pub struct LockedPackage {
     pub identity: ReleaseIdentity,
     pub version: RPackageVersion,
     pub published_version_spelling: Option<Box<str>>,
-    pub dependencies: Vec<PackageName>,
+    /// Effective graph edges, retaining the reason for each selected target.
+    pub dependencies: Vec<LockedDependencyEdge>,
+    /// Repositories whose available occurrences made this package visible for
+    /// the selected solver subject(s). This is provenance visibility, not an
+    /// artifact endpoint restriction.
+    pub visible_repository_ids: Vec<rsolve_core::RepositoryId>,
     pub metadata_sha256: Sha256Digest,
+}
+
+/// One effective dependency edge in the selected lock graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedDependencyEdge {
+    /// The dependency reason projected from the resolved graph.
+    pub kind: EffectiveDependencyKind,
+    /// The selected package target.
+    pub package: PackageName,
 }
 
 impl LockedPackage {
@@ -83,24 +97,29 @@ impl LockedPackage {
                 | EffectiveDependencyKind::Imports
                 | EffectiveDependencyKind::LinkingTo => {
                     if dependency.package.name().as_str() != "R" {
-                        dependencies.push(dependency.package.name().clone());
+                        dependencies.push(LockedDependencyEdge {
+                            kind: dependency.kind,
+                            package: dependency.package.name().clone(),
+                        });
                     }
                 }
                 EffectiveDependencyKind::PromotedSuggests => {
-                    return Err(LockError::UnsupportedDependencyKind {
-                        package: selected.name().to_string(),
-                        dependency: dependency.package.name().to_string(),
-                    });
+                    if dependency.package.name().as_str() != "R" {
+                        dependencies.push(LockedDependencyEdge {
+                            kind: dependency.kind,
+                            package: dependency.package.name().clone(),
+                        });
+                    }
                 }
             }
         }
-        dependencies.sort();
-        dependencies.dedup();
+        canonicalize_dependency_edges(&mut dependencies);
         Ok(Self {
             identity: selected.release().identity().clone(),
             version: selected.release().version().clone(),
             published_version_spelling,
             dependencies,
+            visible_repository_ids: selected.visible_repository_ids().to_vec(),
             metadata_sha256: selected.release().metadata_digest().clone(),
         })
     }
@@ -123,15 +142,21 @@ impl LockedPackage {
                     DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
                 ) && dependency.package.name().as_str() != "R"
             })
-            .map(|dependency| dependency.package.name().clone())
+            .map(|dependency| LockedDependencyEdge {
+                kind: dependency
+                    .kind
+                    .effective()
+                    .expect("filtered hard dependency"),
+                package: dependency.package.name().clone(),
+            })
             .collect::<Vec<_>>();
-        dependencies.sort();
-        dependencies.dedup();
+        canonicalize_dependency_edges(&mut dependencies);
         Self {
             identity: release.identity().clone(),
             version: release.version().clone(),
             published_version_spelling,
             dependencies,
+            visible_repository_ids: Vec::new(),
             metadata_sha256: release.metadata_digest().clone(),
         }
     }
@@ -216,7 +241,7 @@ impl Lockfile {
                 LockedPackage::from_resolved(selected).map(|mut package| {
                     package
                         .dependencies
-                        .retain(|dependency| selected_names.contains(dependency));
+                        .retain(|dependency| selected_names.contains(&dependency.package));
                     package
                 })
             })
@@ -268,7 +293,7 @@ impl Lockfile {
         let resolution = self.single_resolution()?;
         let mut identities = LockedIdentities::new();
         for package in &resolution.packages {
-            for key in identity_solver_keys(&package.identity) {
+            for key in identity_solver_keys(&package.identity, &package.visible_repository_ids) {
                 if let Some(previous) = identities.insert(key, package.identity.clone())
                     && previous != package.identity
                 {
@@ -399,8 +424,8 @@ impl Lockfile {
         for resolution in &mut self.resolutions {
             for package in &mut resolution.packages {
                 package.validate()?;
-                package.dependencies.sort();
-                package.dependencies.dedup();
+                canonicalize_dependency_edges(&mut package.dependencies);
+                validate_visible_repository_ids(package)?;
             }
             resolution
                 .packages
@@ -432,6 +457,7 @@ impl Lockfile {
             packages.sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
             for package in &packages {
                 package.validate()?;
+                validate_visible_repository_ids(package)?;
             }
             for pair in packages.windows(2) {
                 if pair[0].identity == pair[1].identity && pair[0] != pair[1] {
@@ -505,9 +531,9 @@ pub enum LockError {
     UnreachablePackage {
         package: String,
     },
-    UnsupportedDependencyKind {
+    DuplicateVisibleRepository {
         package: String,
-        dependency: String,
+        repository: String,
     },
     ExactIdentitySetMismatch {
         missing: Vec<String>,
@@ -570,12 +596,12 @@ impl fmt::Display for LockError {
                     "locked package {package} is unreachable from manifest roots"
                 )
             }
-            Self::UnsupportedDependencyKind {
+            Self::DuplicateVisibleRepository {
                 package,
-                dependency,
+                repository,
             } => write!(
                 f,
-                "locked package {package} has unsupported effective dependency {dependency}"
+                "locked package {package} lists duplicate visible repository {repository}"
             ),
             Self::ExactIdentitySetMismatch { missing, extra } => write!(
                 f,
@@ -600,27 +626,36 @@ fn mark_reachable(
     for dependency in &package.dependencies {
         let dependency_package =
             by_name
-                .get(dependency)
+                .get(&dependency.package)
                 .ok_or_else(|| LockError::DanglingDependency {
                     package: package.identity.name().to_string(),
-                    dependency: dependency.to_string(),
+                    dependency: dependency.package.to_string(),
                 })?;
         mark_reachable(dependency_package, by_name, reachable)?;
     }
     Ok(())
 }
 
-fn validate_canonical_resolution(resolution: &LockedResolution) -> Result<(), LockError> {
+pub(crate) fn validate_canonical_resolution(
+    resolution: &LockedResolution,
+) -> Result<(), LockError> {
     let mut packages = resolution.packages.clone();
     packages.sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
     if packages != resolution.packages {
+        return Err(LockError::NonCanonical);
+    }
+    if resolution
+        .packages
+        .windows(2)
+        .any(|pair| pair[0].identity == pair[1].identity)
+    {
         return Err(LockError::NonCanonical);
     }
     if resolution.packages.iter().any(|package| {
         package
             .dependencies
             .windows(2)
-            .any(|pair| pair[0] >= pair[1])
+            .any(|pair| dependency_edge_cmp(&pair[0], &pair[1]) != Ordering::Less)
     }) {
         return Err(LockError::NonCanonical);
     }
@@ -651,15 +686,48 @@ fn ensure_dependencies_exist(packages: &[LockedPackage]) -> Result<(), LockError
         .collect::<BTreeSet<_>>();
     for package in packages {
         for dependency in &package.dependencies {
-            if !selected.contains(dependency) {
+            if !selected.contains(&dependency.package) {
                 return Err(LockError::DanglingDependency {
                     package: package.identity.name().to_string(),
-                    dependency: dependency.to_string(),
+                    dependency: dependency.package.to_string(),
                 });
             }
         }
     }
     Ok(())
+}
+
+fn validate_visible_repository_ids(package: &LockedPackage) -> Result<(), LockError> {
+    let mut seen = BTreeSet::new();
+    for repository in &package.visible_repository_ids {
+        if !seen.insert(repository) {
+            return Err(LockError::DuplicateVisibleRepository {
+                package: package.identity.name().to_string(),
+                repository: repository.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn dependency_edge_cmp(left: &LockedDependencyEdge, right: &LockedDependencyEdge) -> Ordering {
+    left.package
+        .cmp(&right.package)
+        .then_with(|| dependency_kind_rank(left.kind).cmp(&dependency_kind_rank(right.kind)))
+}
+
+fn dependency_kind_rank(kind: EffectiveDependencyKind) -> u8 {
+    match kind {
+        EffectiveDependencyKind::Depends => 0,
+        EffectiveDependencyKind::Imports => 1,
+        EffectiveDependencyKind::LinkingTo => 2,
+        EffectiveDependencyKind::PromotedSuggests => 3,
+    }
+}
+
+fn canonicalize_dependency_edges(edges: &mut Vec<LockedDependencyEdge>) {
+    edges.sort_by(dependency_edge_cmp);
+    edges.dedup();
 }
 
 impl Error for LockError {
@@ -683,8 +751,20 @@ fn canonical_version(version: &RPackageVersion) -> String {
         .join(".")
 }
 
-fn identity_solver_keys(identity: &ReleaseIdentity) -> Vec<SolverKey> {
+fn identity_solver_keys(
+    identity: &ReleaseIdentity,
+    visible_repository_ids: &[rsolve_core::RepositoryId],
+) -> Vec<SolverKey> {
     let mut keys = vec![SolverKey::InstalledName(identity.name().clone())];
+    keys.extend(
+        visible_repository_ids
+            .iter()
+            .cloned()
+            .map(|repository| SolverKey::Repository {
+                repository,
+                name: identity.name().clone(),
+            }),
+    );
     match identity.provenance() {
         Provenance::RegistryRelease { namespace, .. } => {
             keys.push(SolverKey::Registry {
