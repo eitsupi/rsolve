@@ -375,6 +375,7 @@ impl Lockfile {
                     | DependencySourceConstraint::Git { .. }
                     | DependencySourceConstraint::Exact(_) => None,
                 },
+                runtime_provided: matches!(root.package.source(), DependencySourceConstraint::Any),
             })
             .collect::<Vec<_>>();
         self.consume_roots(
@@ -415,6 +416,10 @@ impl Lockfile {
                     | ManifestSource::Url { .. }
                     | ManifestSource::Path { .. } => None,
                 },
+                runtime_provided: matches!(
+                    &root.source,
+                    ManifestSource::Registry { repository: None }
+                ),
             })
             .collect::<Vec<_>>();
         self.consume_roots(
@@ -494,7 +499,7 @@ impl Lockfile {
         let mut reachable = BTreeSet::new();
         for root in roots {
             let name = &root.name;
-            if is_r_base_name(name) {
+            if root.runtime_provided && is_r_base_name(name) {
                 if !root.constraint.satisfies(&resolution.target.r_version) {
                     return Err(LockError::DirectRootVersionMismatch {
                         name: name.to_string(),
@@ -599,6 +604,7 @@ struct RootCheck {
     name: PackageName,
     constraint: rsolve_core::VersionConstraint,
     repository: Option<rsolve_core::RepositoryId>,
+    runtime_provided: bool,
 }
 
 /// Consume a lockfile as an immutable graph without exposing any resolver or

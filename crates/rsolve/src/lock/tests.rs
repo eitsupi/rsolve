@@ -226,6 +226,58 @@ fn composed_consumption_neutral_and_direct_roots_do_not_require_visibility() {
 }
 
 #[test]
+fn composed_consumption_applies_r_base_overlay_only_to_unqualified_roots() {
+    let empty_lock = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: Vec::new(),
+    }])
+    .unwrap();
+    let unqualified = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "stats",
+            crate::manifest::ManifestSource::Registry { repository: None },
+        )],
+    );
+    assert!(
+        empty_lock
+            .consume_composed_environment(&unqualified)
+            .is_ok()
+    );
+
+    let qualified = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "stats",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(rsolve_core::RepositoryId::new("main").unwrap()),
+            },
+        )],
+    );
+    assert!(matches!(
+        empty_lock.consume_composed_environment(&qualified),
+        Err(LockError::DirectRootMissing { name }) if name == "stats"
+    ));
+
+    let direct = composed_environment(
+        Vec::new(),
+        vec![composed_root(
+            "stats",
+            crate::manifest::ManifestSource::Url {
+                url: crate::manifest::DirectUrl::parse("https://example.org/stats.tar.gz").unwrap(),
+                sha256: None,
+            },
+        )],
+    );
+    assert!(matches!(
+        empty_lock.consume_composed_environment(&direct),
+        Err(LockError::DirectRootMissing { name }) if name == "stats"
+    ));
+}
+
+#[test]
 fn composed_consumption_requires_matching_publication_cutoff() {
     let cutoff = PublicationDate::parse("2026-08-01").unwrap();
     let other_cutoff = PublicationDate::parse("2026-08-02").unwrap();
