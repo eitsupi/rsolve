@@ -393,6 +393,16 @@ impl Lockfile {
         &self,
         composed: &ComposedEnvironment,
     ) -> Result<ConsumedLockedGraph, LockError> {
+        let resolution = self.single_resolution()?;
+        if resolution.publication_cutoff.as_ref() != composed.published_before.as_ref() {
+            return Err(LockError::PublicationCutoffMismatch {
+                lock: resolution
+                    .publication_cutoff
+                    .as_ref()
+                    .map(ToString::to_string),
+                composed: composed.published_before.as_ref().map(ToString::to_string),
+            });
+        }
         let roots = composed
             .roots
             .iter()
@@ -664,6 +674,10 @@ pub enum LockError {
     VisibleRepositoryOrderMismatch {
         package: String,
     },
+    PublicationCutoffMismatch {
+        lock: Option<String>,
+        composed: Option<String>,
+    },
     ExactIdentitySetMismatch {
         missing: Vec<String>,
         extra: Vec<String>,
@@ -746,6 +760,10 @@ impl fmt::Display for LockError {
             Self::VisibleRepositoryOrderMismatch { package } => write!(
                 f,
                 "locked package {package} visible repositories are not in manifest order"
+            ),
+            Self::PublicationCutoffMismatch { lock, composed } => write!(
+                f,
+                "lock publication cutoff {lock:?} does not match composed environment cutoff {composed:?}"
             ),
             Self::ExactIdentitySetMismatch { missing, extra } => write!(
                 f,

@@ -226,6 +226,62 @@ fn composed_consumption_neutral_and_direct_roots_do_not_require_visibility() {
 }
 
 #[test]
+fn composed_consumption_requires_matching_publication_cutoff() {
+    let cutoff = PublicationDate::parse("2026-08-01").unwrap();
+    let other_cutoff = PublicationDate::parse("2026-08-02").unwrap();
+    let lock_with_cutoff = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: Some(cutoff),
+        packages: vec![LockedPackage::from_release(&release("root", "1.0.0"))],
+    }])
+    .unwrap();
+    let mut composed = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry { repository: None },
+        )],
+    );
+    assert!(matches!(
+        lock_with_cutoff.consume_composed_environment(&composed),
+        Err(LockError::PublicationCutoffMismatch {
+            lock: Some(lock),
+            composed: None,
+        }) if lock == "2026-08-01"
+    ));
+    composed.published_before = Some(other_cutoff);
+    assert!(matches!(
+        lock_with_cutoff.consume_composed_environment(&composed),
+        Err(LockError::PublicationCutoffMismatch {
+            lock: Some(lock),
+            composed: Some(composed),
+        }) if lock == "2026-08-01" && composed == "2026-08-02"
+    ));
+    composed.published_before = Some(cutoff);
+    assert!(
+        lock_with_cutoff
+            .consume_composed_environment(&composed)
+            .is_ok()
+    );
+
+    let lock_without_cutoff = Lockfile::new(vec![LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff: None,
+        packages: vec![LockedPackage::from_release(&release("root", "1.0.0"))],
+    }])
+    .unwrap();
+    assert!(matches!(
+        lock_without_cutoff.consume_composed_environment(&composed),
+        Err(LockError::PublicationCutoffMismatch {
+            lock: None,
+            composed: Some(composed),
+        }) if composed == "2026-08-01"
+    ));
+}
+
+#[test]
 fn composed_consumption_checks_transitive_visible_repositories() {
     let main = rsolve_core::RepositoryId::new("main").unwrap();
     let unknown = rsolve_core::RepositoryId::new("unknown").unwrap();
