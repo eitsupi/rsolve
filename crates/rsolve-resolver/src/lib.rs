@@ -486,7 +486,7 @@ impl<'a> Resolver<'a> {
                 LockDecision::Unlocked => None,
             };
             let context = PreferenceContext { locked };
-            let expansion = root_expansion_for_subject(request, &subject);
+            let expansion = root_expansion_for_package(request, package.name());
             let basis = assignment_basis(
                 package,
                 &candidates,
@@ -795,18 +795,15 @@ fn subject_name(subject: &SolverKey) -> PackageName {
     }
 }
 
-fn root_expansion_for_subject(
+fn root_expansion_for_package(
     request: &ResolutionRequest,
-    subject: &SolverKey,
+    name: &PackageName,
 ) -> RootExpansionPolicy {
     request
         .roots
         .iter()
-        .filter_map(|requirement| {
-            dependency_key(requirement.package.name(), requirement.package.source())
-                .filter(|key| key == subject)
-                .map(|_| requirement.expansion)
-        })
+        .filter(|requirement| requirement.package.name() == name)
+        .map(|requirement| requirement.expansion)
         .find(|expansion| *expansion == RootExpansionPolicy::DirectSuggests)
         .unwrap_or(RootExpansionPolicy::HardOnly)
 }

@@ -458,6 +458,117 @@ fn source_qualified_direct_suggests_can_be_only_statically_compatible() {
 }
 
 #[test]
+fn merged_subject_comparison_uses_direct_suggests_from_same_name_root() {
+    let mut loader = FixtureLoader::default();
+    loader.candidates.insert(
+        package("A"),
+        vec![release(
+            "A",
+            "1.0",
+            vec![any_dependency("Foo", VersionConstraint::unconstrained())],
+        )],
+    );
+    loader.candidates.insert(
+        package("Foo"),
+        vec![
+            release(
+                "Foo",
+                "1.0",
+                vec![dependency(
+                    DependencyKind::Suggests,
+                    "child",
+                    VersionConstraint::from_clause(
+                        rsolve_core::RelationOp::Ge,
+                        RPackageVersion::parse("2.0").unwrap(),
+                    ),
+                )],
+            ),
+            release(
+                "Foo",
+                "2.0",
+                vec![
+                    any_dependency(
+                        "child",
+                        VersionConstraint::from_clause(
+                            rsolve_core::RelationOp::Eq,
+                            RPackageVersion::parse("1.0").unwrap(),
+                        ),
+                    ),
+                    dependency(
+                        DependencyKind::Suggests,
+                        "child",
+                        VersionConstraint::from_clause(
+                            rsolve_core::RelationOp::Eq,
+                            RPackageVersion::parse("1.0").unwrap(),
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    );
+    loader
+        .candidates
+        .insert(package("child"), vec![release("child", "1.0", Vec::new())]);
+    let request = ResolutionRequest::without_lock(
+        vec![
+            RootRequirement {
+                package: PackageRequirement::new(
+                    package("A"),
+                    DependencySourceConstraint::Any,
+                    VersionConstraint::unconstrained(),
+                )
+                .unwrap(),
+                expansion: RootExpansionPolicy::HardOnly,
+            },
+            RootRequirement {
+                package: PackageRequirement::new(
+                    package("Foo"),
+                    DependencySourceConstraint::Repository {
+                        repository: RepositoryId::new("cran").unwrap(),
+                    },
+                    VersionConstraint::unconstrained(),
+                )
+                .unwrap(),
+                expansion: RootExpansionPolicy::DirectSuggests,
+            },
+        ],
+        ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        VersionConstraint::unconstrained(),
+    );
+    let compared = Resolver::new(&loader, &DefaultCandidatePreference, &Unlocked)
+        .resolve_with_assignment_comparison(request)
+        .unwrap();
+    let foo = compared
+        .resolution
+        .packages()
+        .iter()
+        .find(|candidate| candidate.name() == &package("Foo"))
+        .unwrap();
+    assert!(
+        foo.effective_dependencies()
+            .iter()
+            .any(|edge| { edge.kind == rsolve_core::EffectiveDependencyKind::PromotedSuggests })
+    );
+    let assignment = compared
+        .comparison
+        .assignments
+        .iter()
+        .find(|assignment| {
+            assignment.subject == rsolve_resolver::DecisionSubject::InstalledName(package("Foo"))
+        })
+        .unwrap();
+    assert!(assignment.alternatives.iter().any(|alternative| {
+        matches!(
+            alternative.differs_by,
+            rsolve_resolver::AssignmentDifference::ConstraintViolatedByAssignment {
+                against: rsolve_resolver::DecisionSubject::InstalledName(ref name),
+                ..
+            } if name == &package("child")
+        )
+    }));
+}
+
+#[test]
 fn promoted_suggests_are_not_recursive() {
     let mut loader = FixtureLoader::default();
     loader.candidates.insert(
