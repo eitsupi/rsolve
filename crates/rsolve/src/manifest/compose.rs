@@ -179,7 +179,7 @@ fn compose_environment_with_locked(
             });
         }
     };
-    let r_requirement = parse_version_constraint(&document.r_requirement, "r.version")?;
+    let r_requirement = parse_r_constraint(&document.r_requirement, "r.version")?;
     if !r_requirement.satisfies(&target.r_version) {
         return Err(ManifestError::TargetOutsideRConstraint {
             target: target.r_version.to_string(),
@@ -209,9 +209,30 @@ fn compose_environment_with_locked(
     })
 }
 
-pub(crate) fn parse_version_constraint(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstraintVersionKind {
+    R,
+    Package,
+}
+
+pub(super) fn parse_r_constraint(
     input: &str,
     field: impl Into<String>,
+) -> Result<VersionConstraint, ManifestError> {
+    parse_constraint(input, field, ConstraintVersionKind::R)
+}
+
+fn parse_package_constraint(
+    input: &str,
+    field: impl Into<String>,
+) -> Result<VersionConstraint, ManifestError> {
+    parse_constraint(input, field, ConstraintVersionKind::Package)
+}
+
+fn parse_constraint(
+    input: &str,
+    field: impl Into<String>,
+    kind: ConstraintVersionKind,
 ) -> Result<VersionConstraint, ManifestError> {
     let field = field.into();
     if input.is_empty() || input.chars().any(char::is_control) {
@@ -253,14 +274,16 @@ pub(crate) fn parse_version_constraint(
         if version.is_empty() || version == "*" {
             return Err(ManifestError::InvalidVersionConstraint {
                 field: field.clone(),
-                reason: "relation must have a numeric R version".into(),
+                reason: "relation must have a numeric version".into(),
             });
         }
-        let version = rsolve_core::RPackageVersion::parse_bare(version).map_err(|error| {
-            ManifestError::InvalidVersionConstraint {
-                field: field.clone(),
-                reason: error.to_string(),
-            }
+        let version = match kind {
+            ConstraintVersionKind::R => rsolve_core::RPackageVersion::parse_bare(version),
+            ConstraintVersionKind::Package => rsolve_core::RPackageVersion::parse(version),
+        }
+        .map_err(|error| ManifestError::InvalidVersionConstraint {
+            field: field.clone(),
+            reason: error.to_string(),
         })?;
         clauses.push(VersionClause::new(op, version));
     }
@@ -289,7 +312,7 @@ fn append_dependencies(
         }
         let candidate = ComposedRootIntent {
             name: name.clone(),
-            constraint: parse_version_constraint(&dependency.version, name.as_str())?,
+            constraint: parse_package_constraint(&dependency.version, name.as_str())?,
             source: normalize_source(name, &dependency.source)?,
             expansion: if dependency.include_suggests {
                 RootExpansionPolicy::DirectSuggests
@@ -394,7 +417,7 @@ fn validate_document(document: &ManifestDocument) -> Result<(), ManifestError> {
             schema: i64::from(document.schema),
         });
     }
-    parse_version_constraint(&document.r_requirement, "r.version")?;
+    parse_r_constraint(&document.r_requirement, "r.version")?;
     let mut repositories = HashSet::with_capacity(document.repositories.len());
     for repository in &document.repositories {
         validate_repository_id(repository.id())?;
@@ -447,7 +470,7 @@ fn validate_dependency_maps(
     repositories: &HashSet<RepositoryId>,
 ) -> Result<(), ManifestError> {
     for (name, dependency) in dependencies {
-        parse_version_constraint(&dependency.version, name.as_str())?;
+        parse_package_constraint(&dependency.version, name.as_str())?;
         if name.as_str() == "R" {
             return Err(ManifestError::RIsNotAPackageRequirement);
         }

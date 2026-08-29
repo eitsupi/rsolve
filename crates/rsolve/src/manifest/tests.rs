@@ -411,6 +411,43 @@ fn r_requirement_and_publication_cutoff_are_required_and_typed() {
 }
 
 #[test]
+fn r_constraints_allow_one_component_versions_but_package_constraints_do_not() {
+    let r = parse_manifest("[rsolve]\nschema=1\n[r]\nversion='>= 4'\n").unwrap();
+    assert!(
+        r.compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+            .is_ok()
+    );
+    for dependency in ["'1'", "'>= 1'"] {
+        let error = parse_manifest(&format!(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={dependency}\n"
+        ))
+        .unwrap()
+        .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ManifestError::InvalidVersionConstraint { .. }
+        ));
+    }
+    assert!(
+        parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo='1.0'\n")
+            .unwrap()
+            .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+            .is_ok()
+    );
+    let missing_version =
+        parse_manifest("[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo='>'\n")
+            .unwrap()
+            .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+            .unwrap_err();
+    assert!(matches!(
+        missing_version,
+        ManifestError::InvalidVersionConstraint { reason, .. }
+            if reason == "relation must have a numeric version"
+    ));
+}
+
+#[test]
 fn explicit_repository_references_are_validated_during_parse() {
     let error = parse_manifest(
         "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\nfoo={repository='missing'}\n",
@@ -541,7 +578,7 @@ fn document_composition_merges_base_and_selected_groups_deterministically() {
     assert_eq!(request.roots.len(), 3);
     assert_eq!(
         request.r_requirement,
-        super::compose::parse_version_constraint(">= 4.0, < 5.0", "r").unwrap()
+        super::compose::parse_r_constraint(">= 4.0, < 5.0", "r").unwrap()
     );
     assert!(request.publication_cutoff.is_none());
 }
@@ -654,7 +691,7 @@ fn equivalent_constraint_spellings_have_the_same_intent_digest() {
     );
     let mut zero = first.clone();
     zero.roots[0].constraint =
-        VersionConstraint::from_clause(RelationOp::Eq, RPackageVersion::parse_bare("0").unwrap());
+        VersionConstraint::from_clause(RelationOp::Eq, RPackageVersion::parse("0.0").unwrap());
     assert!(zero.resolution_intent_digest().is_ok());
 }
 
@@ -825,7 +862,7 @@ fn zero_and_equivalent_constraints_have_canonical_digests() {
         .resolution_intent_digest()
         .unwrap()
     };
-    assert_eq!(zero("=0"), zero("=0.0"));
+    assert_eq!(zero("=0.0"), zero("=0.0.0"));
 }
 
 #[test]
