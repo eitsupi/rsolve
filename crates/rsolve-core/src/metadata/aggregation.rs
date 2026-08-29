@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::constraints::DeclaredDependency;
-use crate::identity::{Distribution, ReleaseIdentity};
+use crate::identity::{Distribution, ReleaseIdentity, canonicalize_distributions};
 use crate::names::Sha256Digest;
 use crate::publication::ReleasePublication;
 use crate::r_versions::RPackageVersion;
@@ -51,6 +51,38 @@ impl PackageRelease {
                 self.distributions.push(distribution.clone());
             }
         }
+        canonicalize_distributions(&mut self.distributions);
+    }
+
+    pub(crate) fn merge_consistent(
+        &mut self,
+        incoming: &PackageRelease,
+    ) -> Result<(), PackageReleaseError> {
+        if self.version != incoming.version {
+            return Err(PackageReleaseError::ConflictingMetadata { field: "version" });
+        }
+        if self.metadata != incoming.metadata {
+            return Err(PackageReleaseError::ConflictingMetadata { field: "metadata" });
+        }
+        let merged_publication = match (self.publication, incoming.publication) {
+            (Some(left), Some(right)) if left != right => {
+                return Err(PackageReleaseError::ConflictingMetadata {
+                    field: "publication",
+                });
+            }
+            (Some(publication), _) | (_, Some(publication)) => Some(publication),
+            (None, None) => None,
+        };
+        if self.declared_dependencies != incoming.declared_dependencies {
+            return Err(PackageReleaseError::ConflictingMetadata {
+                field: "declared dependencies",
+            });
+        }
+        if self.publication.is_none() {
+            self.publication = merged_publication;
+        }
+        self.merge_distributions(&incoming.distributions);
+        Ok(())
     }
 }
 
@@ -75,27 +107,7 @@ impl ReleaseAggregation {
     /// independently parsed representations of one registry snapshot.
     pub fn observe_release(&mut self, release: PackageRelease) -> Result<(), PackageReleaseError> {
         if let Some(existing) = self.releases.get_mut(release.identity()) {
-            if existing.version != release.version {
-                return Err(PackageReleaseError::ConflictingMetadata { field: "version" });
-            }
-            if existing.metadata != release.metadata {
-                return Err(PackageReleaseError::ConflictingMetadata { field: "metadata" });
-            }
-            match (existing.publication, release.publication) {
-                (Some(left), Some(right)) if left != right => {
-                    return Err(PackageReleaseError::ConflictingMetadata {
-                        field: "publication",
-                    });
-                }
-                (None, Some(publication)) => existing.publication = Some(publication),
-                _ => {}
-            }
-            if existing.declared_dependencies != release.declared_dependencies {
-                return Err(PackageReleaseError::ConflictingMetadata {
-                    field: "declared dependencies",
-                });
-            }
-            existing.merge_distributions(&release.distributions);
+            existing.merge_consistent(&release)?;
         } else {
             self.releases.insert(release.identity.clone(), release);
         }

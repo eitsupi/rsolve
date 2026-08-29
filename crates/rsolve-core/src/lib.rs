@@ -3,6 +3,7 @@
 //! This crate intentionally contains no transport, runtime, parser, solver,
 //! cache, or CLI implementation details.
 
+mod candidates;
 mod constraints;
 mod environment;
 mod identity;
@@ -14,6 +15,11 @@ mod request;
 mod resolution;
 mod target;
 
+pub use candidates::{
+    CandidateAvailability, CandidateCurrentness, PreparedCandidate, PreparedCandidateError,
+    PreparedCandidateSet, PreparedCandidateSetError, RepositoryOccurrence,
+    RepositoryOccurrenceError,
+};
 pub use constraints::{
     DeclaredDependency, DependencyKind, DependencySourceConstraint, EffectiveDependencyKind,
     PackageRequirement, PackageRequirementError, RelationOp, ResolvedDependencyEdge,

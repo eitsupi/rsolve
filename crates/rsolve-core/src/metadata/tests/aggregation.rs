@@ -51,6 +51,35 @@ fn publication_facts_merge_unknown_and_reject_conflicting_known_values() {
 }
 
 #[test]
+fn conflicting_dependencies_do_not_partially_merge_publication_or_distributions() {
+    let identity = identity(Provenance::RegistryRelease {
+        namespace: PackageNamespace::new("cran").unwrap(),
+        version: version("1.0.0"),
+    });
+    let first_distribution = source_distribution("first");
+    let second_distribution = source_distribution("second");
+    let first = observation(identity.clone(), "1.0.0", first_distribution.clone());
+    let mut conflicting = observation(identity.clone(), "1.0.0", second_distribution);
+    conflicting.publication = Some(ReleasePublication::new(
+        PublicationDate::parse("2026-06-24").unwrap(),
+    ));
+    conflicting.declared_dependencies =
+        vec![digest_dependency("different", DependencyKind::Depends)];
+
+    let mut aggregation = ReleaseAggregation::new();
+    aggregation.observe(first).unwrap();
+    assert!(matches!(
+        aggregation.observe(conflicting),
+        Err(PackageReleaseError::ConflictingMetadata {
+            field: "declared dependencies"
+        })
+    ));
+    let retained = aggregation.get(&identity).unwrap();
+    assert_eq!(retained.publication(), None);
+    assert_eq!(retained.distributions(), &[first_distribution]);
+}
+
+#[test]
 fn same_git_commit_with_two_versions_reports_conflicting_metadata() {
     let provenance = Provenance::GitCommit {
         repository: NormalizedGitUrl::new("https://example.test/repo").unwrap(),

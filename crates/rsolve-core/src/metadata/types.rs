@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::constraints::{DeclaredDependency, DependencySourceConstraint};
-use crate::identity::{Distribution, Provenance, ReleaseIdentity};
+use crate::identity::{Distribution, Provenance, ReleaseIdentity, canonicalize_distributions};
 use crate::names::{PackageName, Sha256Digest};
 use crate::publication::ReleasePublication;
 use crate::r_versions::RPackageVersion;
@@ -174,12 +174,7 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
         }
 
         let mut distributions = observation.distributions;
-        let mut unique_distributions = Vec::with_capacity(distributions.len());
-        for distribution in distributions.drain(..) {
-            if !unique_distributions.contains(&distribution) {
-                unique_distributions.push(distribution);
-            }
-        }
+        canonicalize_distributions(&mut distributions);
 
         let metadata_digest = canonical_metadata_digest(
             &observation.identity,
@@ -192,7 +187,7 @@ impl TryFrom<ReleaseObservation> for PackageRelease {
             metadata: observation.metadata,
             publication: observation.publication,
             declared_dependencies: observation.declared_dependencies,
-            distributions: unique_distributions,
+            distributions,
             metadata_digest,
         })
     }
