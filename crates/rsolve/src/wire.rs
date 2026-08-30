@@ -72,10 +72,6 @@ struct WireLockfile {
     r_version: String,
     resolution_intent_sha256: String,
     r_requirement: String,
-    #[serde(
-        default = "default_environment",
-        skip_serializing_if = "is_default_environment"
-    )]
     environment: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     publication_cutoff: Option<String>,
@@ -221,14 +217,6 @@ fn decode_resolution(
     ))
 }
 
-fn is_default_environment(environment: &str) -> bool {
-    environment == "default"
-}
-
-fn default_environment() -> String {
-    "default".into()
-}
-
 fn decode_package(wire: WirePackage) -> Result<LockedPackage, LockWireError> {
     let name = PackageName::new(wire.name)
         .map_err(|error| invalid_field("package.name", error.to_string()))?;
@@ -307,12 +295,10 @@ fn serialize_wire(wire: &WireLockfile) -> Result<String, LockWireError> {
         toml_string(&wire.r_requirement)?,
         toml_string(&wire.resolution_intent_sha256)?,
     );
-    if !is_default_environment(&wire.environment) {
-        output.push_str(&format!(
-            "environment = {}\n",
-            toml_string(&wire.environment)?
-        ));
-    }
+    output.push_str(&format!(
+        "environment = {}\n",
+        toml_string(&wire.environment)?
+    ));
     if let Some(cutoff) = &wire.publication_cutoff {
         output.push_str(&format!("publication-cutoff = {}\n", toml_string(cutoff)?));
     }

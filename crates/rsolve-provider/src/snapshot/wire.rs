@@ -1,4 +1,5 @@
 use super::*;
+use serde::Deserializer;
 
 pub const HEADER_LIMIT: usize = 16 * 1024 * 1024;
 pub const HISTORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -334,7 +335,7 @@ pub struct EligibleReleaseV1 {
     pub package: String,
     pub version: String,
     pub namespace: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub git_provenance: Option<GitProvenanceV1>,
     pub currentness: CandidateCurrentnessV1,
     pub metadata: Vec<FieldV1>,
@@ -343,6 +344,13 @@ pub struct EligibleReleaseV1 {
     pub distributions: Vec<DistributionV1>,
     pub metadata_sha256: [u8; 32],
     pub evidence: Vec<EvidenceReferenceV1>,
+}
+
+fn deserialize_required_option<'de, D>(deserializer: D) -> Result<Option<GitProvenanceV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// Candidate-specific Git identity retained by providers whose release

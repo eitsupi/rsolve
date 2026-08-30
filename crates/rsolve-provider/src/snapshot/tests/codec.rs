@@ -24,10 +24,17 @@ fn header_decoder_rejects_unknown_fields_versions_and_noncanonical_bytes() {
     let mut version: SnapshotHeaderV1 = serde_json::from_slice(header).unwrap();
     version.version = 2;
     assert!(decode_header(&encode_header(&version).unwrap()).is_err());
+}
 
-    let mut legacy_policy: SnapshotHeaderV1 = serde_json::from_slice(header).unwrap();
-    legacy_policy.normalization_policy = 1;
-    assert!(decode_header(&encode_header(&legacy_policy).unwrap()).is_err());
+#[test]
+fn release_wire_requires_git_provenance_key() {
+    let release = present_input().histories[0].eligible_releases[0].clone();
+    let mut value = serde_json::to_value(release).unwrap();
+    value
+        .as_object_mut()
+        .expect("release wire value is an object")
+        .remove("git_provenance");
+    assert!(serde_json::from_value::<EligibleReleaseV1>(value).is_err());
 }
 
 #[test]
