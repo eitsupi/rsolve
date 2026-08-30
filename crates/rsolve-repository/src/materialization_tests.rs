@@ -284,6 +284,38 @@ fn packages_reject_invalid_field_names_and_canonical_duplicate_checksums() {
     ));
 }
 
+#[test]
+fn rejects_unknown_current_materialization_schema() {
+    let cache_root = temporary_root("materialize-unknown-schema-cache");
+    let project_root = temporary_root("materialize-unknown-schema-project");
+    let bytes = archive_bytes();
+    let cached = commit_source_artifact(
+        &cache_root,
+        &artifact(vec![], Some(bytes.len() as u64)),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let selected = registry_selected("schema", "1.0.0", cached);
+    materialize(MaterializationRequest::new(
+        &project_root,
+        std::slice::from_ref(&selected),
+    ))
+    .unwrap();
+    let state_path = project_root.join(".rsolve/materialization.toml");
+    let mut state = fs::read_to_string(&state_path).unwrap();
+    state = state.replacen("schema_version = 2", "schema_version = 99", 1);
+    fs::write(&state_path, state).unwrap();
+    assert!(matches!(
+        materialize(MaterializationRequest::new(
+            &project_root,
+            std::slice::from_ref(&selected),
+        )),
+        Err(MaterializationError::InvalidState { .. })
+    ));
+    fs::remove_dir_all(cache_root).unwrap();
+    fs::remove_dir_all(project_root).unwrap();
+}
+
 fn registry_selected(
     package: &str,
     version: &str,
