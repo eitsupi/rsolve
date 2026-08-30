@@ -4,6 +4,7 @@
 //! CLI orchestration.
 
 pub mod cran;
+pub mod r_universe;
 pub(crate) mod snapshot;
 
 pub use snapshot::{ReadOnlySnapshotCandidateLoader, SnapshotStore, SnapshotStoreError};

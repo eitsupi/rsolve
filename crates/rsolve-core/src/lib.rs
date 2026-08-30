@@ -39,7 +39,7 @@ pub use names::{
     ArtifactLocator, BioconductorRelease, DigestError, DistributionChannel, GitCommitId,
     GitCommitIdError, GitHashAlgorithm, IdentifierError, NormalizedGitUrl, NormalizedGitUrlError,
     PackageName, PackageNameError, PackageNamespace, RegistryId, RepositoryId, RepositoryRank,
-    RepositorySubdir, Sha256Digest, SnapshotId, SourceScheme,
+    RepositorySubdir, RepositorySubdirError, Sha256Digest, SnapshotId, SourceScheme,
 };
 pub use publication::{
     PublicationCutoff, PublicationDate, PublicationDateError, ReleasePublication,

@@ -441,7 +441,103 @@ impl fmt::Display for GitCommitId {
 
 opaque_identifier!(PackageNamespace);
 opaque_identifier!(BioconductorRelease);
-opaque_identifier!(RepositorySubdir);
+/// A canonical relative slash-separated path within a source repository.
+///
+/// This type accepts canonical wire/domain values only. Human-facing inputs
+/// that permit `.` or `..` components must be normalized before construction,
+/// such as by the manifest parser; accepting multiple spellings here would
+/// make source identities ambiguous.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepositorySubdir(Box<str>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RepositorySubdirError {
+    Empty,
+    Absolute,
+    Backslash,
+    ControlCharacter { index: usize },
+    EmptyComponent { index: usize },
+    DotComponent { index: usize },
+    ParentComponent { index: usize },
+    WindowsDrivePrefix,
+}
+
+impl fmt::Display for RepositorySubdirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("repository subdirectory must not be empty"),
+            Self::Absolute => f.write_str("repository subdirectory must be a relative path"),
+            Self::Backslash => f.write_str("repository subdirectory must use slash separators"),
+            Self::ControlCharacter { index } => write!(
+                f,
+                "repository subdirectory contains a control character at {index}"
+            ),
+            Self::EmptyComponent { index } => write!(
+                f,
+                "repository subdirectory has an empty component at {index}"
+            ),
+            Self::DotComponent { index } => write!(
+                f,
+                "repository subdirectory has a non-canonical dot component at {index}"
+            ),
+            Self::ParentComponent { index } => write!(
+                f,
+                "repository subdirectory has a parent component at {index}"
+            ),
+            Self::WindowsDrivePrefix => {
+                f.write_str("repository subdirectory must not have a Windows drive prefix")
+            }
+        }
+    }
+}
+
+impl Error for RepositorySubdirError {}
+
+impl RepositorySubdir {
+    pub fn new(input: impl AsRef<str>) -> Result<Self, RepositorySubdirError> {
+        let input = input.as_ref();
+        if input.is_empty() {
+            return Err(RepositorySubdirError::Empty);
+        }
+        if input.starts_with('/') {
+            return Err(RepositorySubdirError::Absolute);
+        }
+        if input.contains('\\') {
+            return Err(RepositorySubdirError::Backslash);
+        }
+        for (index, character) in input.char_indices() {
+            if character.is_control() {
+                return Err(RepositorySubdirError::ControlCharacter { index });
+            }
+        }
+        if let Some(first) = input.split('/').next()
+            && first.len() >= 2
+            && first.as_bytes()[0].is_ascii_alphabetic()
+            && first.as_bytes()[1] == b':'
+        {
+            return Err(RepositorySubdirError::WindowsDrivePrefix);
+        }
+        for (index, component) in input.split('/').enumerate() {
+            match component {
+                "" => return Err(RepositorySubdirError::EmptyComponent { index }),
+                "." => return Err(RepositorySubdirError::DotComponent { index }),
+                ".." => return Err(RepositorySubdirError::ParentComponent { index }),
+                _ => {}
+            }
+        }
+        Ok(Self(input.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepositorySubdir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 opaque_identifier!(RepositoryId);
 opaque_identifier!(RegistryId);
 opaque_identifier!(SnapshotId);
@@ -583,6 +679,40 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn repository_subdirectories_require_canonical_relative_paths() {
+        assert_eq!(RepositorySubdir::new("a/b").unwrap().as_str(), "a/b");
+        for invalid in [
+            "",
+            "/absolute",
+            "\\absolute",
+            "a\\b",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "../escape",
+            "a/b/",
+            ".",
+            "..",
+            "C:/source",
+            "c:source",
+            "//server/share",
+        ] {
+            assert!(
+                RepositorySubdir::new(invalid).is_err(),
+                "accepted non-canonical subdirectory {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_subdirectories_reject_control_characters() {
+        assert!(matches!(
+            RepositorySubdir::new("a/\n/b"),
+            Err(RepositorySubdirError::ControlCharacter { .. })
+        ));
     }
 
     #[test]
