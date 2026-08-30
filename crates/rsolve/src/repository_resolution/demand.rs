@@ -92,10 +92,18 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
         ));
     }
 
-    let mut visited = BTreeSet::<(PackageName, Option<RepositoryId>)>::new();
+    // Track the strongest expansion mode already used for each scoped package.
+    // A package first reached through a hard-only edge may later be reached as
+    // a direct-suggest root; that stronger mode must get one additional walk
+    // so its promoted Suggests are not silently lost.
+    let mut visited = BTreeMap::<(PackageName, Option<RepositoryId>), bool>::new();
     while let Some((package, scope, promote_suggests)) = pending.pop() {
-        if !visited.insert((package.clone(), scope.clone())) {
-            continue;
+        let key = (package.clone(), scope.clone());
+        match visited.get(&key) {
+            Some(strongest) if *strongest || !promote_suggests => continue,
+            _ => {
+                visited.insert(key, promote_suggests);
+            }
         }
         discovered.insert(package.clone());
         let eligible = eligible_entries(repositories, scope.as_ref(), &package);
@@ -470,6 +478,95 @@ mod tests {
         assert!(plan.discovered.contains(&package("promoted")));
         assert!(plan.discovered.contains(&package("hard")));
         assert!(!plan.discovered.contains(&package("recursive")));
+    }
+
+    #[test]
+    fn direct_suggests_revisit_after_weak_traversal_promotes_suggests() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let mut source = ScriptedSource::default();
+        source.releases.insert(
+            (0, package("direct")),
+            vec![release(
+                "direct",
+                vec![dependency(DependencyKind::Suggests, "promoted")],
+            )],
+        );
+        source.releases.insert(
+            (0, package("other")),
+            vec![release(
+                "other",
+                vec![dependency(DependencyKind::Depends, "direct")],
+            )],
+        );
+        source.releases.insert(
+            (0, package("promoted")),
+            vec![release("promoted", Vec::new())],
+        );
+
+        // The direct-suggest root is pushed first. The later ordinary root is
+        // popped first and reaches the same package through a weak edge.
+        let plan = demand(
+            &mut source,
+            &repositories,
+            &[
+                root("direct", None, RootExpansionPolicy::DirectSuggests),
+                root("other", None, RootExpansionPolicy::HardOnly),
+            ],
+        );
+
+        assert_eq!(
+            source.calls,
+            vec![
+                (0, package("other")),
+                (0, package("direct")),
+                (0, package("direct")),
+                (0, package("promoted")),
+            ]
+        );
+        assert!(plan.discovered.contains(&package("promoted")));
+    }
+
+    #[test]
+    fn strong_first_direct_suggests_root_is_not_revisited_weakly() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let mut source = ScriptedSource::default();
+        source.releases.insert(
+            (0, package("direct")),
+            vec![release(
+                "direct",
+                vec![dependency(DependencyKind::Suggests, "promoted")],
+            )],
+        );
+        source.releases.insert(
+            (0, package("other")),
+            vec![release(
+                "other",
+                vec![dependency(DependencyKind::Depends, "direct")],
+            )],
+        );
+        source.releases.insert(
+            (0, package("promoted")),
+            vec![release("promoted", Vec::new())],
+        );
+
+        let plan = demand(
+            &mut source,
+            &repositories,
+            &[
+                root("other", None, RootExpansionPolicy::HardOnly),
+                root("direct", None, RootExpansionPolicy::DirectSuggests),
+            ],
+        );
+
+        assert_eq!(
+            source.calls,
+            vec![
+                (0, package("direct")),
+                (0, package("promoted")),
+                (0, package("other")),
+            ]
+        );
+        assert!(plan.discovered.contains(&package("promoted")));
     }
 
     #[test]
