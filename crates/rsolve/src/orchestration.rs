@@ -128,6 +128,17 @@ impl<T: RawCandidateLoader + ?Sized> RawCandidateLoader for &T {
     }
 }
 
+impl<T: RawCandidateLoader + ?Sized> RawCandidateLoader for Box<T> {
+    fn load_raw(&self, package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
+        (**self).load_raw(package)
+    }
+
+    #[cfg(test)]
+    fn contains_package(&self, package: &rsolve_core::PackageName) -> bool {
+        (**self).contains_package(package)
+    }
+}
+
 impl<L: RawCandidateLoader> CandidateLoader for RepositoryCandidateLoader<L> {
     fn releases(&self, package: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         let result = self.load(package)?;
@@ -452,6 +463,32 @@ pub(super) fn resolve_request(
     loader: &dyn CandidateLoader,
 ) -> Result<Resolution, CranResolutionError> {
     resolve_request_with_metrics(request, loader, None)
+}
+
+/// Resolve a fully composed request through an already prepared candidate
+/// loader. Providers and caches must be prepared by the caller before this
+/// transport-free boundary is entered.
+pub(crate) fn resolve_prepared_request(
+    request: rsolve_core::ResolutionRequest,
+    loader: &dyn CandidateLoader,
+) -> Result<CranResolutionOutcome, CranResolutionError> {
+    let recorder = Recorder::new();
+    let measured = MeasuredCandidateLoaderRef {
+        loader,
+        metrics: recorder.clone(),
+    };
+    let overlay = RBasePackageOverlay::new(
+        CandidateLoaderRef(&measured),
+        request.target.r_version.clone(),
+    )
+    .map_err(CranResolutionError::Refresh)?;
+    let resolution = resolve_request_with_metrics(request, &overlay, Some(recorder.clone()))?;
+    Ok(CranResolutionOutcome {
+        resolution,
+        diagnostics: Vec::new(),
+        cache_diagnostics: Vec::new(),
+        metrics: recorder.snapshot(),
+    })
 }
 
 pub(super) fn resolve_request_with_metrics(

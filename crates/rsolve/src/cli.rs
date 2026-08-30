@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 
-use rsolve_core::{PackageName, PublicationDate, RPackageVersion, RegistryId, VersionConstraint};
+use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstraint};
 
 use crate::filesystem::ExistingPathIdentity;
 use crate::lock::{canonical_lock_basename, legacy_composed_environment};
@@ -279,75 +279,42 @@ impl ResolutionBackend for CranBackend {
         refresh_metadata: bool,
         progress: Option<ProgressCallback>,
     ) -> Result<ResolvedData, CliError> {
-        // Validate all manifest-only constraints before opening the provider
-        // cache or attempting network access.
-        composed
-            .clone()
-            .into_resolution_request()
-            .map_err(|error| value_error(format!("invalid manifest environment: {error}")))?;
         validate_composed_repository_selection(&composed)?;
-        let registry_id = composed
-            .repositories
-            .first()
-            .map(|repository| repository.configured_registry_id())
-            .transpose()
-            .map_err(|error| value_error(format!("invalid manifest repository: {error}")))?
-            .unwrap_or_else(|| RegistryId::new("cran").expect("cran is a valid registry ID"));
-        let store = metadata_cache
-            .open_store(registry_id)
-            .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
-        let outcome = if offline {
-            crate::prepared_snapshot::resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
-                composed,
-                &store,
-                CranSnapshotCachePolicy::default(),
-                progress,
-            )
-        } else {
-            let policy = if refresh_metadata {
-                CranSnapshotCachePolicy::default().with_refresh_metadata()
-            } else {
-                CranSnapshotCachePolicy::default()
-            };
-            crate::prepared_snapshot::resolve_composed_from_cran_with_store_at_policy_with_progress(
-                composed,
-                &store,
-                policy,
-                progress,
-            )
-        }
-        .map_err(|error| CliError::Operational(format!("resolution failed: {error}")))?;
-        let warnings: Vec<String> = outcome
-            .diagnostics()
-            .iter()
-            .filter_map(|diagnostic| match diagnostic.status_detail() {
-                rsolve_provider::cran::CranFastPathStatus::Available => None,
-                status => Some(format!(
-                    "CRAN refresh diagnostic at {}: {status:?}",
-                    diagnostic.endpoint()
-                )),
-            })
-            .collect();
-        let mut warnings = warnings;
-        warnings.extend(render_cache_warnings(outcome.cache_diagnostics()));
+        let outcome = crate::repository_resolution::resolve_composed(
+            composed,
+            metadata_cache,
+            offline,
+            refresh_metadata,
+            progress,
+        )
+        .map_err(|error| CliError::Operational(error.to_string()))?;
         Ok(ResolvedData {
-            resolution: outcome.resolution().clone(),
-            warnings,
-            metrics: outcome.metrics().clone(),
+            resolution: outcome.resolution,
+            warnings: outcome.warnings,
+            metrics: outcome.metrics,
         })
     }
 }
 
 fn validate_composed_repository_selection(composed: &ComposedEnvironment) -> Result<(), CliError> {
-    if composed.repositories.len() > 1
-        || (composed.repositories.len() == 1
-            && !matches!(composed.repositories[0].registry(), RegistrySpec::Cran))
-        || (composed.repositories.is_empty()
-            && composed.roots.iter().any(is_remote_cran_root_intent))
-    {
+    if composed.repositories.iter().any(|repository| {
+        !matches!(
+            repository.registry(),
+            RegistrySpec::Cran | RegistrySpec::RUniverse
+        )
+    }) {
         return Err(value_error(
-            "manifest must configure exactly one repository with registry = \"cran\" for remote roots"
-                .into(),
+            "manifest repositories must use registry = \"cran\" or \"r-universe\"".into(),
+        ));
+    }
+    let cran_count = composed
+        .repositories
+        .iter()
+        .filter(|repository| matches!(repository.registry(), RegistrySpec::Cran))
+        .count();
+    if composed.roots.iter().any(is_remote_cran_root_intent) && cran_count != 1 {
+        return Err(value_error(
+            "remote composed resolutions require one repository of kind CRAN; additional R-universe repositories are allowed".into(),
         ));
     }
     Ok(())
@@ -365,26 +332,7 @@ fn render_cache_warnings(
                     | rsolve_provider::cran::CranSnapshotCacheStatus::Missing
             )
         })
-        .map(|diagnostic| {
-            let sources = diagnostic.endpoints().collect::<Vec<_>>().join(", ");
-            let age = diagnostic
-                .age_seconds()
-                .map(|seconds| format!("; age {seconds}s"))
-                .unwrap_or_default();
-            if sources.is_empty() {
-                format!(
-                    "CRAN snapshot cache {:?}{age}: {}",
-                    diagnostic.status(),
-                    diagnostic.diagnostic()
-                )
-            } else {
-                format!(
-                    "CRAN snapshot cache {:?}{age}; sources: {sources}: {}",
-                    diagnostic.status(),
-                    diagnostic.diagnostic()
-                )
-            }
-        })
+        .map(crate::prepared_snapshot::render_cran_cache_warning)
         .collect()
 }
 

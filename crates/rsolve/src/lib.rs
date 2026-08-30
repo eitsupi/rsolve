@@ -13,6 +13,7 @@ pub mod orchestration;
 pub mod pak;
 mod prepared_snapshot;
 pub mod progress;
+mod repository_resolution;
 pub mod wire;
 
 pub use lock::{

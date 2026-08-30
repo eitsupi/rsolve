@@ -9,7 +9,7 @@ use crate::manifest::{
     ComposedEnvironment, ComposedRootIntent, Endpoint, ManifestError, ManifestSource, RegistrySpec,
     RepositorySpec, configured_registry_id_for, is_remote_cran_root_intent,
 };
-use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
+use crate::metrics::{Phase, Recorder, ResolutionMetrics, SnapshotCacheDecision};
 #[cfg(test)]
 use crate::orchestration::cran_snapshot_loader;
 use crate::orchestration::{
@@ -33,6 +33,31 @@ use rsolve_provider::cran::{
     CranSnapshotCacheStatus, inspect_cran_snapshot_cache,
 };
 use rsolve_resolver::{RBasePackageOverlay, ResolutionFailure, is_r_base_package_name};
+
+/// Render a cache diagnostic with the detail retained by the provider.
+///
+/// This is shared by the command-line renderer and the composed preparation
+/// path so cache age and source endpoints are not lost at either boundary.
+pub(crate) fn render_cran_cache_warning(diagnostic: &CranSnapshotCacheDiagnostic) -> String {
+    let sources = diagnostic.endpoints().collect::<Vec<_>>().join(", ");
+    let age = diagnostic
+        .age_seconds()
+        .map(|seconds| format!("; age {seconds}s"))
+        .unwrap_or_default();
+    if sources.is_empty() {
+        format!(
+            "CRAN snapshot cache {:?}{age}: {}",
+            diagnostic.status(),
+            diagnostic.diagnostic()
+        )
+    } else {
+        format!(
+            "CRAN snapshot cache {:?}{age}; sources: {sources}: {}",
+            diagnostic.status(),
+            diagnostic.diagnostic()
+        )
+    }
+}
 
 fn snapshot_releases(
     snapshot: &CranCandidateSnapshot,
@@ -204,6 +229,223 @@ pub(crate) fn cran_repository_config(
     })
 }
 
+/// Prepare a CRAN view where cross-provider neutral demands are optional.
+/// A missing optional package is an ordinary absence, while a missing root or
+/// dependency required by this repository remains a hard acquisition error.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn prepare_cran_repository_loader_with_optional_demands(
+    repository: &RepositorySpec,
+    store: &SnapshotStore,
+    root_requirements: &[RootRequirement],
+    optional_demands: &[PackageName],
+    offline: bool,
+    refresh_metadata: bool,
+    publication_cutoff: Option<PublicationDate>,
+    progress: Option<ProgressCallback>,
+) -> Result<
+    (
+        Option<Box<rsolve_provider::ReadOnlySnapshotCandidateLoader>>,
+        Vec<String>,
+        ResolutionMetrics,
+    ),
+    CranResolutionError,
+> {
+    let config = cran_repository_config(repository)?;
+    let endpoint =
+        Endpoint::parse(config.endpoint.as_ref()).map_err(CranResolutionError::Composition)?;
+    let mut policy = CranSnapshotCachePolicy::default().with_expected_endpoint(endpoint.as_str());
+    let metadata = if publication_cutoff.is_some() {
+        CranMetadataConfig::for_repository(endpoint.as_str()).without_allpackages_history()
+    } else {
+        CranMetadataConfig::for_repository(endpoint.as_str())
+    };
+    policy = policy.with_allowed_auxiliary_endpoint(
+        CranMetadataConfig::for_repository(endpoint.as_str()).allpackages_feed_endpoint,
+    );
+    let recorder = Recorder::new();
+    let cached = recorder.measure(Phase::SnapshotCacheDecision, || {
+        inspect_cran_snapshot_cache(store, &policy)
+    });
+    let cache_warning = match &cached {
+        CranSnapshotCacheResult::Compatible { diagnostic, .. }
+        | CranSnapshotCacheResult::Rejected(diagnostic)
+            if !matches!(
+                diagnostic.status(),
+                CranSnapshotCacheStatus::Fresh | CranSnapshotCacheStatus::Missing
+            ) =>
+        {
+            Some(render_cran_cache_warning(diagnostic))
+        }
+        _ => None,
+    };
+    if offline {
+        return match cached {
+            CranSnapshotCacheResult::Compatible { loader, .. } => {
+                recorder
+                    .measure(Phase::SnapshotCacheDecision, || {
+                        ensure_cran_closure_is_covered(
+                            loader.as_ref(),
+                            root_requirements,
+                            config.package_allowlist.as_deref(),
+                            optional_demands,
+                        )
+                    })
+                    .map_err(|error| {
+                        CranResolutionError::Cache(CranSnapshotCacheDiagnostic::closure_incomplete(
+                            &error,
+                        ))
+                    })?;
+                Ok((Some(loader), cache_warning.into_iter().collect(), {
+                    recorder.set_cache_decision(SnapshotCacheDecision::OfflineCompatible);
+                    recorder.snapshot()
+                }))
+            }
+            CranSnapshotCacheResult::Rejected(diagnostic) => {
+                Err(CranResolutionError::Cache(diagnostic))
+            }
+        };
+    }
+    if !refresh_metadata
+        && let CranSnapshotCacheResult::Compatible { loader, diagnostic } = cached
+        && diagnostic.status() == CranSnapshotCacheStatus::Fresh
+        && recorder
+            .measure(Phase::SnapshotCacheDecision, || {
+                ensure_cran_closure_is_covered(
+                    loader.as_ref(),
+                    root_requirements,
+                    config.package_allowlist.as_deref(),
+                    optional_demands,
+                )
+            })
+            .is_ok()
+    {
+        return Ok((Some(loader), cache_warning.into_iter().collect(), {
+            recorder.set_cache_decision(SnapshotCacheDecision::FreshHit);
+            recorder.set_provider_refresh(Default::default());
+            recorder.snapshot()
+        }));
+    }
+    let metadata = if refresh_metadata {
+        metadata.with_refresh_metadata()
+    } else {
+        metadata
+    };
+    let provider_progress = progress.map(|progress| {
+        Rc::new(move |event| progress(ProgressEvent::Cran(event))) as CranRefreshProgressCallback
+    });
+    let refresher = CranSnapshotRefresher::new_with_progress(metadata, provider_progress)
+        .map_err(CranResolutionError::Provider)?;
+    let closure = collect_cran_dependency_closure_with_metrics_and_optional(
+        root_requirements,
+        config.package_allowlist.as_deref(),
+        optional_demands,
+        |batch| {
+            recorder.measure(Phase::RefreshAcquisition, || {
+                refresher.refresh_packages(batch)
+            })
+        },
+        &recorder,
+    )
+    .map_err(CranResolutionError::Refresh)?;
+    let mut diagnostics: Vec<String> = refresher
+        .diagnostics()
+        .into_iter()
+        .map(|diagnostic| {
+            format!(
+                "CRAN refresh diagnostic at {}: {:?}",
+                diagnostic.endpoint(),
+                diagnostic.status_detail()
+            )
+        })
+        .collect();
+    if let Some(cache_warning) = cache_warning {
+        diagnostics.insert(0, cache_warning);
+    }
+    let provider_metrics = refresher.metrics();
+    recorder.set_cache_decision(SnapshotCacheDecision::Refreshed);
+    recorder.set_provider_refresh(provider_metrics);
+    if closure.is_empty() {
+        return Ok((None, diagnostics, recorder.snapshot()));
+    }
+    let loader = recorder
+        .measure(Phase::SnapshotCompositionAndPublication, || {
+            refresher.refresh_and_publish_snapshot(store, &closure)
+        })
+        .map(Box::new)
+        .map_err(CranResolutionError::Publish)?;
+    Ok((Some(loader), diagnostics, recorder.snapshot()))
+}
+
+fn ensure_cran_closure_is_covered(
+    loader: &rsolve_provider::ReadOnlySnapshotCandidateLoader,
+    root_requirements: &[RootRequirement],
+    allowlist: Option<&[PackageName]>,
+    optional_demands: &[PackageName],
+) -> Result<(), CandidateLoadError> {
+    let mut pending = root_requirements
+        .iter()
+        .filter(|root| is_remote_cran_root(root) && package_allowed(allowlist, root.package.name()))
+        .map(|root| root.package.name().clone())
+        .collect::<BTreeSet<_>>();
+    let direct_suggest_roots = root_requirements
+        .iter()
+        .filter(|root| root.expansion == RootExpansionPolicy::DirectSuggests)
+        .map(|root| root.package.name().clone())
+        .collect::<BTreeSet<_>>();
+    let required_roots = root_requirements
+        .iter()
+        .filter(|root| is_remote_cran_root(root) && package_allowed(allowlist, root.package.name()))
+        .map(|root| root.package.name().clone())
+        .collect::<BTreeSet<_>>();
+    let mut optional = optional_demands.iter().cloned().collect::<BTreeSet<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(package) = pending.pop_first() {
+        if !visited.insert(package.clone()) {
+            continue;
+        }
+        let candidates = match loader.load(&SolverKey::InstalledName(package.clone())) {
+            Ok(candidates) => candidates,
+            Err(error)
+                if optional.contains(&package)
+                    && error.category() == CandidateLoadErrorCategory::NotFound =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if candidates.observations().is_empty() {
+            if optional.contains(&package) {
+                continue;
+            }
+            return Err(CandidateLoadError::new(
+                CandidateLoadErrorCategory::SnapshotInvalid,
+                format!("CRAN snapshot has no eligible releases for {package}"),
+            ));
+        }
+        for observation in candidates.observations() {
+            for dependency in observation.release().declared_dependencies() {
+                let hard = matches!(
+                    dependency.kind,
+                    DependencyKind::Depends | DependencyKind::Imports | DependencyKind::LinkingTo
+                );
+                let promoted = direct_suggest_roots.contains(&package)
+                    && dependency.kind == DependencyKind::Suggests;
+                if (hard || promoted)
+                    && is_remote_cran_package(dependency.package.name())
+                    && package_allowed(allowlist, dependency.package.name())
+                {
+                    if !required_roots.contains(dependency.package.name()) {
+                        optional.insert(dependency.package.name().clone());
+                    }
+                    pending.insert(dependency.package.name().clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Collect the hard CRAN dependency closure for package-name test inputs
 /// without making resolver-time transport calls. Optional dependency expansion
 /// is covered by the policy-aware production helper below.
@@ -324,6 +566,110 @@ where
     }
 }
 
+/// Collect a CRAN closure while treating neutral cross-provider requests as
+/// optional. Refreshing those names one at a time lets an ordinary CRAN
+/// absence be distinguished from a required root or dependency failure.
+fn collect_cran_dependency_closure_with_metrics_and_optional<F>(
+    root_requirements: &[RootRequirement],
+    package_allowlist: Option<&[PackageName]>,
+    optional_demands: &[PackageName],
+    mut refresh: F,
+    recorder: &Recorder,
+) -> Result<Vec<PackageName>, CandidateLoadError>
+where
+    F: FnMut(&[PackageName]) -> Result<CranCandidateSnapshot, CandidateLoadError>,
+{
+    let optional_demands = optional_demands.iter().cloned().collect::<BTreeSet<_>>();
+    let required_roots = root_requirements
+        .iter()
+        .filter(|requirement| {
+            is_remote_cran_root(requirement)
+                && package_allowed(package_allowlist, requirement.package.name())
+        })
+        .map(|requirement| requirement.package.name().clone())
+        .collect::<BTreeSet<_>>();
+    let mut closure = required_roots.clone();
+    closure.extend(
+        optional_demands
+            .iter()
+            .filter(|package| package_allowed(package_allowlist, package))
+            .cloned(),
+    );
+    let direct_suggest_roots = root_requirements
+        .iter()
+        .filter(|requirement| requirement.expansion == RootExpansionPolicy::DirectSuggests)
+        .map(|requirement| requirement.package.name().clone())
+        .collect::<BTreeSet<_>>();
+    let mut optional = optional_demands;
+    let mut refreshed = BTreeSet::new();
+    while !closure.difference(&refreshed).next().is_none() {
+        let batch = closure.difference(&refreshed).cloned().collect::<Vec<_>>();
+        let fetched = match refresh(&batch) {
+            Ok(snapshot) => batch
+                .into_iter()
+                .map(|package| (package, snapshot.clone()))
+                .collect::<Vec<_>>(),
+            Err(error) if error.category() == CandidateLoadErrorCategory::NotFound => {
+                // A mixed batch cannot identify which neutral package was
+                // absent. Retry its members individually; successful members
+                // remain cached by the refresher, so this does not duplicate
+                // successful network acquisition.
+                let mut fetched = Vec::new();
+                for package in batch {
+                    match refresh(std::slice::from_ref(&package)) {
+                        Ok(snapshot) => fetched.push((package, snapshot)),
+                        Err(error)
+                            if optional.contains(&package)
+                                && error.category() == CandidateLoadErrorCategory::NotFound =>
+                        {
+                            closure.remove(&package);
+                            refreshed.insert(package);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                fetched
+            }
+            Err(error) => return Err(error),
+        };
+        for (package, snapshot) in fetched {
+            let candidates = recorder.measure(Phase::ClosureLookup, || {
+                snapshot_releases(&snapshot, &SolverKey::InstalledName(package.clone()))
+            })?;
+            if candidates.is_empty() && optional.contains(&package) {
+                closure.remove(&package);
+                refreshed.insert(package);
+                continue;
+            }
+            for release in candidates {
+                for dependency in release.declared_dependencies() {
+                    let hard = matches!(
+                        dependency.kind,
+                        DependencyKind::Depends
+                            | DependencyKind::Imports
+                            | DependencyKind::LinkingTo
+                    );
+                    let promoted = direct_suggest_roots.contains(&package)
+                        && dependency.kind == DependencyKind::Suggests;
+                    if !(hard || promoted)
+                        || !is_remote_cran_package(dependency.package.name())
+                        || !package_allowed(package_allowlist, dependency.package.name())
+                    {
+                        continue;
+                    }
+                    let dependency_name = dependency.package.name().clone();
+                    if !required_roots.contains(&dependency_name) {
+                        optional.insert(dependency_name.clone());
+                    }
+                    closure.insert(dependency_name);
+                }
+            }
+            refreshed.insert(package);
+        }
+    }
+    Ok(closure.into_iter().collect())
+}
+
 fn package_allowed(allowlist: Option<&[PackageName]>, package: &PackageName) -> bool {
     allowlist.is_none_or(|packages| packages.binary_search(package).is_ok())
 }
@@ -364,7 +710,7 @@ fn collect_cran_dependency_closure_from_loader(
     }
 }
 
-fn is_remote_cran_package(name: &PackageName) -> bool {
+pub(crate) fn is_remote_cran_package(name: &PackageName) -> bool {
     name.as_str() != "R" && !is_r_base_package_name(name)
 }
 
@@ -621,6 +967,7 @@ pub(crate) fn resolve_from_cran_with_store_at_policy_with_progress(
 /// Resolve one selected manifest environment through the persistent CRAN
 /// snapshot path. Unlike the legacy entry point, this preserves the manifest
 /// repository ID in candidate provenance and lock visibility.
+#[allow(dead_code)]
 pub(crate) fn resolve_composed_from_cran_with_store_at_policy_with_progress(
     composed: ComposedEnvironment,
     store: &SnapshotStore,
@@ -945,6 +1292,7 @@ pub(crate) fn resolve_from_cran_offline_with_store_at_policy_with_progress(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
     composed: ComposedEnvironment,
     store: &SnapshotStore,
@@ -1903,6 +2251,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_warning_formatter_preserves_age_sources_and_detail() {
+        let diagnostic = CranSnapshotCacheDiagnostic::new(
+            CranSnapshotCacheStatus::Stale,
+            Some(7200),
+            ["https://cran.example.test/"],
+            "detail",
+        );
+
+        assert_eq!(
+            render_cran_cache_warning(&diagnostic),
+            "CRAN snapshot cache Stale; age 7200s; sources: https://cran.example.test/: detail"
+        );
+    }
+
+    #[test]
     fn cache_decision_classification_preserves_all_operation_paths() {
         assert_eq!(
             classify_cache_decision(false, false, false),
@@ -2452,5 +2815,33 @@ mod tests {
                 ProgressEvent::ResolveCompleted { packages: 0 }
             ]
         );
+    }
+
+    #[test]
+    fn optional_neutral_cran_absence_does_not_abort_provider_preparation() {
+        let package = PackageName::new("universeonly").unwrap();
+        let requirement = RootRequirement {
+            package: PackageRequirement::new(
+                package.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        let closure = collect_cran_dependency_closure_with_metrics_and_optional(
+            &[requirement],
+            None,
+            std::slice::from_ref(&package),
+            |_batch| {
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    "package is not published by CRAN",
+                ))
+            },
+            &Recorder::new(),
+        )
+        .unwrap();
+        assert!(closure.is_empty());
     }
 }
