@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use crate::Manifest;
 use crate::manifest::{
-    ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, RepositorySpec,
-    configured_registry_id_for, is_remote_cran_root_intent,
+    ComposedEnvironment, ComposedRootIntent, Endpoint, ManifestError, ManifestSource, RegistrySpec,
+    RepositorySpec, configured_registry_id_for, is_remote_cran_root_intent,
 };
 use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
 #[cfg(test)]
@@ -88,6 +88,97 @@ pub(crate) struct CranRepositoryConfig {
     pub package_allowlist: Option<Vec<PackageName>>,
 }
 
+/// A provider-neutral acquisition route derived from manifest repository order.
+/// Endpoint and registry configuration remain outside this orchestration plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryAcquisitionRoute {
+    pub repository: RepositoryId,
+    pub packages: Vec<PackageName>,
+}
+
+/// Pure package routing facts shared by cold, warm, and offline paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryAcquisitionPlan {
+    pub routes: Vec<RepositoryAcquisitionRoute>,
+    pub unrouted_packages: Vec<PackageName>,
+}
+
+/// Derive provider acquisition routes from repository order, root source
+/// scope, repository allowlists, and neutral package demand. Direct source
+/// roots and runtime packages never create registry acquisition demand.
+pub(crate) fn plan_repository_acquisition(
+    repositories: &[RepositorySpec],
+    roots: &[ComposedRootIntent],
+    package_demand: &[PackageName],
+) -> Result<RepositoryAcquisitionPlan, ManifestError> {
+    let mut routed = repositories
+        .iter()
+        .map(|_| BTreeSet::new())
+        .collect::<Vec<_>>();
+    let mut unrouted = BTreeSet::new();
+
+    for root in roots {
+        let ManifestSource::Registry { repository } = &root.source else {
+            continue;
+        };
+        if let Some(repository) = repository {
+            let index = repositories
+                .iter()
+                .position(|candidate| candidate.id() == repository)
+                .ok_or_else(|| ManifestError::UnknownRepositoryReference {
+                    id: repository.clone(),
+                    field: root.name.to_string(),
+                })?;
+            if !repositories[index].package_allowed(&root.name) {
+                return Err(ManifestError::RepositoryPackageNotAllowed {
+                    repository: repository.clone(),
+                    package: root.name.clone(),
+                });
+            }
+            routed[index].insert(root.name.clone());
+        } else {
+            let mut eligible = false;
+            for (index, repository) in repositories.iter().enumerate() {
+                if repository.package_allowed(&root.name) {
+                    routed[index].insert(root.name.clone());
+                    eligible = true;
+                }
+            }
+            if !eligible && is_remote_cran_root_intent(root) {
+                return Err(ManifestError::NoVisibleRepository {
+                    package: root.name.clone(),
+                });
+            }
+        }
+    }
+
+    for package in package_demand {
+        let mut eligible = false;
+        for (index, repository) in repositories.iter().enumerate() {
+            if repository.package_allowed(package) {
+                routed[index].insert(package.clone());
+                eligible = true;
+            }
+        }
+        if !eligible {
+            unrouted.insert(package.clone());
+        }
+    }
+
+    Ok(RepositoryAcquisitionPlan {
+        routes: repositories
+            .iter()
+            .zip(routed)
+            .filter(|(_, packages)| !packages.is_empty())
+            .map(|(repository, packages)| RepositoryAcquisitionRoute {
+                repository: repository.id().clone(),
+                packages: packages.into_iter().collect(),
+            })
+            .collect(),
+        unrouted_packages: unrouted.into_iter().collect(),
+    })
+}
+
 pub(crate) fn cran_repository_config(
     repository: &RepositorySpec,
 ) -> Result<CranRepositoryConfig, CranResolutionError> {
@@ -157,8 +248,27 @@ where
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn collect_cran_dependency_closure_with_metrics<F>(
     root_requirements: &[RootRequirement],
+    refresh: F,
+    recorder: &Recorder,
+) -> Result<Vec<PackageName>, CandidateLoadError>
+where
+    F: FnMut(&[PackageName]) -> Result<CranCandidateSnapshot, CandidateLoadError>,
+{
+    collect_cran_dependency_closure_with_metrics_and_allowlist(
+        root_requirements,
+        None,
+        refresh,
+        recorder,
+    )
+}
+
+fn collect_cran_dependency_closure_with_metrics_and_allowlist<F>(
+    root_requirements: &[RootRequirement],
+    package_allowlist: Option<&[PackageName]>,
     mut refresh: F,
     recorder: &Recorder,
 ) -> Result<Vec<PackageName>, CandidateLoadError>
@@ -167,7 +277,10 @@ where
 {
     let mut closure = root_requirements
         .iter()
-        .filter(|requirement| is_remote_cran_root(requirement))
+        .filter(|requirement| {
+            is_remote_cran_root(requirement)
+                && package_allowed(package_allowlist, requirement.package.name())
+        })
         .map(|requirement| requirement.package.name().clone())
         .collect::<BTreeSet<_>>();
     let direct_suggest_roots = root_requirements
@@ -196,7 +309,10 @@ where
                         );
                         let promoted = direct_suggest_roots.contains(package)
                             && dependency.kind == DependencyKind::Suggests;
-                        if (hard || promoted) && is_remote_cran_package(dependency.package.name()) {
+                        if (hard || promoted)
+                            && is_remote_cran_package(dependency.package.name())
+                            && package_allowed(package_allowlist, dependency.package.name())
+                        {
                             closure.insert(dependency.package.name().clone());
                         }
                     }
@@ -206,6 +322,10 @@ where
             refreshed.insert(package.clone());
         }
     }
+}
+
+fn package_allowed(allowlist: Option<&[PackageName]>, package: &PackageName) -> bool {
+    allowlist.is_none_or(|packages| packages.binary_search(package).is_ok())
 }
 
 #[cfg(test)]
@@ -507,6 +627,8 @@ pub(crate) fn resolve_composed_from_cran_with_store_at_policy_with_progress(
     cache_policy: CranSnapshotCachePolicy,
     progress: Option<ProgressCallback>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
+    plan_repository_acquisition(&composed.repositories, &composed.roots, &[])
+        .map_err(CranResolutionError::Composition)?;
     let repository = match composed.repositories.as_slice() {
         [] if composed
             .roots
@@ -710,8 +832,9 @@ fn resolve_request_from_cran_with_store_at_policy_with_progress(
         &request,
         |batch| {
             refreshed.set(true);
-            let closure = collect_cran_dependency_closure_with_metrics(
+            let closure = collect_cran_dependency_closure_with_metrics_and_allowlist(
                 &request.roots,
+                repository.package_allowlist.as_deref(),
                 |batch| {
                     recorder.measure(Phase::RefreshAcquisition, || {
                         transaction.refresh_packages(batch)
@@ -828,6 +951,8 @@ pub(crate) fn resolve_composed_from_cran_offline_with_store_at_policy_with_progr
     cache_policy: CranSnapshotCachePolicy,
     progress: Option<ProgressCallback>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
+    plan_repository_acquisition(&composed.repositories, &composed.roots, &[])
+        .map_err(CranResolutionError::Composition)?;
     let repository = match composed.repositories.as_slice() {
         [] if composed
             .roots
@@ -970,9 +1095,9 @@ mod tests {
     use crate::manifest::{ComposedRootIntent, ManifestSource};
     use rsolve_core::{
         CandidateLoadErrorCategory, DeclaredDependency, DependencySourceConstraint,
-        PackageNamespace, PackageRelease, PackageRequirement, Provenance, RPackageVersion,
-        RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RootExpansionPolicy,
-        RootRequirement, VersionConstraint,
+        NormalizedGitUrl, PackageNamespace, PackageRelease, PackageRequirement, Provenance,
+        RPackageVersion, RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+        RootExpansionPolicy, RootRequirement, VersionConstraint,
     };
     use std::collections::BTreeMap;
     use tempfile::tempdir;
@@ -1063,6 +1188,160 @@ mod tests {
         );
     }
 
+    fn plan_repository(id: &str, packages: Option<Vec<&str>>) -> RepositorySpec {
+        RepositorySpec::new_with_packages(
+            RepositoryId::new(id).unwrap(),
+            RegistrySpec::Cran,
+            Endpoint::parse(format!("https://{id}.example.test/cran")).unwrap(),
+            packages.map(|packages| {
+                packages
+                    .into_iter()
+                    .map(|package| PackageName::new(package).unwrap())
+                    .collect()
+            }),
+        )
+        .unwrap()
+    }
+
+    fn plan_root(name: &str, repository: Option<&str>) -> ComposedRootIntent {
+        ComposedRootIntent {
+            name: PackageName::new(name).unwrap(),
+            constraint: VersionConstraint::unconstrained(),
+            source: ManifestSource::Registry {
+                repository: repository.map(|id| RepositoryId::new(id).unwrap()),
+            },
+            expansion: RootExpansionPolicy::HardOnly,
+        }
+    }
+
+    #[test]
+    fn acquisition_plan_preserves_repository_order_and_source_scope() {
+        let repositories = vec![
+            plan_repository("first", Some(vec!["foo", "shared"])),
+            plan_repository("second", Some(vec!["bar", "shared"])),
+        ];
+        let plan = plan_repository_acquisition(
+            &repositories,
+            &[plan_root("foo", Some("first")), plan_root("shared", None)],
+            &[
+                PackageName::new("bar").unwrap(),
+                PackageName::new("missing").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.routes,
+            vec![
+                RepositoryAcquisitionRoute {
+                    repository: RepositoryId::new("first").unwrap(),
+                    packages: vec![
+                        PackageName::new("foo").unwrap(),
+                        PackageName::new("shared").unwrap()
+                    ],
+                },
+                RepositoryAcquisitionRoute {
+                    repository: RepositoryId::new("second").unwrap(),
+                    packages: vec![
+                        PackageName::new("bar").unwrap(),
+                        PackageName::new("shared").unwrap()
+                    ],
+                },
+            ]
+        );
+        assert_eq!(
+            plan.unrouted_packages,
+            vec![PackageName::new("missing").unwrap()]
+        );
+    }
+
+    #[test]
+    fn acquisition_plan_rejects_unqualified_remote_root_without_visibility() {
+        let repositories = vec![plan_repository("cran", Some(vec!["other"]))];
+        assert!(matches!(
+            plan_repository_acquisition(&repositories, &[plan_root("foo", None)], &[]),
+            Err(ManifestError::NoVisibleRepository { package })
+                if package == PackageName::new("foo").unwrap()
+        ));
+    }
+
+    #[test]
+    fn acquisition_plan_does_not_route_direct_sources_or_spread_qualified_scope() {
+        let repositories = vec![
+            plan_repository("first", Some(vec!["foo"])),
+            plan_repository("second", Some(vec!["foo"])),
+        ];
+        let direct = ComposedRootIntent {
+            name: PackageName::new("foo").unwrap(),
+            constraint: VersionConstraint::unconstrained(),
+            source: ManifestSource::Git {
+                url: NormalizedGitUrl::new("https://github.com/example/foo.git").unwrap(),
+                selector: crate::manifest::GitSelector::Branch("main".into()),
+                subdirectory: None,
+            },
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        let plan = plan_repository_acquisition(
+            &repositories,
+            &[plan_root("foo", Some("first")), direct],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.routes,
+            vec![RepositoryAcquisitionRoute {
+                repository: RepositoryId::new("first").unwrap(),
+                packages: vec![PackageName::new("foo").unwrap()],
+            }]
+        );
+    }
+
+    #[test]
+    fn composed_allowlist_preflight_runs_before_provider_or_cache_access() {
+        let repository = plan_repository("cran", Some(vec!["other"]));
+        let root = plan_root("foo", None);
+        let composed = ComposedEnvironment {
+            environment: rsolve_core::EnvironmentId::new("default").unwrap(),
+            r_requirement: VersionConstraint::unconstrained(),
+            published_before: None,
+            target: rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            repositories: vec![repository],
+            roots: vec![root],
+            locked: rsolve_core::LockedIdentities::new(),
+        };
+        let directory = tempdir().unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.example.test/cran").unwrap(),
+        )
+        .unwrap();
+
+        let online = resolve_composed_from_cran_with_store_at_policy_with_progress(
+            composed.clone(),
+            &store,
+            CranSnapshotCachePolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            online,
+            CranResolutionError::Composition(ManifestError::NoVisibleRepository { package })
+                if package == PackageName::new("foo").unwrap()
+        ));
+
+        let offline = resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
+            composed,
+            &store,
+            CranSnapshotCachePolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            offline,
+            CranResolutionError::Composition(ManifestError::NoVisibleRepository { package })
+                if package == PackageName::new("foo").unwrap()
+        ));
+    }
+
     #[test]
     fn repository_qualified_r_base_root_requires_manifest_repository() {
         let repository = RepositoryId::new("mirror").unwrap();
@@ -1097,8 +1376,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             online,
-            CranResolutionError::Composition(ManifestError::InvalidRegistry { reason })
-                if reason.contains("one CRAN repository")
+            CranResolutionError::Composition(ManifestError::UnknownRepositoryReference {
+                id,
+                field,
+            }) if id == RepositoryId::new("mirror").unwrap() && field == "stats"
         ));
         let offline = resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
             composed,
@@ -1109,8 +1390,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             offline,
-            CranResolutionError::Composition(ManifestError::InvalidRegistry { reason })
-                if reason.contains("one CRAN repository")
+            CranResolutionError::Composition(ManifestError::UnknownRepositoryReference {
+                id,
+                field,
+            }) if id == RepositoryId::new("mirror").unwrap() && field == "stats"
         ));
     }
 
@@ -1384,6 +1667,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hard_closure, vec![root]);
+    }
+
+    #[test]
+    fn allowlisted_direct_suggests_closure_is_non_recursive_and_visibility_aware() {
+        let root = PackageName::new("root").unwrap();
+        let excluded = PackageName::new("excluded").unwrap();
+        let promoted = PackageName::new("promoted").unwrap();
+        let hard_dependency = PackageName::new("harddependency").unwrap();
+        let nested_suggest = PackageName::new("nestedsuggest").unwrap();
+        let root_requirement = RootRequirement {
+            package: PackageRequirement::new(
+                root.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::DirectSuggests,
+        };
+        let snapshot = CranCandidateSnapshot::from_candidates([
+            (
+                root.clone(),
+                vec![release_with_dependencies(
+                    &root,
+                    vec![
+                        required_dependency(DependencyKind::Suggests, &excluded),
+                        required_dependency(DependencyKind::Suggests, &promoted),
+                    ],
+                )],
+            ),
+            (
+                promoted.clone(),
+                vec![release_with_dependencies(
+                    &promoted,
+                    vec![
+                        required_dependency(DependencyKind::Depends, &hard_dependency),
+                        required_dependency(DependencyKind::Suggests, &nested_suggest),
+                    ],
+                )],
+            ),
+            (
+                hard_dependency.clone(),
+                vec![release_with_dependencies(&hard_dependency, Vec::new())],
+            ),
+            (
+                excluded.clone(),
+                vec![release_with_dependencies(&excluded, Vec::new())],
+            ),
+            (
+                nested_suggest.clone(),
+                vec![release_with_dependencies(&nested_suggest, Vec::new())],
+            ),
+        ]);
+        let allowlist = vec![hard_dependency.clone(), promoted.clone(), root.clone()];
+        let mut batches = Vec::new();
+        let closure = collect_cran_dependency_closure_with_metrics_and_allowlist(
+            std::slice::from_ref(&root_requirement),
+            Some(&allowlist),
+            |batch| {
+                batches.push(batch.to_vec());
+                Ok(snapshot.clone())
+            },
+            &Recorder::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            closure,
+            vec![hard_dependency.clone(), promoted.clone(), root.clone()]
+        );
+        let refreshed = batches.into_iter().flatten().collect::<BTreeSet<_>>();
+        assert!(refreshed.contains(&root));
+        assert!(refreshed.contains(&promoted));
+        assert!(refreshed.contains(&hard_dependency));
+        assert!(!refreshed.contains(&excluded));
+        assert!(!refreshed.contains(&nested_suggest));
+    }
+
+    #[test]
+    fn allowlisted_closure_skips_unallowed_hard_dependency_refresh() {
+        let root = PackageName::new("root").unwrap();
+        let excluded = PackageName::new("excluded").unwrap();
+        let root_requirement = RootRequirement {
+            package: PackageRequirement::new(
+                root.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        let snapshot = CranCandidateSnapshot::from_candidates([(
+            root.clone(),
+            vec![release_with_dependencies(
+                &root,
+                vec![required_dependency(DependencyKind::Imports, &excluded)],
+            )],
+        )]);
+        let allowlist = vec![root.clone()];
+        let mut batches = Vec::new();
+        let closure = collect_cran_dependency_closure_with_metrics_and_allowlist(
+            std::slice::from_ref(&root_requirement),
+            Some(&allowlist),
+            |batch| {
+                batches.push(batch.to_vec());
+                Ok(snapshot.clone())
+            },
+            &Recorder::new(),
+        )
+        .unwrap();
+        assert_eq!(closure, vec![root.clone()]);
+        assert_eq!(batches, vec![vec![root]]);
+        assert!(!batches.into_iter().flatten().any(|name| name == excluded));
+    }
+
+    #[test]
+    fn allowlisted_loader_backtracks_from_candidate_with_hidden_dependency() {
+        let root = PackageName::new("root").unwrap();
+        let excluded = PackageName::new("excluded").unwrap();
+        let newer = release_at_version_with_dependencies(
+            &root,
+            "2.0.0",
+            vec![required_dependency(DependencyKind::Depends, &excluded)],
+        );
+        let older = release_at_version_with_dependencies(&root, "1.0.0", Vec::new());
+        let snapshot = CranCandidateSnapshot::from_candidates([(root.clone(), vec![older, newer])]);
+        let config = CranRepositoryConfig {
+            repository: RepositoryId::new("cran").unwrap(),
+            registry: RegistryId::new("cran").unwrap(),
+            endpoint: "https://cran.example.test".into(),
+            rank: 0,
+            package_allowlist: Some(vec![root.clone()]),
+        };
+        let loader = configured_cran_loader(&snapshot, &config).unwrap();
+        let request =
+            crate::manifest::compose_resolution_request(manifest_for(root.clone())).unwrap();
+
+        let resolution = resolve_prepared_snapshot_without_transport(request, &loader).unwrap();
+        assert_eq!(
+            resolution.selected(&root).unwrap().version().as_str(),
+            "1.0.0",
+            "a candidate whose dependency is outside the repository view must be backtracked"
+        );
     }
 
     #[test]

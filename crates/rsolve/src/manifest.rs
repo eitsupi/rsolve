@@ -152,6 +152,9 @@ pub enum ManifestError {
         repository: RepositoryId,
         package: rsolve_core::PackageName,
     },
+    NoVisibleRepository {
+        package: rsolve_core::PackageName,
+    },
     UnknownRepositoryReference {
         id: RepositoryId,
         field: String,
@@ -257,6 +260,9 @@ impl fmt::Display for ManifestError {
                 f,
                 "package `{package}` is not allowed by repository `{repository}`"
             ),
+            Self::NoVisibleRepository { package } => {
+                write!(f, "no configured repository allows package `{package}`")
+            }
             Self::UnknownRepositoryReference { id, field } => {
                 write!(
                     f,
