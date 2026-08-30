@@ -135,6 +135,25 @@ fn lockfile_for_manifest(
     )
 }
 
+fn resolution_for_packages(
+    packages: Vec<(PackageRelease, Vec<rsolve_core::RepositoryId>)>,
+) -> Resolution {
+    Resolution::new(
+        target(),
+        packages
+            .into_iter()
+            .map(|(release, visible_repository_ids)| {
+                ResolvedPackage::new(
+                    SolverKey::InstalledName(release.identity().name().clone()),
+                    release,
+                    Vec::new(),
+                    visible_repository_ids,
+                )
+            })
+            .collect(),
+    )
+}
+
 fn project(resolution: &Resolution) -> Result<Lockfile, LockError> {
     Lockfile::from_resolution_with_applicability(
         resolution,
@@ -241,6 +260,83 @@ fn composed_consumption_rejects_locked_visibility_outside_allowlist() {
     assert!(matches!(
         lock.consume_composed_environment(&composed),
         Err(LockError::VisibleRepositoryPackageNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn composed_projection_validates_applicability_before_returning() {
+    let repository = rsolve_core::RepositoryId::new("main").unwrap();
+    let mut valid_root = composed_root(
+        "root",
+        crate::manifest::ManifestSource::Registry {
+            repository: Some(repository.clone()),
+        },
+    );
+    let composed =
+        composed_environment(vec![composed_repository("main")], vec![valid_root.clone()]);
+    let valid_resolution =
+        resolution_for_packages(vec![(release("root", "1.0.0"), vec![repository.clone()])]);
+    assert!(
+        Lockfile::from_resolution_with_composed_environment(&valid_resolution, &composed).is_ok()
+    );
+
+    let missing = resolution_for_packages(Vec::new());
+    assert!(matches!(
+        Lockfile::from_resolution_with_composed_environment(&missing, &composed),
+        Err(LockError::DirectRootMissing { name }) if name == "root"
+    ));
+
+    valid_root.constraint = VersionConstraint::from_clause(RelationOp::Ge, version("2.0"));
+    let constrained = composed_environment(vec![composed_repository("main")], vec![valid_root]);
+    assert!(matches!(
+        Lockfile::from_resolution_with_composed_environment(&valid_resolution, &constrained),
+        Err(LockError::DirectRootVersionMismatch { name }) if name == "root"
+    ));
+
+    let unreachable = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(repository.clone()),
+            },
+        )],
+    );
+    let unreachable_resolution = resolution_for_packages(vec![
+        (release("root", "1.0.0"), vec![repository.clone()]),
+        (release("extra", "1.0.0"), Vec::new()),
+    ]);
+    assert!(matches!(
+        Lockfile::from_resolution_with_composed_environment(
+            &unreachable_resolution,
+            &unreachable
+        ),
+        Err(LockError::UnreachablePackage { package }) if package == "extra"
+    ));
+
+    let allowlist = crate::manifest::RepositorySpec::new_with_packages(
+        repository.clone(),
+        crate::manifest::RegistrySpec::Cran,
+        crate::manifest::Endpoint::new("https://example.org/cran").unwrap(),
+        Some(vec![package("other")]),
+    )
+    .unwrap();
+    let allowlist_composed = composed_environment(
+        vec![allowlist],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry { repository: None },
+        )],
+    );
+    let allowlist_resolution =
+        resolution_for_packages(vec![(release("root", "1.0.0"), vec![repository])]);
+    assert!(matches!(
+        Lockfile::from_resolution_with_composed_environment(
+            &allowlist_resolution,
+            &allowlist_composed
+        ),
+        Err(LockError::VisibleRepositoryPackageNotAllowed { package, .. })
+            if package == "root"
     ));
 }
 

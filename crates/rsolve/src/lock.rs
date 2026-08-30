@@ -240,13 +240,15 @@ impl Lockfile {
         let resolution_intent_sha256 = composed
             .resolution_intent_digest()
             .map_err(LockError::Manifest)?;
-        Self::from_resolution_with_applicability(
+        let lock = Self::from_resolution_with_applicability(
             resolution,
             composed.environment.clone(),
             composed.published_before,
             resolution_intent_sha256,
             composed.r_requirement.clone(),
-        )
+        )?;
+        lock.consume_composed_environment(composed)?;
+        Ok(lock)
     }
 
     pub fn from_resolution_with_applicability(
