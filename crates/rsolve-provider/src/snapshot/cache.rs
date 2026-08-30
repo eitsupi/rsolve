@@ -532,18 +532,47 @@ impl SnapshotStore {
             Err(error) => return Err(SnapshotStoreError::Io(error)),
         };
         let mut latest: Option<ViewHeadV1> = None;
+        let mut malformed = false;
         for entry in views {
-            let path = entry?.path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(_error) if endpoint.is_some() => {
+                    malformed = true;
+                    continue;
+                }
+                Err(error) => return Err(SnapshotStoreError::Io(error)),
+            };
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
             let Some(view_key) = path.file_stem().and_then(|name| name.to_str()) else {
+                if endpoint.is_some() {
+                    malformed = true;
+                    continue;
+                }
                 continue;
             };
-            let bytes = read_at_most(&path, VIEW_HEAD_LIMIT)?;
-            let head = decode_view_head(&bytes, &self.registry_id)
-                .map_err(|error| store_invalid(error.to_string()))?;
+            let bytes = match read_at_most(&path, VIEW_HEAD_LIMIT) {
+                Ok(bytes) => bytes,
+                Err(_error) if endpoint.is_some() => {
+                    malformed = true;
+                    continue;
+                }
+                Err(error) => return Err(SnapshotStoreError::Io(error)),
+            };
+            let head = match decode_view_head(&bytes, &self.registry_id) {
+                Ok(head) => head,
+                Err(_error) if endpoint.is_some() => {
+                    malformed = true;
+                    continue;
+                }
+                Err(error) => return Err(store_invalid(error.to_string())),
+            };
             if head.view_key != view_key {
+                if endpoint.is_some() {
+                    malformed = true;
+                    continue;
+                }
                 return Err(store_invalid(
                     "snapshot view filename does not match its key",
                 ));
@@ -559,6 +588,11 @@ impl SnapshotStore {
             }) {
                 latest = Some(head);
             }
+        }
+        if latest.is_none() && malformed {
+            return Err(store_invalid(
+                "snapshot view validation observation is malformed",
+            ));
         }
         Ok(latest.map(|head| view_validation_revision_token(&validation_record(&head))))
     }
