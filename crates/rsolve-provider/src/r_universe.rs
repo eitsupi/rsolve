@@ -11,9 +11,9 @@ use std::fmt;
 use rsolve_core::{
     DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
     DistributionChannel, DistributionMetadata, GitCommitId, NormalizedGitUrl, PackageName,
-    PackageRelease, PackageReleaseError, PackageRequirement, Provenance, RPackageVersion,
-    RegistryId, RelationOp, ReleaseAggregation, ReleaseMetadata, ReleaseObservation,
-    RepositorySubdir, VersionClause, VersionConstraint,
+    PackageRelease, PackageReleaseError, PackageRequirement, Provenance, PublicationDate,
+    RPackageVersion, RegistryId, RelationOp, ReleaseAggregation, ReleaseMetadata,
+    ReleaseObservation, ReleasePublication, RepositorySubdir, VersionClause, VersionConstraint,
 };
 use serde_json::{Map, Value};
 
@@ -156,6 +156,7 @@ fn parse_package(
         .get("_dependencies")
         .ok_or_else(|| missing_field("_dependencies"))?;
     let dependencies = parse_dependencies(dependencies)?;
+    let publication = parse_publication(object, &package)?;
 
     let mut metadata = BTreeMap::new();
     for (field, value) in object {
@@ -169,6 +170,8 @@ fn parse_package(
                 | "RemoteSubdir"
                 | "_dependencies"
                 | "Packaged"
+                | "Date/Publication"
+                | "Published"
         ) {
             continue;
         }
@@ -176,10 +179,7 @@ fn parse_package(
             field.as_str(),
             "Depends" | "Imports" | "LinkingTo" | "Suggests" | "Enhances"
         ) {
-            return Err(invalid_field(
-                field,
-                "dependency fields must use _dependencies",
-            ));
+            continue;
         }
         if field.starts_with('_') {
             continue;
@@ -214,7 +214,7 @@ fn parse_package(
         observed_package: package,
         observed_version: version,
         metadata,
-        publication: None,
+        publication,
         declared_dependencies: dependencies,
         distributions: vec![distribution],
     })
@@ -265,6 +265,9 @@ fn parse_dependencies(value: &Value) -> Result<Vec<DeclaredDependency>, RUnivers
         let constraint = object
             .get("version")
             .map(|value| {
+                if value.is_null() {
+                    return Ok(VersionConstraint::unconstrained());
+                }
                 let value =
                     value
                         .as_str()
@@ -299,6 +302,55 @@ fn parse_dependencies(value: &Value) -> Result<Vec<DeclaredDependency>, RUnivers
     }
     dependencies.sort_by(compare_dependencies);
     Ok(dependencies)
+}
+
+fn parse_publication(
+    object: &Map<String, Value>,
+    package: &PackageName,
+) -> Result<Option<ReleasePublication>, RUniverseCatalogError> {
+    let date_publication = object
+        .get("Date/Publication")
+        .map(|value| parse_publication_value("Date/Publication", value))
+        .transpose()?;
+    let published = object
+        .get("Published")
+        .map(|value| parse_publication_value("Published", value))
+        .transpose()?;
+    if let (Some(date_publication), Some(published)) = (date_publication, published)
+        && date_publication != published
+    {
+        return Err(RUniverseCatalogError::MetadataConflict {
+            package: package.to_string(),
+            reason: "Date/Publication and Published disagree".into(),
+        });
+    }
+    Ok(date_publication.or(published).map(ReleasePublication::new))
+}
+
+fn parse_publication_value(
+    field: &str,
+    value: &Value,
+) -> Result<PublicationDate, RUniverseCatalogError> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid_field(field, "expected a canonical date or UTC timestamp"))?;
+    if value.len() == 10 {
+        return PublicationDate::parse(value)
+            .map_err(|error| invalid_field(field, error.to_string()));
+    }
+    if value.len() != 23 || !value.ends_with(" UTC") {
+        return Err(invalid_field(
+            field,
+            "expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS UTC",
+        ));
+    }
+    let datetime = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S UTC", value)
+        .map_err(|error| invalid_field(field, error.to_string()))?;
+    if datetime.strftime("%Y-%m-%d %H:%M:%S UTC").to_string() != value {
+        return Err(invalid_field(field, "timestamp is not canonical"));
+    }
+    PublicationDate::parse(datetime.date().strftime("%Y-%m-%d").to_string())
+        .map_err(|error| invalid_field(field, error.to_string()))
 }
 
 fn parse_constraint(input: &str) -> Result<VersionConstraint, String> {
@@ -504,6 +556,82 @@ mod tests {
             release.metadata().fields().get("Title"),
             Some(&"Demo".to_owned())
         );
+    }
+
+    #[test]
+    fn accepts_raw_description_dependencies_alongside_profile_dependencies() {
+        let input = response(&entry(
+            ",\"Depends\":\"R (>= 4.0)\",\"Imports\":\"cli\",\
+             \"LinkingTo\":null,\"Suggests\":[],\"Enhances\":{\"optional\":true}",
+        ));
+        let catalog = parse_catalog(&input, RegistryId::new(REGISTRY).unwrap()).unwrap();
+        let release = &catalog.releases()[0];
+        assert_eq!(release.declared_dependencies().len(), 1);
+        for field in ["Depends", "Imports", "LinkingTo", "Suggests", "Enhances"] {
+            assert!(!release.metadata().fields().contains_key(field));
+        }
+    }
+
+    #[test]
+    fn missing_and_null_dependency_versions_are_unconstrained() {
+        let null_version =
+            response(&entry("").replace("\"version\":\">= 4.0\",", "\"version\":null,"));
+        let missing_version = response(&entry("").replace("\"version\":\">= 4.0\",", ""));
+        for input in [null_version, missing_version] {
+            let catalog = parse_catalog(&input, RegistryId::new(REGISTRY).unwrap()).unwrap();
+            let release = &catalog.releases()[0];
+            assert!(
+                release.declared_dependencies()[0]
+                    .package
+                    .constraint()
+                    .is_unconstrained()
+            );
+        }
+        let invalid = response(&entry("").replace("\"version\":\">= 4.0\"", "\"version\":true"));
+        assert!(matches!(
+            parse_catalog(&invalid, RegistryId::new(REGISTRY).unwrap()),
+            Err(RUniverseCatalogError::InvalidDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn projects_canonical_publication_date_and_excludes_raw_fields() {
+        let input = response(&entry(
+            ",\"Date/Publication\":\"2025-06-10 18:33:15 UTC\",\
+             \"Published\":\"2025-06-10\"",
+        ));
+        let catalog = parse_catalog(&input, RegistryId::new(REGISTRY).unwrap()).unwrap();
+        let release = &catalog.releases()[0];
+        assert_eq!(
+            release
+                .publication()
+                .map(|publication| publication.date().to_string()),
+            Some("2025-06-10".to_owned())
+        );
+        assert!(!release.metadata().fields().contains_key("Date/Publication"));
+        assert!(!release.metadata().fields().contains_key("Published"));
+    }
+
+    #[test]
+    fn rejects_invalid_or_conflicting_publication_values() {
+        let registry = RegistryId::new(REGISTRY).unwrap();
+        for input in [
+            response(&entry(",\"Published\":true")),
+            response(&entry(",\"Date/Publication\":\"2025-06-10 18:33:15\"")),
+            response(&entry(",\"Published\":\"2025-6-11\"")),
+        ] {
+            assert!(
+                parse_catalog(&input, registry.clone()).is_err(),
+                "accepted invalid publication input"
+            );
+        }
+        let conflicting = response(&entry(
+            ",\"Date/Publication\":\"2025-06-10\",\"Published\":\"2025-06-11\"",
+        ));
+        assert!(matches!(
+            parse_catalog(&conflicting, registry),
+            Err(RUniverseCatalogError::MetadataConflict { .. })
+        ));
     }
 
     #[test]
