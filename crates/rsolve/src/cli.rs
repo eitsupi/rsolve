@@ -16,7 +16,10 @@ use rsolve_core::{PackageName, PublicationDate, RPackageVersion, RegistryId, Ver
 
 use crate::filesystem::ExistingPathIdentity;
 use crate::lock::canonical_lock_basename;
-use crate::manifest::{ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, load_manifest};
+use crate::manifest::{
+    ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, is_remote_cran_root_intent,
+    load_manifest,
+};
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::ResolutionMetrics;
 use crate::orchestration::cran_registry_id;
@@ -282,20 +285,7 @@ impl ResolutionBackend for CranBackend {
             .clone()
             .into_resolution_request()
             .map_err(|error| value_error(format!("invalid manifest environment: {error}")))?;
-        if composed.repositories.len() > 1
-            || (composed.repositories.len() == 1
-                && !matches!(composed.repositories[0].registry(), RegistrySpec::Cran))
-            || (composed.repositories.is_empty()
-                && composed.roots.iter().any(|root| {
-                    root.name.as_str() != "R"
-                        && !rsolve_resolver::is_r_base_package_name(&root.name)
-                }))
-        {
-            return Err(value_error(
-                "manifest must configure exactly one repository with registry = \"cran\" for remote roots"
-                    .into(),
-            ));
-        }
+        validate_composed_repository_selection(&composed)?;
         let registry_id = composed
             .repositories
             .first()
@@ -346,6 +336,21 @@ impl ResolutionBackend for CranBackend {
             metrics: outcome.metrics().clone(),
         })
     }
+}
+
+fn validate_composed_repository_selection(composed: &ComposedEnvironment) -> Result<(), CliError> {
+    if composed.repositories.len() > 1
+        || (composed.repositories.len() == 1
+            && !matches!(composed.repositories[0].registry(), RegistrySpec::Cran))
+        || (composed.repositories.is_empty()
+            && composed.roots.iter().any(is_remote_cran_root_intent))
+    {
+        return Err(value_error(
+            "manifest must configure exactly one repository with registry = \"cran\" for remote roots"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn render_cache_warnings(
@@ -708,19 +713,7 @@ fn run_manifest_lock_with_backend_progress_at(
             ));
         }
     }
-    if composed.repositories.len() > 1
-        || (composed.repositories.len() == 1
-            && !matches!(composed.repositories[0].registry(), RegistrySpec::Cran))
-        || (composed.repositories.is_empty()
-            && composed.roots.iter().any(|root| {
-                root.name.as_str() != "R" && !rsolve_resolver::is_r_base_package_name(&root.name)
-            }))
-    {
-        return Err(value_error(
-            "manifest must configure exactly one repository with registry = \"cran\" for remote roots"
-                .into(),
-        ));
-    }
+    validate_composed_repository_selection(&composed)?;
     let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
         .map_err(|error| CliError::Operational(format!("metadata cache: {error}")))?;
     let resolved = backend.resolve_composed(

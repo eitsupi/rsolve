@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::Manifest;
 use crate::manifest::{
     ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, RepositorySpec,
-    configured_registry_id_for,
+    configured_registry_id_for, is_remote_cran_root_intent,
 };
 use crate::metrics::{Phase, Recorder, SnapshotCacheDecision};
 #[cfg(test)]
@@ -508,7 +508,7 @@ pub(crate) fn resolve_composed_from_cran_with_store_at_policy_with_progress(
         [] if composed
             .roots
             .iter()
-            .all(|root| !is_remote_cran_package(&root.name)) =>
+            .all(|root| !is_remote_cran_root_intent(root)) =>
         {
             default_cran_repository_config("not-a-provider-endpoint")?
         }
@@ -828,7 +828,7 @@ pub(crate) fn resolve_composed_from_cran_offline_with_store_at_policy_with_progr
         [] if composed
             .roots
             .iter()
-            .all(|root| !is_remote_cran_package(&root.name)) =>
+            .all(|root| !is_remote_cran_root_intent(root)) =>
         {
             default_cran_repository_config("not-a-provider-endpoint")?
         }
@@ -963,6 +963,7 @@ fn resolve_prepared_snapshot_without_transport_with_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{ComposedRootIntent, ManifestSource};
     use rsolve_core::{
         CandidateLoadErrorCategory, DeclaredDependency, DependencySourceConstraint,
         PackageNamespace, PackageRelease, PackageRequirement, Provenance, RPackageVersion,
@@ -1056,6 +1057,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![RepositoryId::new("mirror").unwrap()]
         );
+    }
+
+    #[test]
+    fn repository_qualified_r_base_root_requires_manifest_repository() {
+        let repository = RepositoryId::new("mirror").unwrap();
+        let composed = ComposedEnvironment {
+            environment: rsolve_core::EnvironmentId::new("default").unwrap(),
+            r_requirement: VersionConstraint::unconstrained(),
+            published_before: None,
+            target: rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            repositories: Vec::new(),
+            roots: vec![ComposedRootIntent {
+                name: PackageName::new("stats").unwrap(),
+                constraint: VersionConstraint::unconstrained(),
+                source: ManifestSource::Registry {
+                    repository: Some(repository),
+                },
+                expansion: RootExpansionPolicy::HardOnly,
+            }],
+            locked: rsolve_core::LockedIdentities::new(),
+        };
+        let directory = tempdir().unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.example").unwrap(),
+        )
+        .unwrap();
+        let online = resolve_composed_from_cran_with_store_at_policy_with_progress(
+            composed.clone(),
+            &store,
+            CranSnapshotCachePolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            online,
+            CranResolutionError::Composition(ManifestError::InvalidRegistry { reason })
+                if reason.contains("one CRAN repository")
+        ));
+        let offline = resolve_composed_from_cran_offline_with_store_at_policy_with_progress(
+            composed,
+            &store,
+            CranSnapshotCachePolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            offline,
+            CranResolutionError::Composition(ManifestError::InvalidRegistry { reason })
+                if reason.contains("one CRAN repository")
+        ));
     }
 
     fn required_dependency(kind: DependencyKind, name: &PackageName) -> DeclaredDependency {

@@ -11,6 +11,7 @@ use rsolve_core::{
     RelationOp, RepositoryId, ResolutionRequest, ResolutionTarget, RootExpansionPolicy,
     RootRequirement, Sha256Digest, VersionClause, VersionConstraint,
 };
+use rsolve_resolver::is_r_base_package_name;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
@@ -25,6 +26,26 @@ pub struct ComposedRootIntent {
     pub constraint: VersionConstraint,
     pub source: ManifestSource,
     pub expansion: RootExpansionPolicy,
+}
+
+/// Classify a composed manifest root before it is projected into a resolver
+/// request. An unqualified R base package is supplied by the target runtime,
+/// while a repository-qualified root must be acquired from that repository.
+/// Direct sources remain remote until acquisition, where they are rejected by
+/// the first-slice request projection.
+pub(crate) fn is_remote_cran_root_intent(root: &ComposedRootIntent) -> bool {
+    if root.name.as_str() == "R" {
+        return false;
+    }
+    match &root.source {
+        ManifestSource::Registry { repository: None } => !is_r_base_package_name(&root.name),
+        ManifestSource::Registry {
+            repository: Some(_),
+        }
+        | ManifestSource::Git { .. }
+        | ManifestSource::Url { .. }
+        | ManifestSource::Path { .. } => true,
+    }
 }
 
 /// The owned result of selecting and composing one environment.

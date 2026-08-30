@@ -247,6 +247,7 @@ mod compose;
 mod repository;
 mod wire;
 
+pub(crate) use compose::is_remote_cran_root_intent;
 pub use compose::{ComposedEnvironment, ComposedRootIntent};
 pub(crate) use repository::configured_registry_id_for;
 pub use repository::{

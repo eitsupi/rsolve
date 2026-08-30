@@ -513,6 +513,37 @@ fn manifest_without_repositories_supports_provider_free_resolution() {
 }
 
 #[test]
+fn cli_repository_validation_treats_qualified_r_base_as_remote() {
+    let root = crate::manifest::ComposedRootIntent {
+        name: PackageName::new("stats").unwrap(),
+        constraint: VersionConstraint::unconstrained(),
+        source: crate::manifest::ManifestSource::Registry {
+            repository: Some(RepositoryId::new("mirror").unwrap()),
+        },
+        expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+    };
+    let composed = ComposedEnvironment {
+        environment: EnvironmentId::new("default").unwrap(),
+        r_requirement: VersionConstraint::unconstrained(),
+        published_before: None,
+        target: rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        repositories: Vec::new(),
+        roots: vec![root],
+        locked: rsolve_core::LockedIdentities::new(),
+    };
+    let error = validate_composed_repository_selection(&composed).unwrap_err();
+    assert!(matches!(error, CliError::Value(message) if message.contains("one repository")));
+
+    let mut runtime_root = composed.roots[0].clone();
+    runtime_root.source = crate::manifest::ManifestSource::Registry { repository: None };
+    let runtime_composed = ComposedEnvironment {
+        roots: vec![runtime_root],
+        ..composed
+    };
+    assert!(validate_composed_repository_selection(&runtime_composed).is_ok());
+}
+
+#[test]
 fn manifest_direct_source_fails_before_backend() {
     let directory = tempfile::tempdir().unwrap();
     let manifest = directory.path().join("rsolve.toml");
