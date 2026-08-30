@@ -76,8 +76,15 @@ pub(crate) struct PersistentRefreshProbe {
     observation_valid: bool,
 }
 
-pub(crate) fn observe_persistent_refresh_probe(store: &SnapshotStore) -> PersistentRefreshProbe {
-    match store.read_latest_view_validation_revision_unlocked() {
+pub(crate) fn observe_persistent_refresh_probe(
+    store: &SnapshotStore,
+    policy: &CranSnapshotCachePolicy,
+) -> PersistentRefreshProbe {
+    let revision = match policy.expected_endpoint.as_deref() {
+        Some(endpoint) => store.read_view_validation_revision_for_endpoint_unlocked(endpoint),
+        None => store.read_latest_view_validation_revision_unlocked(),
+    };
+    match revision {
         Ok(revision) => PersistentRefreshProbe {
             revision,
             observation_valid: true,
@@ -163,7 +170,7 @@ impl CranSnapshotRefresher {
     {
         // Capture the lock-free observation before attempting even the warm
         // probe. This ordering is the forced-waiter coalescing boundary.
-        let probe = observe_persistent_refresh_probe(store);
+        let probe = observe_persistent_refresh_probe(store, policy);
         after_observation();
         let initial_cache = super::inspect_cran_snapshot_cache_without_wait(store, policy);
         CranPersistentRefreshPreflight {
@@ -536,11 +543,13 @@ mod tests {
             )
             .unwrap();
         let path = view_path(&store);
-        let first = observe_persistent_refresh_probe(&store);
+        let policy = CranSnapshotCachePolicy::at("2026-08-25T00:00:00Z".parse().unwrap())
+            .with_expected_endpoint("https://cloud.r-project.org");
+        let first = observe_persistent_refresh_probe(&store, &policy);
         let mut changed = std::fs::read_to_string(&path).unwrap();
         changed = changed.replace("\"refresh_sequence\":1", "\"refresh_sequence\":2");
         std::fs::write(&path, changed).unwrap();
-        let second = observe_persistent_refresh_probe(&store);
+        let second = observe_persistent_refresh_probe(&store, &policy);
         assert!(first.observation_valid && second.observation_valid);
         assert_ne!(first.revision, second.revision);
         assert!(refresh_completed_after_wait(
@@ -548,7 +557,7 @@ mod tests {
             second.revision.as_deref()
         ));
 
-        let identical = observe_persistent_refresh_probe(&store);
+        let identical = observe_persistent_refresh_probe(&store, &policy);
         assert_eq!(second.revision, identical.revision);
         assert!(!refresh_completed_after_wait(
             &second,
@@ -556,7 +565,7 @@ mod tests {
         ));
 
         std::fs::write(&path, b"invalid").unwrap();
-        let invalid = observe_persistent_refresh_probe(&store);
+        let invalid = observe_persistent_refresh_probe(&store, &policy);
         assert!(!invalid.observation_valid);
         assert!(!refresh_completed_after_wait(
             &invalid,
@@ -565,11 +574,38 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let unreadable = observe_persistent_refresh_probe(&store);
+        let unreadable = observe_persistent_refresh_probe(&store, &policy);
         assert!(!unreadable.observation_valid);
         assert!(!refresh_completed_after_wait(
             &unreadable,
             second.revision.as_deref()
+        ));
+    }
+
+    #[test]
+    fn endpoint_scoped_probe_ignores_another_endpoint_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
+        let input = crate::snapshot::test_present_input();
+        let policy_a = CranSnapshotCachePolicy::at("2026-08-25T00:00:00Z".parse().unwrap())
+            .with_expected_endpoint("https://mirror-a.example");
+        let policy_b = CranSnapshotCachePolicy::at("2026-08-25T00:00:00Z".parse().unwrap())
+            .with_expected_endpoint("https://mirror-b.example");
+        store
+            .build_and_publish_with_endpoint(input.clone(), "https://mirror-a.example")
+            .unwrap();
+        let probe_a = observe_persistent_refresh_probe(&store, &policy_a);
+        store
+            .build_and_publish_with_endpoint(input, "https://mirror-b.example")
+            .unwrap();
+        let after_a = observe_persistent_refresh_probe(&store, &policy_a);
+        let after_b = observe_persistent_refresh_probe(&store, &policy_b);
+        assert_eq!(probe_a.revision, after_a.revision);
+        assert_ne!(probe_a.revision, after_b.revision);
+        assert!(!refresh_completed_after_wait(
+            &probe_a,
+            after_a.revision.as_deref()
         ));
     }
 

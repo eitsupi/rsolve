@@ -26,7 +26,13 @@ fn persistent_refresh_child_probe() {
             .unwrap();
     let feed = "https://feed.invalid/ALLPACKAGES.zst";
     let now: jiff::Timestamp = "2026-08-25T00:00:00Z".parse().unwrap();
-    let pre_wait = crate::cran::provider::refresher::observe_persistent_refresh_probe(&store);
+    let pre_wait_policy = CranSnapshotCachePolicy::at(now)
+        .with_expected_endpoint("https://cloud.r-project.org")
+        .with_allowed_auxiliary_endpoint(feed);
+    let pre_wait = crate::cran::provider::refresher::observe_persistent_refresh_probe(
+        &store,
+        &pre_wait_policy,
+    );
     // Keep the child fixture's ordering identical to the production
     // preflight: the opaque observation precedes the non-blocking cache probe.
     // In the waiter process this probe runs while the owner holds the lock and

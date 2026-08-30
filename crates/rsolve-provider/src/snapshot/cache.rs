@@ -512,6 +512,20 @@ impl SnapshotStore {
     pub(crate) fn read_latest_view_validation_revision_unlocked(
         &self,
     ) -> Result<Option<Box<str>>, SnapshotStoreError> {
+        self.read_view_validation_revision_unlocked(None)
+    }
+
+    pub(crate) fn read_view_validation_revision_for_endpoint_unlocked(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<Box<str>>, SnapshotStoreError> {
+        self.read_view_validation_revision_unlocked(Some(endpoint))
+    }
+
+    fn read_view_validation_revision_unlocked(
+        &self,
+        endpoint: Option<&str>,
+    ) -> Result<Option<Box<str>>, SnapshotStoreError> {
         let views = match fs::read_dir(self.root.join(VIEWS_DIR)) {
             Ok(views) => views,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -533,6 +547,11 @@ impl SnapshotStore {
                 return Err(store_invalid(
                     "snapshot view filename does not match its key",
                 ));
+            }
+            if endpoint.is_some_and(|expected| {
+                !view_endpoint_matches(&head.validation.effective_endpoint, expected)
+            }) {
+                continue;
             }
             if latest.as_ref().is_none_or(|current| {
                 (head.validation.refresh_sequence, &head.view_key)
