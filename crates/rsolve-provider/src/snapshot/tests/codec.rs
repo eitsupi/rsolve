@@ -232,6 +232,31 @@ fn git_provenance_is_part_of_release_identity_ordering() {
 }
 
 #[test]
+fn git_commit_order_uses_hash_algorithm_before_hex_value() {
+    let release = |commit: String| EligibleReleaseV1 {
+        package: "foo".into(),
+        version: "1.0.0".into(),
+        namespace: "r-universe".into(),
+        git_provenance: Some(GitProvenanceV1 {
+            repository: "https://github.com/example/foo.git".into(),
+            commit,
+            subdirectory: None,
+        }),
+        currentness: CandidateCurrentnessV1::Current,
+        metadata: vec![],
+        publication: None,
+        dependencies: vec![],
+        distributions: vec![],
+        metadata_sha256: [1; 32],
+        evidence: vec![],
+    };
+    let sha1 = release("f".repeat(40));
+    let sha256 = release("1".repeat(64));
+    assert!(validate_release_order(&[sha1.clone(), sha256.clone()]).is_ok());
+    assert!(validate_release_order(&[sha256, sha1]).is_err());
+}
+
+#[test]
 fn git_provenance_fields_are_bounded_before_snapshot_publication() {
     let dir = tempdir().unwrap();
     let mut oversized = input();

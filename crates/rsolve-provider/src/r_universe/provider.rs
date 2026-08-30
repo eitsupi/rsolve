@@ -905,7 +905,6 @@ mod tests {
     }
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
-    const OTHER_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
     fn package_entry(package: &str) -> String {
         package_entry_with_commit(package, COMMIT)
@@ -1266,10 +1265,11 @@ mod tests {
     #[test]
     fn snapshot_round_trip_preserves_distinct_git_identities_at_one_version() {
         let registry = RegistryId::new("universe").unwrap();
+        let sha256_commit = "1".repeat(64);
         let body = format!(
             "[{},{}]",
             package_entry_with_commit("foo", COMMIT),
-            package_entry_with_commit("foo", OTHER_COMMIT)
+            package_entry_with_commit("foo", &sha256_commit)
         );
         let catalog = RUniverseCatalog::from_json(&body, registry.clone()).unwrap();
         let response = FetchedResponse {
@@ -1297,10 +1297,7 @@ mod tests {
                 },
             )
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            commits,
-            BTreeSet::from([COMMIT.into(), OTHER_COMMIT.into()])
-        );
+        assert_eq!(commits, BTreeSet::from([COMMIT.into(), sha256_commit]));
     }
 
     #[test]

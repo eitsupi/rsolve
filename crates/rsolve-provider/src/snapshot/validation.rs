@@ -566,11 +566,7 @@ pub(super) fn validate_release_order(releases: &[EligibleReleaseV1]) -> Result<(
                         .map(RepositorySubdir::new)
                         .transpose()
                         .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
-                    let git_identity = (
-                        repository.to_string(),
-                        commit.to_string(),
-                        subdirectory.as_ref().map(ToString::to_string),
-                    );
+                    let git_identity = (repository.clone(), commit.clone(), subdirectory.clone());
                     if let Some(previous) =
                         git_versions.insert(git_identity.clone(), version_components.clone())
                         && previous != version_components
@@ -579,9 +575,9 @@ pub(super) fn validate_release_order(releases: &[EligibleReleaseV1]) -> Result<(
                             "Git identity appears with multiple release versions".into(),
                         ));
                     }
-                    git_identity
+                    (Some(git_identity.0), Some(git_identity.1), git_identity.2)
                 }
-                None => (String::new(), String::new(), None),
+                None => (None, None, None),
             };
             let identity = (
                 version_components.clone(),
