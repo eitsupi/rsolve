@@ -1,12 +1,51 @@
 use super::*;
 
+fn view_path(store: &SnapshotStore) -> std::path::PathBuf {
+    std::fs::read_dir(store.root().join("views"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .expect("published snapshot view head")
+}
+
 #[test]
-fn read_current_optional_distinguishes_missing_pointer_from_corruption() {
+fn read_latest_view_optional_distinguishes_missing_head_from_corruption() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
-    assert!(store.read_current_optional().unwrap().is_none());
-    std::fs::write(store.root().join("current"), b"not-json").unwrap();
-    assert!(store.read_current_optional().is_err());
+    assert!(store.read_latest_view_optional().unwrap().is_none());
+    std::fs::write(store.root().join("views/broken.json"), b"not-json").unwrap();
+    assert!(store.read_latest_view_optional().is_err());
+}
+
+#[test]
+fn endpoint_view_lookup_skips_an_invalid_unrelated_head() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    let input = present_input();
+    let endpoint = input.sources[0].endpoint.clone();
+    store
+        .build_and_publish_with_endpoint(input, endpoint.as_str())
+        .unwrap();
+    std::fs::write(store.root().join("views/broken.json"), b"not-json").unwrap();
+
+    let selected = store.read_view_for_endpoint(&endpoint).unwrap();
+    assert!(selected.is_some());
+}
+
+#[test]
+fn publishing_rejects_an_invalid_existing_view_head() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    store.build_and_publish(present_input()).unwrap();
+    std::fs::write(view_path(&store), b"not-json").unwrap();
+
+    let staged_path = store.root().join("tmp/next.redb");
+    let next = SnapshotGenerationBuilder::new(present_input(), &staged_path)
+        .build()
+        .unwrap();
+    let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
+    assert!(store.publish_generation(&lock, next).is_err());
 }
 
 #[test]
@@ -30,7 +69,7 @@ fn build_and_publish_returns_the_generation_it_pinned_before_unlock() {
         1
     );
     assert_eq!(
-        store.read_current().unwrap().header().generation,
+        store.read_latest_view().unwrap().header().generation,
         expected_generation
     );
 }
@@ -61,7 +100,7 @@ fn publish_rejects_a_corrupt_staged_generation_without_publishing() {
     drop(lock);
 
     assert!(staged_path.exists());
-    assert!(store.read_current_optional().unwrap().is_none());
+    assert!(store.read_latest_view_optional().unwrap().is_none());
 }
 
 #[test]
@@ -83,9 +122,9 @@ fn build_and_publish_returns_a_even_if_b_publishes_before_return() {
             drop(lock);
         })
         .unwrap();
-    let current = store.read_current().unwrap();
+    let selected = store.read_latest_view().unwrap();
 
-    assert_ne!(returned.header().generation, current.header().generation);
+    assert_ne!(returned.header().generation, selected.header().generation);
     assert_eq!(
         returned
             .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
@@ -94,7 +133,7 @@ fn build_and_publish_returns_a_even_if_b_publishes_before_return() {
         1
     );
     assert_eq!(
-        current
+        selected
             .releases(&SolverKey::InstalledName(PackageName::new("foo").unwrap()))
             .unwrap()
             .len(),
@@ -103,7 +142,7 @@ fn build_and_publish_returns_a_even_if_b_publishes_before_return() {
 }
 
 #[test]
-fn store_publishes_strict_pointer_and_pins_readers() {
+fn store_publishes_strict_view_head_and_pins_readers() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
     let first_path = store.root().join("tmp/first.redb");
@@ -116,13 +155,25 @@ fn store_publishes_strict_pointer_and_pins_readers() {
     store.publish_generation(&lock, first).unwrap();
     drop(lock);
     assert!(!first_path.exists());
-    let pointer = std::fs::read(store.root().join("current")).unwrap();
-    let expected_pointer = format!(
-        "{{\"format\":\"rsolve-metadata-current\",\"version\":1,\"registry_id\":\"cran\",\"generation\":\"{first_generation}\",\"header_sha256\":\"{first_header_sha256}\"}}"
+    let first_view = view_path(&store);
+    let view = std::fs::read(&first_view).unwrap();
+    assert!(
+        String::from_utf8(view)
+            .unwrap()
+            .contains("\"format\":\"rsolve-metadata-view\"")
     );
-    assert_eq!(pointer, expected_pointer.as_bytes());
-    let old_reader = store.read_current().unwrap();
-    let old_reader_2 = store.read_current().unwrap();
+    assert!(
+        std::fs::read_to_string(&first_view)
+            .unwrap()
+            .contains(&first_generation)
+    );
+    assert!(
+        std::fs::read_to_string(&first_view)
+            .unwrap()
+            .contains(&first_header_sha256)
+    );
+    let old_reader = store.read_latest_view().unwrap();
+    let old_reader_2 = store.read_latest_view().unwrap();
 
     let mut reuse_input = present_input();
     reuse_input.created_at = "2026-08-24T00:00:00Z".into();
@@ -138,10 +189,7 @@ fn store_publishes_strict_pointer_and_pins_readers() {
     store.publish_generation(&lock, reuse).unwrap();
     drop(lock);
     assert!(!reuse_path.exists());
-    assert_eq!(
-        std::fs::read(store.root().join("current")).unwrap(),
-        pointer
-    );
+    assert!(first_view.exists());
 
     let mut second_input = present_input();
     second_input.sources[0].content_sha256 = [9; 32];
@@ -155,7 +203,13 @@ fn store_publishes_strict_pointer_and_pins_readers() {
     store.publish_generation(&lock, second).unwrap();
     drop(lock);
     assert!(!second_path.exists());
-    let new_reader = store.read_current().unwrap();
+    let view_count = std::fs::read_dir(store.root().join("views"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .count();
+    assert!(view_count >= 2);
+    let new_reader = store.read_latest_view().unwrap();
     assert_ne!(
         old_reader.header().generation,
         new_reader.header().generation
@@ -187,7 +241,7 @@ fn store_publishes_strict_pointer_and_pins_readers() {
 }
 
 #[test]
-fn store_repairs_corrupt_same_generation_before_republishing_pointer() {
+fn store_repairs_corrupt_same_generation_before_republishing_view_head() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
     let initial_path = store.root().join("tmp/initial.redb");
@@ -198,7 +252,6 @@ fn store_repairs_corrupt_same_generation_before_republishing_pointer() {
     let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
     store.publish_generation(&lock, initial).unwrap();
     drop(lock);
-    let pointer = std::fs::read(store.root().join("current")).unwrap();
     let final_path = store
         .root()
         .join(format!("generations/{generation_id}.redb"));
@@ -216,11 +269,8 @@ fn store_repairs_corrupt_same_generation_before_republishing_pointer() {
     drop(lock);
 
     assert!(!replacement_path.exists());
-    assert_eq!(
-        std::fs::read(store.root().join("current")).unwrap(),
-        pointer
-    );
-    let loader = store.read_current().unwrap();
+    assert!(view_path(&store).exists());
+    let loader = store.read_latest_view().unwrap();
     assert_eq!(loader.header().generation, generation_id);
     assert_eq!(
         loader
@@ -248,7 +298,7 @@ fn store_repairs_corrupt_generation_while_old_reader_is_pinned() {
     let final_path = store
         .root()
         .join(format!("generations/{generation_id}.redb"));
-    let old_reader = store.read_current().unwrap();
+    let old_reader = store.read_latest_view().unwrap();
     let corrupt_path = store.root().join("tmp/corrupt.redb");
     std::fs::copy(&final_path, &corrupt_path).unwrap();
     corrupt_stored_history(&corrupt_path, "foo");
@@ -265,7 +315,7 @@ fn store_repairs_corrupt_generation_while_old_reader_is_pinned() {
 
     let package = SolverKey::InstalledName(PackageName::new("foo").unwrap());
     assert_eq!(old_reader.releases(&package).unwrap().len(), 1);
-    let new_reader = store.read_current().unwrap();
+    let new_reader = store.read_latest_view().unwrap();
     assert_eq!(new_reader.header().generation, generation_id);
     assert_eq!(new_reader.releases(&package).unwrap().len(), 1);
     assert!(validate_generation(&final_path, &RegistryId::new("cran").unwrap()).is_ok());
@@ -340,10 +390,10 @@ fn refresh_lock_child_probe() {
 }
 
 #[test]
-fn read_current_serializes_generation_open_with_cleanup() {
+fn read_latest_view_serializes_generation_open_with_cleanup() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
-    let staged_path = store.root().join("tmp/current.redb");
+    let staged_path = store.root().join("tmp/view-lock.redb");
     let generation = SnapshotGenerationBuilder::new(present_input(), &staged_path)
         .build()
         .unwrap();
@@ -354,19 +404,19 @@ fn read_current_serializes_generation_open_with_cleanup() {
         .acquire_refresh_lock(RefreshLockMode::Blocking)
         .unwrap();
 
-    let ready_path = dir.path().join("read-current-child-ready");
-    let attempt_path = dir.path().join("read-current-child-attempt");
-    let go_path = dir.path().join("read-current-child-go");
-    let done_path = dir.path().join("read-current-child-done");
+    let ready_path = dir.path().join("read-view-child-ready");
+    let attempt_path = dir.path().join("read-view-child-attempt");
+    let go_path = dir.path().join("read-view-child-go");
+    let done_path = dir.path().join("read-view-child-done");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("snapshot::tests::store::read_current_lock_child_probe")
+        .arg("snapshot::tests::store::read_latest_view_lock_child_probe")
         .arg("--nocapture")
-        .env("RSOLVE_READ_CURRENT_CHILD_ROOT", dir.path())
-        .env("RSOLVE_READ_CURRENT_CHILD_READY", &ready_path)
-        .env("RSOLVE_READ_CURRENT_CHILD_ATTEMPT", &attempt_path)
-        .env("RSOLVE_READ_CURRENT_CHILD_GO", &go_path)
-        .env("RSOLVE_READ_CURRENT_CHILD_DONE", &done_path)
+        .env("RSOLVE_READ_VIEW_CHILD_ROOT", dir.path())
+        .env("RSOLVE_READ_VIEW_CHILD_READY", &ready_path)
+        .env("RSOLVE_READ_VIEW_CHILD_ATTEMPT", &attempt_path)
+        .env("RSOLVE_READ_VIEW_CHILD_GO", &go_path)
+        .env("RSOLVE_READ_VIEW_CHILD_DONE", &done_path)
         .spawn()
         .unwrap();
 
@@ -379,14 +429,14 @@ fn read_current_serializes_generation_open_with_cleanup() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    // Keep the refresh lock held while the child enters read_current.  A
+    // Keep the refresh lock held while the child enters read_latest_view.  A
     // cleanup/publish operation cannot remove the selected generation until
     // the loader has been opened and validated.
     std::fs::write(&go_path, b"").unwrap();
     while !attempt_path.exists() {
         assert!(
             std::time::Instant::now() < wait_deadline,
-            "child did not attempt read_current"
+            "child did not attempt read_latest_view"
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -394,7 +444,7 @@ fn read_current_serializes_generation_open_with_cleanup() {
     while std::time::Instant::now() < blocked_deadline {
         assert!(
             !done_path.exists(),
-            "read_current completed while the refresh lock was held"
+            "read_latest_view completed while the refresh lock was held"
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -405,26 +455,26 @@ fn read_current_serializes_generation_open_with_cleanup() {
 }
 
 #[test]
-fn read_current_lock_child_probe() {
-    let Ok(root) = std::env::var("RSOLVE_READ_CURRENT_CHILD_ROOT") else {
+fn read_latest_view_lock_child_probe() {
+    let Ok(root) = std::env::var("RSOLVE_READ_VIEW_CHILD_ROOT") else {
         return;
     };
-    let ready = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_READY").unwrap());
-    let attempt = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_ATTEMPT").unwrap());
-    let go = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_GO").unwrap());
-    let done = PathBuf::from(std::env::var_os("RSOLVE_READ_CURRENT_CHILD_DONE").unwrap());
+    let ready = PathBuf::from(std::env::var_os("RSOLVE_READ_VIEW_CHILD_READY").unwrap());
+    let attempt = PathBuf::from(std::env::var_os("RSOLVE_READ_VIEW_CHILD_ATTEMPT").unwrap());
+    let go = PathBuf::from(std::env::var_os("RSOLVE_READ_VIEW_CHILD_GO").unwrap());
+    let done = PathBuf::from(std::env::var_os("RSOLVE_READ_VIEW_CHILD_DONE").unwrap());
     let store = SnapshotStore::open(root, RegistryId::new("cran").unwrap()).unwrap();
     std::fs::write(ready, b"").unwrap();
     while !go.exists() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     std::fs::write(attempt, b"").unwrap();
-    assert!(store.read_current().is_ok());
+    assert!(store.read_latest_view().is_ok());
     std::fs::write(done, b"").unwrap();
 }
 
 #[test]
-fn cleanup_preserves_retained_final_orphan_and_current() {
+fn cleanup_preserves_retained_final_orphan_and_view() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
     let old_path = store.root().join("tmp/old.redb");
@@ -435,7 +485,7 @@ fn cleanup_preserves_retained_final_orphan_and_current() {
     let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
     store.publish_generation(&lock, old).unwrap();
     drop(lock);
-    let old_reader = store.read_current().unwrap();
+    let old_reader = store.read_latest_view().unwrap();
     assert_eq!(old_reader.header().generation, old_generation);
 
     let new_path = store.root().join("tmp/new.redb");
@@ -451,7 +501,7 @@ fn cleanup_preserves_retained_final_orphan_and_current() {
         .join(format!("generations/{new_generation}.redb"));
     std::fs::copy(&new_path, &new_final).unwrap();
     assert_eq!(
-        store.read_current().unwrap().header().generation,
+        store.read_latest_view().unwrap().header().generation,
         old_generation
     );
 
@@ -517,17 +567,13 @@ fn cleanup_removes_unclean_child_generation_temp() {
         .root()
         .join(format!("generations/{unclean_generation}.redb"));
     std::fs::copy(store.root().join("tmp/unclean.redb"), &unclean_final).unwrap();
-    let pointer = format!(
-        "{{\"format\":\"rsolve-metadata-current\",\"version\":1,\"registry_id\":\"cran\",\"generation\":\"{unclean_generation}\",\"header_sha256\":\"{}\"}}",
-        "0".repeat(64)
-    );
-    std::fs::write(store.root().join("current"), pointer).unwrap();
-    let error = store.read_current().err().unwrap();
+    std::fs::write(store.root().join("views/broken.json"), b"not-json").unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
-    std::fs::remove_file(store.root().join("current")).unwrap();
+    std::fs::remove_file(store.root().join("views/broken.json")).unwrap();
     let lock = store.acquire_refresh_lock(RefreshLockMode::Try).unwrap();
     store.cleanup(&lock, &[]).unwrap();
     drop(lock);
@@ -549,10 +595,10 @@ fn unclean_generation_child_probe() {
 }
 
 #[test]
-fn store_rejects_broken_pointer_and_cleans_orphans_without_touching_current() {
+fn store_rejects_broken_view_and_cleans_orphans_without_touching_valid_views() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
-    let path = store.root().join("tmp/current.redb");
+    let path = store.root().join("tmp/view-head.redb");
     let generation = SnapshotGenerationBuilder::new(present_input(), &path)
         .build()
         .unwrap();
@@ -585,52 +631,49 @@ fn store_rejects_broken_pointer_and_cleans_orphans_without_touching_current() {
         .root()
         .join(format!("generations/{generation_id}.redb"));
     delete_stored_history(&final_path, "foo");
-    let error = store.read_current().err().unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
 
-    let mut pointer = std::fs::read(store.root().join("current")).unwrap();
+    let view = view_path(&store);
+    let mut head_bytes = std::fs::read(&view).unwrap();
     let marker = b"\"header_sha256\":\"";
-    let start = pointer
+    let start = head_bytes
         .windows(marker.len())
         .position(|window| window == marker)
         .unwrap()
         + marker.len();
-    pointer[start..start + 64].fill(b'0');
-    std::fs::write(store.root().join("current"), pointer).unwrap();
-    let error = store.read_current().err().unwrap();
+    head_bytes[start..start + 64].fill(b'0');
+    std::fs::write(&view, head_bytes).unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
 
-    std::fs::write(store.root().join("current"), b"{\"format\":\"broken\"}").unwrap();
-    let error = store.read_current().err().unwrap();
+    std::fs::write(&view, b"{\"format\":\"broken\"}").unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
-    std::fs::write(store.root().join("current"), vec![b'x'; 16 * 1024 + 1]).unwrap();
-    let error = store.read_current().err().unwrap();
+    std::fs::write(&view, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
-    std::fs::write(store.root().join("current"), b"{").unwrap();
-    let error = store.read_current().err().unwrap();
+    std::fs::write(&view, b"{").unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
     );
 
-    std::fs::remove_file(store.root().join("current")).unwrap();
-    let error = store.read_current().err().unwrap();
-    assert_eq!(
-        error.category(),
-        CandidateLoadErrorCategory::SnapshotInvalid
-    );
+    std::fs::remove_file(&view).unwrap();
+    assert!(store.read_latest_view().is_err());
 }
 
 #[test]
@@ -648,12 +691,12 @@ fn store_rejects_generation_headers_over_the_read_limit() {
     }
     write.commit().unwrap();
     drop(database);
-    let pointer = format!(
-        "{{\"format\":\"rsolve-metadata-current\",\"version\":1,\"registry_id\":\"cran\",\"generation\":\"{generation}\",\"header_sha256\":\"{}\"}}",
-        hex(&Sha256::digest(&header))
-    );
-    std::fs::write(store.root().join("current"), pointer).unwrap();
-    let error = store.read_current().err().unwrap();
+    std::fs::write(
+        store.root().join("views/broken.json"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let error = store.read_latest_view().err().unwrap();
     assert_eq!(
         error.category(),
         CandidateLoadErrorCategory::SnapshotInvalid
@@ -661,7 +704,7 @@ fn store_rejects_generation_headers_over_the_read_limit() {
 }
 
 #[test]
-fn store_cleanup_can_recover_before_first_pointer() {
+fn store_cleanup_can_recover_before_first_view() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
     let staged = store.root().join("tmp/orphan.redb");

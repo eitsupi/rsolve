@@ -79,7 +79,7 @@ pub(crate) fn default_context(registry_id: RegistryId) -> SnapshotCompositionCon
 /// Compose validated CRAN evidence and atomically publish one generation.
 /// The returned loader pins the generation published by this operation while
 /// the publication lock is held, before the lock is released. A later
-/// publication may replace the store's current pointer without changing the
+/// publication may replace the store's selected view head without changing the
 /// generation observed through this loader.
 #[cfg(test)]
 pub fn publish_snapshot(
@@ -209,7 +209,7 @@ mod tests {
         .unwrap();
 
         let loader = publish_snapshot(&store, context(), observations).unwrap();
-        let reopened = store.read_current().unwrap();
+        let reopened = store.read_latest_view().unwrap();
         assert_eq!(read_versions(&loader), ["0.9", "1.0"]);
         assert_eq!(
             semantic_fingerprints(&reference),
@@ -238,7 +238,7 @@ mod tests {
             publish_snapshot(&store, context(), invalid),
             Err(CranSnapshotPublishError::Composition(_))
         ));
-        let reopened = store.read_current().unwrap();
+        let reopened = store.read_latest_view().unwrap();
         assert_eq!(reopened.header().generation, generation);
         assert_eq!(read_versions(&pinned), ["0.9", "1.0"]);
         assert_eq!(read_versions(&reopened), ["0.9", "1.0"]);
@@ -258,7 +258,7 @@ mod tests {
             Err(CranSnapshotPublishError::Publication(_))
         ));
         assert_eq!(
-            store.read_current().unwrap().header().generation,
+            store.read_latest_view().unwrap().header().generation,
             generation
         );
         assert_eq!(read_versions(&pinned), ["0.9", "1.0"]);
@@ -390,61 +390,8 @@ mod tests {
         ));
         assert!(matches!(
             crate::cran::inspect_cran_snapshot_cache(&store, &expected_b),
-            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
-                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
-        ));
-
-        let validation_path = directory.path().join("current-validation");
-        let read_validation = || -> crate::snapshot::CurrentValidationV2 {
-            serde_json::from_slice(&std::fs::read(&validation_path).unwrap()).unwrap()
-        };
-        let write_validation = |validation: &crate::snapshot::CurrentValidationV2| {
-            std::fs::write(&validation_path, serde_json::to_vec(validation).unwrap()).unwrap();
-        };
-        let mut validation = read_validation();
-        validation.effective_endpoint = "https://other.example".into();
-        write_validation(&validation);
-        let mismatched = crate::cran::inspect_cran_snapshot_cache(
-            &store,
-            &crate::cran::CranSnapshotCachePolicy::at(t2.parse().unwrap())
-                .with_expected_endpoint("https://configured.example"),
-        );
-        assert!(matches!(
-            mismatched,
-            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
-                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
-        ));
-        let mut validation = read_validation();
-        validation.generation = "0".repeat(64);
-        write_validation(&validation);
-        assert!(matches!(
-            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
-            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
-                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
-        ));
-        let mut validation = read_validation();
-        validation.compatibility_profile = 2;
-        write_validation(&validation);
-        assert!(matches!(
-            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
-            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
-                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
-        ));
-        let mut validation = read_validation();
-        validation.sources[0].content_sha256 = "0".repeat(64);
-        validation.sources[0].id = "0".repeat(64);
-        write_validation(&validation);
-        assert!(matches!(
-            crate::cran::inspect_cran_snapshot_cache(&store, &expected_a),
-            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
-                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
-        ));
-        std::fs::write(&validation_path, b"{").unwrap();
-        let malformed = crate::cran::inspect_cran_snapshot_cache(&store, &stale);
-        assert!(matches!(
-            malformed,
-            crate::cran::CranSnapshotCacheResult::Compatible { diagnostic, .. }
-                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Stale
+            crate::cran::CranSnapshotCacheResult::Rejected(diagnostic)
+                if diagnostic.status() == crate::cran::CranSnapshotCacheStatus::Missing
         ));
     }
 
@@ -472,17 +419,12 @@ mod tests {
             panic!("expected compatible generation");
         };
         assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Fresh);
-        let CranSnapshotCacheResult::Compatible { diagnostic, .. } =
+        let CranSnapshotCacheResult::Rejected(diagnostic) =
             inspect_cran_snapshot_cache(&store, &at_thirty_seconds("https://other.example"))
         else {
-            panic!("expected compatible generation");
+            panic!("a different endpoint must not select this view");
         };
-        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Stale);
-        assert!(
-            diagnostic
-                .diagnostic()
-                .contains("different acquisition endpoint")
-        );
+        assert_eq!(diagnostic.status(), CranSnapshotCacheStatus::Missing);
     }
 
     #[test]

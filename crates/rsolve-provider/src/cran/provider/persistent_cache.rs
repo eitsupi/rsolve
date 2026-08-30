@@ -70,7 +70,7 @@ pub enum CranSnapshotCacheStatus {
 }
 
 /// A typed explanation for reusing or rejecting the provider-owned current
-/// generation. Local generation names and paths are intentionally omitted.
+/// view generation. Local generation names and paths are intentionally omitted.
 #[derive(Clone, Debug)]
 pub struct CranSnapshotCacheDiagnostic {
     status: CranSnapshotCacheStatus,
@@ -156,12 +156,12 @@ pub enum CranSnapshotCacheResult {
 }
 
 fn cache_revision_token(
-    validation: Option<&crate::snapshot::CurrentValidationV2>,
+    validation: Option<&crate::snapshot::ViewValidationV1>,
 ) -> Option<Box<str>> {
-    validation.map(crate::snapshot::current_validation_revision_token)
+    validation.map(crate::snapshot::view_validation_revision_token)
 }
 
-/// Inspect the current immutable generation without transport. This is the
+/// Inspect the selected immutable view without transport. This is the
 /// sole CRAN freshness boundary; resolver traversal remains loader-only.
 pub fn inspect_cran_snapshot_cache(
     store: &SnapshotStore,
@@ -182,7 +182,7 @@ pub fn inspect_cran_snapshot_cache(
     inspect_cran_snapshot_cache_with_refresh_guard(&guard, policy)
 }
 
-/// Inspect the current snapshot without waiting for another process's
+/// Inspect a snapshot view without waiting for another process's
 /// refresh transaction. `None` means the transaction lock was busy; callers
 /// must not interpret that as a missing or fresh generation and should
 /// re-check after acquiring their own transaction.
@@ -214,15 +214,25 @@ pub(crate) fn inspect_cran_snapshot_cache_with_refresh_guard(
     guard: &crate::snapshot::SnapshotRefreshGuard<'_>,
     policy: &CranSnapshotCachePolicy,
 ) -> CranSnapshotCacheResult {
-    let loader = guard.read_current_optional();
-    let validation = guard.read_current_validation().ok().flatten();
+    let (loader, validation) = if let Some(endpoint) = policy.expected_endpoint.as_deref() {
+        match guard.read_view_for_endpoint(endpoint) {
+            Ok(Some((loader, validation))) => (Ok(Some(loader)), Some(validation)),
+            Ok(None) => (Ok(None), None),
+            Err(error) => (Err(error), None),
+        }
+    } else {
+        (
+            guard.read_latest_view_optional(),
+            guard.read_latest_view_validation().ok().flatten(),
+        )
+    };
     inspect_cran_snapshot_cache_from_reads(policy, loader, validation)
 }
 
 fn inspect_cran_snapshot_cache_from_reads(
     policy: &CranSnapshotCachePolicy,
     loader_result: Result<Option<ReadOnlySnapshotCandidateLoader>, CandidateLoadError>,
-    validation: Option<crate::snapshot::CurrentValidationV2>,
+    validation: Option<crate::snapshot::ViewValidationV1>,
 ) -> CranSnapshotCacheResult {
     let loader = match loader_result {
         Ok(Some(loader)) => loader,
@@ -231,7 +241,7 @@ fn inspect_cran_snapshot_cache_from_reads(
                 status: CranSnapshotCacheStatus::Missing,
                 age_seconds: None,
                 endpoints: Vec::new(),
-                diagnostic: "current CRAN snapshot pointer is missing".into(),
+                diagnostic: "CRAN snapshot view head is missing".into(),
                 revision_token: None,
             });
         }
@@ -409,7 +419,7 @@ fn canonical_endpoints(header: &crate::snapshot::SnapshotHeaderV1) -> Vec<Box<st
     endpoints.into_iter().map(String::into_boxed_str).collect()
 }
 
-fn canonical_validation_endpoints(record: &crate::snapshot::CurrentValidationV2) -> Vec<Box<str>> {
+fn canonical_validation_endpoints(record: &crate::snapshot::ViewValidationV1) -> Vec<Box<str>> {
     let mut endpoints = record
         .sources
         .iter()

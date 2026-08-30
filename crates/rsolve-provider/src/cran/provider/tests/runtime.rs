@@ -121,7 +121,7 @@ fn persisted_snapshot_replays_quarantined_xml_candidates_offline() {
         .load(&SolverKey::InstalledName(package.clone()))
         .expect("online snapshot must load XML");
     let offline = store
-        .read_current()
+        .read_latest_view()
         .expect("published snapshot must be readable offline");
     let offline_result = offline
         .load(&SolverKey::InstalledName(package))
@@ -314,7 +314,7 @@ fn production_refresh_publishes_fixture_evidence_and_preserves_old_generation_on
         Err(crate::cran::CranSnapshotPublishError::Acquisition(_))
     ));
     assert_eq!(
-        store.read_current().unwrap().header().generation,
+        store.read_latest_view().unwrap().header().generation,
         generation
     );
 }
@@ -444,7 +444,7 @@ fn production_refresh_propagates_configured_registry_id_to_header_and_loader() {
     .expect("configured registry publication should succeed");
     assert_eq!(loader.header().registry_id, registry.as_str());
     assert_eq!(
-        store.read_current().unwrap().header().registry_id,
+        store.read_latest_view().unwrap().header().registry_id,
         registry.as_str()
     );
     let releases = loader

@@ -393,7 +393,7 @@ fn archive_rejection_survives_snapshot_roundtrip_and_keeps_valid_sibling_visible
     );
     assert_eq!(loader.header().observation_count, 3);
 
-    let offline = store.read_current().unwrap();
+    let offline = store.read_latest_view().unwrap();
     let offline_releases = offline
         .releases(&SolverKey::InstalledName(
             PackageName::new("Matrix").unwrap(),
@@ -442,7 +442,7 @@ fn invalid_version_archive_survives_snapshot_roundtrip_and_keeps_valid_siblings_
     );
     assert_eq!(loader.header().observation_count, 3);
 
-    let offline = store.read_current().unwrap();
+    let offline = store.read_latest_view().unwrap();
     let offline_releases = offline
         .releases(&SolverKey::InstalledName(PackageName::new("nlme").unwrap()))
         .unwrap();

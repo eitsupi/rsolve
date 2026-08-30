@@ -1,3 +1,16 @@
+fn view_refresh_sequence(root: &std::path::Path) -> u64 {
+    let path = std::fs::read_dir(root.join("views"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap())
+        .unwrap()["validation"]["refresh_sequence"]
+        .as_u64()
+        .unwrap()
+}
+
 #[test]
 fn persistent_refresh_child_probe() {
     let Ok(root) = std::env::var("RSOLVE_PERSISTENT_CHILD_ROOT") else {
@@ -232,9 +245,7 @@ fn persistent_refresh_child_processes_coalesce_normal_refresh() {
             .join("newer-orphan.redb")
             .exists()
     );
-    let validation: crate::snapshot::CurrentValidationV2 =
-        serde_json::from_slice(&std::fs::read(root.join("current-validation")).unwrap()).unwrap();
-    assert_eq!(validation.refresh_sequence, 1);
+    assert_eq!(view_refresh_sequence(root), 1);
 }
 
 #[test]
@@ -268,9 +279,7 @@ fn persistent_refresh_child_processes_coalesce_forced_refresh_and_retry_after_pa
             .count(),
         3
     );
-    let validation: crate::snapshot::CurrentValidationV2 =
-        serde_json::from_slice(&std::fs::read(root.join("current-validation")).unwrap()).unwrap();
-    assert_eq!(validation.refresh_sequence, 1);
+    assert_eq!(view_refresh_sequence(root), 1);
 
     let failure_directory = tempfile::tempdir().unwrap();
     let failure_root = failure_directory.path();
@@ -281,10 +290,7 @@ fn persistent_refresh_child_processes_coalesce_forced_refresh_and_retry_after_pa
     wait_for_child_file(&failure_root.join("failure-waiter-attempting-lock"));
     assert!(!wait_for_child(failure_owner).success());
     assert!(wait_for_child(retry).success());
-    let failure_validation: crate::snapshot::CurrentValidationV2 =
-        serde_json::from_slice(&std::fs::read(failure_root.join("current-validation")).unwrap())
-            .unwrap();
-    assert_eq!(failure_validation.refresh_sequence, 1);
+    assert_eq!(view_refresh_sequence(failure_root), 1);
 }
 
 #[test]

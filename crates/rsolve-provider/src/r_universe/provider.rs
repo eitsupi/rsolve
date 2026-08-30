@@ -285,29 +285,45 @@ impl<T: RUniverseTransport> RUniverseProvider<T> {
             .map_err(|error| RUniverseProviderError::Snapshot(error.to_string()))
     }
 
-    /// Open the current generation only when its local interpretation profile
+    /// Open the exact compatible view only when its local interpretation profile
     /// is compatible. This method never falls back to network acquisition.
     pub fn open_compatible(
         &self,
         store: &SnapshotStore,
         allowlist: Option<&[PackageName]>,
     ) -> Result<ReadOnlySnapshotCandidateLoader, RUniverseProviderError> {
-        let loader = store
-            .read_current_optional()
-            .map_err(|error| RUniverseProviderError::OfflineIncompatible(error.to_string()))?
-            .ok_or_else(|| {
-                RUniverseProviderError::OfflineMissing("current snapshot pointer is missing".into())
-            })?;
-        let validation = store
-            .read_current_validation()
-            .map_err(|error| RUniverseProviderError::OfflineIncompatible(error.to_string()))?
-            .ok_or_else(|| {
-                RUniverseProviderError::OfflineIncompatible(
-                    "snapshot validation evidence is unavailable".into(),
-                )
-            })?;
-        let header = loader.header();
         let expected_scope = coverage_scope(allowlist)?;
+        let view_key = super::super::snapshot::view_key_for_parts(
+            &self.registry_id,
+            "complete",
+            &expected_scope,
+            "current",
+            self.endpoint.as_ref(),
+        );
+        let (loader, validation) = match store
+            .read_view_with_validation(&view_key)
+            .map_err(|error| RUniverseProviderError::OfflineIncompatible(error.to_string()))?
+        {
+            Some(value) => value,
+            None => match store.has_view_heads() {
+                Ok(true) => {
+                    return Err(RUniverseProviderError::OfflineIncompatible(
+                        "no compatible snapshot view head exists for the provider request".into(),
+                    ));
+                }
+                Ok(false) => {
+                    return Err(RUniverseProviderError::OfflineMissing(
+                        "snapshot view head is missing".into(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(RUniverseProviderError::OfflineIncompatible(
+                        error.to_string(),
+                    ));
+                }
+            },
+        };
+        let header = loader.header();
         if header.compatibility_profile != super::RUNIVERSE_COMPATIBILITY_PROFILE
             || header.parser_schema != super::RUNIVERSE_PARSER_SCHEMA
             || header.normalization_policy != RUNIVERSE_NORMALIZATION_POLICY
@@ -1395,7 +1411,13 @@ mod tests {
         )
         .unwrap();
         provider.refresh_snapshot(&invalid_store, None).unwrap();
-        std::fs::write(invalid_store.root().join("current-validation"), b"{}").unwrap();
+        let view = std::fs::read_dir(invalid_store.root().join("views"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+            .unwrap();
+        std::fs::write(view, b"{}").unwrap();
         assert!(matches!(
             provider.open_compatible(&invalid_store, None),
             Err(RUniverseProviderError::OfflineIncompatible(_))

@@ -77,7 +77,7 @@ pub(crate) struct PersistentRefreshProbe {
 }
 
 pub(crate) fn observe_persistent_refresh_probe(store: &SnapshotStore) -> PersistentRefreshProbe {
-    match store.read_current_validation_revision_unlocked() {
+    match store.read_latest_view_validation_revision_unlocked() {
         Ok(revision) => PersistentRefreshProbe {
             revision,
             observation_valid: true,
@@ -512,27 +512,16 @@ mod tests {
         CranSnapshotCachePolicy, CranSnapshotCacheResult, CranSnapshotRefresher,
         observe_persistent_refresh_probe, refresh_completed_after_wait,
     };
-    use crate::snapshot::{CurrentValidationSourceV2, CurrentValidationV2, SnapshotStore};
+    use crate::snapshot::SnapshotStore;
     use rsolve_core::RegistryId;
 
-    fn validation(sequence: u64) -> CurrentValidationV2 {
-        CurrentValidationV2 {
-            format: "rsolve-metadata-current-validation".into(),
-            version: 2,
-            registry_id: "cran".into(),
-            generation: "0".repeat(64),
-            compatibility_profile: 1,
-            parser_schema: 1,
-            normalization_policy: 1,
-            validated_at: "2026-08-25T00:00:00Z".into(),
-            refresh_sequence: sequence,
-            effective_endpoint: "https://cloud.r-project.org".into(),
-            sources: vec![CurrentValidationSourceV2 {
-                id: "1".repeat(64),
-                content_sha256: "2".repeat(64),
-                endpoint: "https://cloud.r-project.org/src/contrib/PACKAGES".into(),
-            }],
-        }
+    fn view_path(store: &SnapshotStore) -> std::path::PathBuf {
+        std::fs::read_dir(store.root().join("views"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+            .expect("published view head")
     }
 
     #[test]
@@ -540,10 +529,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store =
             SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
-        let path = store.root().join("current-validation");
-        std::fs::write(&path, serde_json::to_vec(&validation(1)).unwrap()).unwrap();
+        store
+            .build_and_publish_with_endpoint(
+                crate::snapshot::test_present_input(),
+                "https://cloud.r-project.org",
+            )
+            .unwrap();
+        let path = view_path(&store);
         let first = observe_persistent_refresh_probe(&store);
-        std::fs::write(&path, serde_json::to_vec(&validation(2)).unwrap()).unwrap();
+        let mut changed = std::fs::read_to_string(&path).unwrap();
+        changed = changed.replace("\"refresh_sequence\":1", "\"refresh_sequence\":2");
+        std::fs::write(&path, changed).unwrap();
         let second = observe_persistent_refresh_probe(&store);
         assert!(first.observation_valid && second.observation_valid);
         assert_ne!(first.revision, second.revision);
@@ -552,7 +548,6 @@ mod tests {
             second.revision.as_deref()
         ));
 
-        std::fs::write(&path, serde_json::to_vec(&validation(2)).unwrap()).unwrap();
         let identical = observe_persistent_refresh_probe(&store);
         assert_eq!(second.revision, identical.revision);
         assert!(!refresh_completed_after_wait(
@@ -587,8 +582,7 @@ mod tests {
         store
             .build_and_publish_with_endpoint(input, "https://cloud.r-project.org")
             .unwrap();
-        let validation_path = store.root().join("current-validation");
-        let current = store.read_current_validation().unwrap().unwrap();
+        let validation_path = view_path(&store);
         let refresher = CranSnapshotRefresher::new(crate::cran::CranMetadataConfig::new(
             "https://cloud.r-project.org",
             "https://cloud.r-project.org/src/contrib/ALLPACKAGES.rds",
@@ -604,11 +598,11 @@ mod tests {
         // cache probe. Simulate an owner publishing sequence 2 immediately
         // after observation and before that probe.
         let preflight = refresher.preflight_refresh_with_after_observation(&store, &policy, || {
-            let mut next = current.clone();
-            next.refresh_sequence = 2;
-            std::fs::write(&validation_path, serde_json::to_vec(&next).unwrap()).unwrap();
+            let mut next = std::fs::read_to_string(&validation_path).unwrap();
+            next = next.replace("\"refresh_sequence\":1", "\"refresh_sequence\":2");
+            std::fs::write(&validation_path, next).unwrap();
         });
-        let locked_revision = store.read_current_validation_revision_unlocked().unwrap();
+        let locked_revision = store.read_latest_view_validation_revision().unwrap();
         let probed_revision = match preflight.cache_result().unwrap() {
             CranSnapshotCacheResult::Compatible { diagnostic, .. }
             | CranSnapshotCacheResult::Rejected(diagnostic) => {
