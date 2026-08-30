@@ -273,6 +273,14 @@ pub(super) fn validate_history_limits(history: &PackageHistoryV1) -> Result<(), 
         if release.package.len() > STRING_LIMIT
             || release.version.len() > STRING_LIMIT
             || release.namespace.len() > STRING_LIMIT
+            || release.git_provenance.as_ref().is_some_and(|provenance| {
+                provenance.repository.len() > STRING_LIMIT
+                    || provenance.commit.len() > STRING_LIMIT
+                    || provenance
+                        .subdirectory
+                        .as_ref()
+                        .is_some_and(|subdirectory| subdirectory.len() > STRING_LIMIT)
+            })
             || release.metadata.len() > MEMBER_LIMIT
             || release.dependencies.len() > MEMBER_LIMIT
             || release.distributions.len() > MEMBER_LIMIT
@@ -285,6 +293,13 @@ pub(super) fn validate_history_limits(history: &PackageHistoryV1) -> Result<(), 
         validate_string(&release.package, true, "release package")?;
         validate_string(&release.version, true, "release version")?;
         validate_string(&release.namespace, true, "release namespace")?;
+        if let Some(provenance) = &release.git_provenance {
+            validate_string(&provenance.repository, true, "Git repository")?;
+            validate_string(&provenance.commit, true, "Git commit")?;
+            if let Some(subdirectory) = &provenance.subdirectory {
+                validate_string(subdirectory, false, "Git subdirectory")?;
+            }
+        }
         for field in &release.metadata {
             validate_string(&field.name, false, "release metadata name")?;
             validate_string(&field.value, false, "release metadata value")?;
@@ -531,26 +546,68 @@ pub(super) fn canonical_version_components(version: &RPackageVersion) -> Vec<u32
 }
 
 pub(super) fn validate_release_order(releases: &[EligibleReleaseV1]) -> Result<(), SnapshotError> {
+    let mut identities = BTreeSet::new();
+    let mut git_versions = BTreeMap::new();
     let keys = releases
         .iter()
         .map(|release| {
             let version = RPackageVersion::parse(&release.version)
                 .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
+            let version_components = canonical_version_components(&version);
+            let (repository, commit, subdirectory) = match &release.git_provenance {
+                Some(provenance) => {
+                    let repository = NormalizedGitUrl::new(&provenance.repository)
+                        .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
+                    let commit = GitCommitId::new(&provenance.commit)
+                        .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
+                    let subdirectory = provenance
+                        .subdirectory
+                        .as_deref()
+                        .map(RepositorySubdir::new)
+                        .transpose()
+                        .map_err(|error| SnapshotError::Invalid(error.to_string()))?;
+                    let git_identity = (
+                        repository.to_string(),
+                        commit.to_string(),
+                        subdirectory.as_ref().map(ToString::to_string),
+                    );
+                    if let Some(previous) =
+                        git_versions.insert(git_identity.clone(), version_components.clone())
+                        && previous != version_components
+                    {
+                        return Err(SnapshotError::Invalid(
+                            "Git identity appears with multiple release versions".into(),
+                        ));
+                    }
+                    git_identity
+                }
+                None => (String::new(), String::new(), None),
+            };
+            let identity = (
+                version_components.clone(),
+                release.namespace.clone(),
+                repository.clone(),
+                commit.clone(),
+                subdirectory.clone(),
+            );
+            if !identities.insert(identity) {
+                return Err(SnapshotError::Invalid(
+                    "duplicate eligible release identity".into(),
+                ));
+            }
             Ok((
-                canonical_version_components(&version),
+                version_components,
                 release.version.clone(),
-                release.metadata_sha256,
+                release.namespace.clone(),
+                repository,
+                commit,
+                subdirectory,
             ))
         })
         .collect::<Result<Vec<_>, SnapshotError>>()?;
     if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(SnapshotError::Invalid(
             "eligible releases are not canonically ordered".into(),
-        ));
-    }
-    if keys.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(SnapshotError::Invalid(
-            "duplicate eligible release version".into(),
         ));
     }
     Ok(())

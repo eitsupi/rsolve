@@ -905,10 +905,15 @@ mod tests {
     }
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
     fn package_entry(package: &str) -> String {
+        package_entry_with_commit(package, COMMIT)
+    }
+
+    fn package_entry_with_commit(package: &str, commit: &str) -> String {
         format!(
-            r#"{{"Package":"{package}","Version":"1.0.0","RemoteUrl":"https://github.com/example/{package}.git","RemoteSha":"{COMMIT}","_dependencies":[]}}"#
+            r#"{{"Package":"{package}","Version":"1.0.0","RemoteUrl":"https://github.com/example/{package}.git","RemoteSha":"{commit}","_dependencies":[]}}"#
         )
     }
 
@@ -1125,6 +1130,28 @@ mod tests {
     }
 
     #[test]
+    fn bulk_refresh_rejects_duplicate_release_identity() {
+        let (provider, _) = fixture_provider(
+            "https://custom.example/universe",
+            &[
+                (
+                    "https://custom.example/universe/api/ls",
+                    r#"["foo"]"#.into(),
+                ),
+                (
+                    "https://custom.example/universe/api/packages?limit=1",
+                    format!("[{},{}]", package_entry("foo"), package_entry("foo")),
+                ),
+            ],
+        );
+        assert!(matches!(
+            provider.refresh(None),
+            Err(RUniverseProviderError::DuplicatePackage { package, .. })
+                if package == "foo"
+        ));
+    }
+
+    #[test]
     fn allowlisted_missing_package_is_a_typed_boundary_error() {
         let (provider, requests) = fixture_provider_with_statuses(
             "https://custom.example/universe",
@@ -1234,6 +1261,46 @@ mod tests {
         ));
         let offline = provider.open_compatible(&store, None).unwrap();
         assert_eq!(offline.registry_id().as_str(), "universe");
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_distinct_git_identities_at_one_version() {
+        let registry = RegistryId::new("universe").unwrap();
+        let body = format!(
+            "[{},{}]",
+            package_entry_with_commit("foo", COMMIT),
+            package_entry_with_commit("foo", OTHER_COMMIT)
+        );
+        let catalog = RUniverseCatalog::from_json(&body, registry.clone()).unwrap();
+        let response = FetchedResponse {
+            endpoint: "https://custom.example/universe/api/packages".into(),
+            body: body.into_bytes(),
+        };
+        let input = snapshot_input(&registry, &catalog, &[response], "api-catalog".into()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(directory.path(), registry).unwrap();
+        let loader = store
+            .build_and_publish_with_endpoint(input, "https://custom.example/universe")
+            .unwrap();
+        let loaded = loader
+            .load(&rsolve_core::SolverKey::InstalledName(
+                PackageName::new("foo").unwrap(),
+            ))
+            .unwrap();
+        let commits = loaded
+            .observations()
+            .iter()
+            .filter_map(
+                |observation| match observation.release().identity().provenance() {
+                    Provenance::GitCommit { commit, .. } => Some(commit.to_string()),
+                    _ => None,
+                },
+            )
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            commits,
+            BTreeSet::from([COMMIT.into(), OTHER_COMMIT.into()])
+        );
     }
 
     #[test]

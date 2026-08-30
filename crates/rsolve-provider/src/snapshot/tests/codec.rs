@@ -124,6 +124,34 @@ fn nested_collections_and_limits_must_be_canonical() {
             .build()
             .is_err()
     );
+
+    let mut oversized_subdirectory = input();
+    oversized_subdirectory.histories[0].eligible_releases = vec![EligibleReleaseV1 {
+        package: "foo".into(),
+        version: "1.0.0".into(),
+        namespace: "r-universe".into(),
+        git_provenance: Some(GitProvenanceV1 {
+            repository: "https://github.com/example/foo.git".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            subdirectory: Some("x".repeat(STRING_LIMIT + 1)),
+        }),
+        currentness: CandidateCurrentnessV1::Current,
+        metadata: vec![],
+        publication: None,
+        dependencies: vec![],
+        distributions: vec![],
+        metadata_sha256: [1; 32],
+        evidence: vec![],
+    }];
+    oversized_subdirectory.histories[0].state = LookupStateV1::Present;
+    assert!(
+        SnapshotGenerationBuilder::new(
+            oversized_subdirectory,
+            dir.path().join("oversized-subdirectory.redb")
+        )
+        .build()
+        .is_err()
+    );
 }
 
 #[test]
@@ -169,6 +197,67 @@ fn versions_use_numeric_components_and_reject_logical_duplicates() {
         },
     ];
     assert!(validate_release_order(&releases).is_err());
+}
+
+#[test]
+fn git_provenance_is_part_of_release_identity_ordering() {
+    let release = |commit: &str, version: &str| EligibleReleaseV1 {
+        package: "foo".into(),
+        version: version.into(),
+        namespace: "r-universe".into(),
+        git_provenance: Some(GitProvenanceV1 {
+            repository: "https://github.com/example/foo.git".into(),
+            commit: commit.into(),
+            subdirectory: None,
+        }),
+        currentness: CandidateCurrentnessV1::Current,
+        metadata: vec![],
+        publication: None,
+        dependencies: vec![],
+        distributions: vec![],
+        metadata_sha256: [1; 32],
+        evidence: vec![],
+    };
+    let first = release("0123456789abcdef0123456789abcdef01234567", "1.0.0");
+    let second = release("fedcba9876543210fedcba9876543210fedcba98", "1.0.0");
+    assert!(validate_release_order(&[first.clone(), second]).is_ok());
+    assert!(validate_release_order(&[first.clone(), first.clone()]).is_err());
+    assert!(
+        validate_release_order(&[
+            first,
+            release("0123456789abcdef0123456789abcdef01234567", "2.0.0"),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn git_provenance_fields_are_bounded_before_snapshot_publication() {
+    let dir = tempdir().unwrap();
+    let mut oversized = input();
+    oversized.histories[0].eligible_releases = vec![EligibleReleaseV1 {
+        package: "foo".into(),
+        version: "1.0.0".into(),
+        namespace: "r-universe".into(),
+        git_provenance: Some(GitProvenanceV1 {
+            repository: "x".repeat(STRING_LIMIT + 1),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            subdirectory: Some("src/foo".into()),
+        }),
+        currentness: CandidateCurrentnessV1::Current,
+        metadata: vec![],
+        publication: None,
+        dependencies: vec![],
+        distributions: vec![],
+        metadata_sha256: [1; 32],
+        evidence: vec![],
+    }];
+    oversized.histories[0].state = LookupStateV1::Present;
+    assert!(
+        SnapshotGenerationBuilder::new(oversized, dir.path().join("oversized.redb"))
+            .build()
+            .is_err()
+    );
 }
 
 #[test]
