@@ -905,6 +905,8 @@ mod tests {
     }
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const ARTIFACT_SHA256: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn package_entry(package: &str) -> String {
         package_entry_with_commit(package, COMMIT)
@@ -912,7 +914,7 @@ mod tests {
 
     fn package_entry_with_commit(package: &str, commit: &str) -> String {
         format!(
-            r#"{{"Package":"{package}","Version":"1.0.0","RemoteUrl":"https://github.com/example/{package}.git","RemoteSha":"{commit}","_dependencies":[]}}"#
+            r#"{{"Package":"{package}","Version":"1.0.0","RemoteUrl":"https://github.com/example/{package}.git","RemoteSha":"{commit}","_type":"src","_status":"success","_file":"{package}_1.0.0.tar.gz","_fileid":"https://downloads.example.test/{package}_1.0.0.tar.gz","_sha256":"{ARTIFACT_SHA256}","_filesize":123,"_dependencies":[]}}"#
         )
     }
 
@@ -1257,6 +1259,14 @@ mod tests {
         assert!(matches!(
             releases.observations()[0].release().identity().provenance(),
             Provenance::GitCommit { commit, .. } if commit.as_str() == COMMIT
+        ));
+        assert!(matches!(
+            &releases.observations()[0].release().distributions()[0].artifacts[..],
+            [Artifact::Source(source)]
+                if source.locator.as_str()
+                    == "https://downloads.example.test/foo_1.0.0.tar.gz"
+                    && source.size == Some(123)
+                    && source.upstream_checksums.len() == 1
         ));
         let offline = provider.open_compatible(&store, None).unwrap();
         assert_eq!(offline.registry_id().as_str(), "universe");

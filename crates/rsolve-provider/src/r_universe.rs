@@ -9,13 +9,15 @@ use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
-    DistributionChannel, DistributionMetadata, GitCommitId, NormalizedGitUrl, PackageName,
-    PackageRelease, PackageReleaseError, PackageRequirement, Provenance, PublicationDate,
-    RPackageVersion, RegistryId, RelationOp, ReleaseAggregation, ReleaseMetadata,
-    ReleaseObservation, ReleasePublication, RepositorySubdir, VersionClause, VersionConstraint,
+    Artifact, ArtifactLocator, DeclaredDependency, DependencyKind, DependencySourceConstraint,
+    Distribution, DistributionChannel, DistributionMetadata, GitCommitId, NormalizedGitUrl,
+    PackageName, PackageRelease, PackageReleaseError, PackageRequirement, Provenance,
+    PublicationDate, RPackageVersion, RegistryId, RelationOp, ReleaseAggregation, ReleaseMetadata,
+    ReleaseObservation, ReleasePublication, RepositorySubdir, Sha256Digest, SourceArtifact,
+    UpstreamChecksum, VersionClause, VersionConstraint,
 };
 use serde_json::{Map, Value};
+use url::Url;
 
 mod provider;
 pub use provider::*;
@@ -27,7 +29,13 @@ pub const RUNIVERSE_API_PROFILE: &str = "r-universe.v1";
 pub const RUNIVERSE_COMPATIBILITY_PROFILE: u32 = 1;
 
 /// Local parser revision for the R-universe catalog projection.
-pub const RUNIVERSE_PARSER_SCHEMA: u32 = 1;
+pub const RUNIVERSE_PARSER_SCHEMA: u32 = 2;
+
+/// Maximum source archive size accepted from the current package API.
+///
+/// This provider-owned bound matches the repository layer's compressed input
+/// ceiling without introducing a provider-to-repository dependency.
+const MAX_SOURCE_ARTIFACT_BYTES: u64 = 1 << 30;
 
 /// A validated catalog projected from one R-universe response.
 #[derive(Clone, Debug)]
@@ -160,6 +168,7 @@ fn parse_package(
         .ok_or_else(|| missing_field("_dependencies"))?;
     let dependencies = parse_dependencies(dependencies)?;
     let publication = parse_publication(object, &package)?;
+    let source_artifact = parse_source_artifact(object, &package, &version)?;
 
     let mut metadata = BTreeMap::new();
     for (field, value) in object {
@@ -209,7 +218,7 @@ fn parse_package(
         registry: registry.clone(),
         channel: DistributionChannel::new("source").expect("source is a valid channel"),
         snapshot: None,
-        artifacts: Vec::new(),
+        artifacts: vec![Artifact::Source(source_artifact)],
         observed_metadata: DistributionMetadata::default(),
     };
     PackageRelease::try_from(ReleaseObservation {
@@ -222,6 +231,84 @@ fn parse_package(
         distributions: vec![distribution],
     })
     .map_err(|error| map_release_error(index, error))
+}
+
+fn parse_source_artifact(
+    object: &Map<String, Value>,
+    package: &PackageName,
+    version: &RPackageVersion,
+) -> Result<SourceArtifact, RUniverseCatalogError> {
+    let artifact_type = required_string(object, "_type")?;
+    if artifact_type != "src" {
+        return Err(invalid_field("_type", "expected the exact value \"src\""));
+    }
+    let status = required_string(object, "_status")?;
+    if status != "success" {
+        return Err(invalid_field(
+            "_status",
+            "expected the exact value \"success\"",
+        ));
+    }
+    let file = required_string(object, "_file")?;
+    let expected_file = format!("{package}_{version}.tar.gz");
+    if file != expected_file {
+        return Err(invalid_field(
+            "_file",
+            format!("expected canonical file name {expected_file:?}"),
+        ));
+    }
+
+    let fileid = required_string(object, "_fileid")?;
+    let fileid_url = Url::parse(&fileid)
+        .map_err(|error| invalid_field("_fileid", format!("invalid artifact URL: {error}")))?;
+    if !matches!(fileid_url.scheme(), "http" | "https") || fileid_url.host_str().is_none() {
+        return Err(invalid_field(
+            "_fileid",
+            "expected an absolute HTTP(S) URL with a host",
+        ));
+    }
+    if !fileid_url.username().is_empty()
+        || fileid_url.password().is_some()
+        || fileid_url.fragment().is_some()
+    {
+        return Err(invalid_field(
+            "_fileid",
+            "userinfo and fragments are not allowed",
+        ));
+    }
+    let locator = ArtifactLocator::new(fileid_url.as_str())
+        .map_err(|error| invalid_field("_fileid", error.to_string()))?;
+
+    let checksum_text = required_string(object, "_sha256")?;
+    let checksum = Sha256Digest::new(&checksum_text)
+        .map_err(|error| invalid_field("_sha256", error.to_string()))?;
+    if checksum.as_str() != checksum_text {
+        return Err(invalid_field(
+            "_sha256",
+            "checksum must use lowercase hexadecimal spelling",
+        ));
+    }
+
+    let size = object
+        .get("_filesize")
+        .ok_or_else(|| missing_field("_filesize"))?
+        .as_u64()
+        .ok_or_else(|| invalid_field("_filesize", "expected a positive unsigned integer"))?;
+    if size == 0 {
+        return Err(invalid_field("_filesize", "must be greater than zero"));
+    }
+    if size > MAX_SOURCE_ARTIFACT_BYTES {
+        return Err(invalid_field(
+            "_filesize",
+            format!("exceeds the {MAX_SOURCE_ARTIFACT_BYTES}-byte provider limit"),
+        ));
+    }
+
+    Ok(SourceArtifact {
+        locator,
+        upstream_checksums: vec![UpstreamChecksum::Sha256(checksum)],
+        size: Some(size),
+    })
 }
 
 fn parse_dependencies(value: &Value) -> Result<Vec<DeclaredDependency>, RUniverseCatalogError> {
@@ -534,6 +621,8 @@ mod tests {
 
     const REGISTRY: &str = "r-universe-test";
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const ARTIFACT_SHA256: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn response(entry: &str) -> String {
         format!(r#"[{entry}]"#)
@@ -541,7 +630,7 @@ mod tests {
 
     fn entry(extra: &str) -> String {
         format!(
-            r#"{{"Package":"demo","Version":"1.2.0","RemoteUrl":"https://github.com/example/demo.git","RemoteSha":"{COMMIT}","_dependencies":[{{"package":"R","version":">= 4.0","role":"Depends"}}]{extra}}}"#
+            r#"{{"Package":"demo","Version":"1.2.0","RemoteUrl":"https://github.com/example/demo.git","RemoteSha":"{COMMIT}","_type":"src","_status":"success","_file":"demo_1.2.0.tar.gz","_fileid":"https://downloads.example.test/demo_1.2.0.tar.gz","_sha256":"{ARTIFACT_SHA256}","_filesize":123,"_dependencies":[{{"package":"R","version":">= 4.0","role":"Depends"}}]{extra}}}"#
         )
     }
 
@@ -571,6 +660,15 @@ mod tests {
             release.metadata().fields().get("Title"),
             Some(&"Demo".to_owned())
         );
+        assert!(matches!(
+            &release.distributions()[0].artifacts[..],
+            [Artifact::Source(source)]
+                if source.locator.as_str() == "https://downloads.example.test/demo_1.2.0.tar.gz"
+                    && source.size == Some(123)
+                    && source.upstream_checksums == vec![UpstreamChecksum::Sha256(
+                        Sha256Digest::new(ARTIFACT_SHA256).unwrap()
+                    )]
+        ));
     }
 
     #[test]
@@ -746,6 +844,65 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_source_artifact_evidence() {
+        let registry = RegistryId::new(REGISTRY).unwrap();
+        let invalid_cases = [
+            (",\"_type\":\"binary\"", "_type"),
+            (",\"_type\":null", "_type"),
+            (",\"_status\":\"failed\"", "_status"),
+            (",\"_status\":null", "_status"),
+            (",\"_file\":\"demo.tar.gz\"", "_file"),
+            (",\"_file\":null", "_file"),
+            (",\"_fileid\":\"/tmp/demo_1.2.0.tar.gz\"", "_fileid"),
+            (",\"_fileid\":null", "_fileid"),
+            (
+                ",\"_fileid\":\"https://user:pass@downloads.example.test/demo_1.2.0.tar.gz\"",
+                "_fileid",
+            ),
+            (
+                ",\"_fileid\":\"https://downloads.example.test/demo_1.2.0.tar.gz#fragment\"",
+                "_fileid",
+            ),
+            (
+                ",\"_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+                "_sha256",
+            ),
+            (",\"_sha256\":null", "_sha256"),
+            (",\"_filesize\":0", "_filesize"),
+            (",\"_filesize\":null", "_filesize"),
+            (",\"_filesize\":-1", "_filesize"),
+            (",\"_filesize\":1.5", "_filesize"),
+            (",\"_filesize\":true", "_filesize"),
+        ];
+        for (extra, field) in invalid_cases {
+            let error = parse_catalog(&response(&entry(extra)), registry.clone()).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+
+        for (fragment, field) in [
+            ("\"_type\":\"src\"", "_type"),
+            ("\"_status\":\"success\"", "_status"),
+            ("\"_file\":\"demo_1.2.0.tar.gz\"", "_file"),
+            (
+                "\"_fileid\":\"https://downloads.example.test/demo_1.2.0.tar.gz\"",
+                "_fileid",
+            ),
+            (
+                "\"_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+                "_sha256",
+            ),
+            ("\"_filesize\":123", "_filesize"),
+        ] {
+            let input = response(&entry("").replace(&format!(",{fragment}"), ""));
+            assert!(matches!(
+                parse_catalog(&input, registry.clone()),
+                Err(RUniverseCatalogError::MissingField { field: missing })
+                    if missing == field
+            ));
+        }
+    }
+
+    #[test]
     fn rejects_cran_like_records() {
         let registry = RegistryId::new(REGISTRY).unwrap();
         let cran_like = r#"[{"Package":"demo","Version":"1.0.0","_dependencies":[]}]"#;
@@ -786,13 +943,13 @@ mod tests {
     #[test]
     fn local_profile_revisions_are_numeric() {
         assert_eq!(RUNIVERSE_COMPATIBILITY_PROFILE, 1);
-        assert_eq!(RUNIVERSE_PARSER_SCHEMA, 1);
+        assert_eq!(RUNIVERSE_PARSER_SCHEMA, 2);
     }
 
     #[test]
     fn rejects_conflicting_dependency_metadata() {
         let input = response(&format!(
-            r#"{{"Package":"demo","Version":"1.2.0","RemoteUrl":"https://github.com/example/demo.git","RemoteSha":"{COMMIT}","_dependencies":[{{"package":"dep","version":">= 1.0","role":"Imports"}},{{"package":"dep","version":"< 1.0","role":"Imports"}}]}}"#
+            r#"{{"Package":"demo","Version":"1.2.0","RemoteUrl":"https://github.com/example/demo.git","RemoteSha":"{COMMIT}","_type":"src","_status":"success","_file":"demo_1.2.0.tar.gz","_fileid":"https://downloads.example.test/demo_1.2.0.tar.gz","_sha256":"{ARTIFACT_SHA256}","_filesize":123,"_dependencies":[{{"package":"dep","version":">= 1.0","role":"Imports"}},{{"package":"dep","version":"< 1.0","role":"Imports"}}]}}"#
         ));
         assert!(matches!(
             parse_catalog(&input, RegistryId::new(REGISTRY).unwrap()),
