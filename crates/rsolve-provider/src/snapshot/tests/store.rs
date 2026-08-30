@@ -49,16 +49,25 @@ fn endpoint_revision_probe_skips_an_invalid_unrelated_head() {
 }
 
 #[test]
-fn endpoint_revision_probe_rejects_malformed_views_without_a_match() {
+fn endpoint_revision_probe_ignores_malformed_views_until_a_match_exists() {
     let dir = tempdir().unwrap();
     let store = SnapshotStore::open(dir.path(), RegistryId::new("cran").unwrap()).unwrap();
+    store
+        .build_and_publish_with_endpoint(present_input(), "https://mirror-b.example")
+        .unwrap();
     std::fs::write(store.root().join("views/broken.json"), b"not-json").unwrap();
 
-    assert!(
-        store
-            .read_view_validation_revision_for_endpoint_unlocked("https://mirror-a.example")
-            .is_err()
-    );
+    let before = store
+        .read_view_validation_revision_for_endpoint_unlocked("https://mirror-a.example")
+        .unwrap();
+    assert!(before.is_none());
+    store
+        .build_and_publish_with_endpoint(present_input(), "https://mirror-a.example")
+        .unwrap();
+    let after = store
+        .read_view_validation_revision_for_endpoint_unlocked("https://mirror-a.example")
+        .unwrap();
+    assert!(after.is_some());
 }
 
 #[test]

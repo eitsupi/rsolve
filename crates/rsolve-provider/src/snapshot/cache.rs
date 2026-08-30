@@ -589,7 +589,7 @@ impl SnapshotStore {
                 latest = Some(head);
             }
         }
-        if latest.is_none() && malformed {
+        if latest.is_none() && malformed && endpoint.is_none() {
             return Err(store_invalid(
                 "snapshot view validation observation is malformed",
             ));

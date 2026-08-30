@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_wait_validation_revision_is_stable_and_fail_closed() {
+    fn pre_wait_validation_revision_is_stable_and_scoped_misses_are_detectable() {
         let directory = tempfile::tempdir().unwrap();
         let store =
             SnapshotStore::open(directory.path(), RegistryId::new("cran").unwrap()).unwrap();
@@ -566,20 +566,21 @@ mod tests {
 
         std::fs::write(&path, b"invalid").unwrap();
         let invalid = observe_persistent_refresh_probe(&store, &policy);
-        assert!(!invalid.observation_valid);
-        assert!(!refresh_completed_after_wait(
-            &invalid,
-            second.revision.as_deref()
-        ));
+        assert!(invalid.observation_valid);
+        assert!(invalid.revision.is_none());
+        assert!(!refresh_completed_after_wait(&invalid, None));
+        let global_invalid = observe_persistent_refresh_probe(
+            &store,
+            &CranSnapshotCachePolicy::at("2026-08-25T00:00:00Z".parse().unwrap()),
+        );
+        assert!(!global_invalid.observation_valid);
 
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         let unreadable = observe_persistent_refresh_probe(&store, &policy);
-        assert!(!unreadable.observation_valid);
-        assert!(!refresh_completed_after_wait(
-            &unreadable,
-            second.revision.as_deref()
-        ));
+        assert!(unreadable.observation_valid);
+        assert!(unreadable.revision.is_none());
+        assert!(!refresh_completed_after_wait(&unreadable, None));
     }
 
     #[test]
