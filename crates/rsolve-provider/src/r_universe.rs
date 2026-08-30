@@ -310,12 +310,14 @@ fn parse_publication(
 ) -> Result<Option<ReleasePublication>, RUniverseCatalogError> {
     let date_publication = object
         .get("Date/Publication")
-        .map(|value| parse_publication_value("Date/Publication", value))
-        .transpose()?;
+        .map(|value| parse_optional_publication_value("Date/Publication", value))
+        .transpose()?
+        .flatten();
     let published = object
         .get("Published")
-        .map(|value| parse_publication_value("Published", value))
-        .transpose()?;
+        .map(|value| parse_optional_publication_value("Published", value))
+        .transpose()?
+        .flatten();
     if let (Some(date_publication), Some(published)) = (date_publication, published)
         && date_publication != published
     {
@@ -325,6 +327,16 @@ fn parse_publication(
         });
     }
     Ok(date_publication.or(published).map(ReleasePublication::new))
+}
+
+fn parse_optional_publication_value(
+    field: &str,
+    value: &Value,
+) -> Result<Option<PublicationDate>, RUniverseCatalogError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    parse_publication_value(field, value).map(Some)
 }
 
 fn parse_publication_value(
@@ -610,6 +622,30 @@ mod tests {
         );
         assert!(!release.metadata().fields().contains_key("Date/Publication"));
         assert!(!release.metadata().fields().contains_key("Published"));
+    }
+
+    #[test]
+    fn treats_missing_and_null_publication_as_unobserved() {
+        let registry = RegistryId::new(REGISTRY).unwrap();
+        let missing = parse_catalog(&response(&entry("")), registry.clone()).unwrap();
+        assert_eq!(missing.releases()[0].publication(), None);
+
+        let null_only =
+            parse_catalog(&response(&entry(",\"Published\":null")), registry.clone()).unwrap();
+        assert_eq!(null_only.releases()[0].publication(), None);
+
+        for extra in [
+            ",\"Date/Publication\":\"2025-06-10\",\"Published\":null",
+            ",\"Date/Publication\":null,\"Published\":\"2025-06-10\"",
+        ] {
+            let catalog = parse_catalog(&response(&entry(extra)), registry.clone()).unwrap();
+            assert_eq!(
+                catalog.releases()[0]
+                    .publication()
+                    .map(|publication| publication.date().to_string()),
+                Some("2025-06-10".to_owned())
+            );
+        }
     }
 
     #[test]
