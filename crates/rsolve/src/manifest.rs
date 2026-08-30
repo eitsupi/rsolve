@@ -95,31 +95,104 @@ impl ManifestTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestError {
     RIsNotAPackageRequirement,
-    DuplicateRequirement { name: rsolve_core::PackageName },
+    DuplicateRequirement {
+        name: rsolve_core::PackageName,
+    },
     InvalidDependency(String),
     Toml(String),
-    Io { path: PathBuf, source: String },
-    NotFound { start: PathBuf },
-    UnknownSchema { schema: i64 },
-    MissingField { field: String },
-    InvalidField { field: String, reason: String },
-    UnknownField { field: String },
-    WrongType { field: String, expected: String },
-    UnknownRegistryKind { kind: String },
-    InvalidRegistry { reason: String },
-    InvalidRepository { reason: String },
-    DuplicateRepository { id: RepositoryId },
-    UnknownRepositoryReference { id: RepositoryId, field: String },
-    UnknownEnvironmentGroup { environment: String, group: String },
-    DuplicateEnvironmentGroup { environment: String, group: String },
-    UnknownEnvironment { id: String },
-    InvalidVersionConstraint { field: String, reason: String },
-    TargetOutsideRConstraint { target: String, constraint: String },
-    DirectSourceRequiresAcquisition { name: rsolve_core::PackageName },
-    InvalidIdentifier { kind: String, value: String },
-    InvalidEndpoint { value: String, reason: String },
-    SourceConflict { field: String },
-    InvalidDependencyField { name: String, reason: String },
+    Io {
+        path: PathBuf,
+        source: String,
+    },
+    NotFound {
+        start: PathBuf,
+    },
+    UnknownSchema {
+        schema: i64,
+    },
+    MissingField {
+        field: String,
+    },
+    InvalidField {
+        field: String,
+        reason: String,
+    },
+    UnknownField {
+        field: String,
+    },
+    WrongType {
+        field: String,
+        expected: String,
+    },
+    UnknownRegistryKind {
+        kind: String,
+    },
+    InvalidRegistry {
+        reason: String,
+    },
+    InvalidRepository {
+        reason: String,
+    },
+    DuplicateRepository {
+        id: RepositoryId,
+    },
+    EmptyRepositoryPackageAllowlist {
+        id: RepositoryId,
+    },
+    InvalidRepositoryPackage {
+        repository: RepositoryId,
+        value: String,
+        reason: String,
+    },
+    DuplicateRepositoryPackage {
+        repository: RepositoryId,
+        package: rsolve_core::PackageName,
+    },
+    RepositoryPackageNotAllowed {
+        repository: RepositoryId,
+        package: rsolve_core::PackageName,
+    },
+    UnknownRepositoryReference {
+        id: RepositoryId,
+        field: String,
+    },
+    UnknownEnvironmentGroup {
+        environment: String,
+        group: String,
+    },
+    DuplicateEnvironmentGroup {
+        environment: String,
+        group: String,
+    },
+    UnknownEnvironment {
+        id: String,
+    },
+    InvalidVersionConstraint {
+        field: String,
+        reason: String,
+    },
+    TargetOutsideRConstraint {
+        target: String,
+        constraint: String,
+    },
+    DirectSourceRequiresAcquisition {
+        name: rsolve_core::PackageName,
+    },
+    InvalidIdentifier {
+        kind: String,
+        value: String,
+    },
+    InvalidEndpoint {
+        value: String,
+        reason: String,
+    },
+    SourceConflict {
+        field: String,
+    },
+    InvalidDependencyField {
+        name: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ManifestError {
@@ -158,6 +231,32 @@ impl fmt::Display for ManifestError {
             }
             Self::InvalidRepository { reason } => write!(f, "invalid repository: {reason}"),
             Self::DuplicateRepository { id } => write!(f, "duplicate repository ID `{id}`"),
+            Self::EmptyRepositoryPackageAllowlist { id } => write!(
+                f,
+                "repository `{id}` package allowlist must contain at least one package"
+            ),
+            Self::InvalidRepositoryPackage {
+                repository,
+                value,
+                reason,
+            } => write!(
+                f,
+                "repository `{repository}` has invalid package `{value}`: {reason}"
+            ),
+            Self::DuplicateRepositoryPackage {
+                repository,
+                package,
+            } => write!(
+                f,
+                "repository `{repository}` package allowlist repeats `{package}`"
+            ),
+            Self::RepositoryPackageNotAllowed {
+                repository,
+                package,
+            } => write!(
+                f,
+                "package `{package}` is not allowed by repository `{repository}`"
+            ),
             Self::UnknownRepositoryReference { id, field } => {
                 write!(
                     f,

@@ -122,6 +122,16 @@ impl ComposedEnvironment {
                 &mut payload,
                 repository.manifest_endpoint().as_str().as_bytes(),
             );
+            append_field(&mut payload, b"packages");
+            match repository.packages() {
+                None => append_field(&mut payload, b"all"),
+                Some(packages) => {
+                    append_field(&mut payload, b"allowlist");
+                    for package in packages {
+                        append_field(&mut payload, package.as_str().as_bytes());
+                    }
+                }
+            }
         }
         for root in &self.roots {
             append_field(&mut payload, b"root");
@@ -219,6 +229,7 @@ fn compose_environment_with_locked(
         })?;
         append_dependencies(&mut roots, dependencies)?;
     }
+    validate_repository_package_allowlists(&roots, &document.repositories)?;
     Ok(ComposedEnvironment {
         environment,
         r_requirement,
@@ -228,6 +239,31 @@ fn compose_environment_with_locked(
         roots: roots.into_values().collect(),
         locked,
     })
+}
+
+fn validate_repository_package_allowlists(
+    roots: &BTreeMap<PackageName, ComposedRootIntent>,
+    repositories: &[RepositorySpec],
+) -> Result<(), ManifestError> {
+    for root in roots.values() {
+        let ManifestSource::Registry {
+            repository: Some(repository),
+        } = &root.source
+        else {
+            continue;
+        };
+        let spec = repositories
+            .iter()
+            .find(|candidate| candidate.id() == repository)
+            .expect("repository references are validated before composition");
+        if !spec.package_allowed(&root.name) {
+            return Err(ManifestError::RepositoryPackageNotAllowed {
+                repository: repository.clone(),
+                package: root.name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

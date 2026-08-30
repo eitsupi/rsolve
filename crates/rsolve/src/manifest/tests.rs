@@ -130,6 +130,101 @@ fn strict_codec_normalizes_repositories_and_rejects_unknown_fields() {
 }
 
 #[test]
+fn repository_package_allowlists_are_canonical_and_part_of_intent() {
+    let first = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['zeta','alpha']\n",
+    )
+    .unwrap();
+    assert_eq!(
+        first.repositories[0]
+            .packages()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["alpha", "zeta"]
+    );
+    assert_eq!(
+        first.repositories[0].configured_registry_id().unwrap(),
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='other'\nurl='https://example.org'\nregistry='cran'\npackages=['alpha']\n",
+        )
+        .unwrap()
+        .repositories[0]
+        .configured_registry_id()
+        .unwrap()
+    );
+    let reordered = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['alpha','zeta']\n",
+    )
+    .unwrap();
+    assert_eq!(
+        first.repository_intent_digest().unwrap(),
+        reordered.repository_intent_digest().unwrap()
+    );
+    let changed = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['alpha']\n",
+    )
+    .unwrap();
+    assert_ne!(
+        first.repository_intent_digest().unwrap(),
+        changed.repository_intent_digest().unwrap()
+    );
+    assert!(matches!(
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=[]\n",
+        ),
+        Err(ManifestError::EmptyRepositoryPackageAllowlist { .. })
+    ));
+    assert!(matches!(
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['alpha','alpha']\n",
+        ),
+        Err(ManifestError::DuplicateRepositoryPackage { .. })
+    ));
+    assert!(matches!(
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['not-a-package']\n",
+        ),
+        Err(ManifestError::InvalidRepositoryPackage { .. })
+    ));
+    assert!(matches!(
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages='alpha'\n",
+        ),
+        Err(ManifestError::WrongType { .. })
+    ));
+    assert!(matches!(
+        parse_manifest(
+            "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['alpha', 1]\n",
+        ),
+        Err(ManifestError::WrongType { field, .. })
+            if field == "repositories[cran].packages[]"
+    ));
+}
+
+#[test]
+fn repository_qualified_root_must_be_in_the_repository_allowlist() {
+    let allowed = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['foo']\n[dependencies]\nfoo={repository='cran'}\n",
+    )
+    .unwrap();
+    assert!(
+        allowed
+            .compose_environment("default", ResolutionTarget::new(version("4.4.0")))
+            .is_ok()
+    );
+    let rejected = parse_manifest(
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='cran'\nurl='https://example.org'\nregistry='cran'\npackages=['foo']\n[dependencies]\nbar={repository='cran'}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected.compose_environment("default", ResolutionTarget::new(version("4.4.0"))),
+        Err(ManifestError::RepositoryPackageNotAllowed { .. })
+    ));
+}
+
+#[test]
 fn registry_forms_and_invalid_kinds_are_typed() {
     let cran_like = parse_manifest(
             "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='private'\nurl='https://example.org'\nregistry={kind='cran-like',namespace='company'}\n",

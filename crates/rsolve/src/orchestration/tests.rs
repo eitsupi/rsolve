@@ -9,8 +9,10 @@ use rsolve_core::{
     ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence, ResolutionTarget,
     Sha256Digest, SolverKey, SourceScheme, VersionConstraint,
 };
+use rsolve_provider::RawCandidateObservation;
 use rsolve_provider::cran::CranCandidateSnapshot;
 use rsolve_resolver::R_BASE_PACKAGE_NAMES;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 /// A compact CRAN-shaped fixture for the historical R 3.6 tidyverse closure.
@@ -219,6 +221,130 @@ struct QuarantinedFixtureLoader {
 
 struct ChoiceLoader {
     packages: Vec<PackageRelease>,
+}
+
+struct CountingRawLoader {
+    calls: Cell<usize>,
+}
+
+struct FixedRawLoader {
+    release: PackageRelease,
+}
+
+impl RawCandidateLoader for CountingRawLoader {
+    fn load_raw(&self, _package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(RawCandidateLoadResult::new(Vec::new(), Vec::new()))
+    }
+}
+
+impl RawCandidateLoader for FixedRawLoader {
+    fn load_raw(&self, _package: &SolverKey) -> Result<RawCandidateLoadResult, CandidateLoadError> {
+        Ok(RawCandidateLoadResult::new(
+            vec![RawCandidateObservation::new(
+                self.release.clone(),
+                CandidateCurrentness::Current,
+            )],
+            Vec::new(),
+        ))
+    }
+}
+
+#[test]
+fn repository_candidate_loader_filters_allowlisted_packages_before_raw_lookup() {
+    let raw = CountingRawLoader {
+        calls: Cell::new(0),
+    };
+    let allowed = vec![PackageName::new("foo").unwrap()];
+    let loader = RepositoryCandidateLoader::with_package_allowlist(
+        raw,
+        RepositoryId::new("main").unwrap(),
+        RegistryId::new("registry").unwrap(),
+        rsolve_core::RepositoryRank::new(0),
+        Some(&allowed),
+    );
+    let installed = loader
+        .load(&SolverKey::InstalledName(PackageName::new("bar").unwrap()))
+        .unwrap();
+    assert!(installed.candidates().is_empty());
+    let qualified = loader
+        .load(&SolverKey::Repository {
+            repository: RepositoryId::new("main").unwrap(),
+            name: PackageName::new("bar").unwrap(),
+        })
+        .unwrap();
+    assert!(qualified.candidates().is_empty());
+    assert_eq!(loader.raw.calls.get(), 0);
+}
+
+#[test]
+fn repositories_with_same_registry_identity_split_candidate_visibility_by_allowlist() {
+    let endpoint = Endpoint::new("https://example.org/cran").unwrap();
+    let first_id = RepositoryId::new("first").unwrap();
+    let second_id = RepositoryId::new("second").unwrap();
+    let foo = PackageName::new("foo").unwrap();
+    let bar = PackageName::new("bar").unwrap();
+    let first_spec = RepositorySpec::new_with_packages(
+        first_id.clone(),
+        RegistrySpec::Cran,
+        endpoint.clone(),
+        Some(vec![foo.clone()]),
+    )
+    .unwrap();
+    let second_spec = RepositorySpec::new_with_packages(
+        second_id.clone(),
+        RegistrySpec::Cran,
+        endpoint,
+        Some(vec![bar.clone()]),
+    )
+    .unwrap();
+    assert_ne!(first_spec.id(), second_spec.id());
+    assert_eq!(
+        first_spec.configured_registry_id().unwrap(),
+        second_spec.configured_registry_id().unwrap()
+    );
+
+    let first_loader = RepositoryCandidateLoader::with_package_allowlist(
+        FixedRawLoader {
+            release: release_at_version(&foo, "1.0.0"),
+        },
+        first_id.clone(),
+        first_spec.configured_registry_id().unwrap(),
+        rsolve_core::RepositoryRank::new(0),
+        first_spec.packages(),
+    );
+    let second_loader = RepositoryCandidateLoader::with_package_allowlist(
+        FixedRawLoader {
+            release: release_at_version(&bar, "1.0.0"),
+        },
+        second_id.clone(),
+        second_spec.configured_registry_id().unwrap(),
+        rsolve_core::RepositoryRank::new(0),
+        second_spec.packages(),
+    );
+    let first_visible = first_loader
+        .load(&SolverKey::InstalledName(foo.clone()))
+        .unwrap();
+    assert_eq!(first_visible.candidates().len(), 1);
+    assert_eq!(
+        first_visible.candidates()[0].occurrences()[0].repository(),
+        &first_id
+    );
+    assert!(
+        second_loader
+            .load(&SolverKey::InstalledName(foo))
+            .unwrap()
+            .candidates()
+            .is_empty()
+    );
+    assert_eq!(
+        second_loader
+            .load(&SolverKey::InstalledName(bar))
+            .unwrap()
+            .candidates()
+            .len(),
+        1
+    );
 }
 
 impl CandidateLoader for ChoiceLoader {

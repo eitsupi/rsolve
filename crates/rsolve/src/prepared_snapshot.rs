@@ -67,11 +67,12 @@ fn configured_cran_loader<L: crate::orchestration::RawCandidateLoader>(
     raw: L,
     repository: &CranRepositoryConfig,
 ) -> Result<RepositoryCandidateLoader<L>, CranResolutionError> {
-    Ok(RepositoryCandidateLoader::new(
+    Ok(RepositoryCandidateLoader::with_package_allowlist(
         raw,
         repository.repository.clone(),
         repository.registry.clone(),
         RepositoryRank::new(repository.rank),
+        repository.package_allowlist.as_deref(),
     ))
 }
 
@@ -84,6 +85,7 @@ pub(crate) struct CranRepositoryConfig {
     pub registry: RegistryId,
     pub endpoint: Box<str>,
     pub rank: u64,
+    pub package_allowlist: Option<Vec<PackageName>>,
 }
 
 pub(crate) fn cran_repository_config(
@@ -107,6 +109,7 @@ pub(crate) fn cran_repository_config(
         registry,
         endpoint: repository.manifest_endpoint().as_str().into(),
         rank: 0,
+        package_allowlist: repository.packages().map(<[_]>::to_vec),
     })
 }
 
@@ -554,6 +557,7 @@ fn default_cran_repository_config(
         registry: RegistryId::new("cran").expect("the built-in CRAN registry id is valid"),
         endpoint: base_url.into(),
         rank: 0,
+        package_allowlist: None,
     })
 }
 
@@ -1897,6 +1901,7 @@ mod tests {
                 registry: RegistryId::new("cran").unwrap(),
                 endpoint: "not-a-url".into(),
                 rank: 0,
+                package_allowlist: None,
             },
             None,
             &store,

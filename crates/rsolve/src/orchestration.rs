@@ -60,6 +60,7 @@ pub(crate) struct RepositoryCandidateLoader<L: RawCandidateLoader> {
     repository: RepositoryId,
     registry: RegistryId,
     rank: RepositoryRank,
+    package_allowlist: Option<BTreeSet<rsolve_core::PackageName>>,
 }
 
 #[cfg(test)]
@@ -86,6 +87,23 @@ impl<L: RawCandidateLoader> RepositoryCandidateLoader<L> {
             repository,
             registry,
             rank,
+            package_allowlist: None,
+        }
+    }
+
+    pub(crate) fn with_package_allowlist(
+        raw: L,
+        repository: RepositoryId,
+        registry: RegistryId,
+        rank: RepositoryRank,
+        packages: Option<&[rsolve_core::PackageName]>,
+    ) -> Self {
+        Self {
+            raw,
+            repository,
+            registry,
+            rank,
+            package_allowlist: packages.map(|packages| packages.iter().cloned().collect()),
         }
     }
 
@@ -113,14 +131,33 @@ impl<L: RawCandidateLoader> CandidateLoader for RepositoryCandidateLoader<L> {
     }
 
     fn load(&self, package: &SolverKey) -> Result<CandidateLoadResult, CandidateLoadError> {
-        let lookup = match package {
-            SolverKey::InstalledName(name) => SolverKey::InstalledName(name.clone()),
+        let requested_name = match package {
+            SolverKey::InstalledName(name)
+            | SolverKey::Registry { name, .. }
+            | SolverKey::Bioconductor { name, .. } => Some(name),
             SolverKey::Repository { repository, name } => {
                 if repository != &self.repository {
                     return Ok(CandidateLoadResult::new(Vec::new(), Vec::new()));
                 }
-                SolverKey::InstalledName(name.clone())
+                Some(name)
             }
+            SolverKey::Exact(identity) => Some(identity.name()),
+            SolverKey::R => None,
+        };
+        if let Some(name) = requested_name
+            && self
+                .package_allowlist
+                .as_ref()
+                .is_some_and(|packages| !packages.contains(name))
+        {
+            return Ok(CandidateLoadResult::new(Vec::new(), Vec::new()));
+        }
+        let lookup = match package {
+            SolverKey::InstalledName(name) => SolverKey::InstalledName(name.clone()),
+            SolverKey::Repository {
+                repository: _,
+                name,
+            } => SolverKey::InstalledName(name.clone()),
             SolverKey::Registry { name, .. } | SolverKey::Bioconductor { name, .. } => {
                 SolverKey::InstalledName(name.clone())
             }

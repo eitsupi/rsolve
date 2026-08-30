@@ -538,6 +538,19 @@ impl Lockfile {
                         });
                     }
                 }
+                for repository in &package.visible_repository_ids {
+                    let spec = configured_repositories
+                        .expect("configured repository IDs were provided")
+                        .iter()
+                        .find(|candidate| candidate.id() == repository)
+                        .expect("visible repository IDs were validated above");
+                    if !spec.package_allowed(package.identity.name()) {
+                        return Err(LockError::VisibleRepositoryPackageNotAllowed {
+                            package: package.identity.name().to_string(),
+                            repository: repository.to_string(),
+                        });
+                    }
+                }
             }
             if let Some(configured_ranks) = &configured_ranks {
                 let mut previous_rank = None;
@@ -766,6 +779,10 @@ pub enum LockError {
         name: String,
         repository: String,
     },
+    VisibleRepositoryPackageNotAllowed {
+        package: String,
+        repository: String,
+    },
     VisibleRepositoryOrderMismatch {
         package: String,
     },
@@ -853,6 +870,13 @@ impl fmt::Display for LockError {
             Self::RootRepositoryNotVisible { name, repository } => write!(
                 f,
                 "locked root {name} is not visible from repository {repository}"
+            ),
+            Self::VisibleRepositoryPackageNotAllowed {
+                package,
+                repository,
+            } => write!(
+                f,
+                "locked package {package} is excluded by repository {repository}"
             ),
             Self::VisibleRepositoryOrderMismatch { package } => write!(
                 f,

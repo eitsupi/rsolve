@@ -217,6 +217,60 @@ fn composed_consumption_accepts_configured_visible_repository() {
 }
 
 #[test]
+fn composed_consumption_rejects_locked_visibility_outside_allowlist() {
+    let repository = rsolve_core::RepositoryId::new("main").unwrap();
+    let spec = crate::manifest::RepositorySpec::new_with_packages(
+        repository.clone(),
+        crate::manifest::RegistrySpec::Cran,
+        crate::manifest::Endpoint::new("https://example.org/cran").unwrap(),
+        Some(vec![package("other")]),
+    )
+    .unwrap();
+    let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
+    locked.visible_repository_ids = vec![repository.clone()];
+    let composed = composed_environment(
+        vec![spec],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(repository),
+            },
+        )],
+    );
+    let lock = lockfile_for_composed(vec![locked], &composed).unwrap();
+    assert!(matches!(
+        lock.consume_composed_environment(&composed),
+        Err(LockError::VisibleRepositoryPackageNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn composed_consumption_accepts_allowlisted_locked_visibility_without_catalog_lookup() {
+    let repository = rsolve_core::RepositoryId::new("main").unwrap();
+    let package_name = package("root");
+    let spec = crate::manifest::RepositorySpec::new_with_packages(
+        repository.clone(),
+        crate::manifest::RegistrySpec::Cran,
+        crate::manifest::Endpoint::new("https://example.org/cran").unwrap(),
+        Some(vec![package_name.clone()]),
+    )
+    .unwrap();
+    let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
+    locked.visible_repository_ids = vec![repository.clone()];
+    let composed = composed_environment(
+        vec![spec],
+        vec![composed_root(
+            package_name.as_str(),
+            crate::manifest::ManifestSource::Registry {
+                repository: Some(repository),
+            },
+        )],
+    );
+    let lock = lockfile_for_composed(vec![locked], &composed).unwrap();
+    assert!(lock.consume_composed_environment(&composed).is_ok());
+}
+
+#[test]
 fn composed_consumption_rejects_unknown_visible_repository_and_root_mismatch() {
     let unknown = rsolve_core::RepositoryId::new("unknown").unwrap();
     let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));

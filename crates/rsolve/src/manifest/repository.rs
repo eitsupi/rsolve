@@ -1,5 +1,5 @@
 use super::ManifestError;
-use rsolve_core::{PackageNamespace, RegistryId, RepositoryId};
+use rsolve_core::{PackageName, PackageNamespace, RegistryId, RepositoryId};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use url::Url;
@@ -270,6 +270,7 @@ pub struct RepositorySpec {
     id: RepositoryId,
     registry: RegistrySpec,
     manifest_endpoint: Endpoint,
+    packages: Option<Vec<PackageName>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -284,6 +285,15 @@ impl RepositorySpec {
         registry: RegistrySpec,
         manifest_endpoint: Endpoint,
     ) -> Result<Self, ManifestError> {
+        Self::new_with_packages(id, registry, manifest_endpoint, None)
+    }
+
+    pub fn new_with_packages(
+        id: RepositoryId,
+        registry: RegistrySpec,
+        manifest_endpoint: Endpoint,
+        packages: Option<Vec<PackageName>>,
+    ) -> Result<Self, ManifestError> {
         validate_repository_id(&id)?;
         if let RegistrySpec::CranLike { namespace } = &registry
             && namespace.as_str() == "cran"
@@ -292,10 +302,33 @@ impl RepositorySpec {
                 reason: "cran-like cannot use reserved namespace `cran`".into(),
             });
         }
+        let packages = match packages {
+            None => None,
+            Some(packages) if packages.is_empty() => {
+                return Err(ManifestError::EmptyRepositoryPackageAllowlist { id });
+            }
+            Some(packages) => {
+                let mut canonical = packages;
+                canonical.sort();
+                if canonical.windows(2).any(|window| window[0] == window[1]) {
+                    let package = canonical
+                        .windows(2)
+                        .find(|window| window[0] == window[1])
+                        .expect("duplicate package exists")[0]
+                        .clone();
+                    return Err(ManifestError::DuplicateRepositoryPackage {
+                        repository: id,
+                        package,
+                    });
+                }
+                Some(canonical)
+            }
+        };
         Ok(Self {
             id,
             registry,
             manifest_endpoint,
+            packages,
         })
     }
 
@@ -316,6 +349,18 @@ impl RepositorySpec {
 
     pub fn registry(&self) -> &RegistrySpec {
         &self.registry
+    }
+
+    /// Returns the canonical package allowlist, or `None` when all packages
+    /// are visible from this repository.
+    pub fn packages(&self) -> Option<&[PackageName]> {
+        self.packages.as_deref()
+    }
+
+    pub fn package_allowed(&self, package: &PackageName) -> bool {
+        self.packages
+            .as_ref()
+            .is_none_or(|packages| packages.binary_search(package).is_ok())
     }
 
     /// The configured registry identity excludes repository IDs and ephemeral
@@ -365,6 +410,14 @@ impl EffectiveRepository {
 
     pub fn spec(&self) -> &RepositorySpec {
         &self.spec
+    }
+
+    pub fn packages(&self) -> Option<&[PackageName]> {
+        self.spec.packages()
+    }
+
+    pub fn package_allowed(&self, package: &PackageName) -> bool {
+        self.spec.package_allowed(package)
     }
 }
 

@@ -119,6 +119,13 @@ impl ManifestDocument {
                 fields.push(namespace.as_str().as_bytes());
             }
             fields.push(repository.manifest_endpoint().as_str().as_bytes());
+            match repository.packages() {
+                None => fields.push(b"all"),
+                Some(packages) => {
+                    fields.push(b"allowlist");
+                    fields.extend(packages.iter().map(|package| package.as_str().as_bytes()));
+                }
+            }
         }
         Sha256Digest::new(hex_digest(&digest_fields(&fields))).map_err(|error| {
             ManifestError::InvalidRepository {
@@ -378,7 +385,11 @@ fn parse_repositories(value: Option<&toml::Value>) -> Result<Vec<RepositorySpec>
             field: "repositories[]".into(),
             expected: "table".into(),
         })?;
-        reject_unknown(table, &["id", "url", "registry"], "repositories[]")?;
+        reject_unknown(
+            table,
+            &["id", "url", "registry", "packages"],
+            "repositories[]",
+        )?;
         let id = RepositoryId::new(required_string(table, "id")?).map_err(|error| {
             ManifestError::InvalidRepository {
                 reason: error.to_string(),
@@ -390,9 +401,40 @@ fn parse_repositories(value: Option<&toml::Value>) -> Result<Vec<RepositorySpec>
         }
         let endpoint = Endpoint::parse(required_string(table, "url")?)?;
         let registry = parse_registry(table.get("registry"))?;
-        result.push(RepositorySpec::new(id, registry, endpoint)?);
+        let packages = parse_repository_packages(table.get("packages"), &id)?;
+        result.push(RepositorySpec::new_with_packages(
+            id, registry, endpoint, packages,
+        )?);
     }
     Ok(result)
+}
+
+fn parse_repository_packages(
+    value: Option<&toml::Value>,
+    repository: &RepositoryId,
+) -> Result<Option<Vec<PackageName>>, ManifestError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let entries = value.as_array().ok_or_else(|| ManifestError::WrongType {
+        field: format!("repositories[{repository}].packages"),
+        expected: "array of package names".into(),
+    })?;
+    let mut packages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let value = entry.as_str().ok_or_else(|| ManifestError::WrongType {
+            field: format!("repositories[{repository}].packages[]"),
+            expected: "package name string".into(),
+        })?;
+        packages.push(PackageName::new(value).map_err(|error| {
+            ManifestError::InvalidRepositoryPackage {
+                repository: repository.clone(),
+                value: value.into(),
+                reason: error.to_string(),
+            }
+        })?);
+    }
+    Ok(Some(packages))
 }
 
 fn parse_registry(value: Option<&toml::Value>) -> Result<RegistrySpec, ManifestError> {
