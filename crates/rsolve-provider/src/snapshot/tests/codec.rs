@@ -145,6 +145,7 @@ fn versions_use_numeric_components_and_reject_logical_duplicates() {
             package: "foo".into(),
             version: "1.0".into(),
             namespace: "cran".into(),
+            git_provenance: None,
             currentness: CandidateCurrentnessV1::Current,
             metadata: vec![],
             publication: None,
@@ -157,6 +158,7 @@ fn versions_use_numeric_components_and_reject_logical_duplicates() {
             package: "foo".into(),
             version: "1.0.0".into(),
             namespace: "cran".into(),
+            git_provenance: None,
             currentness: CandidateCurrentnessV1::Historical,
             metadata: vec![],
             publication: None,
@@ -199,7 +201,7 @@ fn header_rejects_observation_timestamp_generation_and_revision_mismatch() {
         .build()
         .unwrap();
     let mut old_encoding = generation.header().clone();
-    old_encoding.history_encoding = 1;
+    old_encoding.history_encoding = 3;
     old_encoding.generation = generation_id_from_header(&old_encoding);
     assert!(decode_header(&encode_header(&old_encoding).unwrap()).is_err());
 }

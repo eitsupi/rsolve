@@ -706,23 +706,48 @@ pub(super) fn hex(bytes: &[u8]) -> String {
 }
 
 pub(super) fn release_to_domain(wire: &EligibleReleaseV1) -> Result<PackageRelease, SnapshotError> {
-    if wire.namespace != "cran" {
-        return Err(SnapshotError::Invalid(
-            "history v1 only supports the cran namespace".into(),
-        ));
+    match (&wire.namespace[..], wire.git_provenance.is_some()) {
+        ("cran", false) | ("r-universe", true) => {}
+        (namespace, true) => {
+            return Err(SnapshotError::Invalid(format!(
+                "Git provenance cannot use namespace {namespace:?}"
+            )));
+        }
+        (_, false) => {
+            return Err(SnapshotError::Invalid(
+                "registry releases require the cran namespace".into(),
+            ));
+        }
     }
     let package =
         PackageName::new(&wire.package).map_err(|e| SnapshotError::Invalid(e.to_string()))?;
     let version =
         RPackageVersion::parse(&wire.version).map_err(|e| SnapshotError::Invalid(e.to_string()))?;
-    let identity = ReleaseIdentity::new(
-        package.clone(),
-        Provenance::RegistryRelease {
-            namespace: PackageNamespace::new("cran")
-                .map_err(|e| SnapshotError::Invalid(e.to_string()))?,
-            version: version.clone(),
-        },
-    );
+    let identity = match &wire.git_provenance {
+        Some(provenance) => ReleaseIdentity::new(
+            package.clone(),
+            Provenance::GitCommit {
+                repository: NormalizedGitUrl::new(&provenance.repository)
+                    .map_err(|e| SnapshotError::Invalid(e.to_string()))?,
+                commit: GitCommitId::new(&provenance.commit)
+                    .map_err(|e| SnapshotError::Invalid(e.to_string()))?,
+                subdirectory: provenance
+                    .subdirectory
+                    .as_deref()
+                    .map(RepositorySubdir::new)
+                    .transpose()
+                    .map_err(|e| SnapshotError::Invalid(e.to_string()))?,
+            },
+        ),
+        None => ReleaseIdentity::new(
+            package.clone(),
+            Provenance::RegistryRelease {
+                namespace: PackageNamespace::new("cran")
+                    .map_err(|e| SnapshotError::Invalid(e.to_string()))?,
+                version: version.clone(),
+            },
+        ),
+    };
     let metadata = ReleaseMetadata::from_pairs(
         wire.metadata
             .iter()

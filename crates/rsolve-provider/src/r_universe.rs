@@ -17,6 +17,9 @@ use rsolve_core::{
 };
 use serde_json::{Map, Value};
 
+mod provider;
+pub use provider::*;
+
 /// Human-readable name for the R-universe response profile.
 pub const RUNIVERSE_API_PROFILE: &str = "r-universe.v1";
 

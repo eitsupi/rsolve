@@ -13,8 +13,8 @@ pub const SNAPSHOT_HEADER: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const PACKAGE_HISTORIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("package_histories");
 pub(super) const HEADER_KEY: &str = "header";
-pub(super) const HISTORY_ENCODING: u32 = 3;
-pub(super) const HISTORY_MAGIC: &[u8; 8] = b"RSLVHST3";
+pub(super) const HISTORY_ENCODING: u32 = 4;
+pub(super) const HISTORY_MAGIC: &[u8; 8] = b"RSLVHST4";
 pub(super) const HISTORY_PREFIX_LEN: usize = 48;
 
 #[derive(Debug)]
@@ -334,6 +334,8 @@ pub struct EligibleReleaseV1 {
     pub package: String,
     pub version: String,
     pub namespace: String,
+    #[serde(default)]
+    pub git_provenance: Option<GitProvenanceV1>,
     pub currentness: CandidateCurrentnessV1,
     pub metadata: Vec<FieldV1>,
     pub publication: Option<String>,
@@ -341,6 +343,15 @@ pub struct EligibleReleaseV1 {
     pub distributions: Vec<DistributionV1>,
     pub metadata_sha256: [u8; 32],
     pub evidence: Vec<EvidenceReferenceV1>,
+}
+
+/// Candidate-specific Git identity retained by providers whose release
+/// provenance is not a registry namespace and version.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitProvenanceV1 {
+    pub repository: String,
+    pub commit: String,
+    pub subdirectory: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackageHistoryV1 {

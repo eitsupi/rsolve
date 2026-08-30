@@ -118,12 +118,12 @@ impl ReadOnlySnapshotCandidateLoader {
             return if self.header.coverage.state == "complete" {
                 Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::NotFound,
-                    format!("CRAN snapshot has no candidates for {name}"),
+                    format!("metadata snapshot has no candidates for {name}"),
                 ))
             } else {
                 Err(CandidateLoadError::new(
                     CandidateLoadErrorCategory::MetadataInvalid,
-                    format!("CRAN snapshot is partial for missing package {name}"),
+                    format!("metadata snapshot is partial for missing package {name}"),
                 ))
             };
         };
@@ -173,7 +173,7 @@ impl ReadOnlySnapshotCandidateLoader {
         let SolverKey::InstalledName(name) = package else {
             return Err(CandidateLoadError::new(
                 CandidateLoadErrorCategory::NotFound,
-                format!("CRAN snapshot does not support solver key {package:?}"),
+                format!("metadata snapshot does not support solver key {package:?}"),
             ));
         };
         self.releases_for_name(name)

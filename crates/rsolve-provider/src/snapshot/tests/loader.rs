@@ -220,7 +220,7 @@ fn read_only_loader_rejects_registry_and_wire_revision_mismatch() {
         .build()
         .unwrap();
     let mut old_encoding = encoding_generation.header().clone();
-    old_encoding.history_encoding = 1;
+    old_encoding.history_encoding = 3;
     old_encoding.generation = generation_id_from_header(&old_encoding);
     rewrite_stored_header(&encoding_path, |header| *header = old_encoding);
     let encoding_error =
