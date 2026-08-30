@@ -164,9 +164,8 @@ where
 {
     let mut closure = root_requirements
         .iter()
-        .map(|requirement| requirement.package.name())
-        .filter(|name| is_remote_cran_package(name))
-        .cloned()
+        .filter(|requirement| is_remote_cran_root(requirement))
+        .map(|requirement| requirement.package.name().clone())
         .collect::<BTreeSet<_>>();
     let direct_suggest_roots = root_requirements
         .iter()
@@ -244,6 +243,22 @@ fn collect_cran_dependency_closure_from_loader(
 
 fn is_remote_cran_package(name: &PackageName) -> bool {
     name.as_str() != "R" && !is_r_base_package_name(name)
+}
+
+/// Classify a resolver root without losing its source scope. An unqualified R
+/// base package is supplied by the target runtime, but a repository-qualified
+/// root must be acquired from that repository even when its name is also an R
+/// base package. Other source-qualified roots are conservatively treated as
+/// remote until an acquisition-capable provider handles them.
+fn is_remote_cran_root(requirement: &RootRequirement) -> bool {
+    let name = requirement.package.name();
+    if name.as_str() == "R" {
+        return false;
+    }
+    match requirement.package.source() {
+        rsolve_core::DependencySourceConstraint::Any => is_remote_cran_package(name),
+        _ => true,
+    }
 }
 
 enum CacheProbe<L> {
@@ -550,12 +565,7 @@ fn resolve_request_from_cran_with_store_at_policy_with_progress(
     cache_policy: CranSnapshotCachePolicy,
     progress: Option<ProgressCallback>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
-    let roots = request
-        .roots
-        .iter()
-        .map(|requirement| requirement.package.name().clone())
-        .collect::<Vec<_>>();
-    if roots.iter().all(|name| !is_remote_cran_package(name)) {
+    if request.roots.iter().all(|root| !is_remote_cran_root(root)) {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
         let recorder = Recorder::new();
         recorder.set_cache_decision(classify_cache_decision(false, false, false));
@@ -587,6 +597,11 @@ fn resolve_request_from_cran_with_store_at_policy_with_progress(
             metrics: recorder.snapshot(),
         });
     }
+    let roots = request
+        .roots
+        .iter()
+        .map(|requirement| requirement.package.name().clone())
+        .collect::<Vec<_>>();
     let endpoint =
         Endpoint::parse(repository.endpoint.as_ref()).map_err(CranResolutionError::Composition)?;
     let mut repository = repository;
@@ -856,12 +871,7 @@ fn resolve_request_from_cran_offline_with_store_at_policy_with_progress(
     cache_policy: CranSnapshotCachePolicy,
     progress: Option<ProgressCallback>,
 ) -> Result<CranResolutionOutcome, CranResolutionError> {
-    let roots = request
-        .roots
-        .iter()
-        .map(|requirement| requirement.package.name().clone())
-        .collect::<Vec<_>>();
-    if roots.iter().all(|name| !is_remote_cran_package(name)) {
+    if request.roots.iter().all(|root| !is_remote_cran_root(root)) {
         emit_progress(&progress, ProgressEvent::ResolveStarted);
         let recorder = Recorder::new();
         recorder.set_cache_decision(classify_cache_decision(false, false, false));
@@ -1320,6 +1330,85 @@ mod tests {
         assert_eq!(hard_closure, vec![root]);
     }
 
+    #[test]
+    fn root_source_scope_controls_cran_closure_seed() {
+        let stats = PackageName::new("stats").unwrap();
+        let repository = rsolve_core::RepositoryId::new("cran").unwrap();
+        let qualified = RootRequirement {
+            package: PackageRequirement::new(
+                stats.clone(),
+                DependencySourceConstraint::Repository { repository },
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        let mut qualified_batch = None;
+        let _ = collect_cran_dependency_closure_with_metrics(
+            std::slice::from_ref(&qualified),
+            |batch| {
+                qualified_batch = Some(batch.to_vec());
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    "stop after observing the closure seed",
+                ))
+            },
+            &Recorder::new(),
+        );
+        assert_eq!(qualified_batch, Some(vec![stats.clone()]));
+
+        let unqualified_base = RootRequirement {
+            package: PackageRequirement::new(
+                stats.clone(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        let mut base_called = false;
+        let base_closure = collect_cran_dependency_closure_with_metrics(
+            std::slice::from_ref(&unqualified_base),
+            |_| {
+                base_called = true;
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    "an unqualified R base root must not refresh",
+                ))
+            },
+            &Recorder::new(),
+        )
+        .unwrap();
+        assert!(!base_called);
+        assert!(base_closure.is_empty());
+
+        let ordinary = RootRequirement {
+            package: PackageRequirement::new(
+                PackageName::new("ordinary").unwrap(),
+                DependencySourceConstraint::Any,
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        let mut ordinary_batch = None;
+        let _ = collect_cran_dependency_closure_with_metrics(
+            std::slice::from_ref(&ordinary),
+            |batch| {
+                ordinary_batch = Some(batch.to_vec());
+                Err(CandidateLoadError::new(
+                    CandidateLoadErrorCategory::NotFound,
+                    "stop after observing the closure seed",
+                ))
+            },
+            &Recorder::new(),
+        );
+        assert_eq!(
+            ordinary_batch,
+            Some(vec![PackageName::new("ordinary").unwrap()])
+        );
+    }
+
     fn cache_diagnostic(
         status: CranSnapshotCacheStatus,
         age: Option<u64>,
@@ -1719,6 +1808,55 @@ mod tests {
                 .snapshot_cache_decision_ns
                 .is_none()
         );
+    }
+
+    #[test]
+    fn repository_qualified_r_base_root_enters_online_provider_path() {
+        let stats = PackageName::new("stats").unwrap();
+        let repository_id = RepositoryId::new("mirror").unwrap();
+        let qualified = RootRequirement {
+            package: PackageRequirement::new(
+                stats,
+                DependencySourceConstraint::Repository {
+                    repository: repository_id.clone(),
+                },
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        };
+        assert!(is_remote_cran_root(&qualified));
+
+        let request = rsolve_core::ResolutionRequest::without_lock(
+            vec![qualified],
+            rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            VersionConstraint::unconstrained(),
+        );
+        let directory = tempdir().unwrap();
+        let store = SnapshotStore::open(
+            directory.path(),
+            cran_registry_id("https://cran.example").unwrap(),
+        )
+        .unwrap();
+        let error = resolve_request_from_cran_with_store_at_policy_with_progress(
+            request,
+            CranRepositoryConfig {
+                repository: repository_id,
+                registry: RegistryId::new("cran").unwrap(),
+                endpoint: "not-a-url".into(),
+                rank: 0,
+            },
+            None,
+            &store,
+            CranSnapshotCachePolicy::at("2026-08-23T00:00:00Z".parse().unwrap()),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CranResolutionError::Composition(ManifestError::InvalidEndpoint { value, .. })
+                if value == "not-a-url"
+        ));
     }
 
     #[test]
