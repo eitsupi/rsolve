@@ -622,7 +622,7 @@ fn manifest_environment_is_projected_into_lock() {
     run_lock_with_backend(command, &MatrixBackend).unwrap();
     let lock =
         from_toml(&fs::read_to_string(directory.path().join("rsolve.ci.lock")).unwrap()).unwrap();
-    let resolution = lock.single_resolution().unwrap();
+    let resolution = &lock.resolution;
     assert_eq!(resolution.environment.as_str(), "ci");
     assert_eq!(
         resolution.publication_cutoff,
@@ -660,18 +660,8 @@ fn manifest_default_and_named_outputs_are_independent() {
         from_toml(&fs::read_to_string(directory.path().join("rsolve.lock")).unwrap()).unwrap();
     let named_lock =
         from_toml(&fs::read_to_string(directory.path().join("rsolve.test.lock")).unwrap()).unwrap();
-    assert_eq!(
-        default_lock
-            .single_resolution()
-            .unwrap()
-            .environment
-            .as_str(),
-        "default"
-    );
-    assert_eq!(
-        named_lock.single_resolution().unwrap().environment.as_str(),
-        "test"
-    );
+    assert_eq!(default_lock.resolution.environment.as_str(), "default");
+    assert_eq!(named_lock.resolution.environment.as_str(), "test");
     assert!(!directory.path().join("rsolve.default.lock").exists());
 }
 
@@ -1214,36 +1204,31 @@ fn hermetic_matrix_versions_produce_distinct_canonical_locks() {
     let first_lock = from_toml(std::str::from_utf8(&first_bytes).unwrap()).unwrap();
     let second_lock = from_toml(std::str::from_utf8(&second_bytes).unwrap()).unwrap();
     assert_eq!(
-        first_lock.resolutions[0].packages[0]
-            .identity
-            .name()
-            .as_str(),
+        first_lock.resolution.packages[0].identity.name().as_str(),
         "Matrix"
     );
     assert_eq!(
-        second_lock.resolutions[0].packages[0]
-            .identity
-            .name()
-            .as_str(),
+        second_lock.resolution.packages[0].identity.name().as_str(),
         "Matrix"
     );
     assert_eq!(
-        first_lock.resolutions[0].packages[0].version,
+        first_lock.resolution.packages[0].version,
         RPackageVersion::parse("1.6-5").unwrap()
     );
     assert_eq!(
-        second_lock.resolutions[0].packages[0].version,
+        second_lock.resolution.packages[0].version,
         RPackageVersion::parse("1.7-0").unwrap()
     );
     assert_eq!(
-        first_lock.resolutions[0].target.r_version,
+        first_lock.resolution.target.r_version,
         RPackageVersion::parse("4.3.3").unwrap()
     );
     assert_eq!(
-        second_lock.resolutions[0].target.r_version,
+        second_lock.resolution.target.r_version,
         RPackageVersion::parse("4.4.0").unwrap()
     );
-    let matrix = second_lock.resolutions[0]
+    let matrix = second_lock
+        .resolution
         .packages
         .iter()
         .find(|package| package.identity.name().as_str() == "Matrix")
@@ -1255,12 +1240,13 @@ fn hermetic_matrix_versions_produce_distinct_canonical_locks() {
             package: PackageName::new("lattice").unwrap(),
         }]
     );
-    assert_eq!(second_lock.resolutions[0].packages.len(), 2);
+    assert_eq!(second_lock.resolution.packages.len(), 2);
     assert!(
-        second_lock.resolutions[0]
-            .packages
-            .iter()
-            .all(|package| package.metadata_sha256.as_str().len() == 64)
+        second_lock.resolution.packages.iter().all(|package| package
+            .metadata_sha256
+            .as_str()
+            .len()
+            == 64)
     );
     assert!(
         second_bytes

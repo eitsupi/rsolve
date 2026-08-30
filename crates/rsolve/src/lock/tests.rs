@@ -76,7 +76,73 @@ fn manifest_for(name: &str, constraint: VersionConstraint) -> Manifest {
 }
 
 fn digest() -> Sha256Digest {
-    Sha256Digest::new("0".repeat(64)).unwrap()
+    Sha256Digest::new("1".repeat(64)).unwrap()
+}
+
+fn locked_resolution(
+    packages: Vec<LockedPackage>,
+    publication_cutoff: Option<PublicationDate>,
+) -> LockedResolution {
+    LockedResolution {
+        target: target(),
+        environment: environment(),
+        publication_cutoff,
+        packages,
+    }
+}
+
+fn lockfile(
+    packages: Vec<LockedPackage>,
+    publication_cutoff: Option<PublicationDate>,
+) -> Result<Lockfile, LockError> {
+    Lockfile::new(
+        digest(),
+        VersionConstraint::unconstrained(),
+        locked_resolution(packages, publication_cutoff),
+    )
+}
+
+fn lockfile_for_composed(
+    packages: Vec<LockedPackage>,
+    composed: &crate::manifest::ComposedEnvironment,
+) -> Result<Lockfile, LockError> {
+    Lockfile::new(
+        composed.resolution_intent_digest().unwrap(),
+        composed.r_requirement.clone(),
+        LockedResolution {
+            target: composed.target.clone(),
+            environment: composed.environment.clone(),
+            publication_cutoff: composed.published_before,
+            packages,
+        },
+    )
+}
+
+fn lockfile_for_manifest(
+    packages: Vec<LockedPackage>,
+    manifest: &Manifest,
+    publication_cutoff: Option<PublicationDate>,
+) -> Result<Lockfile, LockError> {
+    Lockfile::new(
+        digest(),
+        manifest.r_requirement.clone(),
+        LockedResolution {
+            target: target(),
+            environment: environment(),
+            publication_cutoff,
+            packages,
+        },
+    )
+}
+
+fn project(resolution: &Resolution) -> Result<Lockfile, LockError> {
+    Lockfile::from_resolution_with_applicability(
+        resolution,
+        environment(),
+        None,
+        digest(),
+        VersionConstraint::unconstrained(),
+    )
 }
 
 fn composed_repository(id: &str) -> crate::manifest::RepositorySpec {
@@ -116,21 +182,20 @@ fn composed_root(
 }
 
 #[test]
-fn v1_requires_exactly_one_resolution() {
-    assert_eq!(
-        Lockfile::new(Vec::new()),
-        Err(LockError::UnsupportedResolutionCount { found: 0 })
-    );
-    let empty = LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: Vec::new(),
-    };
-    assert_eq!(
-        Lockfile::new(vec![empty.clone(), empty]),
-        Err(LockError::UnsupportedResolutionCount { found: 2 })
-    );
+fn direct_resolution_container_round_trips_empty_packages() {
+    let lock = lockfile(Vec::new(), None).unwrap();
+    assert_eq!(lock.resolution.packages, Vec::<LockedPackage>::new());
+}
+
+#[test]
+fn constructor_rejects_r_requirement_incompatible_with_target() {
+    let error = Lockfile::new(
+        digest(),
+        VersionConstraint::from_clause(RelationOp::Ge, version("5.0")),
+        locked_resolution(Vec::new(), None),
+    )
+    .unwrap_err();
+    assert_eq!(error, LockError::RRequirementMismatch);
 }
 
 #[test]
@@ -138,13 +203,6 @@ fn composed_consumption_accepts_configured_visible_repository() {
     let repository = rsolve_core::RepositoryId::new("main").unwrap();
     let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
     locked.visible_repository_ids = vec![repository.clone()];
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![locked.clone()],
-    }])
-    .unwrap();
     let composed = composed_environment(
         vec![composed_repository("main")],
         vec![composed_root(
@@ -154,6 +212,7 @@ fn composed_consumption_accepts_configured_visible_repository() {
             },
         )],
     );
+    let lock = lockfile_for_composed(vec![locked.clone()], &composed).unwrap();
     assert!(lock.consume_composed_environment(&composed).is_ok());
 }
 
@@ -162,13 +221,6 @@ fn composed_consumption_rejects_unknown_visible_repository_and_root_mismatch() {
     let unknown = rsolve_core::RepositoryId::new("unknown").unwrap();
     let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
     locked.visible_repository_ids = vec![unknown.clone()];
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![locked.clone()],
-    }])
-    .unwrap();
     let composed = composed_environment(
         vec![composed_repository("main")],
         vec![composed_root(
@@ -178,19 +230,13 @@ fn composed_consumption_rejects_unknown_visible_repository_and_root_mismatch() {
             },
         )],
     );
+    let lock = lockfile_for_composed(vec![locked.clone()], &composed).unwrap();
     assert!(matches!(
         lock.consume_composed_environment(&composed),
         Err(LockError::UnknownVisibleRepository { repository, .. }) if repository == "unknown"
     ));
 
     locked.visible_repository_ids = vec![rsolve_core::RepositoryId::new("other").unwrap()];
-    let mismatch_lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![locked],
-    }])
-    .unwrap();
     let mismatch = composed_environment(
         vec![composed_repository("main"), composed_repository("other")],
         vec![composed_root(
@@ -200,6 +246,7 @@ fn composed_consumption_rejects_unknown_visible_repository_and_root_mismatch() {
             },
         )],
     );
+    let mismatch_lock = lockfile_for_composed(vec![locked], &mismatch).unwrap();
     assert!(matches!(
         mismatch_lock.consume_composed_environment(&mismatch),
         Err(LockError::RootRepositoryNotVisible { repository, .. }) if repository == "main"
@@ -209,13 +256,6 @@ fn composed_consumption_rejects_unknown_visible_repository_and_root_mismatch() {
 #[test]
 fn composed_consumption_neutral_and_direct_roots_do_not_require_visibility() {
     let locked = LockedPackage::from_release(&release("root", "1.0.0"));
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![locked],
-    }])
-    .unwrap();
     let neutral = composed_environment(
         vec![composed_repository("main")],
         vec![composed_root(
@@ -223,6 +263,7 @@ fn composed_consumption_neutral_and_direct_roots_do_not_require_visibility() {
             crate::manifest::ManifestSource::Registry { repository: None },
         )],
     );
+    let lock = lockfile_for_composed(vec![locked.clone()], &neutral).unwrap();
     assert!(lock.consume_composed_environment(&neutral).is_ok());
     let direct = composed_environment(
         Vec::new(),
@@ -234,18 +275,12 @@ fn composed_consumption_neutral_and_direct_roots_do_not_require_visibility() {
             },
         )],
     );
-    assert!(lock.consume_composed_environment(&direct).is_ok());
+    let direct_lock = lockfile_for_composed(vec![locked], &direct).unwrap();
+    assert!(direct_lock.consume_composed_environment(&direct).is_ok());
 }
 
 #[test]
 fn composed_consumption_applies_r_base_overlay_only_to_unqualified_roots() {
-    let empty_lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: Vec::new(),
-    }])
-    .unwrap();
     let unqualified = composed_environment(
         vec![composed_repository("main")],
         vec![composed_root(
@@ -253,6 +288,7 @@ fn composed_consumption_applies_r_base_overlay_only_to_unqualified_roots() {
             crate::manifest::ManifestSource::Registry { repository: None },
         )],
     );
+    let empty_lock = lockfile_for_composed(Vec::new(), &unqualified).unwrap();
     assert!(
         empty_lock
             .consume_composed_environment(&unqualified)
@@ -268,8 +304,9 @@ fn composed_consumption_applies_r_base_overlay_only_to_unqualified_roots() {
             },
         )],
     );
+    let qualified_lock = lockfile_for_composed(Vec::new(), &qualified).unwrap();
     assert!(matches!(
-        empty_lock.consume_composed_environment(&qualified),
+        qualified_lock.consume_composed_environment(&qualified),
         Err(LockError::DirectRootMissing { name }) if name == "stats"
     ));
 
@@ -283,8 +320,9 @@ fn composed_consumption_applies_r_base_overlay_only_to_unqualified_roots() {
             },
         )],
     );
+    let direct_lock = lockfile_for_composed(Vec::new(), &direct).unwrap();
     assert!(matches!(
-        empty_lock.consume_composed_environment(&direct),
+        direct_lock.consume_composed_environment(&direct),
         Err(LockError::DirectRootMissing { name }) if name == "stats"
     ));
 }
@@ -293,13 +331,6 @@ fn composed_consumption_applies_r_base_overlay_only_to_unqualified_roots() {
 fn composed_consumption_requires_matching_publication_cutoff() {
     let cutoff = PublicationDate::parse("2026-08-01").unwrap();
     let other_cutoff = PublicationDate::parse("2026-08-02").unwrap();
-    let lock_with_cutoff = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: Some(cutoff),
-        packages: vec![LockedPackage::from_release(&release("root", "1.0.0"))],
-    }])
-    .unwrap();
     let mut composed = composed_environment(
         vec![composed_repository("main")],
         vec![composed_root(
@@ -307,6 +338,13 @@ fn composed_consumption_requires_matching_publication_cutoff() {
             crate::manifest::ManifestSource::Registry { repository: None },
         )],
     );
+    composed.published_before = Some(cutoff);
+    let lock_with_cutoff = lockfile_for_composed(
+        vec![LockedPackage::from_release(&release("root", "1.0.0"))],
+        &composed,
+    )
+    .unwrap();
+    composed.published_before = None;
     assert!(matches!(
         lock_with_cutoff.consume_composed_environment(&composed),
         Err(LockError::PublicationCutoffMismatch {
@@ -329,12 +367,17 @@ fn composed_consumption_requires_matching_publication_cutoff() {
             .is_ok()
     );
 
-    let lock_without_cutoff = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![LockedPackage::from_release(&release("root", "1.0.0"))],
-    }])
+    let no_cutoff_composed = composed_environment(
+        vec![composed_repository("main")],
+        vec![composed_root(
+            "root",
+            crate::manifest::ManifestSource::Registry { repository: None },
+        )],
+    );
+    let lock_without_cutoff = lockfile_for_composed(
+        vec![LockedPackage::from_release(&release("root", "1.0.0"))],
+        &no_cutoff_composed,
+    )
     .unwrap();
     assert!(matches!(
         lock_without_cutoff.consume_composed_environment(&composed),
@@ -354,13 +397,6 @@ fn composed_consumption_checks_transitive_visible_repositories() {
     root.visible_repository_ids = vec![main];
     let mut child = LockedPackage::from_release(&release("child", "1.0.0"));
     child.visible_repository_ids = vec![unknown];
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![root, child],
-    }])
-    .unwrap();
     let composed = composed_environment(
         vec![composed_repository("main")],
         vec![composed_root(
@@ -370,6 +406,7 @@ fn composed_consumption_checks_transitive_visible_repositories() {
             },
         )],
     );
+    let lock = lockfile_for_composed(vec![root, child], &composed).unwrap();
     assert!(matches!(
         lock.consume_composed_environment(&composed),
         Err(LockError::UnknownVisibleRepository { package, repository })
@@ -383,13 +420,6 @@ fn composed_consumption_rejects_visible_repositories_out_of_manifest_order() {
     let second = rsolve_core::RepositoryId::new("second").unwrap();
     let mut locked = LockedPackage::from_release(&release("root", "1.0.0"));
     locked.visible_repository_ids = vec![second.clone(), first.clone()];
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![locked],
-    }])
-    .unwrap();
     let composed = composed_environment(
         vec![composed_repository("first"), composed_repository("second")],
         vec![composed_root(
@@ -399,10 +429,58 @@ fn composed_consumption_rejects_visible_repositories_out_of_manifest_order() {
             },
         )],
     );
+    let lock = lockfile_for_composed(vec![locked], &composed).unwrap();
     assert!(matches!(
         lock.consume_composed_environment(&composed),
         Err(LockError::VisibleRepositoryOrderMismatch { package }) if package == "root"
     ));
+}
+
+#[test]
+fn composed_consumption_enforces_selected_intent_freshness() {
+    let input = "[rsolve]\nschema=1\n[r]\nversion='*'\n[[repositories]]\nid='main'\nurl='https://main.example'\nregistry='cran'\n[dependencies]\nfoo='*'\n[groups.unselected.dependencies]\nbar='*'\n[environments]\nci=['unselected']\n";
+    let target = ResolutionTarget::new(version("4.4.0"));
+    let baseline_document = crate::manifest::parse_manifest(input).unwrap();
+    let baseline = baseline_document
+        .compose_environment("default", target.clone())
+        .unwrap();
+    let lock = lockfile_for_composed(
+        vec![LockedPackage::from_release(&release("foo", "1.0.0"))],
+        &baseline,
+    )
+    .unwrap();
+    assert!(lock.consume_composed_environment(&baseline).is_ok());
+
+    let unselected = crate::manifest::parse_manifest(&input.replace("bar='*'", "bar='< 9.0'"))
+        .unwrap()
+        .compose_environment("default", target.clone())
+        .unwrap();
+    assert_eq!(
+        baseline.resolution_intent_digest().unwrap(),
+        unselected.resolution_intent_digest().unwrap()
+    );
+    assert!(lock.consume_composed_environment(&unselected).is_ok());
+
+    let changed_inputs = [
+        input.replace("foo='*'", "foo='>= 2.0'"),
+        input.replace("url='https://main.example'", "url='https://other.example'"),
+        input.replace("foo='*'", "foo={repository='main'}"),
+        input.replace("foo='*'", "foo={version='*',include-suggests=true}"),
+        input.replace(
+            "[environments]\nci=['unselected']",
+            "[groups.selected.dependencies]\nbar='*'\n[environments]\ndefault=['selected']\nci=['unselected']",
+        ),
+    ];
+    for changed in changed_inputs {
+        let composed = crate::manifest::parse_manifest(&changed)
+            .unwrap()
+            .compose_environment("default", target.clone())
+            .unwrap();
+        assert!(matches!(
+            lock.consume_composed_environment(&composed),
+            Err(LockError::ResolutionIntentMismatch { .. })
+        ));
+    }
 }
 
 #[test]
@@ -423,12 +501,7 @@ fn reader_rejects_registry_record_version_mismatch() {
         metadata_sha256: digest(),
     };
     assert!(matches!(
-        Lockfile::new(vec![LockedResolution {
-            target: target(),
-            environment: environment(),
-            publication_cutoff: None,
-            packages: vec![package],
-        }]),
+        lockfile(vec![package], None),
         Err(LockError::ConflictingMetadata { identity }) if identity.contains("mismatch")
     ));
 }
@@ -454,20 +527,8 @@ fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
     let mut reversed = make(alpha.clone());
     reversed.dependencies.reverse();
     let ordered = make(alpha.clone());
-    let first = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![ordered, make(beta.clone())],
-    }])
-    .unwrap();
-    let second = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![make(beta.clone()), reversed],
-    }])
-    .unwrap();
+    let first = lockfile(vec![ordered, make(beta.clone())], None).unwrap();
+    let second = lockfile(vec![make(beta.clone()), reversed], None).unwrap();
     assert_eq!(first, second);
 }
 
@@ -522,8 +583,8 @@ fn projection_is_sorted_and_keeps_logical_fields_only() {
             ),
         ],
     );
-    let lock = Lockfile::from_resolution(&resolution, environment()).unwrap();
-    let packages = &lock.single_resolution().unwrap().packages;
+    let lock = project(&resolution).unwrap();
+    let packages = &lock.resolution.packages;
     assert_eq!(packages[0].identity.name().as_str(), "alpha");
     assert_eq!(packages[1].identity.name().as_str(), "zeta");
     let zeta = &packages[1];
@@ -582,10 +643,9 @@ fn projection_preserves_effective_dependency_reasons_and_visibility() {
             ),
         ],
     );
-    let lock = Lockfile::from_resolution(&resolution, environment()).unwrap();
+    let lock = project(&resolution).unwrap();
     let root_lock = lock
-        .single_resolution()
-        .unwrap()
+        .resolution
         .packages
         .iter()
         .find(|package| package.identity.name().as_str() == "root")
@@ -635,9 +695,9 @@ fn projection_preserves_effective_dependency_reasons_and_visibility() {
             ),
         ],
     );
-    let promoted_lock = Lockfile::from_resolution(&promoted, environment()).unwrap();
+    let promoted_lock = project(&promoted).unwrap();
     assert_eq!(
-        promoted_lock.single_resolution().unwrap().packages[0].dependencies,
+        promoted_lock.resolution.packages[0].dependencies,
         vec![
             LockedDependencyEdge {
                 kind: EffectiveDependencyKind::Depends,
@@ -663,8 +723,8 @@ fn downstream_projection_revalidates_mutated_public_lock_state() {
             Vec::new(),
         )],
     );
-    let mut lock = Lockfile::from_resolution(&resolution, environment()).unwrap();
-    lock.resolutions[0].packages[0].version = version("2.0.0");
+    let mut lock = project(&resolution).unwrap();
+    lock.resolution.packages[0].version = version("2.0.0");
     assert!(matches!(
         lock.locked_identities(),
         Err(LockError::ConflictingMetadata { identity }) if identity.contains("mutable")
@@ -689,13 +749,7 @@ fn downstream_projection_revalidates_mutated_public_lock_state() {
 #[test]
 fn publication_cutoff_is_reconstructed_from_lock() {
     let cutoff = rsolve_core::PublicationDate::parse("2026-06-24").unwrap();
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: Some(cutoff),
-        packages: Vec::new(),
-    }])
-    .unwrap();
+    let lock = lockfile(Vec::new(), Some(cutoff)).unwrap();
     let request = lock
         .resolution_request(
             Manifest::new(
@@ -719,26 +773,21 @@ fn consume_locked_graph_preserves_locked_records_without_a_loader() {
     let dependency = release("dependency", "2.0.0");
     let mut root_package = LockedPackage::from_release(&root);
     root_package.dependencies = vec![edge("dependency")];
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![root_package, LockedPackage::from_release(&dependency)],
-    }])
+    let manifest = manifest_for("root", VersionConstraint::unconstrained());
+    let lock = lockfile_for_manifest(
+        vec![root_package, LockedPackage::from_release(&dependency)],
+        &manifest,
+        None,
+    )
     .unwrap();
     let before = lock.clone();
 
-    let graph = lock
-        .consume_locked_graph(
-            manifest_for("root", VersionConstraint::unconstrained()),
-            &environment(),
-        )
-        .unwrap();
+    let graph = lock.consume_locked_graph(manifest, &environment()).unwrap();
 
     assert_eq!(lock, before);
     assert_eq!(graph.target(), &target());
     assert_eq!(graph.environment(), &environment());
-    assert_eq!(graph.packages(), lock.single_resolution().unwrap().packages);
+    assert_eq!(graph.packages(), lock.resolution.packages);
     let root_package = graph
         .packages()
         .iter()
@@ -749,12 +798,12 @@ fn consume_locked_graph_preserves_locked_records_without_a_loader() {
 
 #[test]
 fn consume_locked_graph_rejects_root_and_r_constraint_mismatches() {
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![LockedPackage::from_release(&release("root", "1.0.0"))],
-    }])
+    let base_manifest = manifest_for("root", VersionConstraint::unconstrained());
+    let lock = lockfile_for_manifest(
+        vec![LockedPackage::from_release(&release("root", "1.0.0"))],
+        &base_manifest,
+        None,
+    )
     .unwrap();
     assert!(matches!(
         lock.consume_locked_graph(
@@ -805,17 +854,11 @@ fn consume_locked_graph_rejects_root_and_r_constraint_mismatches() {
 
 #[test]
 fn consume_locked_graph_checks_base_root_against_target_r_version() {
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: Vec::new(),
-    }])
-    .unwrap();
     let exact_target = manifest_for(
         "methods",
         VersionConstraint::from_clause(RelationOp::Eq, version("4.4.0")),
     );
+    let lock = lockfile_for_manifest(Vec::new(), &exact_target, None).unwrap();
     assert!(
         lock.consume_locked_graph(exact_target, &environment())
             .is_ok()
@@ -832,19 +875,19 @@ fn consume_locked_graph_checks_base_root_against_target_r_version() {
 
 #[test]
 fn consume_locked_graph_rejects_unreachable_locked_packages() {
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![
+    let manifest = manifest_for("root", VersionConstraint::unconstrained());
+    let lock = lockfile_for_manifest(
+        vec![
             LockedPackage::from_release(&release("root", "1.0.0")),
             LockedPackage::from_release(&release("extra", "1.0.0")),
         ],
-    }])
+        &manifest,
+        None,
+    )
     .unwrap();
     assert!(matches!(
         lock.consume_locked_graph(
-            manifest_for("root", VersionConstraint::unconstrained()),
+            manifest,
             &environment(),
         ),
         Err(LockError::UnreachablePackage { package }) if package == "extra"
@@ -858,15 +901,7 @@ fn conflicting_repeated_identity_is_rejected_before_lock_state() {
     let first = LockedPackage::from_release(&identity_release);
     let mut second = first.clone();
     second.metadata_sha256 = Sha256Digest::new("f".repeat(64)).unwrap();
-    assert!(
-        Lockfile::new(vec![LockedResolution {
-            target: target(),
-            environment: environment(),
-            publication_cutoff: None,
-            packages: vec![first, second],
-        }])
-        .is_err()
-    );
+    assert!(lockfile(vec![first, second], None).is_err());
     assert_eq!(identity.name().as_str(), "same");
 }
 
@@ -924,7 +959,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         ],
     );
     assert!(matches!(
-        Lockfile::from_resolution(&resolution, environment()),
+        project(&resolution),
         Err(LockError::InstalledNameConflict { .. })
     ));
     let first_lock = LockedPackage {
@@ -944,12 +979,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         metadata_sha256: digest(),
     };
     assert!(matches!(
-        Lockfile::new(vec![LockedResolution {
-            target: target(),
-            environment: environment(),
-            publication_cutoff: None,
-            packages: vec![first_lock, second_lock],
-        }]),
+        lockfile(vec![first_lock, second_lock], None),
         Err(LockError::InstalledNameConflict { .. })
     ));
 }
@@ -971,11 +1001,8 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
             version: version("2.0.0"),
         },
     );
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![
+    let lock = lockfile(
+        vec![
             LockedPackage {
                 identity: registry.clone(),
                 version: version("1.0.0"),
@@ -993,7 +1020,8 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
                 metadata_sha256: digest(),
             },
         ],
-    }])
+        None,
+    )
     .unwrap();
     let identities = lock.locked_identities().unwrap();
 
@@ -1048,13 +1076,7 @@ fn visible_repository_ids_restore_repository_solver_keys_in_order() {
         visible_repository_ids: vec![repository.clone()],
         metadata_sha256: digest(),
     };
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: target(),
-        environment: environment(),
-        publication_cutoff: None,
-        packages: vec![locked],
-    }])
-    .unwrap();
+    let lock = lockfile(vec![locked], None).unwrap();
     let identities = lock.locked_identities().unwrap();
     assert_eq!(
         identities.get(&SolverKey::Repository {

@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use rsolve_core::{PackageName, PublicationDate, RPackageVersion, RegistryId, VersionConstraint};
 
 use crate::filesystem::ExistingPathIdentity;
-use crate::lock::canonical_lock_basename;
+use crate::lock::{canonical_lock_basename, legacy_composed_environment};
 use crate::manifest::{
     ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, is_remote_cran_root_intent,
     load_manifest,
@@ -529,6 +529,8 @@ fn run_lock_with_backend_progress(
             .collect(),
     )
     .map_err(|error| value_error(format!("invalid manifest: {error}")))?;
+    let legacy_composed = legacy_composed_environment(&manifest, &mirror, cutoff)
+        .map_err(|error| CliError::Operational(format!("lock applicability failed: {error}")))?;
 
     let requested_package_count = command.package.len();
     let metadata_cache = MetadataCache::resolve(command.metadata_cache.as_deref())
@@ -547,15 +549,10 @@ fn run_lock_with_backend_progress(
             "metrics overflow; refusing to write report".into(),
         ));
     }
-    let environment = EnvironmentId::new("default")
-        .map_err(|error| CliError::Operational(format!("invalid environment: {error}")))?;
     let projection_started = Instant::now();
-    let lock = Lockfile::from_resolution_with_publication_cutoff(
-        &resolved.resolution,
-        environment,
-        cutoff,
-    )
-    .map_err(|error| CliError::Operational(format!("lock projection failed: {error}")))?;
+    let lock =
+        Lockfile::from_resolution_with_composed_environment(&resolved.resolution, &legacy_composed)
+            .map_err(|error| CliError::Operational(format!("lock projection failed: {error}")))?;
     let projection_ns = elapsed_ns(projection_started)?;
     let serialization_started = Instant::now();
     let serialized = to_toml(&lock)
@@ -729,12 +726,8 @@ fn run_manifest_lock_with_backend_progress_at(
         ));
     }
     let projection_started = Instant::now();
-    let lock = Lockfile::from_resolution_with_publication_cutoff(
-        &resolved.resolution,
-        composed.environment.clone(),
-        composed.published_before,
-    )
-    .map_err(|error| CliError::Operational(format!("lock projection failed: {error}")))?;
+    let lock = Lockfile::from_resolution_with_composed_environment(&resolved.resolution, &composed)
+        .map_err(|error| CliError::Operational(format!("lock projection failed: {error}")))?;
     let projection_ns = elapsed_ns(projection_started)?;
     let serialization_started = Instant::now();
     let serialized = to_toml(&lock)

@@ -198,8 +198,14 @@ fn tidyverse_manifest() -> Manifest {
 fn tidyverse_lock(loader: &TidyverseFixtureLoader) -> Lockfile {
     let resolution =
         resolve_with_loader(tidyverse_manifest(), loader).expect("tidyverse fixture must resolve");
-    Lockfile::from_resolution(&resolution, EnvironmentId::new("default").unwrap())
-        .expect("tidyverse resolution must project into a lock")
+    Lockfile::from_resolution_with_applicability(
+        &resolution,
+        EnvironmentId::new("default").unwrap(),
+        None,
+        Sha256Digest::new("1".repeat(64)).unwrap(),
+        ge_version("3.6.0"),
+    )
+    .expect("tidyverse resolution must project into a lock")
 }
 
 struct FixtureLoader {
@@ -358,7 +364,7 @@ fn release_with_identity(identity: ReleaseIdentity, version: RPackageVersion) ->
 }
 
 fn lock_for_identity(identity: ReleaseIdentity, version: RPackageVersion) -> Lockfile {
-    Lockfile::new(vec![LockedResolution {
+    let resolution = LockedResolution {
         target: ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
         environment: EnvironmentId::new("default").unwrap(),
         publication_cutoff: None,
@@ -370,7 +376,26 @@ fn lock_for_identity(identity: ReleaseIdentity, version: RPackageVersion) -> Loc
             visible_repository_ids: Vec::new(),
             metadata_sha256: Sha256Digest::new("0".repeat(64)).unwrap(),
         }],
-    }])
+    };
+    Lockfile::new(
+        Sha256Digest::new("1".repeat(64)).unwrap(),
+        VersionConstraint::from_clause(
+            rsolve_core::RelationOp::Ge,
+            RPackageVersion::parse("4.0").unwrap(),
+        ),
+        resolution,
+    )
+    .unwrap()
+}
+
+fn projected_lock(resolution: &Resolution, r_requirement: VersionConstraint) -> Lockfile {
+    Lockfile::from_resolution_with_applicability(
+        resolution,
+        EnvironmentId::new("default").unwrap(),
+        None,
+        Sha256Digest::new("1".repeat(64)).unwrap(),
+        r_requirement,
+    )
     .unwrap()
 }
 
@@ -538,7 +563,7 @@ fn lock_boundary_uses_prefer_fallback_and_require_exact_policy() {
         )],
     );
     let environment = EnvironmentId::new("default").unwrap();
-    let lock = Lockfile::from_resolution(&old_resolution, environment.clone()).unwrap();
+    let lock = projected_lock(&old_resolution, manifest_for(name.clone()).r_requirement);
     let loader = ChoiceLoader {
         packages: vec![newer.clone()],
     };
@@ -598,7 +623,7 @@ fn prefer_policy_updates_a_changed_root_without_consume_precondition() {
         ],
     );
     let environment = EnvironmentId::new("default").unwrap();
-    let lock = Lockfile::from_resolution(&old_resolution, environment.clone()).unwrap();
+    let lock = projected_lock(&old_resolution, manifest_for(root.clone()).r_requirement);
     let changed_manifest = Manifest::new(
         VersionConstraint::from_clause(
             rsolve_core::RelationOp::Ge,
@@ -650,7 +675,7 @@ fn require_exact_rejects_new_transitive_identity_from_upstream_metadata() {
         )],
     );
     let environment = EnvironmentId::new("default").unwrap();
-    let lock = Lockfile::from_resolution(&old_resolution, environment.clone()).unwrap();
+    let lock = projected_lock(&old_resolution, manifest_for(root.clone()).r_requirement);
     let refreshed_root = release_with_dependencies(
         &root,
         vec![
@@ -688,19 +713,16 @@ fn require_exact_identity_mismatch_diagnostics_are_order_independent() {
     let root = PackageName::new("root").unwrap();
     let first = PackageName::new("first").unwrap();
     let second = PackageName::new("second").unwrap();
-    let lock = Lockfile::from_resolution(
-        &Resolution::new(
-            ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
-            vec![rsolve_core::ResolvedPackage::new(
-                SolverKey::InstalledName(root.clone()),
-                release_at_version(&root, "1.0.0"),
-                Vec::new(),
-                Vec::new(),
-            )],
-        ),
-        EnvironmentId::new("default").unwrap(),
-    )
-    .unwrap();
+    let old_resolution = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+        vec![rsolve_core::ResolvedPackage::new(
+            SolverKey::InstalledName(root.clone()),
+            release_at_version(&root, "1.0.0"),
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    let lock = projected_lock(&old_resolution, manifest_for(root.clone()).r_requirement);
     let environment = EnvironmentId::new("default").unwrap();
     let refreshed_root = release_with_dependencies(
         &root,
@@ -1017,7 +1039,7 @@ fn hermetic_tidyverse_r36_lock_reaches_xml_without_quarantined_releases() {
     let decoded = crate::from_toml(&encoded).expect("tidyverse lock must decode");
     assert_eq!(decoded, lock);
 
-    let packages = &lock.resolutions[0].packages;
+    let packages = &lock.resolution.packages;
     let xml = packages
         .iter()
         .find(|package| package.identity.name().as_str() == "XML")

@@ -2,8 +2,8 @@ use super::*;
 use rsolve_core::{
     ArtifactLocator, DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
     DistributionChannel, DistributionMetadata, EnvironmentId, PackageNamespace, Provenance,
-    RPackageVersion, RegistryId, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
-    RepositorySubdir, Sha256Digest, SourceArtifact, SourceScheme, UpstreamChecksum,
+    RPackageVersion, RegistryId, RelationOp, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+    RepositorySubdir, Sha256Digest, SourceArtifact, SourceScheme, UpstreamChecksum, VersionClause,
     VersionConstraint,
 };
 
@@ -48,52 +48,56 @@ fn package_record(name: &str, provenance: Provenance) -> LockedPackage {
 }
 
 fn logical_lock() -> Lockfile {
-    Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
-        environment: EnvironmentId::new("default").unwrap(),
-        publication_cutoff: None,
-        packages: vec![
-            package_record(
-                "registry",
-                Provenance::RegistryRelease {
-                    namespace: PackageNamespace::new("cran").unwrap(),
-                    version: version("1.0"),
-                },
-            ),
-            package_record(
-                "bioc",
-                Provenance::BioconductorRelease {
-                    namespace: PackageNamespace::new("bioc").unwrap(),
-                    release: rsolve_core::BioconductorRelease::new("3.20").unwrap(),
-                    version: version("1.0"),
-                },
-            ),
-            package_record(
-                "git",
-                Provenance::GitCommit {
-                    repository: rsolve_core::NormalizedGitUrl::new("https://example.test/repo")
+    Lockfile::new(
+        Sha256Digest::new("a".repeat(64)).unwrap(),
+        VersionConstraint::unconstrained(),
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
+            environment: EnvironmentId::new("default").unwrap(),
+            publication_cutoff: None,
+            packages: vec![
+                package_record(
+                    "registry",
+                    Provenance::RegistryRelease {
+                        namespace: PackageNamespace::new("cran").unwrap(),
+                        version: version("1.0"),
+                    },
+                ),
+                package_record(
+                    "bioc",
+                    Provenance::BioconductorRelease {
+                        namespace: PackageNamespace::new("bioc").unwrap(),
+                        release: rsolve_core::BioconductorRelease::new("3.20").unwrap(),
+                        version: version("1.0"),
+                    },
+                ),
+                package_record(
+                    "git",
+                    Provenance::GitCommit {
+                        repository: rsolve_core::NormalizedGitUrl::new("https://example.test/repo")
+                            .unwrap(),
+                        commit: rsolve_core::GitCommitId::new(
+                            "0123456789abcdef0123456789abcdef01234567",
+                        )
                         .unwrap(),
-                    commit: rsolve_core::GitCommitId::new(
-                        "0123456789abcdef0123456789abcdef01234567",
-                    )
-                    .unwrap(),
-                    subdirectory: Some(RepositorySubdir::new("sub/pkg").unwrap()),
-                },
-            ),
-            package_record(
-                "immutable",
-                Provenance::ImmutableSource {
-                    scheme: SourceScheme::new("sha256").unwrap(),
-                    digest: Sha256Digest::new("c".repeat(64)).unwrap(),
-                },
-            ),
-        ],
-    }])
+                        subdirectory: Some(RepositorySubdir::new("sub/pkg").unwrap()),
+                    },
+                ),
+                package_record(
+                    "immutable",
+                    Provenance::ImmutableSource {
+                        scheme: SourceScheme::new("sha256").unwrap(),
+                        digest: Sha256Digest::new("c".repeat(64)).unwrap(),
+                    },
+                ),
+            ],
+        },
+    )
     .unwrap()
 }
 
 fn empty_wire() -> &'static str {
-    "version = 1\nr-version = \"4.4\"\npackages = []\n"
+    "version = 1\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"1111111111111111111111111111111111111111111111111111111111111111\"\npackages = []\n"
 }
 
 #[test]
@@ -135,12 +139,16 @@ fn package_published_spelling_is_preserved_but_r_version_is_canonical() {
 
 #[test]
 fn one_component_target_r_version_round_trips() {
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(RPackageVersion::parse_bare("4").unwrap()),
-        environment: EnvironmentId::new("default").unwrap(),
-        publication_cutoff: None,
-        packages: Vec::new(),
-    }])
+    let lock = Lockfile::new(
+        Sha256Digest::new("a".repeat(64)).unwrap(),
+        VersionConstraint::unconstrained(),
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(RPackageVersion::parse_bare("4").unwrap()),
+            environment: EnvironmentId::new("default").unwrap(),
+            publication_cutoff: None,
+            packages: Vec::new(),
+        },
+    )
     .unwrap();
     let text = to_toml(&lock).unwrap();
     assert!(text.contains("r-version = \"4\""));
@@ -150,12 +158,16 @@ fn one_component_target_r_version_round_trips() {
 #[test]
 fn publication_cutoff_round_trips_and_is_canonical() {
     let cutoff = PublicationDate::parse("2026-06-24").unwrap();
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
-        environment: EnvironmentId::new("default").unwrap(),
-        publication_cutoff: Some(cutoff),
-        packages: Vec::new(),
-    }])
+    let lock = Lockfile::new(
+        Sha256Digest::new("a".repeat(64)).unwrap(),
+        VersionConstraint::unconstrained(),
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
+            environment: EnvironmentId::new("default").unwrap(),
+            publication_cutoff: Some(cutoff),
+            packages: Vec::new(),
+        },
+    )
     .unwrap();
     let text = to_toml(&lock).unwrap();
     assert!(text.contains("publication-cutoff = \"2026-06-24\""));
@@ -163,6 +175,68 @@ fn publication_cutoff_round_trips_and_is_canonical() {
     assert!(matches!(
         from_toml(&text.replace("2026-06-24", "2026-6-24")),
         Err(LockWireError::InvalidField { field, .. }) if field == "publication-cutoff"
+    ));
+}
+
+#[test]
+fn r_requirement_is_canonicalized_and_required_on_wire() {
+    let requirement = VersionConstraint::new(vec![
+        VersionClause::new(RelationOp::Ge, version("3.0.0")),
+        VersionClause::new(RelationOp::Le, version("4.0")),
+        VersionClause::new(RelationOp::Ge, version("3.0")),
+    ]);
+    let lock = Lockfile::new(
+        Sha256Digest::new("a".repeat(64)).unwrap(),
+        requirement,
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(version("4.0")),
+            environment: EnvironmentId::new("default").unwrap(),
+            publication_cutoff: None,
+            packages: Vec::new(),
+        },
+    )
+    .unwrap();
+    let text = to_toml(&lock).unwrap();
+    assert!(text.contains("r-requirement = \"<=4.0,>=3.0\""));
+    assert_eq!(from_toml(&text).unwrap(), lock);
+
+    let noncanonical = text.replace(
+        "r-requirement = \"<=4.0,>=3.0\"",
+        "r-requirement = \" >= 3.0, <= 4.0 \"",
+    );
+    assert!(matches!(
+        from_toml(&noncanonical),
+        Err(LockWireError::InvalidField { field, .. }) if field == "r-requirement"
+    ));
+    let missing_digest = text.replace(
+        "resolution-intent-sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        "",
+    );
+    assert!(matches!(
+        from_toml(&missing_digest),
+        Err(LockWireError::Parse(_))
+    ));
+    let invalid_digest = text.replace(
+        "resolution-intent-sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        "resolution-intent-sha256 = \"invalid\"",
+    );
+    assert!(matches!(
+        from_toml(&invalid_digest),
+        Err(LockWireError::InvalidField { field, .. }) if field == "resolution-intent-sha256"
+    ));
+    let mut incompatible = lock.clone();
+    incompatible.r_requirement = VersionConstraint::from_clause(RelationOp::Ge, version("5.0"));
+    assert!(matches!(
+        to_toml(&incompatible),
+        Err(LockWireError::Domain(LockError::RRequirementMismatch))
+    ));
+    let incompatible_wire = text.replace(
+        "r-requirement = \"<=4.0,>=3.0\"",
+        "r-requirement = \">=5.0\"",
+    );
+    assert!(matches!(
+        from_toml(&incompatible_wire),
+        Err(LockWireError::Domain(LockError::RRequirementMismatch))
     ));
 }
 
@@ -227,8 +301,14 @@ fn resolution_projection_excludes_artifacts_and_unselected_dependencies() {
             Vec::new(),
         )],
     );
-    let lock =
-        Lockfile::from_resolution(&resolution, EnvironmentId::new("default").unwrap()).unwrap();
+    let lock = Lockfile::from_resolution_with_applicability(
+        &resolution,
+        EnvironmentId::new("default").unwrap(),
+        None,
+        Sha256Digest::new("a".repeat(64)).unwrap(),
+        VersionConstraint::unconstrained(),
+    )
+    .unwrap();
     let text = to_toml(&lock).unwrap();
     for forbidden in [
         "/machine/secret.tar.gz",
@@ -253,7 +333,10 @@ fn reader_requires_version_one_and_rejects_removed_headers_and_wrappers() {
         assert!(matches!(from_toml(input), Err(LockWireError::Parse(_))));
     }
     for version in [0, 2, 3] {
-        let input = format!("version = {version}\nr-version = \"4.4\"\npackages = []\n");
+        let input = format!(
+            "version = {version}\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"{}\"\npackages = []\n",
+            "1".repeat(64)
+        );
         assert!(matches!(
             from_toml(&input),
             Err(LockWireError::UnsupportedSchema { version: found, .. }) if found == version
@@ -263,7 +346,7 @@ fn reader_requires_version_one_and_rejects_removed_headers_and_wrappers() {
 
 #[test]
 fn dangling_dependency_is_rejected_at_the_lock_boundary() {
-    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [{ kind = \"depends\", package = \"missing\" }]\nvisible-repository-ids = []\n";
+    let input = "version = 1\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"1111111111111111111111111111111111111111111111111111111111111111\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [{ kind = \"depends\", package = \"missing\" }]\nvisible-repository-ids = []\n";
     assert!(matches!(
         from_toml(input),
         Err(LockWireError::Domain(LockError::DanglingDependency { package, dependency }))
@@ -310,12 +393,16 @@ fn unknown_and_machine_local_fields_are_rejected_and_not_emitted() {
 
 #[test]
 fn non_default_environment_round_trips_without_being_dropped() {
-    let lock = Lockfile::new(vec![LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(version("4.4")),
-        environment: EnvironmentId::new("other").unwrap(),
-        publication_cutoff: None,
-        packages: Vec::new(),
-    }])
+    let lock = Lockfile::new(
+        Sha256Digest::new("a".repeat(64)).unwrap(),
+        VersionConstraint::unconstrained(),
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(version("4.4")),
+            environment: EnvironmentId::new("other").unwrap(),
+            publication_cutoff: None,
+            packages: Vec::new(),
+        },
+    )
     .unwrap();
     let text = to_toml(&lock).unwrap();
     assert!(text.contains("environment = \"other\""));
@@ -325,19 +412,24 @@ fn non_default_environment_round_trips_without_being_dropped() {
 #[test]
 fn reversed_logical_input_has_identical_wire_bytes() {
     let first = logical_lock();
-    let mut resolution = first.resolutions[0].clone();
+    let mut resolution = first.resolution.clone();
     resolution.packages.reverse();
     for package in &mut resolution.packages {
         package.dependencies.reverse();
     }
-    let second = Lockfile::new(vec![resolution]).unwrap();
+    let second = Lockfile::new(
+        first.resolution_intent_sha256.clone(),
+        first.r_requirement.clone(),
+        resolution,
+    )
+    .unwrap();
     assert_eq!(to_toml(&first).unwrap(), to_toml(&second).unwrap());
 }
 
 #[test]
 fn structured_edges_and_visible_repository_ids_round_trip() {
     let mut lock = logical_lock();
-    lock.resolutions[0].packages[0].visible_repository_ids = vec![
+    lock.resolution.packages[0].visible_repository_ids = vec![
         rsolve_core::RepositoryId::new("secondary").unwrap(),
         rsolve_core::RepositoryId::new("primary").unwrap(),
     ];
@@ -349,12 +441,12 @@ fn structured_edges_and_visible_repository_ids_round_trip() {
 
 #[test]
 fn unknown_dependency_kind_and_duplicate_visible_repository_are_rejected() {
-    let unknown = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [{ kind = \"optional\", package = \"bar\" }]\nvisible-repository-ids = []\n";
+    let unknown = "version = 1\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"1111111111111111111111111111111111111111111111111111111111111111\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = [{ kind = \"optional\", package = \"bar\" }]\nvisible-repository-ids = []\n";
     assert!(matches!(
         from_toml(unknown),
         Err(LockWireError::InvalidField { field, .. }) if field == "package.dependencies.kind"
     ));
-    let duplicate = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = []\nvisible-repository-ids = [\"main\", \"main\"]\n";
+    let duplicate = "version = 1\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"1111111111111111111111111111111111111111111111111111111111111111\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = []\nvisible-repository-ids = [\"main\", \"main\"]\n";
     assert!(matches!(
         from_toml(duplicate),
         Err(LockWireError::Domain(
@@ -365,7 +457,7 @@ fn unknown_dependency_kind_and_duplicate_visible_repository_are_rejected() {
 
 #[test]
 fn wire_rejects_noncanonical_structured_edges_and_duplicate_packages() {
-    let base = "version = 1\nr-version = \"4.4\"\n";
+    let base = "version = 1\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"1111111111111111111111111111111111111111111111111111111111111111\"\n";
     let bar = format!(
         "[[packages]]\nname = \"bar\"\nversion = \"1.0\"\nsource = {{ kind = \"registry\", namespace = \"cran\" }}\nmetadata-sha256 = \"{}\"\ndependencies = []\nvisible-repository-ids = []\n",
         "0".repeat(64),
@@ -422,7 +514,7 @@ fn wire_rejects_noncanonical_structured_edges_and_duplicate_packages() {
 
 #[test]
 fn wire_rejects_invalid_visible_repository_id() {
-    let input = "version = 1\nr-version = \"4.4\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = []\nvisible-repository-ids = [\"\"]\n";
+    let input = "version = 1\nr-version = \"4.4\"\nr-requirement = \"*\"\nresolution-intent-sha256 = \"1111111111111111111111111111111111111111111111111111111111111111\"\n[[packages]]\nname = \"foo\"\nversion = \"1.0\"\nsource = { kind = \"registry\", namespace = \"cran\" }\nmetadata-sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ndependencies = []\nvisible-repository-ids = [\"\"]\n";
     assert!(matches!(
         from_toml(input),
         Err(LockWireError::InvalidField { field, .. })

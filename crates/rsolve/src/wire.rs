@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use rsolve_core::{
     EffectiveDependencyKind, EnvironmentId, PackageName, Provenance, PublicationDate,
-    RPackageVersion, ReleaseIdentity, RepositoryId, RepositorySubdir, Sha256Digest, SourceScheme,
+    RPackageVersion, RelationOp, ReleaseIdentity, RepositoryId, RepositorySubdir, Sha256Digest,
+    SourceScheme, VersionConstraint,
 };
 
 use crate::lock::{LockError, LockedDependencyEdge, LockedPackage, LockedResolution, Lockfile};
@@ -69,6 +70,8 @@ impl Error for LockWireError {
 struct WireLockfile {
     version: u32,
     r_version: String,
+    resolution_intent_sha256: String,
+    r_requirement: String,
     #[serde(
         default = "default_environment",
         skip_serializing_if = "is_default_environment"
@@ -128,22 +131,28 @@ pub fn from_toml(input: &str) -> Result<Lockfile, LockWireError> {
             version: wire.version,
         });
     }
-    let resolution = decode_resolution(wire)?;
+    let (resolution, resolution_intent_digest, r_requirement) = decode_resolution(wire)?;
     crate::lock::validate_canonical_resolution(&resolution).map_err(LockWireError::Domain)?;
-    Lockfile::new(vec![resolution]).map_err(LockWireError::Domain)
+    Lockfile::new(resolution_intent_digest, r_requirement, resolution)
+        .map_err(LockWireError::Domain)
 }
 
 /// Encode a logical lockfile with deterministic field and collection order.
 pub fn to_toml(lockfile: &Lockfile) -> Result<String, LockWireError> {
     // Re-normalize a clone so public field mutation cannot affect byte
     // determinism or bypass domain validation at the wire boundary.
-    let normalized = Lockfile::new(lockfile.resolutions.clone()).map_err(LockWireError::Domain)?;
-    let resolution = normalized
-        .single_resolution()
-        .map_err(LockWireError::Domain)?;
+    let normalized = Lockfile::new(
+        lockfile.resolution_intent_sha256.clone(),
+        lockfile.r_requirement.clone(),
+        lockfile.resolution.clone(),
+    )
+    .map_err(LockWireError::Domain)?;
+    let resolution = &normalized.resolution;
     let wire = WireLockfile {
         version: SCHEMA_VERSION,
         r_version: canonical_version(&resolution.target.r_version),
+        resolution_intent_sha256: normalized.resolution_intent_sha256.to_string(),
+        r_requirement: canonical_r_requirement(&normalized.r_requirement),
         environment: resolution.environment.to_string(),
         publication_cutoff: resolution.publication_cutoff.map(|date| date.to_string()),
         packages: {
@@ -172,8 +181,20 @@ impl Lockfile {
     }
 }
 
-fn decode_resolution(wire: WireLockfile) -> Result<LockedResolution, LockWireError> {
+fn decode_resolution(
+    wire: WireLockfile,
+) -> Result<(LockedResolution, Sha256Digest, VersionConstraint), LockWireError> {
     let r_version = parse_canonical_r_version_field("r-version", &wire.r_version)?;
+    let r_requirement = crate::manifest::parse_r_constraint(&wire.r_requirement, "r-requirement")
+        .map_err(|error| invalid_field("r-requirement", error.to_string()))?;
+    if canonical_r_requirement(&r_requirement) != wire.r_requirement {
+        return Err(invalid_field(
+            "r-requirement",
+            "constraint is not canonically spelled",
+        ));
+    }
+    let resolution_intent_digest = Sha256Digest::new(wire.resolution_intent_sha256)
+        .map_err(|error| invalid_field("resolution-intent-sha256", error.to_string()))?;
     let packages = wire
         .packages
         .into_iter()
@@ -188,12 +209,16 @@ fn decode_resolution(wire: WireLockfile) -> Result<LockedResolution, LockWireErr
         .transpose()?;
     let environment = EnvironmentId::new(wire.environment)
         .map_err(|error| invalid_field("environment", error.to_string()))?;
-    Ok(LockedResolution {
-        target: rsolve_core::ResolutionTarget::new(r_version),
-        environment,
-        publication_cutoff,
-        packages,
-    })
+    Ok((
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(r_version),
+            environment,
+            publication_cutoff,
+            packages,
+        },
+        resolution_intent_digest,
+        r_requirement,
+    ))
 }
 
 fn is_default_environment(environment: &str) -> bool {
@@ -276,9 +301,11 @@ fn encode_package(
 
 fn serialize_wire(wire: &WireLockfile) -> Result<String, LockWireError> {
     let mut output = format!(
-        "{GENERATED_HEADER}version = {}\nr-version = {}\n",
+        "{GENERATED_HEADER}version = {}\nr-version = {}\nr-requirement = {}\nresolution-intent-sha256 = {}\n",
         wire.version,
         toml_string(&wire.r_version)?,
+        toml_string(&wire.r_requirement)?,
+        toml_string(&wire.resolution_intent_sha256)?,
     );
     if !is_default_environment(&wire.environment) {
         output.push_str(&format!(
@@ -514,6 +541,53 @@ fn canonical_version(version: &RPackageVersion) -> String {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn canonical_r_requirement(constraint: &VersionConstraint) -> String {
+    if constraint.clauses.is_empty() {
+        return "*".into();
+    }
+    let mut clauses = constraint.clauses.clone();
+    clauses.sort_by(|left, right| {
+        r_requirement_relation_rank(left.op)
+            .cmp(&r_requirement_relation_rank(right.op))
+            .then_with(|| left.version.cmp(&right.version))
+            .then_with(|| left.version.as_str().cmp(right.version.as_str()))
+    });
+    clauses.dedup_by(|left, right| left.op == right.op && left.version == right.version);
+    clauses
+        .iter()
+        .map(|clause| {
+            format!(
+                "{}{}",
+                r_requirement_relation_tag(clause.op),
+                canonical_version(&clause.version)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn r_requirement_relation_rank(op: RelationOp) -> u8 {
+    match op {
+        RelationOp::Lt => 0,
+        RelationOp::Le => 1,
+        RelationOp::Eq => 2,
+        RelationOp::Ne => 3,
+        RelationOp::Ge => 4,
+        RelationOp::Gt => 5,
+    }
+}
+
+fn r_requirement_relation_tag(op: RelationOp) -> &'static str {
+    match op {
+        RelationOp::Lt => "<",
+        RelationOp::Le => "<=",
+        RelationOp::Eq => "=",
+        RelationOp::Ne => "!=",
+        RelationOp::Ge => ">=",
+        RelationOp::Gt => ">",
+    }
 }
 
 fn invalid_field(field: impl Into<String>, message: impl Into<String>) -> LockWireError {

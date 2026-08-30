@@ -236,7 +236,7 @@ enum ConstraintVersionKind {
     Package,
 }
 
-pub(super) fn parse_r_constraint(
+pub(crate) fn parse_r_constraint(
     input: &str,
     field: impl Into<String>,
 ) -> Result<VersionConstraint, ManifestError> {
@@ -311,7 +311,7 @@ fn parse_constraint(
     Ok(canonicalize_constraint(&VersionConstraint::new(clauses)))
 }
 
-fn canonicalize_constraint(constraint: &VersionConstraint) -> VersionConstraint {
+pub(crate) fn canonicalize_constraint(constraint: &VersionConstraint) -> VersionConstraint {
     let mut clauses = constraint.clauses.clone();
     clauses.sort_by(|left, right| {
         relation_rank(left.op)

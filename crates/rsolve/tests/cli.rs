@@ -64,7 +64,7 @@ fn opt_in_live_cran_lock_resolves_matrix() {
     let text = std::fs::read_to_string(output_path).expect("read generated lock");
     let lock = rsolve::from_toml(&text).expect("decode generated lock");
     assert!(
-        lock.resolutions[0]
+        lock.resolution
             .packages
             .iter()
             .any(|package| package.identity.name().as_str() == "Matrix")

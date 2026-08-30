@@ -11,7 +11,7 @@ use std::fmt;
 
 use rsolve_core::{
     DependencySourceConstraint, EffectiveDependencyKind, LockedIdentities, PackageName, Provenance,
-    PublicationCutoff, PublicationDate, RPackageVersion, ReleaseIdentity, Resolution,
+    PublicationCutoff, PublicationDate, RPackageVersion, ReleaseIdentity, RepositoryId, Resolution,
     ResolutionRequest, ResolutionTarget, ResolvedPackage, Sha256Digest, SolverKey,
 };
 
@@ -20,7 +20,10 @@ use rsolve_core::{DependencyKind, PackageRelease};
 
 pub use rsolve_core::{EnvironmentId, EnvironmentIdError};
 
-use crate::manifest::{ComposedEnvironment, Manifest, ManifestError, ManifestSource};
+use crate::manifest::{
+    ComposedEnvironment, ComposedRootIntent, Endpoint, Manifest, ManifestError, ManifestSource,
+    RegistrySpec, RepositorySpec, canonicalize_constraint,
+};
 
 /// An immutable, validated projection of a lockfile for direct consumption.
 ///
@@ -198,7 +201,7 @@ impl LockedPackage {
     }
 }
 
-/// The one resolution container currently supported by the command boundary.
+/// The direct single-resolution container used by the command boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockedResolution {
     pub target: ResolutionTarget,
@@ -207,12 +210,13 @@ pub struct LockedResolution {
     pub packages: Vec<LockedPackage>,
 }
 
-/// Shared lock state. The current command boundary accepts exactly one
-/// logical resolution; the TOML projection flattens that resolution at the
-/// wire root.
+/// Shared lock state. The TOML projection flattens this single resolution at
+/// the wire root and records the applicability facts needed for safe reuse.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lockfile {
-    pub resolutions: Vec<LockedResolution>,
+    pub resolution_intent_sha256: Sha256Digest,
+    pub r_requirement: rsolve_core::VersionConstraint,
+    pub resolution: LockedResolution,
 }
 
 /// Return the canonical primary lock basename for one selected environment.
@@ -226,18 +230,31 @@ pub(crate) fn canonical_lock_basename(environment: &EnvironmentId) -> String {
 }
 
 impl Lockfile {
-    /// Project one successful logical resolution into a deterministic lock.
-    pub fn from_resolution(
+    pub fn from_resolution_with_composed_environment(
         resolution: &Resolution,
-        environment: EnvironmentId,
+        composed: &ComposedEnvironment,
     ) -> Result<Self, LockError> {
-        Self::from_resolution_with_publication_cutoff(resolution, environment, None)
+        if resolution.target() != &composed.target {
+            return Err(LockError::TargetMismatch);
+        }
+        let resolution_intent_sha256 = composed
+            .resolution_intent_digest()
+            .map_err(LockError::Manifest)?;
+        Self::from_resolution_with_applicability(
+            resolution,
+            composed.environment.clone(),
+            composed.published_before,
+            resolution_intent_sha256,
+            composed.r_requirement.clone(),
+        )
     }
 
-    pub fn from_resolution_with_publication_cutoff(
+    pub fn from_resolution_with_applicability(
         resolution: &Resolution,
         environment: EnvironmentId,
         publication_cutoff: Option<PublicationDate>,
+        resolution_intent_sha256: Sha256Digest,
+        r_requirement: rsolve_core::VersionConstraint,
     ) -> Result<Self, LockError> {
         let selected_names = resolution
             .packages()
@@ -274,33 +291,39 @@ impl Lockfile {
             }
             unique.push(package);
         }
-        Self::new(vec![LockedResolution {
-            target: resolution.target().clone(),
-            environment,
-            publication_cutoff,
-            packages: unique,
-        }])
+        Self::new(
+            resolution_intent_sha256,
+            canonicalize_constraint(&r_requirement),
+            LockedResolution {
+                target: resolution.target().clone(),
+                environment,
+                publication_cutoff,
+                packages: unique,
+            },
+        )
     }
 
     /// Validate a lock container at the reader/command boundary.
-    pub fn new(resolutions: Vec<LockedResolution>) -> Result<Self, LockError> {
-        validate_resolution_count(resolutions.len())?;
-        let mut lock = Self { resolutions };
+    pub fn new(
+        resolution_intent_sha256: Sha256Digest,
+        r_requirement: rsolve_core::VersionConstraint,
+        resolution: LockedResolution,
+    ) -> Result<Self, LockError> {
+        let mut lock = Self {
+            resolution_intent_sha256,
+            r_requirement: canonicalize_constraint(&r_requirement),
+            resolution,
+        };
         lock.normalize_contents()?;
+        lock.validate_contents()?;
         Ok(lock)
-    }
-
-    pub fn single_resolution(&self) -> Result<&LockedResolution, LockError> {
-        self.validate()?;
-        self.resolutions
-            .first()
-            .ok_or(LockError::UnsupportedResolutionCount { found: 0 })
     }
 
     /// Produce the identity map consumed by the resolver. Lock policy is
     /// intentionally selected by orchestration, not by the lock reader.
     pub fn locked_identities(&self) -> Result<LockedIdentities, LockError> {
-        let resolution = self.single_resolution()?;
+        self.validate()?;
+        let resolution = &self.resolution;
         let mut identities = LockedIdentities::new();
         for package in &resolution.packages {
             for key in identity_solver_keys(&package.identity, &package.visible_repository_ids) {
@@ -324,10 +347,7 @@ impl Lockfile {
         environment: &EnvironmentId,
     ) -> Result<ResolutionRequest, LockError> {
         self.validate()?;
-        let resolution = self
-            .resolutions
-            .first()
-            .ok_or(LockError::UnsupportedResolutionCount { found: 0 })?;
+        let resolution = &self.resolution;
         let target = resolution.target.clone();
         if &resolution.environment != environment {
             return Err(LockError::EnvironmentMismatch {
@@ -340,6 +360,12 @@ impl Lockfile {
             .map_err(LockError::Manifest)?;
         if request.target != target {
             return Err(LockError::TargetMismatch);
+        }
+        if !request.r_requirement.satisfies(&target.r_version) {
+            return Err(LockError::RRequirementMismatch);
+        }
+        if request.r_requirement != self.r_requirement {
+            return Err(LockError::RRequirementIntentMismatch);
         }
         Ok(ResolutionRequest::new(
             request.roots,
@@ -404,7 +430,23 @@ impl Lockfile {
         &self,
         composed: &ComposedEnvironment,
     ) -> Result<ConsumedLockedGraph, LockError> {
-        let resolution = self.single_resolution()?;
+        self.validate()?;
+        let resolution = &self.resolution;
+        if resolution.target != composed.target {
+            return Err(LockError::TargetMismatch);
+        }
+        if resolution.environment != composed.environment {
+            return Err(LockError::EnvironmentMismatch {
+                expected: resolution.environment.to_string(),
+                found: composed.environment.to_string(),
+            });
+        }
+        if !self.r_requirement.satisfies(&composed.target.r_version) {
+            return Err(LockError::RRequirementMismatch);
+        }
+        if self.r_requirement != composed.r_requirement {
+            return Err(LockError::RRequirementIntentMismatch);
+        }
         if resolution.publication_cutoff.as_ref() != composed.published_before.as_ref() {
             return Err(LockError::PublicationCutoffMismatch {
                 lock: resolution
@@ -412,6 +454,15 @@ impl Lockfile {
                     .as_ref()
                     .map(ToString::to_string),
                 composed: composed.published_before.as_ref().map(ToString::to_string),
+            });
+        }
+        let resolution_intent_sha256 = composed
+            .resolution_intent_digest()
+            .map_err(LockError::Manifest)?;
+        if self.resolution_intent_sha256 != resolution_intent_sha256 {
+            return Err(LockError::ResolutionIntentMismatch {
+                lock: self.resolution_intent_sha256.to_string(),
+                composed: resolution_intent_sha256.to_string(),
             });
         }
         let roots = composed
@@ -449,7 +500,8 @@ impl Lockfile {
         roots: &[RootCheck],
         configured_repositories: Option<&[crate::manifest::RepositorySpec]>,
     ) -> Result<ConsumedLockedGraph, LockError> {
-        let resolution = self.single_resolution()?;
+        self.validate()?;
+        let resolution = &self.resolution;
         validate_canonical_resolution(resolution)?;
         if &resolution.target != target {
             return Err(LockError::TargetMismatch);
@@ -553,61 +605,99 @@ impl Lockfile {
     }
 
     pub fn validate(&self) -> Result<(), LockError> {
-        validate_resolution_count(self.resolutions.len())?;
         self.validate_contents()
     }
 
     fn normalize_contents(&mut self) -> Result<(), LockError> {
-        for resolution in &mut self.resolutions {
-            for package in &mut resolution.packages {
-                package.validate()?;
-                canonicalize_dependency_edges(&mut package.dependencies);
-                validate_visible_repository_ids(package)?;
-            }
-            resolution
-                .packages
-                .sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
-            let mut unique: Vec<LockedPackage> = Vec::with_capacity(resolution.packages.len());
-            for package in resolution.packages.drain(..) {
-                if let Some(previous) = unique.last()
-                    && previous.identity == package.identity
-                {
-                    if previous != &package {
-                        return Err(LockError::ConflictingMetadata {
-                            identity: identity_key(&package.identity),
-                        });
-                    }
-                    continue;
-                }
-                unique.push(package);
-            }
-            resolution.packages = unique;
-            ensure_installed_names(&resolution.packages)?;
-            ensure_dependencies_exist(&resolution.packages)?;
+        let resolution = &mut self.resolution;
+        for package in &mut resolution.packages {
+            package.validate()?;
+            canonicalize_dependency_edges(&mut package.dependencies);
+            validate_visible_repository_ids(package)?;
         }
+        resolution
+            .packages
+            .sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
+        let mut unique: Vec<LockedPackage> = Vec::with_capacity(resolution.packages.len());
+        for package in resolution.packages.drain(..) {
+            if let Some(previous) = unique.last()
+                && previous.identity == package.identity
+            {
+                if previous != &package {
+                    return Err(LockError::ConflictingMetadata {
+                        identity: identity_key(&package.identity),
+                    });
+                }
+                continue;
+            }
+            unique.push(package);
+        }
+        resolution.packages = unique;
+        ensure_installed_names(&resolution.packages)?;
+        ensure_dependencies_exist(&resolution.packages)?;
         Ok(())
     }
 
     fn validate_contents(&self) -> Result<(), LockError> {
-        for resolution in &self.resolutions {
-            let mut packages = resolution.packages.clone();
-            packages.sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
-            for package in &packages {
-                package.validate()?;
-                validate_visible_repository_ids(package)?;
-            }
-            for pair in packages.windows(2) {
-                if pair[0].identity == pair[1].identity && pair[0] != pair[1] {
-                    return Err(LockError::ConflictingMetadata {
-                        identity: identity_key(&pair[0].identity),
-                    });
-                }
-            }
-            ensure_installed_names(&packages)?;
-            ensure_dependencies_exist(&packages)?;
+        let resolution = &self.resolution;
+        if !self.r_requirement.satisfies(&resolution.target.r_version) {
+            return Err(LockError::RRequirementMismatch);
         }
+        let mut packages = resolution.packages.clone();
+        packages.sort_by(|left, right| cmp_identity(&left.identity, &right.identity));
+        for package in &packages {
+            package.validate()?;
+            validate_visible_repository_ids(package)?;
+        }
+        for pair in packages.windows(2) {
+            if pair[0].identity == pair[1].identity && pair[0] != pair[1] {
+                return Err(LockError::ConflictingMetadata {
+                    identity: identity_key(&pair[0].identity),
+                });
+            }
+        }
+        ensure_installed_names(&packages)?;
+        ensure_dependencies_exist(&packages)?;
         Ok(())
     }
+}
+
+/// Build the applicability facts for the legacy package command. The legacy
+/// surface has no manifest file, so its canonical input is represented as a
+/// default environment with unconstrained roots and the normalized CRAN
+/// endpoint selected by the command.
+pub(crate) fn legacy_composed_environment(
+    manifest: &Manifest,
+    mirror: &str,
+    publication_cutoff: Option<PublicationDate>,
+) -> Result<ComposedEnvironment, LockError> {
+    let endpoint = Endpoint::parse(mirror).map_err(LockError::Manifest)?;
+    let repository = RepositorySpec::new(
+        RepositoryId::new("cran").expect("cran is a valid repository ID"),
+        RegistrySpec::Cran,
+        endpoint,
+    )
+    .map_err(LockError::Manifest)?;
+    let roots = manifest
+        .requirements
+        .iter()
+        .map(|requirement| ComposedRootIntent {
+            name: requirement.name.clone(),
+            constraint: requirement.constraint.clone(),
+            source: ManifestSource::Registry { repository: None },
+            expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+        })
+        .collect();
+    Ok(ComposedEnvironment {
+        environment: EnvironmentId::new("default")
+            .expect("default is a valid environment identifier"),
+        r_requirement: manifest.r_requirement.clone(),
+        published_before: publication_cutoff,
+        target: ResolutionTarget::new(manifest.target.r_version.clone()),
+        repositories: vec![repository],
+        roots,
+        locked: rsolve_core::LockedIdentities::new(),
+    })
 }
 
 struct RootCheck {
@@ -627,19 +717,8 @@ pub fn consume_locked_graph(
     lockfile.consume_locked_graph(manifest, environment)
 }
 
-fn validate_resolution_count(found: usize) -> Result<(), LockError> {
-    if found == 1 {
-        Ok(())
-    } else {
-        Err(LockError::UnsupportedResolutionCount { found })
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LockError {
-    UnsupportedResolutionCount {
-        found: usize,
-    },
     ConflictingMetadata {
         identity: String,
     },
@@ -694,6 +773,11 @@ pub enum LockError {
         lock: Option<String>,
         composed: Option<String>,
     },
+    ResolutionIntentMismatch {
+        lock: String,
+        composed: String,
+    },
+    RRequirementIntentMismatch,
     ExactIdentitySetMismatch {
         missing: Vec<String>,
         extra: Vec<String>,
@@ -703,9 +787,6 @@ pub enum LockError {
 impl fmt::Display for LockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedResolutionCount { found } => {
-                write!(f, "v1 lock requires exactly one resolution, found {found}")
-            }
             Self::ConflictingMetadata { identity } => {
                 write!(f, "conflicting metadata for locked identity {identity}")
             }
@@ -738,7 +819,7 @@ impl fmt::Display for LockError {
             Self::Manifest(error) => write!(f, "manifest composition failed: {error}"),
             Self::NonCanonical => f.write_str("lock contents are not in canonical order"),
             Self::RRequirementMismatch => {
-                f.write_str("manifest R requirement is not satisfied by the lock target")
+                f.write_str("stored R requirement is not satisfied by the lock target")
             }
             Self::DirectRootMissing { name } => {
                 write!(f, "direct manifest root {name} is absent from the lock")
@@ -781,6 +862,13 @@ impl fmt::Display for LockError {
                 f,
                 "lock publication cutoff {lock:?} does not match composed environment cutoff {composed:?}"
             ),
+            Self::ResolutionIntentMismatch { lock, composed } => write!(
+                f,
+                "lock resolution intent {lock} does not match composed environment intent {composed}"
+            ),
+            Self::RRequirementIntentMismatch => {
+                f.write_str("lock R requirement does not match the composed environment")
+            }
             Self::ExactIdentitySetMismatch { missing, extra } => write!(
                 f,
                 "exact lock identity set mismatch (missing: {missing:?}, extra: {extra:?})"
