@@ -25,6 +25,10 @@ use crate::metrics::{Phase, Recorder, ResolutionMetrics};
 use std::io;
 use tempfile::tempdir;
 
+mod candidate_union;
+#[allow(unused_imports)]
+pub(crate) use candidate_union::CompositeCandidateLoader;
+
 /// Provider observations are deliberately adapted to resolver candidates only
 /// after the consumer has supplied repository provenance. Providers do not
 /// invent repository identifiers or ranks.
