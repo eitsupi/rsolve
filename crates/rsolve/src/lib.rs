@@ -3,6 +3,8 @@
 //! This crate must not move domain, provider, resolver, or repository
 //! implementation into the binary beyond composition responsibilities.
 
+#[allow(dead_code)]
+pub(crate) mod artifact_acquisition;
 pub mod cli;
 pub(crate) mod filesystem;
 pub mod lock;

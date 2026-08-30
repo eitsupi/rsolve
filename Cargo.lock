@@ -983,6 +983,7 @@ name = "rsolve"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "flate2",
  "percent-encoding",
  "rsolve-core",
  "rsolve-provider",
@@ -992,8 +993,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
+ "thiserror",
  "toml",
+ "ureq",
  "url",
  "windows-sys 0.61.2",
 ]
