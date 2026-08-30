@@ -412,6 +412,10 @@ impl Lockfile {
                     | DependencySourceConstraint::Exact(_) => None,
                 },
                 runtime_provided: matches!(root.package.source(), DependencySourceConstraint::Any),
+                direct_source: matches!(
+                    root.package.source(),
+                    DependencySourceConstraint::Git { .. }
+                ),
             })
             .collect::<Vec<_>>();
         self.consume_roots(
@@ -480,6 +484,12 @@ impl Lockfile {
                 runtime_provided: matches!(
                     &root.source,
                     ManifestSource::Registry { repository: None }
+                ),
+                direct_source: matches!(
+                    &root.source,
+                    ManifestSource::Git { .. }
+                        | ManifestSource::Url { .. }
+                        | ManifestSource::Path { .. }
                 ),
             })
             .collect::<Vec<_>>();
@@ -608,6 +618,22 @@ impl Lockfile {
                     package: package.identity.name().to_string(),
                 });
             }
+            let direct_source_root = roots
+                .iter()
+                .any(|root| root.direct_source && root.name == *package.identity.name());
+            if let Some(repositories) = configured_repositories
+                && !direct_source_root
+                && !package.visible_repository_ids.iter().any(|visible| {
+                    repositories.iter().any(|repository| {
+                        repository.id() == visible
+                            && repository.package_allowed(package.identity.name())
+                    })
+                })
+            {
+                return Err(LockError::NoVisibleRepository {
+                    package: package.identity.name().to_string(),
+                });
+            }
         }
         Ok(ConsumedLockedGraph {
             target: resolution.target.clone(),
@@ -718,6 +744,7 @@ struct RootCheck {
     constraint: rsolve_core::VersionConstraint,
     repository: Option<rsolve_core::RepositoryId>,
     runtime_provided: bool,
+    direct_source: bool,
 }
 
 /// Consume a lockfile as an immutable graph without exposing any resolver or
@@ -782,6 +809,9 @@ pub enum LockError {
     VisibleRepositoryPackageNotAllowed {
         package: String,
         repository: String,
+    },
+    NoVisibleRepository {
+        package: String,
     },
     VisibleRepositoryOrderMismatch {
         package: String,
@@ -877,6 +907,10 @@ impl fmt::Display for LockError {
             } => write!(
                 f,
                 "locked package {package} is excluded by repository {repository}"
+            ),
+            Self::NoVisibleRepository { package } => write!(
+                f,
+                "locked package {package} has no visible configured repository"
             ),
             Self::VisibleRepositoryOrderMismatch { package } => write!(
                 f,
