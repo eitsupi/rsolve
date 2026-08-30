@@ -8,7 +8,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use rsolve_core::{Sha256Digest, SourceArtifact};
+use rsolve_core::{
+    GitCommitId, NormalizedGitUrl, PackageName, RPackageVersion, RepositorySubdir, Sha256Digest,
+    SourceArtifact,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -58,6 +61,82 @@ pub struct ArtifactCommitRequest<'a> {
     /// The selected source artifact descriptor.
     pub artifact: &'a SourceArtifact,
     /// A stream supplied by the caller. It is only read after a cache miss.
+    pub reader: &'a mut dyn Read,
+}
+
+/// Immutable release identity facts required when validating a source archive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactValidationExpectation {
+    package: PackageName,
+    version: RPackageVersion,
+    git_provenance: Option<GitProvenanceExpectation>,
+}
+
+impl ArtifactValidationExpectation {
+    /// Creates a registry-style expectation with no Git provenance fields.
+    pub fn new(package: PackageName, version: RPackageVersion) -> Self {
+        Self {
+            package,
+            version,
+            git_provenance: None,
+        }
+    }
+
+    /// Adds the candidate-specific Git provenance expected in DESCRIPTION.
+    pub fn with_git_provenance(
+        mut self,
+        repository: NormalizedGitUrl,
+        commit: GitCommitId,
+        subdirectory: Option<RepositorySubdir>,
+    ) -> Self {
+        self.git_provenance = Some(GitProvenanceExpectation {
+            repository,
+            commit,
+            subdirectory,
+        });
+        self
+    }
+
+    pub fn package(&self) -> &PackageName {
+        &self.package
+    }
+
+    pub fn version(&self) -> &RPackageVersion {
+        &self.version
+    }
+
+    pub fn git_provenance(&self) -> Option<&GitProvenanceExpectation> {
+        self.git_provenance.as_ref()
+    }
+}
+
+/// Git identity fields used for source archive validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitProvenanceExpectation {
+    repository: NormalizedGitUrl,
+    commit: GitCommitId,
+    subdirectory: Option<RepositorySubdir>,
+}
+
+impl GitProvenanceExpectation {
+    pub fn repository(&self) -> &NormalizedGitUrl {
+        &self.repository
+    }
+
+    pub fn commit(&self) -> &GitCommitId {
+        &self.commit
+    }
+
+    pub fn subdirectory(&self) -> Option<&RepositorySubdir> {
+        self.subdirectory.as_ref()
+    }
+}
+
+/// Input for identity-aware source archive commits.
+pub struct ValidatedArtifactCommitRequest<'a> {
+    pub cache_root: &'a Path,
+    pub artifact: &'a SourceArtifact,
+    pub expectation: &'a ArtifactValidationExpectation,
     pub reader: &'a mut dyn Read,
 }
 
@@ -149,6 +228,22 @@ pub enum CacheError {
         "source artifact is not a readable gzip tar archive (or exceeds the 256 MiB/100k-entry sanity limits): {reason}"
     )]
     InvalidArchive { reason: String },
+    #[error("source archive is missing its required Package/DESCRIPTION entry")]
+    MissingDescription,
+    #[error("source archive contains duplicate Package/DESCRIPTION entries")]
+    DuplicateDescription,
+    #[error("source archive DESCRIPTION is too large (limit {limit} bytes)")]
+    DescriptionTooLarge { limit: u64 },
+    #[error("source archive DESCRIPTION is malformed: {reason}")]
+    MalformedDescription { reason: String },
+    #[error("source archive DESCRIPTION contains duplicate `{field}` fields")]
+    DuplicateDescriptionField { field: String },
+    #[error("source archive DESCRIPTION field {field} mismatch: expected {expected}, got {actual}")]
+    DescriptionFieldMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -185,12 +280,36 @@ pub fn commit_artifact(request: ArtifactCommitRequest<'_>) -> Result<CachedArtif
     commit_artifact_with_fs(request, &RealPublishFs)
 }
 
+/// Commits a source artifact after validating its package and release identity.
+pub fn commit_validated_artifact(
+    request: ValidatedArtifactCommitRequest<'_>,
+) -> Result<CachedArtifact, CacheError> {
+    commit_artifact_with_fs_and_expectation(
+        ArtifactCommitRequest {
+            cache_root: request.cache_root,
+            artifact: request.artifact,
+            reader: request.reader,
+        },
+        &RealPublishFs,
+        Some(request.expectation),
+    )
+}
+
 fn commit_artifact_with_fs(
     request: ArtifactCommitRequest<'_>,
     publish_fs: &dyn PublishFs,
 ) -> Result<CachedArtifact, CacheError> {
+    commit_artifact_with_fs_and_expectation(request, publish_fs, None)
+}
+
+fn commit_artifact_with_fs_and_expectation(
+    request: ArtifactCommitRequest<'_>,
+    publish_fs: &dyn PublishFs,
+    expectation: Option<&ArtifactValidationExpectation>,
+) -> Result<CachedArtifact, CacheError> {
     let checksums = metadata::validate_checksums(&request.artifact.upstream_checksums)?;
-    let descriptor_key = metadata::descriptor_key(request.artifact, &checksums);
+    let descriptor_key =
+        metadata::descriptor_key_with_expectation(request.artifact, &checksums, expectation);
     let paths = CachePaths::new(request.cache_root, &descriptor_key);
     paths::create_cache_directories(&paths)?;
 
@@ -224,6 +343,7 @@ fn commit_artifact_with_fs(
         &descriptor_key,
         request.reader,
         &partial,
+        expectation,
         publish_fs,
     );
     if result.is_err() {
@@ -243,6 +363,51 @@ pub fn commit_source_artifact<R: Read>(
         artifact,
         reader: &mut reader,
     })
+}
+
+/// Convenience identity-aware form for callers that own the reader.
+pub fn commit_source_artifact_with_expectation<R: Read>(
+    cache_root: impl AsRef<Path>,
+    artifact: &SourceArtifact,
+    expectation: &ArtifactValidationExpectation,
+    mut reader: R,
+) -> Result<CachedArtifact, CacheError> {
+    commit_validated_artifact(ValidatedArtifactCommitRequest {
+        cache_root: cache_root.as_ref(),
+        artifact,
+        expectation,
+        reader: &mut reader,
+    })
+}
+
+/// Probes an identity-aware cache entry without opening a reader or network.
+pub fn probe_artifact(
+    cache_root: impl AsRef<Path>,
+    artifact: &SourceArtifact,
+    expectation: &ArtifactValidationExpectation,
+) -> Result<Option<CachedArtifact>, CacheError> {
+    let checksums = metadata::validate_checksums(&artifact.upstream_checksums)?;
+    let descriptor_key =
+        metadata::descriptor_key_with_expectation(artifact, &checksums, Some(expectation));
+    let paths = CachePaths::new(cache_root.as_ref(), &descriptor_key);
+    paths::create_cache_directories(&paths)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&paths.lock)
+        .map_err(|source| CacheError::Io {
+            operation: "create artifact lock",
+            path: paths.lock.clone(),
+            source,
+        })?;
+    lock.lock().map_err(|source| CacheError::Io {
+        operation: "lock artifact",
+        path: paths.lock.clone(),
+        source,
+    })?;
+    object::load_hit(&paths, &descriptor_key, artifact, &checksums)
 }
 
 trait PublishFs {

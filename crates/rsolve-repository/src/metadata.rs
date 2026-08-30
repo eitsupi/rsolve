@@ -6,7 +6,8 @@ use rsolve_core::{Sha256Digest, SourceArtifact, UpstreamChecksum};
 use sha2::{Digest as Sha2Digest, Sha256};
 
 use super::{
-    CacheError, CachePaths, CachedArtifact, Checksums, Metadata, MetadataFile, VerificationStrength,
+    ArtifactValidationExpectation, CacheError, CachePaths, CachedArtifact, Checksums, Metadata,
+    MetadataFile, VerificationStrength,
 };
 use crate::util::{hex_lower, open_file, sync_directory, unique_nonce};
 
@@ -95,6 +96,58 @@ pub(super) fn descriptor_key(artifact: &SourceArtifact, checksums: &Checksums) -
             .unwrap_or("")
             .as_bytes(),
     );
+    let digest = <Sha256 as Sha2Digest>::digest(bytes);
+    hex_lower(&digest)
+}
+
+pub(super) fn descriptor_key_with_expectation(
+    artifact: &SourceArtifact,
+    checksums: &Checksums,
+    expectation: Option<&ArtifactValidationExpectation>,
+) -> String {
+    let Some(expectation) = expectation else {
+        return descriptor_key(artifact, checksums);
+    };
+    let mut bytes = b"rsolve/source-artifact/identity/v1\0".to_vec();
+    append_field(&mut bytes, artifact.locator.as_str().as_bytes());
+    append_field(
+        &mut bytes,
+        checksums.md5.as_deref().unwrap_or("").as_bytes(),
+    );
+    append_field(
+        &mut bytes,
+        checksums
+            .sha256
+            .as_ref()
+            .map(Sha256Digest::as_str)
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    append_field(
+        &mut bytes,
+        artifact
+            .size
+            .map(|size| size.to_string())
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    append_field(&mut bytes, expectation.package().as_str().as_bytes());
+    append_field(&mut bytes, expectation.version().as_str().as_bytes());
+    if let Some(git) = expectation.git_provenance() {
+        append_field(&mut bytes, b"git");
+        append_field(&mut bytes, git.repository().as_str().as_bytes());
+        append_field(&mut bytes, git.commit().as_str().as_bytes());
+        append_field(
+            &mut bytes,
+            git.subdirectory()
+                .map(|value| value.as_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+    } else {
+        append_field(&mut bytes, b"registry");
+    }
     let digest = <Sha256 as Sha2Digest>::digest(bytes);
     hex_lower(&digest)
 }

@@ -6,12 +6,16 @@ use md5::{Digest as Md5Digest, Md5};
 use rsolve_core::{Sha256Digest, SourceArtifact};
 use sha2::{Digest as Sha2Digest, Sha256};
 
-use super::{CacheError, CachePaths, CachedArtifact, Checksums, Metadata, PublishFs};
+use super::{
+    ArtifactValidationExpectation, CacheError, CachePaths, CachedArtifact, Checksums, Metadata,
+    PublishFs,
+};
 use crate::archive::validate_source_archive;
 use crate::input::copy_compressed_input;
 use crate::metadata::{cached_artifact, commit_metadata, read_metadata, verification_strength};
 use crate::util::{hex_lower, make_read_only, open_file, sync_directory, unique_nonce};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn commit_miss(
     paths: &CachePaths,
     artifact: &SourceArtifact,
@@ -19,6 +23,7 @@ pub(super) fn commit_miss(
     descriptor_key: &str,
     reader: &mut dyn Read,
     partial: &Path,
+    expectation: Option<&ArtifactValidationExpectation>,
     publish_fs: &dyn PublishFs,
 ) -> Result<CachedArtifact, CacheError> {
     let mut output = open_file(partial, true, "create partial artifact")?;
@@ -70,7 +75,7 @@ pub(super) fn commit_miss(
     }
     let sha256 = Sha256Digest::new(&actual_sha).expect("internal SHA-256 is always 64 hex digits");
     let object = paths.object(&sha256);
-    validate_source_archive(partial)?;
+    validate_source_archive(partial, expectation)?;
     fs::create_dir_all(object.parent().expect("object has a shard parent")).map_err(|source| {
         CacheError::Io {
             operation: "create object shard directory",

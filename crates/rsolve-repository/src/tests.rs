@@ -5,6 +5,8 @@ use rsolve_core::UpstreamChecksum;
 use sha2::Sha256;
 use std::cell::Cell;
 use std::io::{self, Cursor, Read};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tar::{Builder, Header};
 
 fn temporary_root(label: &str) -> PathBuf {
@@ -34,18 +36,39 @@ fn archive_bytes() -> Vec<u8> {
 }
 
 fn archive_bytes_with(contents: &str, name: &str) -> Vec<u8> {
+    archive_bytes_with_entries(&[(name, contents)])
+}
+
+fn archive_bytes_with_entries(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut encoded = Vec::new();
     let encoder = GzEncoder::new(&mut encoded, Compression::default());
     let mut builder = Builder::new(encoder);
-    let contents = contents.as_bytes();
-    let mut header = Header::new_gnu();
-    header.set_size(contents.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder.append_data(&mut header, name, contents).unwrap();
+    for (name, contents) in entries {
+        let contents = contents.as_bytes();
+        let mut header = Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, *name, contents).unwrap();
+    }
     let encoder = builder.into_inner().unwrap();
     encoder.finish().unwrap();
     encoded
+}
+
+fn identity_expectation(package_name: &str, version_text: &str) -> ArtifactValidationExpectation {
+    ArtifactValidationExpectation::new(
+        rsolve_core::PackageName::new(package_name).unwrap(),
+        rsolve_core::RPackageVersion::parse(version_text).unwrap(),
+    )
+}
+
+fn git_expectation(subdirectory: Option<&str>) -> ArtifactValidationExpectation {
+    identity_expectation("example", "1.0").with_git_provenance(
+        rsolve_core::NormalizedGitUrl::new("https://example.test/project").unwrap(),
+        rsolve_core::GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        subdirectory.map(|value| rsolve_core::RepositorySubdir::new(value).unwrap()),
+    )
 }
 
 fn empty_archive_bytes() -> Vec<u8> {
@@ -116,6 +139,247 @@ fn commits_and_reuses_without_reading_a_hit_stream() {
             .permissions()
             .readonly()
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn identity_validated_registry_archive_can_be_probed_without_a_reader() {
+    let root = temporary_root("identity-registry");
+    let bytes = archive_bytes_with(
+        "Package: example\nVersion: 1.0\nDescription: fixture\n",
+        "example/DESCRIPTION",
+    );
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    let expectation = identity_expectation("example", "1.0");
+    let committed = commit_source_artifact_with_expectation(
+        &root,
+        &descriptor,
+        &expectation,
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let probed = probe_artifact(&root, &descriptor, &expectation)
+        .unwrap()
+        .expect("validated cache hit");
+    assert_eq!(probed, committed);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn identity_validated_git_archive_requires_matching_provenance() {
+    let root = temporary_root("identity-git");
+    let no_subdir = archive_bytes_with(
+        "Package: example\nVersion: 1.0\nDescription: first\n second\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789ABCDEF0123456789ABCDEF01234567\n",
+        "example/DESCRIPTION",
+    );
+    let descriptor = artifact(vec![], Some(no_subdir.len() as u64));
+    let expectation = git_expectation(None);
+    commit_source_artifact_with_expectation(
+        &root,
+        &descriptor,
+        &expectation,
+        Cursor::new(no_subdir),
+    )
+    .unwrap();
+
+    let wrong_url = git_expectation(None).with_git_provenance(
+        rsolve_core::NormalizedGitUrl::new("https://other.test/project").unwrap(),
+        rsolve_core::GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        None,
+    );
+    assert!(matches!(
+        probe_artifact(&root, &descriptor, &wrong_url),
+        Ok(None)
+    ));
+
+    let with_subdir = archive_bytes_with(
+        "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\nRemoteSubdir: packages/example\n",
+        "example/DESCRIPTION",
+    );
+    let with_subdir_descriptor = artifact(vec![], Some(with_subdir.len() as u64));
+    let with_subdir_expectation = git_expectation(Some("packages/example"));
+    assert!(
+        commit_source_artifact_with_expectation(
+            &root,
+            &with_subdir_descriptor,
+            &with_subdir_expectation,
+            Cursor::new(with_subdir),
+        )
+        .is_ok()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn identity_validation_rejects_description_defects_before_publication() {
+    let cases = [
+        (
+            "missing",
+            archive_bytes_with("Package: example\nVersion: 1.0\n", "other/DESCRIPTION"),
+        ),
+        (
+            "duplicate",
+            archive_bytes_with_entries(&[
+                ("example/DESCRIPTION", "Package: example\nVersion: 1.0\n"),
+                ("example/DESCRIPTION", "Package: example\nVersion: 1.0\n"),
+            ]),
+        ),
+        (
+            "malformed",
+            archive_bytes_with("not a DCF record\n", "example/DESCRIPTION"),
+        ),
+        (
+            "package-mismatch",
+            archive_bytes_with("Package: other\nVersion: 1.0\n", "example/DESCRIPTION"),
+        ),
+        (
+            "version-mismatch",
+            archive_bytes_with("Package: example\nVersion: 1.0.0\n", "example/DESCRIPTION"),
+        ),
+        (
+            "unexpected-remote",
+            archive_bytes_with(
+                "Package: example\nVersion: 1.0\nRemoteSubdir: src\n",
+                "example/DESCRIPTION",
+            ),
+        ),
+    ];
+    for (label, bytes) in cases {
+        let root = temporary_root(label);
+        let descriptor = artifact(vec![], Some(bytes.len() as u64));
+        let expectation = identity_expectation("example", "1.0");
+        let result = commit_source_artifact_with_expectation(
+            &root,
+            &descriptor,
+            &expectation,
+            Cursor::new(bytes),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CacheError::MissingDescription)
+                    | Err(CacheError::DuplicateDescription)
+                    | Err(CacheError::MalformedDescription { .. })
+                    | Err(CacheError::DescriptionFieldMismatch { .. })
+            ),
+            "unexpected result for {label}: {result:?}"
+        );
+        assert!(!contains_file_named(&root.join("artifacts"), ".json"));
+        assert!(!contains_file_prefix(
+            &root.join("objects/sources/sha256"),
+            PARTIAL_PREFIX
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn identity_git_field_mismatches_are_rejected() {
+    let cases = [
+        (
+            "remote-url",
+            "Package: example\nVersion: 1.0\nRemoteUrl: https://other.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n",
+            git_expectation(None),
+        ),
+        (
+            "remote-sha",
+            "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: abcdef0123456789abcdef0123456789abcdef01\n",
+            git_expectation(None),
+        ),
+        (
+            "missing-subdir",
+            "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n",
+            git_expectation(Some("packages/example")),
+        ),
+        (
+            "wrong-subdir",
+            "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\nRemoteSubdir: other\n",
+            git_expectation(Some("packages/example")),
+        ),
+        (
+            "unexpected-subdir",
+            "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\nRemoteSubdir: packages/example\n",
+            git_expectation(None),
+        ),
+        (
+            "duplicate-field",
+            "Package: example\npackage: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n",
+            git_expectation(None),
+        ),
+    ];
+    for (label, contents, expectation) in cases {
+        let root = temporary_root(label);
+        let bytes = archive_bytes_with(contents, "example/DESCRIPTION");
+        let descriptor = artifact(vec![], Some(bytes.len() as u64));
+        assert!(matches!(
+            commit_source_artifact_with_expectation(
+                &root,
+                &descriptor,
+                &expectation,
+                Cursor::new(bytes),
+            ),
+            Err(CacheError::DescriptionFieldMismatch { .. })
+                | Err(CacheError::DuplicateDescriptionField { .. })
+        ));
+        assert!(!contains_file_named(&root.join("artifacts"), ".json"));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn identity_probe_reports_misses_and_corrupt_hits_without_a_reader() {
+    let root = temporary_root("identity-probe");
+    let bytes = archive_bytes_with("Package: example\nVersion: 1.0\n", "example/DESCRIPTION");
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    let expectation = identity_expectation("example", "1.0");
+    assert_eq!(
+        probe_artifact(&root, &descriptor, &expectation).unwrap(),
+        None
+    );
+    let committed = commit_source_artifact_with_expectation(
+        &root,
+        &descriptor,
+        &expectation,
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&committed.object_path).unwrap().permissions();
+    #[cfg(unix)]
+    permissions.set_mode(permissions.mode() | 0o200);
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(&committed.object_path, permissions).unwrap();
+    fs::write(
+        &committed.object_path,
+        vec![b'x'; usize::try_from(committed.size).unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        probe_artifact(&root, &descriptor, &expectation),
+        Err(CacheError::CorruptObject { .. })
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn identity_validation_rejects_an_oversized_description() {
+    let root = temporary_root("identity-description-size");
+    let contents = format!(
+        "Package: example\nVersion: 1.0\nDescription: {}\n",
+        "x".repeat(1 << 20)
+    );
+    let bytes = archive_bytes_with(&contents, "example/DESCRIPTION");
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    assert!(matches!(
+        commit_source_artifact_with_expectation(
+            &root,
+            &descriptor,
+            &identity_expectation("example", "1.0"),
+            Cursor::new(bytes),
+        ),
+        Err(CacheError::DescriptionTooLarge { .. })
+    ));
+    assert!(!contains_file_named(&root.join("artifacts"), ".json"));
     fs::remove_dir_all(root).unwrap();
 }
 
