@@ -211,6 +211,85 @@ fn identity_validated_git_archive_requires_matching_provenance() {
 }
 
 #[test]
+fn git_description_without_subdir_accepts_comments_and_folded_unmodeled_fields() {
+    let root = temporary_root("git-commented-description");
+    let contents = "# leading comment\r\nPackage: example\r\n# comment between fields\r\nVersion: 1.0\r\nDescription: first # stays in the value\r\n second\r\nRemoteUrl: https://example.test/project\r\nRemoteSha: 0123456789ABCDEF0123456789ABCDEF01234567\r\n";
+    let bytes = archive_bytes_with(contents, "example/DESCRIPTION");
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    commit_source_artifact_with_expectation(
+        &root,
+        &descriptor,
+        &git_expectation(None),
+        Cursor::new(bytes),
+    )
+    .unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn description_comments_preserve_modeled_field_continuations() {
+    let root = temporary_root("comment-continuation");
+    let contents = "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\n # continuation must remain part of RemoteUrl\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n";
+    let bytes = archive_bytes_with(contents, "example/DESCRIPTION");
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    assert!(matches!(
+        commit_source_artifact_with_expectation(
+            &root,
+            &descriptor,
+            &git_expectation(None),
+            Cursor::new(bytes),
+        ),
+        Err(CacheError::DescriptionFieldMismatch {
+            field: "RemoteUrl",
+            ..
+        })
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn description_inline_hash_is_preserved_in_modeled_fields() {
+    let root = temporary_root("inline-hash");
+    let contents = "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567#inline\n";
+    let bytes = archive_bytes_with(contents, "example/DESCRIPTION");
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    assert!(matches!(
+        commit_source_artifact_with_expectation(
+            &root,
+            &descriptor,
+            &git_expectation(None),
+            Cursor::new(bytes),
+        ),
+        Err(CacheError::DescriptionFieldMismatch {
+            field: "RemoteSha",
+            ..
+        })
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn description_comment_does_not_reset_modeled_field_state() {
+    let root = temporary_root("comment-state");
+    let contents = "Package: example\nVersion: 1.0\nRemoteUrl: https://example.test/project\n# comment between field and continuation\n https://other.test/project\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n";
+    let bytes = archive_bytes_with(contents, "example/DESCRIPTION");
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    assert!(matches!(
+        commit_source_artifact_with_expectation(
+            &root,
+            &descriptor,
+            &git_expectation(None),
+            Cursor::new(bytes),
+        ),
+        Err(CacheError::DescriptionFieldMismatch {
+            field: "RemoteUrl",
+            ..
+        })
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn identity_validation_rejects_description_defects_before_publication() {
     let cases = [
         (

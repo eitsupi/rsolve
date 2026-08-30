@@ -132,6 +132,9 @@ fn parse_description(bytes: &[u8]) -> Result<DescriptionFields, CacheError> {
     let mut current = None::<String>;
     let mut have_field = false;
     for line in text.lines() {
+        if line.as_bytes().first() == Some(&b'#') {
+            continue;
+        }
         if line.trim().is_empty() {
             continue;
         }
