@@ -108,7 +108,7 @@ pub(super) fn descriptor_key_with_expectation(
     let Some(expectation) = expectation else {
         return descriptor_key(artifact, checksums);
     };
-    let mut bytes = b"rsolve/source-artifact/identity/v1\0".to_vec();
+    let mut bytes = b"rsolve/source-artifact/identity/v2\0".to_vec();
     append_field(&mut bytes, artifact.locator.as_str().as_bytes());
     append_field(
         &mut bytes,
@@ -133,7 +133,18 @@ pub(super) fn descriptor_key_with_expectation(
             .as_bytes(),
     );
     append_field(&mut bytes, expectation.package().as_str().as_bytes());
-    append_field(&mut bytes, expectation.version().as_str().as_bytes());
+    append_field(&mut bytes, b"version-components");
+    append_field(
+        &mut bytes,
+        &(expectation.version().canonical_component_count() as u64).to_le_bytes(),
+    );
+    for component in expectation
+        .version()
+        .components()
+        .take(expectation.version().canonical_component_count())
+    {
+        append_field(&mut bytes, &component.to_le_bytes());
+    }
     if let Some(git) = expectation.git_provenance() {
         append_field(&mut bytes, b"git");
         append_field(&mut bytes, git.repository().as_str().as_bytes());

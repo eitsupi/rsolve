@@ -362,8 +362,26 @@ mod tests {
         contents: Vec<u8>,
         include_source: bool,
     ) -> (ResolvedPackage, crate::manifest::ComposedEnvironment) {
+        selected_with_version_and_content(
+            locator,
+            extra_distribution,
+            git_identity,
+            contents,
+            include_source,
+            "1.0",
+        )
+    }
+
+    fn selected_with_version_and_content(
+        locator: &str,
+        extra_distribution: Option<Distribution>,
+        git_identity: bool,
+        contents: Vec<u8>,
+        include_source: bool,
+        version_text: &str,
+    ) -> (ResolvedPackage, crate::manifest::ComposedEnvironment) {
         let package = PackageName::new("example").unwrap();
-        let version = rsolve_core::RPackageVersion::parse("1.0").unwrap();
+        let version = rsolve_core::RPackageVersion::parse(version_text).unwrap();
         let repository = repository();
         let registry = repository.configured_registry_id().unwrap();
         let identity = if git_identity {
@@ -528,6 +546,86 @@ mod tests {
         .unwrap();
         assert_eq!(cached.artifact.sha256, result.artifact.sha256);
         assert_eq!(fetcher.calls.get(), 1);
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn equivalent_release_versions_reuse_r_universe_cache_entry() {
+        let locator = "https://download.example/version-alias.tar.gz";
+        let bytes = archive("example", "1.7-0", "");
+        let (selected_release, composed) =
+            selected_with_version_and_content(locator, None, true, bytes.clone(), true, "1.7.0");
+        let (alias_release, alias_composed) =
+            selected_with_version_and_content(locator, None, true, bytes.clone(), true, "1.7-0");
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes,
+            calls: Cell::new(0),
+            locator: locator.into(),
+            failure: None,
+        };
+        let cache = root();
+        let committed = acquire_selected_artifact(
+            &cache,
+            &selected_release,
+            &composed,
+            ArtifactAcquisitionMode::Online,
+            &fetcher,
+        )
+        .unwrap();
+        let probed = acquire_selected_artifact(
+            &cache,
+            &alias_release,
+            &alias_composed,
+            ArtifactAcquisitionMode::Offline,
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(probed.artifact.sha256, committed.artifact.sha256);
+        assert_eq!(fetcher.calls.get(), 1);
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn semantically_different_release_version_is_rejected_before_publication() {
+        let locator = "https://download.example/version-mismatch.tar.gz";
+        let bytes = archive("example", "1.7.1", "");
+        let (selected_release, composed) =
+            selected_with_version_and_content(locator, None, true, bytes.clone(), true, "1.7.0");
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes,
+            calls: Cell::new(0),
+            locator: locator.into(),
+            failure: None,
+        };
+        let cache = root();
+        assert!(matches!(
+            acquire_selected_artifact(
+                &cache,
+                &selected_release,
+                &composed,
+                ArtifactAcquisitionMode::Online,
+                &fetcher,
+            ),
+            Err(ArtifactAcquisitionError::Cache(
+                CacheError::DescriptionFieldMismatch {
+                    field: "Version",
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(fetcher.calls.get(), 1);
+        assert!(matches!(
+            acquire_selected_artifact(
+                &cache,
+                &selected_release,
+                &composed,
+                ArtifactAcquisitionMode::Offline,
+                &fetcher,
+            ),
+            Err(ArtifactAcquisitionError::OfflineMiss { .. })
+        ));
         std::fs::remove_dir_all(cache).unwrap();
     }
 

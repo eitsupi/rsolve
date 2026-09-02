@@ -206,7 +206,12 @@ fn validate_description(
             actual: fields.package,
         });
     }
-    if fields.version != expected.version().as_str() {
+    let actual_version = rsolve_core::RPackageVersion::parse(&fields.version).map_err(|error| {
+        CacheError::MalformedDescription {
+            reason: format!("Version is invalid: {error}"),
+        }
+    })?;
+    if actual_version != *expected.version() {
         return Err(CacheError::DescriptionFieldMismatch {
             field: "Version",
             expected: expected.version().to_string(),

@@ -166,6 +166,45 @@ fn identity_validated_registry_archive_can_be_probed_without_a_reader() {
 }
 
 #[test]
+fn equivalent_description_versions_share_validated_cache_identity() {
+    let root = temporary_root("identity-version-alias");
+    let bytes = archive_bytes_with(
+        "Package: example\nVersion: 1.7-0\nDescription: fixture\n",
+        "example/DESCRIPTION",
+    );
+    let descriptor = artifact(vec![], Some(bytes.len() as u64));
+    let canonical_expectation = identity_expectation("example", "1.7.0");
+    let committed = commit_source_artifact_with_expectation(
+        &root,
+        &descriptor,
+        &canonical_expectation,
+        Cursor::new(bytes.clone()),
+    )
+    .unwrap();
+
+    let alias_expectation = identity_expectation("example", "1.7-0");
+    let probed = probe_artifact(&root, &descriptor, &alias_expectation)
+        .unwrap()
+        .expect("equivalent version should reuse the validated cache entry");
+    assert_eq!(probed, committed);
+
+    let different_expectation = identity_expectation("example", "1.7.1");
+    assert!(matches!(
+        commit_source_artifact_with_expectation(
+            &root,
+            &descriptor,
+            &different_expectation,
+            Cursor::new(bytes),
+        ),
+        Err(CacheError::DescriptionFieldMismatch {
+            field: "Version",
+            ..
+        })
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn identity_validated_git_archive_requires_matching_provenance() {
     let root = temporary_root("identity-git");
     let no_subdir = archive_bytes_with(
@@ -313,7 +352,7 @@ fn identity_validation_rejects_description_defects_before_publication() {
         ),
         (
             "version-mismatch",
-            archive_bytes_with("Package: example\nVersion: 1.0.0\n", "example/DESCRIPTION"),
+            archive_bytes_with("Package: example\nVersion: 1.0.1\n", "example/DESCRIPTION"),
         ),
         (
             "unexpected-remote",
