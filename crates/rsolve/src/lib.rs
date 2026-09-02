@@ -3,8 +3,7 @@
 //! This crate must not move domain, provider, resolver, or repository
 //! implementation into the binary beyond composition responsibilities.
 
-#[allow(dead_code)]
-pub(crate) mod artifact_acquisition;
+pub mod artifact_acquisition;
 pub mod cli;
 pub(crate) mod filesystem;
 pub mod lock;
@@ -15,8 +14,18 @@ pub mod orchestration;
 pub mod pak;
 mod prepared_snapshot;
 pub mod progress;
+pub mod repository_preparation;
 mod repository_resolution;
 pub mod wire;
+
+pub use artifact_acquisition::{
+    ArtifactAcquisitionError, ArtifactAcquisitionMode, ArtifactFetchError, ArtifactFetchResponse,
+    ArtifactFetcher, UreqArtifactFetcher, acquire_selected_artifact,
+};
+pub use repository_preparation::{
+    RepositoryPreparationError, prepare_r_universe_project_repository,
+    prepare_r_universe_project_repository_with_fetcher,
+};
 
 pub use lock::{
     ConsumedLockedGraph, EnvironmentId, EnvironmentIdError, LockError, LockedDependencyEdge,
