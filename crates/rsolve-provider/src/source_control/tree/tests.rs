@@ -368,9 +368,9 @@ fn windows_root_traversal_rejects_reparse_redirects() {
     let outside = root.path().join("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("sentinel"), b"do not touch").unwrap();
-    if std::os::windows::fs::symlink_dir(&outside, &redirected).is_err() {
-        return;
-    }
+    std::os::windows::fs::symlink_dir(&outside, &redirected).expect(
+        "creating the reparse-point fixture requires directory-link permission or Developer Mode",
+    );
 
     let result = DirectoryCapability::open_or_create(&redirected.join("child"));
     assert!(result.is_err());
