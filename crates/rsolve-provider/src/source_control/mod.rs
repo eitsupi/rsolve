@@ -4,6 +4,7 @@
 //! selectors and transport diagnostics stay in [`git`]; downstream callers
 //! receive only owned, validated source-control facts.
 
+pub(crate) mod cache_fs;
 pub mod description;
 pub mod git;
 pub(crate) mod tree;

@@ -9,21 +9,22 @@ use std::sync::Arc;
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsExt as CapFsExtOpenOptionsExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use super::cache_fs::{self, CapabilityLock, DirectoryCapability};
 
 const SOURCE_SCHEMA: u32 = 1;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
-const MAX_PATH_DEPTH: usize = 64;
+pub(crate) const MAX_PATH_DEPTH: usize = 64;
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
 const POLICY_REVISION: u32 = 1;
-const MAX_CLEANUP_DEPTH: usize = MAX_PATH_DEPTH + 2;
-const MAX_CLEANUP_NODES: usize = MAX_ENTRIES
+pub(crate) const MAX_CLEANUP_DEPTH: usize = MAX_PATH_DEPTH + 2;
+pub(crate) const MAX_CLEANUP_NODES: usize = MAX_ENTRIES
     .saturating_mul(MAX_PATH_DEPTH.saturating_add(1))
     .saturating_add(2);
 
@@ -345,31 +346,33 @@ where
     I: IntoIterator<Item = TreeEntry>,
 {
     let destination = destination.as_ref();
-    let parent = destination.parent().ok_or_else(|| TreeError::Io {
+    let parent_path = destination.parent().ok_or_else(|| TreeError::Io {
         reason: "source view has no parent".to_owned(),
     })?;
-    ensure_directory(parent)?;
-    let lock_path = parent.join(format!(
-        ".{}.lock",
-        destination.file_name().unwrap().to_string_lossy()
-    ));
-    let _lock = AdvisoryLock::acquire(&lock_path)?;
-    match fs::symlink_metadata(destination) {
-        Ok(stat) if stat.file_type().is_symlink() => {
-            return Err(TreeError::InvalidMarker {
-                path: destination.to_path_buf(),
-            });
-        }
+    let parent = DirectoryCapability::open_or_create(parent_path)
+        .map_err(|error| cache_error_at(error, parent_path))?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(TreeError::NonCanonicalPath)?;
+    let lock_name = format!(".{destination_name}.lock");
+    let _lock = CapabilityLock::acquire(&parent, &lock_name)
+        .map_err(|error| cache_error_at(error, &parent_path.join(&lock_name)))?;
+    match parent.entry_metadata(destination_name) {
+        Ok(stat) if stat.file_type().is_symlink() => return Err(invalid_marker(destination)),
         Ok(stat) if !stat.is_dir() => {
             return Err(TreeError::PublicationConflict {
                 path: destination.to_path_buf(),
             });
         }
         Ok(_) => {
-            return validate_existing_view(destination, binding);
+            let destination = parent
+                .open_dir(destination_name)
+                .map_err(|error| cache_error_at(error, destination))?;
+            return validate_existing_view_cap(&destination, binding);
         }
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(io_error(error)),
-        Err(_) => {}
+        Err(cache_fs::CacheFsError::NotFound) => {}
+        Err(error) => return Err(cache_error_at(error, destination)),
     }
 
     let mut builder = TreeBuilder::new();
@@ -378,52 +381,70 @@ where
     }
     let (validated, total) = builder.finish();
     let tree_digest = tree_digest(&validated);
-    let staging = parent.join(format!(
-        ".{}.partial",
-        destination.file_name().unwrap().to_string_lossy()
-    ));
-    match fs::symlink_metadata(&staging) {
+    let staging_name = format!(".{destination_name}.partial");
+    match parent.entry_metadata(&staging_name) {
         Ok(stat) if stat.file_type().is_symlink() => {
-            return Err(TreeError::InvalidMarker { path: staging });
+            return Err(invalid_marker(&parent_path.join(&staging_name)));
         }
         Ok(stat) if !stat.is_dir() => {
-            return Err(TreeError::PublicationConflict { path: staging });
+            return Err(TreeError::PublicationConflict {
+                path: parent_path.join(&staging_name),
+            });
         }
-        Ok(_) => remove_tree_bounded(&staging)?,
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(io_error(error)),
-        Err(_) => {}
+        Ok(_) => parent
+            .remove_tree_bounded(&staging_name, MAX_CLEANUP_DEPTH, MAX_CLEANUP_NODES)
+            .map_err(|error| cache_error_at(error, &parent_path.join(&staging_name)))?,
+        Err(cache_fs::CacheFsError::NotFound) => {}
+        Err(error) => return Err(cache_error_at(error, &parent_path.join(&staging_name))),
     }
-    ensure_directory(&staging)?;
-    let tree = staging.join("tree");
-    ensure_directory(&tree)?;
+    let staging = parent
+        .create_dir(&staging_name)
+        .map_err(|error| cache_error_at(error, &parent_path.join(&staging_name)))?;
+    let tree = staging
+        .create_dir("tree")
+        .map_err(|error| cache_error_at(error, &parent_path.join(&staging_name).join("tree")))?;
     for entry in &validated {
-        let path = tree.join(&entry.path);
-        if let Some(parent) = path.parent() {
-            ensure_directory(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(io_error)?;
+        let path = Path::new(&entry.path);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(TreeError::NonCanonicalPath)?;
+        let file_parent = tree
+            .open_or_create_path(path.parent().unwrap_or(Path::new("")))
+            .map_err(cache_error)?;
+        let mut file = file_parent.create_file_new(name).map_err(cache_error)?;
         file.write_all(&entry.bytes).map_err(io_error)?;
         #[cfg(unix)]
         if entry.executable {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).map_err(io_error)?;
+            file.set_permissions(cap_std::fs::Permissions::from_std(
+                fs::Permissions::from_mode(0o755),
+            ))
+            .map_err(io_error)?;
         }
         file.sync_all().map_err(io_error)?;
     }
-    sync_directories_bounded(&tree)?;
-    let marker = staging.join("source.toml");
-    let mut marker_file = File::create(&marker).map_err(io_error)?;
+    tree.sync_tree_bounded(MAX_PATH_DEPTH, MAX_CLEANUP_NODES)
+        .map_err(|error| TreeError::Io {
+            reason: format!("tree sync: {error}"),
+        })?;
+    let mut marker_file = staging
+        .create_file_new("source.toml")
+        .map_err(cache_error)?;
     let marker = SourceMarker::new(&tree_digest, validated.len(), total, binding)?;
     marker.write(&mut marker_file)?;
     marker_file.sync_all().map_err(io_error)?;
-    sync_directory(&staging)?;
-    fs::rename(&staging, destination).map_err(io_error)?;
-    sync_directory(parent)?;
-    validate_existing_view(destination, binding)
+    staging.sync().map_err(|error| TreeError::Io {
+        reason: format!("staging sync: {error}"),
+    })?;
+    parent
+        .rename_noreplace(&staging_name, destination_name)
+        .map_err(cache_error)?;
+    parent.sync().map_err(|error| TreeError::Io {
+        reason: format!("parent sync: {error}"),
+    })?;
+    let destination = parent.open_dir(destination_name).map_err(cache_error)?;
+    validate_existing_view_cap(&destination, binding)
 }
 
 fn validate_path(path: &str) -> Result<(), TreeError> {
@@ -486,7 +507,7 @@ impl SourceMarker {
         })
     }
 
-    fn write(&self, file: &mut File) -> Result<(), TreeError> {
+    fn write(&self, file: &mut impl Write) -> Result<(), TreeError> {
         writeln!(file, "schema = {SOURCE_SCHEMA}").map_err(io_error)?;
         writeln!(file, "policy = {POLICY_REVISION}").map_err(io_error)?;
         writeln!(file, "binding_namespace = \"{}\"", self.binding.namespace).map_err(io_error)?;
@@ -499,16 +520,11 @@ impl SourceMarker {
         Ok(())
     }
 
-    fn parse(path: &Path) -> Result<Self, TreeError> {
-        let stat = fs::symlink_metadata(path).map_err(io_error)?;
-        if stat.file_type().is_symlink() || stat.len() > MAX_MARKER_BYTES {
+    fn parse(contents: &[u8], path: &Path) -> Result<Self, TreeError> {
+        if contents.len() as u64 > MAX_MARKER_BYTES {
             return Err(invalid_marker(path));
         }
-        let contents = String::from_utf8(
-            read_bounded_file_with_limit(path, stat.len(), MAX_MARKER_BYTES)
-                .map_err(|_| invalid_marker(path))?,
-        )
-        .map_err(|_| invalid_marker(path))?;
+        let contents = String::from_utf8(contents.to_vec()).map_err(|_| invalid_marker(path))?;
         let mut fields = BTreeMap::new();
         let mut order = Vec::new();
         for line in contents.split_inclusive('\n') {
@@ -629,49 +645,46 @@ fn valid_marker_atom(value: &str) -> bool {
         })
 }
 
-fn validate_existing_view(
-    destination: &Path,
+fn validate_existing_view_cap(
+    destination: &DirectoryCapability,
     binding: &ViewBinding,
 ) -> Result<ImmutableSourceView, TreeError> {
-    let mut tree_path = None;
-    for item in fs::read_dir(destination).map_err(io_error)? {
+    for item in destination.entries().map_err(cache_error)? {
         let item = item.map_err(io_error)?;
-        let path = item.path();
         let name = item.file_name();
-        let stat = fs::symlink_metadata(&path).map_err(io_error)?;
+        let name = name.to_str().ok_or(TreeError::NonCanonicalPath)?;
+        let stat = destination.entry_metadata(name).map_err(cache_error)?;
         if stat.file_type().is_symlink() {
-            return Err(invalid_marker(&path));
+            return Err(invalid_marker(&destination.path().join(name)));
         }
-        match name.to_str() {
-            Some("tree") if stat.is_dir() => tree_path = Some(path),
-            Some("source.toml") if stat.is_file() => {}
-            _ => return Err(invalid_marker(&path)),
+        match name {
+            "tree" if stat.is_dir() => {}
+            "tree" => return Err(invalid_marker(&destination.path().join(name))),
+            "source.toml" if stat.is_file() => {}
+            _ => return Err(invalid_marker(&destination.path().join(name))),
         }
     }
-    let tree = tree_path.ok_or_else(|| invalid_marker(destination))?;
-    let marker_path = destination.join("source.toml");
-    if fs::symlink_metadata(&marker_path)
-        .map_err(io_error)?
-        .file_type()
-        .is_symlink()
-    {
+    let tree = destination
+        .open_dir("tree")
+        .map_err(|_| invalid_marker(&destination.path().join("tree")))?;
+    let marker_path = destination.path().join("source.toml");
+    let marker_stat = destination
+        .entry_metadata("source.toml")
+        .map_err(cache_error)?;
+    if marker_stat.file_type().is_symlink() || marker_stat.len() > MAX_MARKER_BYTES {
         return Err(invalid_marker(&marker_path));
     }
-    let marker_stat = fs::symlink_metadata(&marker_path).map_err(io_error)?;
-    if marker_stat.len() > MAX_MARKER_BYTES {
-        return Err(invalid_marker(&marker_path));
-    }
-    let marker = SourceMarker::parse(&marker_path)?;
+    let marker_file = destination
+        .open_file_read("source.toml")
+        .map_err(cache_error)?;
+    let marker_contents =
+        read_bounded_cap_file_with_limit(marker_file, marker_stat.len(), MAX_MARKER_BYTES)?;
+    let marker = SourceMarker::parse(&marker_contents, &marker_path)?;
     if marker.binding != *binding {
         return Err(invalid_marker(&marker_path));
     }
-    let destination_dir =
-        Dir::open_ambient_dir(destination, ambient_authority()).map_err(io_error)?;
-    let directory = destination_dir
-        .open_dir_nofollow("tree")
-        .map_err(|_| invalid_marker(&tree))?;
     let mut builder = TreeBuilder::new();
-    collect_files(&tree, &directory, Path::new(""), 0, &mut builder)?;
+    collect_files(tree.path(), tree.as_dir(), Path::new(""), 0, &mut builder)?;
     let (entries, total_bytes) = builder.finish();
     let digest = tree_digest(&entries);
     if digest != marker.tree_digest || entries.len() != marker.entries {
@@ -694,8 +707,8 @@ fn validate_existing_view(
         })
         .collect();
     Ok(ImmutableSourceView {
-        path: tree,
-        directory: Arc::new(directory),
+        path: tree.path().to_owned(),
+        directory: Arc::new(tree.as_dir().try_clone().map_err(io_error)?),
         entry_facts: Arc::new(entry_facts),
         tree_digest: marker.tree_digest,
         entries: marker.entries,
@@ -778,24 +791,17 @@ fn open_tree_file(
 }
 
 fn read_bounded_cap_file(file: cap_std::fs::File, size: u64) -> Result<Vec<u8>, TreeError> {
-    if size > MAX_BLOB_BYTES {
-        return Err(TreeError::BlobLimit);
-    }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.take(MAX_BLOB_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if bytes.len() as u64 > MAX_BLOB_BYTES {
-        return Err(TreeError::BlobLimit);
-    }
-    Ok(bytes)
+    read_bounded_cap_file_with_limit(file, size, MAX_BLOB_BYTES)
 }
 
-fn read_bounded_file_with_limit(path: &Path, size: u64, limit: u64) -> Result<Vec<u8>, TreeError> {
+fn read_bounded_cap_file_with_limit(
+    file: cap_std::fs::File,
+    size: u64,
+    limit: u64,
+) -> Result<Vec<u8>, TreeError> {
     if size > limit {
         return Err(TreeError::BlobLimit);
     }
-    let file = File::open(path).map_err(io_error)?;
     let mut bytes = Vec::with_capacity(size as usize);
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -835,59 +841,6 @@ fn blob_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn remove_tree_bounded(path: &Path) -> Result<(), TreeError> {
-    fn visit(path: &Path, depth: usize, count: &mut usize) -> Result<(), TreeError> {
-        if depth > MAX_CLEANUP_DEPTH {
-            return Err(TreeError::EntryLimit);
-        }
-        *count = count.checked_add(1).ok_or(TreeError::EntryLimit)?;
-        if *count > MAX_CLEANUP_NODES {
-            return Err(TreeError::EntryLimit);
-        }
-        let stat = fs::symlink_metadata(path).map_err(io_error)?;
-        if stat.file_type().is_symlink() {
-            return Err(invalid_marker(path));
-        }
-        if stat.is_dir() {
-            for item in fs::read_dir(path).map_err(io_error)? {
-                visit(&item.map_err(io_error)?.path(), depth + 1, count)?;
-            }
-            fs::remove_dir(path).map_err(io_error)
-        } else {
-            fs::remove_file(path).map_err(io_error)
-        }
-    }
-    visit(path, 0, &mut 0)
-}
-
-fn sync_directories_bounded(root: &Path) -> Result<(), TreeError> {
-    fn sync(path: &Path, depth: usize, count: &mut usize) -> Result<(), TreeError> {
-        if depth > MAX_PATH_DEPTH {
-            return Err(TreeError::EntryLimit);
-        }
-        *count = count.checked_add(1).ok_or(TreeError::EntryLimit)?;
-        if *count > MAX_CLEANUP_NODES {
-            return Err(TreeError::EntryLimit);
-        }
-        let stat = fs::symlink_metadata(path).map_err(io_error)?;
-        if stat.file_type().is_symlink() || !stat.is_dir() {
-            return Err(invalid_marker(path));
-        }
-        for item in fs::read_dir(path).map_err(io_error)? {
-            let child = item.map_err(io_error)?.path();
-            let child_stat = fs::symlink_metadata(&child).map_err(io_error)?;
-            if child_stat.file_type().is_symlink() {
-                return Err(invalid_marker(&child));
-            }
-            if child_stat.is_dir() {
-                sync(&child, depth + 1, count)?;
-            }
-        }
-        sync_directory(path)
-    }
-    sync(root, 0, &mut 0)
-}
-
 pub(crate) fn sync_directory(path: &Path) -> Result<(), TreeError> {
     #[cfg(not(windows))]
     {
@@ -906,6 +859,32 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), TreeError> {
 fn io_error(error: io::Error) -> TreeError {
     TreeError::Io {
         reason: error.to_string(),
+    }
+}
+
+fn cache_error(error: cache_fs::CacheFsError) -> TreeError {
+    cache_error_at(error, Path::new(""))
+}
+
+fn cache_error_at(error: cache_fs::CacheFsError, path: &Path) -> TreeError {
+    match error {
+        cache_fs::CacheFsError::UnsafePath => TreeError::UnsafePath,
+        cache_fs::CacheFsError::NonCanonicalPath => TreeError::NonCanonicalPath,
+        cache_fs::CacheFsError::NotFound => TreeError::Io {
+            reason: "cache filesystem entry is missing".to_owned(),
+        },
+        cache_fs::CacheFsError::Symlink => TreeError::InvalidMarker {
+            path: path.to_owned(),
+        },
+        cache_fs::CacheFsError::Conflict => TreeError::PublicationConflict {
+            path: path.to_owned(),
+        },
+        cache_fs::CacheFsError::Limit => TreeError::EntryLimit,
+        cache_fs::CacheFsError::LockUnavailable => TreeError::LockUnavailable,
+        cache_fs::CacheFsError::UnsupportedRename => TreeError::Io {
+            reason: "atomic no-replace rename is unavailable on this platform".to_owned(),
+        },
+        cache_fs::CacheFsError::Io { reason } => TreeError::Io { reason },
     }
 }
 

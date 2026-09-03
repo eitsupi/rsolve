@@ -1,4 +1,5 @@
 use super::*;
+use crate::source_control::cache_fs::DirectoryCapability;
 use std::collections::HashSet;
 
 #[test]
@@ -263,4 +264,98 @@ fn process_publishers_converge_on_one_validated_view() {
     }
     assert!(destination.join("source.toml").is_file());
     assert!(!root.path().join(".process-converged.partial").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_cache_capability_survives_parent_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    let moved = root.path().join("parent-moved");
+    let outside = root.path().join("outside");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"do not touch").unwrap();
+
+    let capability = DirectoryCapability::open(&parent).unwrap();
+    fs::rename(&parent, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+
+    let staging = capability.create_dir("staging").unwrap();
+    let mut file = staging.create_file_new("payload").unwrap();
+    file.write_all(b"capability-bound").unwrap();
+    file.sync_all().unwrap();
+    capability
+        .remove_tree_bounded("staging", MAX_CLEANUP_DEPTH, MAX_CLEANUP_NODES)
+        .unwrap();
+
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"do not touch");
+    assert!(!outside.join("payload").exists());
+    assert!(!moved.join("staging").exists());
+    assert!(parent.is_symlink());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn capability_rename_does_not_replace_existing_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let capability = DirectoryCapability::open(root.path()).unwrap();
+    let mut source = capability.create_file_new("source").unwrap();
+    source.write_all(b"new").unwrap();
+    let mut destination = capability.create_file_new("destination").unwrap();
+    destination.write_all(b"old").unwrap();
+
+    assert!(
+        capability
+            .rename_noreplace("source", "destination")
+            .is_err()
+    );
+    assert_eq!(fs::read(root.path().join("destination")).unwrap(), b"old");
+    assert_eq!(fs::read(root.path().join("source")).unwrap(), b"new");
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_rejects_replaced_parent_without_touching_outside() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    let moved = root.path().join("parent-moved");
+    let outside = root.path().join("outside");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"do not touch").unwrap();
+    fs::rename(&parent, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+
+    let result = publish(
+        parent.join("view"),
+        [TreeEntry::regular("DESCRIPTION", b"Package: x\n".to_vec())],
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"do not touch");
+    assert!(!outside.join("view").exists());
+    assert!(!moved.join("view").exists());
+}
+
+#[test]
+fn concurrent_capability_root_creation_converges_after_create_race() {
+    use std::sync::{Arc, Barrier};
+
+    let root = tempfile::tempdir().unwrap();
+    let target = Arc::new(root.path().join("nested/cache"));
+    let barrier = Arc::new(Barrier::new(8));
+    let workers = (0..8)
+        .map(|_| {
+            let target = Arc::clone(&target);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                DirectoryCapability::open_or_create(&target).map(|_| ())
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+    assert!(target.is_dir());
 }
