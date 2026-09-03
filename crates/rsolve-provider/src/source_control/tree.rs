@@ -175,6 +175,7 @@ impl TreeEntry {
 pub struct ImmutableSourceView {
     path: PathBuf,
     directory: Arc<Dir>,
+    entry_facts: Arc<BTreeMap<String, ValidatedEntry>>,
     tree_digest: String,
     entries: usize,
     total_bytes: u64,
@@ -208,15 +209,91 @@ impl ImmutableSourceView {
         self.total_bytes
     }
 
-    /// Opens a path relative to the directory capability validated for this
-    /// view. Callers must apply any file-specific open policy to `options`.
-    pub(crate) fn open_with(
+    /// Reads a previously validated regular file through the retained tree
+    /// capability and verifies that its size, mode, and content are unchanged.
+    pub(crate) fn read_validated_file(
         &self,
         path: impl AsRef<Path>,
-        options: &CapOpenOptions,
-    ) -> io::Result<cap_std::fs::File> {
-        self.directory.open_with(path, options)
+        limit: u64,
+    ) -> Result<Vec<u8>, ValidatedFileError> {
+        let relative = path
+            .as_ref()
+            .to_str()
+            .ok_or(ValidatedFileError::NotValidated)?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let fact = self
+            .entry_facts
+            .get(&relative)
+            .ok_or(ValidatedFileError::Missing)?;
+        if fact.size > limit {
+            return Err(ValidatedFileError::TooLarge { limit });
+        }
+
+        let mut options = CapOpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        CapFsExtOpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+        let file = match self.directory.open_with(path, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ValidatedFileError::Missing);
+            }
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(ValidatedFileError::Symlink);
+            }
+            Err(error) => {
+                return Err(ValidatedFileError::Io {
+                    reason: error.to_string(),
+                });
+            }
+        };
+        let metadata = file.metadata().map_err(|error| ValidatedFileError::Io {
+            reason: error.to_string(),
+        })?;
+        if !metadata.is_file() {
+            return Err(ValidatedFileError::NotRegular);
+        }
+        if metadata.len() != fact.size || is_executable(&metadata) != fact.executable {
+            return Err(ValidatedFileError::Changed);
+        }
+        let mut bytes = Vec::with_capacity(fact.size as usize);
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| ValidatedFileError::Io {
+                reason: error.to_string(),
+            })?;
+        if bytes.len() as u64 != fact.size || blob_digest(&bytes) != fact.digest {
+            return Err(ValidatedFileError::Changed);
+        }
+        Ok(bytes)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedEntry {
+    digest: [u8; 32],
+    size: u64,
+    executable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub(crate) enum ValidatedFileError {
+    #[error("validated source-tree file is missing")]
+    Missing,
+    #[error("validated source-tree file is a symlink")]
+    Symlink,
+    #[error("validated source-tree file is not regular")]
+    NotRegular,
+    #[error("validated source-tree file exceeds the configured limit")]
+    TooLarge { limit: u64 },
+    #[error("source-tree file changed after validation")]
+    Changed,
+    #[error("source-tree file I/O failed: {reason}")]
+    Io { reason: String },
+    #[error("source-tree path was not validated")]
+    NotValidated,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -603,9 +680,23 @@ fn validate_existing_view(
     if total_bytes != marker.total_bytes {
         return Err(invalid_marker(&marker_path));
     }
+    let entry_facts = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                ValidatedEntry {
+                    digest: blob_digest(&entry.bytes),
+                    size: entry.bytes.len() as u64,
+                    executable: entry.executable,
+                },
+            )
+        })
+        .collect();
     Ok(ImmutableSourceView {
         path: tree,
         directory: Arc::new(directory),
+        entry_facts: Arc::new(entry_facts),
         tree_digest: marker.tree_digest,
         entries: marker.entries,
         total_bytes: marker.total_bytes,
@@ -738,6 +829,10 @@ fn tree_digest(entries: &[TreeEntry]) -> String {
         digest.update([u8::from(entry.executable)]);
     }
     hex(&digest.finalize())
+}
+
+fn blob_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 fn remove_tree_bounded(path: &Path) -> Result<(), TreeError> {

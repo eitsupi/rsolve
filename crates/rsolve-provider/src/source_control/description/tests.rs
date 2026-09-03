@@ -123,6 +123,39 @@ fn rejects_description_symlink() {
     ));
 }
 
+#[test]
+fn rejects_description_replaced_with_different_regular_content() {
+    let root = tempfile::tempdir().unwrap();
+    let source = view(root.path(), b"Package: demo\nVersion: 1.0\n");
+    let description = source.path().join("DESCRIPTION");
+    std::fs::remove_file(&description).unwrap();
+    std::fs::write(&description, b"Package: demo\nVersion: 2.0\n").unwrap();
+
+    let identity = identity("demo");
+    let expected = expected("demo", VersionConstraint::any());
+    assert!(matches!(
+        project(&source, &identity, &expected),
+        Err(DescriptionProjectionError::Changed { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn accepts_replacement_with_identical_hardlinked_content() {
+    let root = tempfile::tempdir().unwrap();
+    let contents = b"Package: demo\nVersion: 1.0\n";
+    let source = view(root.path(), contents);
+    let description = source.path().join("DESCRIPTION");
+    let replacement = root.path().join("identical-description");
+    std::fs::write(&replacement, contents).unwrap();
+    std::fs::remove_file(&description).unwrap();
+    std::fs::hard_link(&replacement, &description).unwrap();
+
+    let identity = identity("demo");
+    let expected = expected("demo", VersionConstraint::any());
+    assert!(project(&source, &identity, &expected).is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn keeps_reading_the_validated_directory_after_path_replacement() {

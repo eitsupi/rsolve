@@ -5,12 +5,8 @@
 //! release identity; Git URLs, revisions, and object storage remain outside
 //! this boundary.
 
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use cap_fs_ext::OpenOptionsExt as CapFsExtOpenOptionsExt;
-use cap_fs_ext::{FollowSymlinks, OpenOptions as CapOpenOptions, OpenOptionsFollowExt};
 use rsolve_core::{
     PackageName, PackageRelease, PackageReleaseError, PackageRequirement, RPackageVersion,
     ReleaseIdentity, ReleaseObservation,
@@ -18,6 +14,7 @@ use rsolve_core::{
 use thiserror::Error;
 
 use super::ImmutableSourceView;
+use super::tree::ValidatedFileError;
 use crate::package_description::{
     DcfDocument, DcfError, DescriptionError, parse_description_fields,
 };
@@ -56,6 +53,8 @@ pub enum DescriptionProjectionError {
     NotRegular { path: PathBuf },
     #[error("source-tree DESCRIPTION exceeds the {limit}-byte limit")]
     TooLarge { path: PathBuf, limit: u64 },
+    #[error("source-tree DESCRIPTION changed after validation")]
+    Changed { path: PathBuf },
     #[error("source-tree DESCRIPTION I/O failed at {path}: {reason}")]
     Io { path: PathBuf, reason: String },
     #[error("source-tree DESCRIPTION DCF is invalid: {0}")]
@@ -168,53 +167,33 @@ fn read_description(
     view: &ImmutableSourceView,
     display_path: &Path,
 ) -> Result<Vec<u8>, DescriptionProjectionError> {
-    let mut options = CapOpenOptions::new();
-    options.read(true);
-    options.follow(FollowSymlinks::No);
-    #[cfg(unix)]
-    CapFsExtOpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-    let file = match view.open_with("DESCRIPTION", &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(DescriptionProjectionError::Missing {
+    view.read_validated_file("DESCRIPTION", MAX_DESCRIPTION_BYTES)
+        .map_err(|error| match error {
+            ValidatedFileError::Missing => DescriptionProjectionError::Missing {
                 path: display_path.to_owned(),
-            });
-        }
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(DescriptionProjectionError::Symlink {
+            },
+            ValidatedFileError::Symlink => DescriptionProjectionError::Symlink {
                 path: display_path.to_owned(),
-            });
-        }
-        Err(error) => return Err(io_error(display_path, error)),
-    };
-    if !file
-        .metadata()
-        .map_err(|error| io_error(display_path, error))?
-        .is_file()
-    {
-        return Err(DescriptionProjectionError::NotRegular {
-            path: display_path.to_owned(),
-        });
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_DESCRIPTION_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error(display_path, error))?;
-    if bytes.len() as u64 > MAX_DESCRIPTION_BYTES {
-        return Err(DescriptionProjectionError::TooLarge {
-            path: display_path.to_owned(),
-            limit: MAX_DESCRIPTION_BYTES,
-        });
-    }
-    Ok(bytes)
-}
-
-fn io_error(path: &Path, error: io::Error) -> DescriptionProjectionError {
-    DescriptionProjectionError::Io {
-        path: path.to_owned(),
-        reason: error.to_string(),
-    }
+            },
+            ValidatedFileError::NotRegular => DescriptionProjectionError::NotRegular {
+                path: display_path.to_owned(),
+            },
+            ValidatedFileError::TooLarge { limit } => DescriptionProjectionError::TooLarge {
+                path: display_path.to_owned(),
+                limit,
+            },
+            ValidatedFileError::Changed => DescriptionProjectionError::Changed {
+                path: display_path.to_owned(),
+            },
+            ValidatedFileError::Io { reason } => DescriptionProjectionError::Io {
+                path: display_path.to_owned(),
+                reason,
+            },
+            ValidatedFileError::NotValidated => DescriptionProjectionError::Io {
+                path: display_path.to_owned(),
+                reason: error.to_string(),
+            },
+        })
 }
 
 #[cfg(test)]
