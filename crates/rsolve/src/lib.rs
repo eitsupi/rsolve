@@ -19,11 +19,12 @@ mod repository_resolution;
 pub mod wire;
 
 pub use artifact_acquisition::{
-    ArtifactAcquisitionError, ArtifactAcquisitionMode, ArtifactFetchError, ArtifactFetchResponse,
-    ArtifactFetcher, UreqArtifactFetcher, acquire_selected_artifact,
+    ArtifactAcquisitionCapability, ArtifactAcquisitionError, ArtifactAcquisitionMode,
+    ArtifactFetchError, ArtifactFetchResponse, ArtifactFetcher, UreqArtifactFetcher,
+    acquire_selected_artifact,
 };
 pub use repository_preparation::{
-    RepositoryPreparationError, prepare_r_universe_project_repository,
+    ArtifactPreflightFailure, RepositoryPreparationError, prepare_r_universe_project_repository,
     prepare_r_universe_project_repository_with_fetcher,
 };
 

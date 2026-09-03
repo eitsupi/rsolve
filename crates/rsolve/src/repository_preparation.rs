@@ -15,14 +15,18 @@ use rsolve_repository::{
 use thiserror::Error;
 
 use crate::artifact_acquisition::{
-    ArtifactAcquisitionError, ArtifactAcquisitionMode, ArtifactFetcher, UreqArtifactFetcher,
-    acquire_selected_artifact,
+    ArtifactAcquisitionCapability, ArtifactAcquisitionError, ArtifactAcquisitionMode,
+    ArtifactFetcher, UreqArtifactFetcher, acquire_planned_artifact, preflight_selected_artifact,
 };
 use crate::manifest::ComposedEnvironment;
 
 /// A failure while preparing a project-local source repository.
 #[derive(Debug, Error)]
 pub enum RepositoryPreparationError {
+    #[error("artifact acquisition preflight failed for selected packages")]
+    Preflight {
+        failures: Vec<ArtifactPreflightFailure>,
+    },
     #[error("artifact acquisition failed for {package}: {source}")]
     Acquisition {
         package: String,
@@ -34,6 +38,63 @@ pub enum RepositoryPreparationError {
         #[source]
         source: MaterializationError,
     },
+}
+
+/// Context for one selected package that cannot be acquired in the requested
+/// preparation mode. Keeping the original typed acquisition error allows
+/// callers to inspect the precise failure while the surrounding fields make a
+/// complete graph failure report actionable.
+#[derive(Debug, thiserror::Error)]
+#[error("{package} release {version} source {source:?} lacks {capability:?} capability: {cause}")]
+pub struct ArtifactPreflightFailure {
+    package: rsolve_core::PackageName,
+    release: rsolve_core::ReleaseIdentity,
+    version: rsolve_core::RPackageVersion,
+    source: rsolve_core::Provenance,
+    capability: ArtifactAcquisitionCapability,
+    #[source]
+    cause: ArtifactAcquisitionError,
+}
+
+impl ArtifactPreflightFailure {
+    fn new(
+        selected: &rsolve_core::ResolvedPackage,
+        capability: ArtifactAcquisitionCapability,
+        cause: ArtifactAcquisitionError,
+    ) -> Self {
+        Self {
+            package: selected.name().clone(),
+            release: selected.identity().clone(),
+            version: selected.version().clone(),
+            source: selected.identity().provenance().clone(),
+            capability,
+            cause,
+        }
+    }
+
+    pub fn package(&self) -> &rsolve_core::PackageName {
+        &self.package
+    }
+
+    pub fn release(&self) -> &rsolve_core::ReleaseIdentity {
+        &self.release
+    }
+
+    pub fn version(&self) -> &rsolve_core::RPackageVersion {
+        &self.version
+    }
+
+    pub fn source(&self) -> &rsolve_core::Provenance {
+        &self.source
+    }
+
+    pub fn capability(&self) -> ArtifactAcquisitionCapability {
+        self.capability
+    }
+
+    pub fn cause(&self) -> &ArtifactAcquisitionError {
+        &self.cause
+    }
 }
 
 /// Acquire all selected package artifacts and publish them as one repository.
@@ -62,9 +123,9 @@ pub fn prepare_r_universe_project_repository(
 /// Acquire all selected package artifacts through an injected transport and
 /// publish them as one repository.
 ///
-/// Every selected package must acquire successfully before materialization is
-/// started. In particular, packages without a visible R-universe source are
-/// reported as an acquisition failure instead of being silently omitted.
+/// Every selected package is preflighted before any artifact fetch or
+/// materialization starts. In particular, packages without a visible
+/// R-universe source are reported instead of being silently omitted.
 pub fn prepare_r_universe_project_repository_with_fetcher<F: ArtifactFetcher>(
     project_root: impl AsRef<Path>,
     cache_root: impl AsRef<Path>,
@@ -75,9 +136,25 @@ pub fn prepare_r_universe_project_repository_with_fetcher<F: ArtifactFetcher>(
 ) -> Result<MaterializationState, RepositoryPreparationError> {
     let project_root = project_root.as_ref();
     let cache_root = cache_root.as_ref();
-    let mut artifacts = Vec::with_capacity(resolution.packages().len());
+    let capability = match mode {
+        ArtifactAcquisitionMode::Online => ArtifactAcquisitionCapability::OnlineFetch,
+        ArtifactAcquisitionMode::Offline => ArtifactAcquisitionCapability::OfflineCache,
+    };
+    let mut plans = Vec::with_capacity(resolution.packages().len());
+    let mut failures = Vec::new();
     for selected in resolution.packages() {
-        let artifact = acquire_selected_artifact(cache_root, selected, composed, mode, fetcher)
+        match preflight_selected_artifact(cache_root, selected, composed, mode) {
+            Ok(plan) => plans.push((selected, plan)),
+            Err(cause) => failures.push(ArtifactPreflightFailure::new(selected, capability, cause)),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(RepositoryPreparationError::Preflight { failures });
+    }
+
+    let mut artifacts = Vec::with_capacity(plans.len());
+    for (selected, plan) in plans {
+        let artifact = acquire_planned_artifact(cache_root, selected, plan, mode, fetcher)
             .map_err(|source| RepositoryPreparationError::Acquisition {
                 package: selected.name().to_string(),
                 source,

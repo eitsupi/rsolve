@@ -16,6 +16,7 @@ use rsolve_core::{
     ReleaseAggregation, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId,
     Resolution, ResolutionTarget, Sha256Digest, SolverKey, SourceArtifact, VersionConstraint,
 };
+use rsolve_repository::{ArtifactValidationExpectation, commit_source_artifact_with_expectation};
 use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
 
@@ -284,6 +285,118 @@ fn prepares_nested_project_repository_and_reuses_online_artifacts_offline() {
 }
 
 #[test]
+fn offline_preflight_requires_every_selected_artifact_cache_hit() {
+    let repository = repository();
+    let first_bytes = archive("alpha", "1.0.0");
+    let second_bytes = archive("beta", "1.0.0");
+    let first_locator = "https://download.example/alpha.tar.gz";
+    let second_locator = "https://download.example/beta.tar.gz";
+    let first = selected(&repository, "alpha", first_locator, &first_bytes);
+    let second = selected(&repository, "beta", second_locator, &second_bytes);
+    let resolution = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
+        vec![first.clone(), second],
+    );
+    let fetcher = FixtureFetcher {
+        archives: BTreeMap::from([(first_locator.to_owned(), first_bytes)]),
+        calls: Cell::new(0),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let composed = composed(&repository);
+    let single = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
+        vec![first],
+    );
+    prepare_r_universe_project_repository_with_fetcher(
+        root.path().join("seed-project"),
+        &cache,
+        &single,
+        &composed,
+        ArtifactAcquisitionMode::Online,
+        &fetcher,
+    )
+    .unwrap();
+    assert_eq!(fetcher.calls.get(), 1);
+
+    let error = prepare_r_universe_project_repository_with_fetcher(
+        root.path().join("offline-project"),
+        &cache,
+        &resolution,
+        &composed,
+        ArtifactAcquisitionMode::Offline,
+        &fetcher,
+    )
+    .unwrap_err();
+    let RepositoryPreparationError::Preflight { failures } = error else {
+        panic!("expected offline preflight failure");
+    };
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].package().as_str(), "beta");
+    assert!(matches!(
+        failures[0].cause(),
+        ArtifactAcquisitionError::OfflineMiss { package } if package == "beta"
+    ));
+    assert_eq!(fetcher.calls.get(), 1);
+    assert!(
+        !root
+            .path()
+            .join("offline-project/.rsolve/repository")
+            .exists()
+    );
+}
+
+#[test]
+fn online_preflight_uses_verified_cache_before_validating_locator() {
+    let repository = repository();
+    let bytes = archive("alpha", "1.0.0");
+    let selected = selected(
+        &repository,
+        "alpha",
+        "ftp://offline.example/alpha.tar.gz",
+        &bytes,
+    );
+    let source = match &selected.distributions()[0].artifacts[0] {
+        Artifact::Source(source) => source.clone(),
+    };
+    let Provenance::GitCommit {
+        repository: git_repository,
+        commit,
+        subdirectory,
+    } = selected.release().identity().provenance()
+    else {
+        panic!("fixture must use Git provenance");
+    };
+    let expectation =
+        ArtifactValidationExpectation::new(selected.name().clone(), selected.version().clone())
+            .with_git_provenance(git_repository.clone(), commit.clone(), subdirectory.clone());
+    let resolution = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
+        vec![selected],
+    );
+    let fetcher = FixtureFetcher {
+        archives: BTreeMap::new(),
+        calls: Cell::new(0),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    commit_source_artifact_with_expectation(&cache, &source, &expectation, Cursor::new(bytes))
+        .unwrap();
+
+    let state = prepare_r_universe_project_repository_with_fetcher(
+        root.path().join("project"),
+        &cache,
+        &resolution,
+        &composed(&repository),
+        ArtifactAcquisitionMode::Online,
+        &fetcher,
+    )
+    .unwrap();
+    assert_eq!(state.records().len(), 1);
+    assert_eq!(fetcher.calls.get(), 0);
+}
+
+#[test]
 fn acquisition_failure_keeps_package_context_and_does_not_materialize_partial_results() {
     let repository = repository();
     let bytes = archive("alpha", "1.0.0");
@@ -351,13 +464,121 @@ fn selected_package_without_r_universe_artifact_is_not_silently_omitted() {
     .unwrap_err();
     assert!(matches!(
         error,
-        RepositoryPreparationError::Acquisition {
-            package,
-            source: ArtifactAcquisitionError::NoRUniverseArtifact { .. },
-        } if package == "zeta"
+        RepositoryPreparationError::Preflight { ref failures }
+            if failures.len() == 1
+                && failures[0].package().as_str() == "zeta"
+                && matches!(
+                    failures[0].cause(),
+                    ArtifactAcquisitionError::NoRUniverseArtifact { .. }
+                )
     ));
-    assert_eq!(fetcher.calls.get(), 1);
+    assert_eq!(fetcher.calls.get(), 0);
     assert!(!project.join(".rsolve/repository").exists());
+}
+
+#[test]
+fn preflight_reports_all_unsupported_packages_before_fetching() {
+    let repository = repository();
+    let alpha_bytes = archive("alpha", "1.0.0");
+    let zeta_bytes = archive("zeta", "1.0.0");
+    let resolution = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
+        vec![
+            selected_without_source(
+                &repository,
+                "alpha",
+                "https://download.example/alpha.tar.gz",
+                &alpha_bytes,
+            ),
+            selected_without_source(
+                &repository,
+                "zeta",
+                "https://download.example/zeta.tar.gz",
+                &zeta_bytes,
+            ),
+        ],
+    );
+    let fetcher = FixtureFetcher {
+        archives: BTreeMap::new(),
+        calls: Cell::new(0),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let error = prepare_r_universe_project_repository_with_fetcher(
+        root.path().join("project"),
+        root.path().join("cache"),
+        &resolution,
+        &composed(&repository),
+        ArtifactAcquisitionMode::Online,
+        &fetcher,
+    )
+    .unwrap_err();
+    let RepositoryPreparationError::Preflight { failures } = error else {
+        panic!("expected complete preflight failure report");
+    };
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.package().as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "zeta"]
+    );
+    assert!(failures.iter().all(|failure| matches!(
+        failure.cause(),
+        ArtifactAcquisitionError::NoRUniverseArtifact { .. }
+    )));
+    assert_eq!(fetcher.calls.get(), 0);
+}
+
+#[test]
+fn direct_git_only_selection_is_rejected_before_online_fetch() {
+    let repository = repository();
+    let archive_bytes = archive("alpha", "1.0.0");
+    let selected = selected_without_source(
+        &repository,
+        "alpha",
+        "https://download.example/alpha.tar.gz",
+        &archive_bytes,
+    );
+    let selected = rsolve_core::ResolvedPackage::new(
+        selected.subject().clone(),
+        selected.release().clone(),
+        selected.effective_dependencies().to_vec(),
+        Vec::new(),
+    );
+    let resolution = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
+        vec![selected],
+    );
+    let fetcher = FixtureFetcher {
+        archives: BTreeMap::new(),
+        calls: Cell::new(0),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let error = prepare_r_universe_project_repository_with_fetcher(
+        root.path().join("project"),
+        root.path().join("cache"),
+        &resolution,
+        &composed(&repository),
+        ArtifactAcquisitionMode::Online,
+        &fetcher,
+    )
+    .unwrap_err();
+    let RepositoryPreparationError::Preflight { failures } = error else {
+        panic!("expected direct Git preflight failure");
+    };
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].package().as_str(), "alpha");
+    assert_eq!(failures[0].version().to_string(), "1.0.0");
+    assert!(matches!(failures[0].source(), Provenance::GitCommit { .. }));
+    assert_eq!(
+        failures[0].capability(),
+        rsolve::ArtifactAcquisitionCapability::OnlineFetch
+    );
+    assert!(matches!(
+        failures[0].cause(),
+        ArtifactAcquisitionError::NoRUniverseArtifact { .. }
+    ));
+    assert_eq!(fetcher.calls.get(), 0);
 }
 
 #[test]

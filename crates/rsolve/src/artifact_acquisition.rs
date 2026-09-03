@@ -123,6 +123,23 @@ pub enum ArtifactAcquisitionError {
     Cache(#[from] CacheError),
 }
 
+/// Which acquisition capability a repository-preparation preflight checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactAcquisitionCapability {
+    /// The descriptor can be fetched and validated by the online transport.
+    OnlineFetch,
+    /// The descriptor resolves to a verified local artifact cache entry.
+    OfflineCache,
+}
+
+/// An immutable plan produced before acquisition starts.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedArtifactPlan {
+    artifact: SourceArtifact,
+    expectation: ArtifactValidationExpectation,
+    cached: Option<CachedArtifact>,
+}
+
 impl ArtifactAcquisitionError {
     fn package_name(package: &rsolve_core::PackageName) -> String {
         package.to_string()
@@ -137,6 +154,16 @@ pub fn acquire_selected_artifact<F: ArtifactFetcher>(
     mode: ArtifactAcquisitionMode,
     fetcher: &F,
 ) -> Result<MaterializationArtifact, ArtifactAcquisitionError> {
+    let plan = plan_selected_artifact(selected, composed)?;
+    acquire_planned_artifact(cache_root, selected, plan, mode, fetcher)
+}
+
+/// Selects the source descriptor according to visible repository priority and
+/// builds the identity expectation used by cache validation.
+pub(crate) fn plan_selected_artifact(
+    selected: &ResolvedPackage,
+    composed: &crate::manifest::ComposedEnvironment,
+) -> Result<SelectedArtifactPlan, ArtifactAcquisitionError> {
     let package = selected.name();
     let mut artifact = None;
     for repository_id in selected.visible_repository_ids() {
@@ -176,29 +203,75 @@ pub fn acquire_selected_artifact<F: ArtifactFetcher>(
         package: ArtifactAcquisitionError::package_name(package),
     })?;
     let expectation = expectation_for_release(selected.release())?;
-    let cached = match probe_artifact(cache_root.as_ref(), &artifact, &expectation)? {
-        Some(cached) => cached,
-        None if mode == ArtifactAcquisitionMode::Offline => {
+    Ok(SelectedArtifactPlan {
+        artifact,
+        expectation,
+        cached: None,
+    })
+}
+
+/// Checks descriptor and mode-specific acquisition capability without
+/// invoking a network fetch.
+pub(crate) fn preflight_selected_artifact(
+    cache_root: &std::path::Path,
+    selected: &ResolvedPackage,
+    composed: &crate::manifest::ComposedEnvironment,
+    mode: ArtifactAcquisitionMode,
+) -> Result<SelectedArtifactPlan, ArtifactAcquisitionError> {
+    let mut plan = plan_selected_artifact(selected, composed)?;
+    plan.cached = probe_artifact(cache_root, &plan.artifact, &plan.expectation)?;
+    if plan.cached.is_some() {
+        return Ok(plan);
+    }
+    match mode {
+        ArtifactAcquisitionMode::Online => validate_http_locator(&plan.artifact.locator)?,
+        ArtifactAcquisitionMode::Offline => {
             return Err(ArtifactAcquisitionError::OfflineMiss {
-                package: package.to_string(),
+                package: selected.name().to_string(),
             });
         }
-        None => {
-            validate_http_locator(&artifact.locator)?;
-            let response = fetcher.fetch(artifact.locator.as_str())?;
-            if response.status != 200 {
-                return Err(ArtifactAcquisitionError::HttpStatus {
-                    locator: artifact.locator.to_string(),
-                    status: response.status,
+    }
+    Ok(plan)
+}
+
+/// Executes a previously preflighted plan. Keeping this separate ensures a
+/// preparation caller can preflight the complete graph before any fetch.
+pub(crate) fn acquire_planned_artifact<F: ArtifactFetcher>(
+    cache_root: impl AsRef<std::path::Path>,
+    selected: &ResolvedPackage,
+    plan: SelectedArtifactPlan,
+    mode: ArtifactAcquisitionMode,
+    fetcher: &F,
+) -> Result<MaterializationArtifact, ArtifactAcquisitionError> {
+    let package = selected.name();
+    let artifact = plan.artifact;
+    let expectation = plan.expectation;
+    let cached = match plan.cached {
+        Some(cached) => cached,
+        None => match probe_artifact(cache_root.as_ref(), &artifact, &expectation)? {
+            Some(cached) => cached,
+            None if mode == ArtifactAcquisitionMode::Offline => {
+                return Err(ArtifactAcquisitionError::OfflineMiss {
+                    package: package.to_string(),
                 });
             }
-            commit_source_artifact_with_expectation(
-                cache_root,
-                &artifact,
-                &expectation,
-                response.reader,
-            )?
-        }
+            None => {
+                validate_http_locator(&artifact.locator)?;
+                let response = fetcher.fetch(artifact.locator.as_str())?;
+                if response.status != 200 {
+                    return Err(ArtifactAcquisitionError::HttpStatus {
+                        locator: artifact.locator.to_string(),
+                        status: response.status,
+                    });
+                }
+                commit_source_artifact_with_expectation(
+                    cache_root,
+                    &artifact,
+                    &expectation,
+                    response.reader,
+                )?
+            }
+        },
     };
     Ok(materialization_artifact(selected.release(), cached))
 }
