@@ -293,6 +293,11 @@ fn resolve_composed_with_factory(
             &mut source,
         )
         .map_err(|error| RepositoryResolutionError::Cran(CranResolutionError::Refresh(error)))?;
+        // A provider can reveal new cross-provider dependencies during a
+        // later fixed-point iteration.  Validate the complete plan before
+        // preparing any provider for this iteration, so multiple CRAN
+        // entries can never degrade into silently selecting the first one.
+        validate_cran_demand_count(&composed.repositories, &plan.entry_demands)?;
         let mut prepared = false;
 
         if let Some(index) = cran_index {
@@ -1966,6 +1971,28 @@ mod tests {
         let demands = BTreeMap::from([(0, BTreeSet::from([package("dependency")]))]);
         assert!(matches!(
             validate_cran_demand_count(&repositories, &demands),
+            Err(RepositoryResolutionError::Composition(
+                ManifestError::InvalidRegistry { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn fixed_point_cran_demand_is_validated_when_later_plan_reveals_it() {
+        let repositories = vec![
+            repository("cran-one", RegistrySpec::Cran, None),
+            repository("cran-two", RegistrySpec::Cran, None),
+            repository("universe", RegistrySpec::RUniverse, None),
+        ];
+        // The first iteration only needs the R-universe candidate.  A
+        // transitive dependency discovered from that candidate later adds a
+        // CRAN demand; it must not cause the coordinator to pick cran-one.
+        let initial_plan = BTreeMap::from([(2, BTreeSet::from([package("directdep")]))]);
+        assert!(validate_cran_demand_count(&repositories, &initial_plan).is_ok());
+
+        let later_plan = BTreeMap::from([(0, BTreeSet::from([package("transitive")]))]);
+        assert!(matches!(
+            validate_cran_demand_count(&repositories, &later_plan),
             Err(RepositoryResolutionError::Composition(
                 ManifestError::InvalidRegistry { .. }
             ))
