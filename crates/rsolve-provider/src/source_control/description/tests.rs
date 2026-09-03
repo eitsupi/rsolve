@@ -123,6 +123,49 @@ fn rejects_description_symlink() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn keeps_reading_the_validated_directory_after_path_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let source = view(root.path(), b"Package: demo\nVersion: 1.0\n");
+    let view_path = root.path().join("view");
+    std::fs::rename(&view_path, root.path().join("original")).unwrap();
+    let _replacement = view(root.path(), b"Package: replacement\nVersion: 9.0\n");
+
+    let identity = identity("demo");
+    let expected = expected("demo", VersionConstraint::any());
+    let release = project(&source, &identity, &expected).unwrap();
+    assert_eq!(release.identity(), &identity);
+    assert_eq!(release.version(), &RPackageVersion::parse("1.0").unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_description_fifo_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = view(root.path(), b"Package: demo\nVersion: 1.0\n");
+    let description = source.path().join("DESCRIPTION");
+    std::fs::remove_file(&description).unwrap();
+    let path = CString::new(description.as_os_str().as_bytes()).unwrap();
+    let result = unsafe { libc::mkfifo(path.as_ptr(), 0o644) };
+    assert_eq!(
+        result,
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let identity = identity("demo");
+    let expected = expected("demo", VersionConstraint::any());
+    assert!(matches!(
+        project(&source, &identity, &expected),
+        Err(DescriptionProjectionError::NotRegular { .. })
+    ));
+}
+
 #[test]
 fn rejects_multiple_records_and_duplicate_fields() {
     let root = tempfile::tempdir().unwrap();

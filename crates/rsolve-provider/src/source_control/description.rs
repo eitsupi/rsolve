@@ -8,12 +8,9 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use cap_std::ambient_authority;
 #[cfg(unix)]
-use cap_std::fs::OpenOptionsExt as CapOpenOptionsExt;
-#[cfg(windows)]
-use cap_std::fs::OpenOptionsExt as CapWindowsOpenOptionsExt;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_fs_ext::OpenOptionsExt as CapFsExtOpenOptionsExt;
+use cap_fs_ext::{FollowSymlinks, OpenOptions as CapOpenOptions, OpenOptionsFollowExt};
 use rsolve_core::{
     PackageName, PackageRelease, PackageReleaseError, PackageRequirement, RPackageVersion,
     ReleaseIdentity, ReleaseObservation,
@@ -107,7 +104,7 @@ pub fn project_description(
     }
 
     let path = view.path().join("DESCRIPTION");
-    let bytes = read_description(view.path(), &path)?;
+    let bytes = read_description(view, &path)?;
     let document = DcfDocument::parse(&bytes)?;
     let record = match document.records() {
         [record] => record,
@@ -168,18 +165,15 @@ fn map_record_error(error: DescriptionError) -> DescriptionProjectionError {
 }
 
 fn read_description(
-    directory_path: &Path,
+    view: &ImmutableSourceView,
     display_path: &Path,
 ) -> Result<Vec<u8>, DescriptionProjectionError> {
-    let directory = Dir::open_ambient_dir(directory_path, ambient_authority())
-        .map_err(|error| io_error(display_path, error))?;
-    let mut options = OpenOptions::new();
+    let mut options = CapOpenOptions::new();
     options.read(true);
+    options.follow(FollowSymlinks::No);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    #[cfg(windows)]
-    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = match directory.open_with("DESCRIPTION", &options) {
+    CapFsExtOpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = match view.open_with("DESCRIPTION", &options) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(DescriptionProjectionError::Missing {

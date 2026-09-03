@@ -4,7 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsExt as CapFsExtOpenOptionsExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -165,13 +171,25 @@ impl TreeEntry {
 
 /// An immutable source-view handle. It is a Git-independent tree path, not
 /// an installable R source archive.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ImmutableSourceView {
     path: PathBuf,
+    directory: Arc<Dir>,
     tree_digest: String,
     entries: usize,
     total_bytes: u64,
 }
+
+impl PartialEq for ImmutableSourceView {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.tree_digest == other.tree_digest
+            && self.entries == other.entries
+            && self.total_bytes == other.total_bytes
+    }
+}
+
+impl Eq for ImmutableSourceView {}
 
 impl ImmutableSourceView {
     pub fn path(&self) -> &Path {
@@ -188,6 +206,16 @@ impl ImmutableSourceView {
 
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    /// Opens a path relative to the directory capability validated for this
+    /// view. Callers must apply any file-specific open policy to `options`.
+    pub(crate) fn open_with(
+        &self,
+        path: impl AsRef<Path>,
+        options: &CapOpenOptions,
+    ) -> io::Result<cap_std::fs::File> {
+        self.directory.open_with(path, options)
     }
 }
 
@@ -560,8 +588,13 @@ fn validate_existing_view(
     if marker.binding != *binding {
         return Err(invalid_marker(&marker_path));
     }
+    let destination_dir =
+        Dir::open_ambient_dir(destination, ambient_authority()).map_err(io_error)?;
+    let directory = destination_dir
+        .open_dir_nofollow("tree")
+        .map_err(|_| invalid_marker(&tree))?;
     let mut builder = TreeBuilder::new();
-    collect_files(&tree, &tree, 0, &mut builder)?;
+    collect_files(&tree, &directory, Path::new(""), 0, &mut builder)?;
     let (entries, total_bytes) = builder.finish();
     let digest = tree_digest(&entries);
     if digest != marker.tree_digest || entries.len() != marker.entries {
@@ -572,6 +605,7 @@ fn validate_existing_view(
     }
     Ok(ImmutableSourceView {
         path: tree,
+        directory: Arc::new(directory),
         tree_digest: marker.tree_digest,
         entries: marker.entries,
         total_bytes: marker.total_bytes,
@@ -580,7 +614,8 @@ fn validate_existing_view(
 
 fn collect_files(
     root: &Path,
-    current: &Path,
+    current: &Dir,
+    relative_dir: &Path,
     depth: usize,
     builder: &mut TreeBuilder,
 ) -> Result<(), TreeError> {
@@ -588,23 +623,32 @@ fn collect_files(
         return Err(TreeError::EntryLimit);
     }
     let mut saw_entry = false;
-    for item in fs::read_dir(current).map_err(io_error)? {
+    for item in current.entries().map_err(io_error)? {
         let item = item.map_err(io_error)?;
         saw_entry = true;
-        let path = item.path();
-        let stat = fs::symlink_metadata(&path).map_err(io_error)?;
-        if stat.file_type().is_symlink() {
+        let name = item.file_name();
+        let name = name.to_str().ok_or(TreeError::NonCanonicalPath)?;
+        let relative_path = relative_dir.join(name);
+        let path = root.join(&relative_path);
+        let file_type = item.file_type().map_err(io_error)?;
+        if file_type.is_symlink() {
             return Err(invalid_marker(&path));
         }
-        if stat.is_dir() {
-            collect_files(root, &path, depth + 1, builder)?;
-        } else if stat.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_| invalid_marker(&path))?
+        if file_type.is_dir() {
+            let child = current
+                .open_dir_nofollow(name)
+                .map_err(|_| invalid_marker(&path))?;
+            collect_files(root, &child, &relative_path, depth + 1, builder)?;
+        } else if file_type.is_file() {
+            let relative = relative_path
                 .to_str()
                 .ok_or(TreeError::NonCanonicalPath)?
                 .replace(std::path::MAIN_SEPARATOR, "/");
+            let file = open_tree_file(current, name, &path)?;
+            let stat = file.metadata().map_err(io_error)?;
+            if !stat.is_file() {
+                return Err(invalid_marker(&path));
+            }
             builder.check_path(&relative)?;
             let executable = is_executable(&stat);
             if stat.len() > MAX_BLOB_BYTES {
@@ -613,20 +657,47 @@ fn collect_files(
             if stat.len() > builder.remaining_bytes() {
                 return Err(TreeError::TotalLimit);
             }
-            let bytes = read_bounded_file(&path, stat.len())?;
+            let bytes = read_bounded_cap_file(file, stat.len())?;
             builder.add(TreeEntry::regular(relative, bytes).executable(executable))?;
         } else {
             return Err(invalid_marker(&path));
         }
     }
-    if current != root && !saw_entry {
-        return Err(invalid_marker(current));
+    if relative_dir != Path::new("") && !saw_entry {
+        return Err(invalid_marker(&root.join(relative_dir)));
     }
     Ok(())
 }
 
-fn read_bounded_file(path: &Path, size: u64) -> Result<Vec<u8>, TreeError> {
-    read_bounded_file_with_limit(path, size, MAX_BLOB_BYTES)
+fn open_tree_file(
+    directory: &Dir,
+    name: &str,
+    path: &Path,
+) -> Result<cap_std::fs::File, TreeError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    CapFsExtOpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = directory.open_with(name, &options).map_err(io_error)?;
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err(invalid_marker(path));
+    }
+    Ok(file)
+}
+
+fn read_bounded_cap_file(file: cap_std::fs::File, size: u64) -> Result<Vec<u8>, TreeError> {
+    if size > MAX_BLOB_BYTES {
+        return Err(TreeError::BlobLimit);
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_BLOB_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > MAX_BLOB_BYTES {
+        return Err(TreeError::BlobLimit);
+    }
+    Ok(bytes)
 }
 
 fn read_bounded_file_with_limit(path: &Path, size: u64, limit: u64) -> Result<Vec<u8>, TreeError> {
@@ -645,13 +716,13 @@ fn read_bounded_file_with_limit(path: &Path, size: u64, limit: u64) -> Result<Ve
 }
 
 #[cfg(unix)]
-fn is_executable(stat: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
+fn is_executable(stat: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::PermissionsExt;
     stat.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-fn is_executable(_stat: &std::fs::Metadata) -> bool {
+fn is_executable(_stat: &cap_std::fs::Metadata) -> bool {
     false
 }
 
