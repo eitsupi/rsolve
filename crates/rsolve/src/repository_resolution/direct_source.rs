@@ -137,6 +137,24 @@ impl DirectGitCandidateLoader {
     }
 }
 
+#[cfg(test)]
+pub(super) fn prepared_for_test(
+    request: ResolutionRequest,
+    releases: Vec<rsolve_core::PackageRelease>,
+) -> PreparedDirectGit {
+    let candidates = releases
+        .into_iter()
+        .map(|release| {
+            PreparedCandidate::new(release, NonRepositoryExposure::ExactOnly, Vec::new())
+                .expect("valid direct Git fixture candidate")
+        })
+        .collect();
+    PreparedDirectGit {
+        request,
+        loader: DirectGitCandidateLoader { candidates },
+    }
+}
+
 impl CandidateLoader for DirectGitCandidateLoader {
     fn releases(&self, subject: &SolverKey) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
         Ok(self

@@ -204,6 +204,35 @@ fn resolve_composed_with_factory(
         .map_err(RepositoryResolutionError::Composition)?;
     let prepared_direct = direct_source::prepare(&composed, metadata_cache.root(), offline)
         .map_err(RepositoryResolutionError::DirectGit)?;
+    let factories = ResolutionFactories {
+        provider_factory,
+        cran_factory,
+    };
+    resolve_composed_with_prepared_direct(
+        composed,
+        metadata_cache,
+        offline,
+        refresh_metadata,
+        progress,
+        factories,
+        prepared_direct,
+    )
+}
+
+struct ResolutionFactories<'a> {
+    provider_factory: &'a dyn RUniverseProviderFactory,
+    cran_factory: &'a dyn CranProviderFactory,
+}
+
+fn resolve_composed_with_prepared_direct(
+    composed: ComposedEnvironment,
+    metadata_cache: &crate::metadata_cache::MetadataCache,
+    offline: bool,
+    refresh_metadata: bool,
+    progress: Option<ProgressCallback>,
+    factories: ResolutionFactories<'_>,
+    prepared_direct: direct_source::PreparedDirectGit,
+) -> Result<RepositoryResolutionOutcome, RepositoryResolutionError> {
     let request = prepared_direct.request;
     let direct_loader = prepared_direct.loader;
     let direct_releases = direct_loader
@@ -260,7 +289,7 @@ fn resolve_composed_with_factory(
             cran_roots.push(root_requirement(package)?);
         }
         if !cran_roots.is_empty() {
-            let prepared = cran_factory.prepare(
+            let prepared = factories.cran_factory.prepare(
                 &composed.repositories[index],
                 &cran_roots,
                 &initial_optional,
@@ -332,7 +361,7 @@ fn resolve_composed_with_factory(
                 // Rebuild the CRAN immutable view when a new cross-provider
                 // demand appears. Forced refresh is intentionally limited to
                 // the first preparation in this operation.
-                let cran_prepared = cran_factory.prepare(
+                let cran_prepared = factories.cran_factory.prepare(
                     &composed.repositories[index],
                     &cran_roots,
                     &cran_optional_demands(&composed, &plan, index),
@@ -376,7 +405,8 @@ fn resolve_composed_with_factory(
             let store = metadata_cache
                 .open_store(registry.clone())
                 .map_err(RepositoryResolutionError::Cache)?;
-            let provider = provider_factory
+            let provider = factories
+                .provider_factory
                 .create(&endpoint, registry.clone())
                 .map_err(RepositoryResolutionError::RUniverse)?;
             let loader = if offline {
@@ -954,9 +984,10 @@ mod tests {
     use super::*;
     use crate::manifest::{ComposedRootIntent, ManifestSource};
     use rsolve_core::{
-        DeclaredDependency, DependencyKind, DependencySourceConstraint, EnvironmentId,
-        LockedIdentities, PackageNamespace, PackageRelease, Provenance, RPackageVersion,
-        ReleaseIdentity, ReleaseMetadata, ReleaseObservation, ResolutionTarget, VersionConstraint,
+        DeclaredDependency, DependencyKind, DependencySourceConstraint, EnvironmentId, GitCommitId,
+        LockedIdentities, NormalizedGitUrl, PackageNamespace, PackageRelease, PackageRequirement,
+        Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation,
+        ResolutionRequest, ResolutionTarget, RootRequirement, VersionConstraint,
     };
     use rsolve_provider::cran::CranCandidateSnapshot;
     use tempfile::tempdir;
@@ -1155,6 +1186,63 @@ mod tests {
             distributions: Vec::new(),
         })
         .unwrap()
+    }
+
+    fn direct_git_release_with_repository_dependency() -> PackageRelease {
+        let name = package("root");
+        let version = RPackageVersion::parse("1.0.0").unwrap();
+        let dependency = DeclaredDependency::from_parts(
+            DependencyKind::Depends,
+            package("dep"),
+            DependencySourceConstraint::Repository {
+                repository: rsolve_core::RepositoryId::new("universe").unwrap(),
+            },
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap();
+        PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                Provenance::GitCommit {
+                    repository: NormalizedGitUrl::new("https://example.test/root").unwrap(),
+                    commit: GitCommitId::new("0123456789012345678901234567890123456789").unwrap(),
+                    subdirectory: None,
+                },
+            ),
+            observed_package: name,
+            observed_version: version,
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
+            declared_dependencies: vec![dependency],
+            distributions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn direct_git_request() -> ResolutionRequest {
+        let identity = ReleaseIdentity::new(
+            package("root"),
+            Provenance::GitCommit {
+                repository: NormalizedGitUrl::new("https://example.test/root").unwrap(),
+                commit: GitCommitId::new("0123456789012345678901234567890123456789").unwrap(),
+                subdirectory: None,
+            },
+        );
+        let package = PackageRequirement::new(
+            package("root"),
+            DependencySourceConstraint::Exact(identity),
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap();
+        ResolutionRequest::new(
+            vec![RootRequirement {
+                package,
+                expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+            }],
+            ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            VersionConstraint::unconstrained(),
+            LockedIdentities::new(),
+        )
     }
 
     fn snapshot(releases: &[(&str, &[(&str, DependencyKind)])]) -> CranCandidateSnapshot {
@@ -1997,5 +2085,61 @@ mod tests {
                 ManifestError::InvalidRegistry { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn fixed_point_direct_git_transitive_cran_demand_fails_before_cran_prepare() {
+        let state = fixture_state();
+        let composed = composed(
+            vec![
+                repository("cran-one", RegistrySpec::Cran, None),
+                repository("cran-two", RegistrySpec::Cran, None),
+                repository("universe", RegistrySpec::RUniverse, Some(&["dep"])),
+            ],
+            vec![ComposedRootIntent {
+                name: package("root"),
+                constraint: VersionConstraint::unconstrained(),
+                source: ManifestSource::Git {
+                    url: NormalizedGitUrl::new("https://example.test/root").unwrap(),
+                    selector: crate::manifest::GitSelector::DefaultBranch,
+                    subdirectory: None,
+                },
+                expansion: rsolve_core::RootExpansionPolicy::HardOnly,
+            }],
+        );
+        let directory = tempdir().unwrap();
+        let cache = crate::metadata_cache::MetadataCache::resolve(Some(directory.path())).unwrap();
+        let result = resolve_composed_with_prepared_direct(
+            composed,
+            &cache,
+            false,
+            false,
+            None,
+            ResolutionFactories {
+                provider_factory: &FakeUniverseFactory {
+                    state: Rc::clone(&state),
+                    snapshot: snapshot(&[("dep", &[("transitive", DependencyKind::Depends)])]),
+                    compatible: true,
+                },
+                cran_factory: &FakeCranFactory {
+                    state: Rc::clone(&state),
+                    snapshots: Vec::new(),
+                    fail_after: None,
+                    return_none: false,
+                },
+            },
+            direct_source::prepared_for_test(
+                direct_git_request(),
+                vec![direct_git_release_with_repository_dependency()],
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(RepositoryResolutionError::Composition(
+                ManifestError::InvalidRegistry { .. }
+            ))
+        ));
+        assert_eq!(state.borrow().cran_prepares, 0);
+        assert_eq!(state.borrow().ru_creates, 1);
     }
 }
