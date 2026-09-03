@@ -49,6 +49,23 @@ fn partial_cleanup_bounds_cover_valid_tree_shape_without_unbounded_depth() {
 }
 
 #[test]
+fn byte_limit_allows_empty_entry_at_exact_limit_but_rejects_nonempty_entry() {
+    let mut builder = TreeBuilder::new();
+    builder.total = MAX_TOTAL_BYTES;
+    assert_eq!(builder.add(TreeEntry::regular("empty", Vec::new())), Ok(()));
+    assert_eq!(
+        builder.add(TreeEntry::regular("nonempty", vec![1])),
+        Err(TreeError::TotalLimit)
+    );
+}
+
+#[test]
+fn directory_sync_helper_is_platform_safe() {
+    let root = tempfile::tempdir().unwrap();
+    sync_directory(root.path()).unwrap();
+}
+
+#[test]
 fn publishes_complete_marker_and_reuses_view() {
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("view");

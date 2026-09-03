@@ -96,9 +96,6 @@ impl TreeBuilder {
         if predecessor_is_collision || successor_is_collision {
             return Err(TreeError::PathCollision);
         }
-        if self.remaining_bytes() == 0 {
-            return Err(TreeError::TotalLimit);
-        }
         Ok(())
     }
 
@@ -315,15 +312,9 @@ where
     let marker = SourceMarker::new(&tree_digest, validated.len(), total, binding)?;
     marker.write(&mut marker_file)?;
     marker_file.sync_all().map_err(io_error)?;
-    fs::File::open(&staging)
-        .map_err(io_error)?
-        .sync_all()
-        .map_err(io_error)?;
+    sync_directory(&staging)?;
     fs::rename(&staging, destination).map_err(io_error)?;
-    File::open(parent)
-        .map_err(io_error)?
-        .sync_all()
-        .map_err(io_error)?;
+    sync_directory(parent)?;
     validate_existing_view(destination, binding)
 }
 
@@ -723,12 +714,24 @@ fn sync_directories_bounded(root: &Path) -> Result<(), TreeError> {
                 sync(&child, depth + 1, count)?;
             }
         }
+        sync_directory(path)
+    }
+    sync(root, 0, &mut 0)
+}
+
+pub(crate) fn sync_directory(path: &Path) -> Result<(), TreeError> {
+    #[cfg(not(windows))]
+    {
         File::open(path)
             .map_err(io_error)?
             .sync_all()
             .map_err(io_error)
     }
-    sync(root, 0, &mut 0)
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn io_error(error: io::Error) -> TreeError {

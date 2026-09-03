@@ -384,14 +384,7 @@ fn write_origin(
         reason: error.to_string(),
     })?;
     if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .map_err(|error| TreeError::Io {
-                reason: error.to_string(),
-            })?
-            .sync_all()
-            .map_err(|error| TreeError::Io {
-                reason: error.to_string(),
-            })?;
+        tree::sync_directory(parent)?;
     }
     Ok(())
 }
