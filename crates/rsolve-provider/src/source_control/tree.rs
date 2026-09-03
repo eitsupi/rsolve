@@ -217,7 +217,10 @@ pub enum TreeError {
 
 /// Validates and atomically publishes entries into `destination`.
 #[cfg(test)]
-fn publish<I>(destination: impl AsRef<Path>, entries: I) -> Result<ImmutableSourceView, TreeError>
+pub(crate) fn publish<I>(
+    destination: impl AsRef<Path>,
+    entries: I,
+) -> Result<ImmutableSourceView, TreeError>
 where
     I: IntoIterator<Item = TreeEntry>,
 {

@@ -1,5 +1,6 @@
-use super::dependency::parse_dependency_entry;
 use super::*;
+use crate::package_description::{DescriptionError, parse_description_fields};
+use std::collections::BTreeSet;
 
 type ProviderIdentityKey = (PackageName, RPackageVersion, CranCatalogRecordScope);
 
@@ -273,10 +274,10 @@ fn provider_identity_from_fields(
     context: CranCatalogRecordContext,
 ) -> Result<(PackageName, RPackageVersion, CranCatalogRecordScope), CranRecordError> {
     reject_identity_duplicates(fields)?;
-    let package = PackageName::new(required_field(fields, "Package")?.trim())
-        .map_err(CranRecordError::InvalidPackageName)?;
     let version = RPackageVersion::parse(required_field(fields, "Version")?.trim())
         .map_err(CranRecordError::InvalidVersion)?;
+    let package = PackageName::new(required_field(fields, "Package")?.trim())
+        .map_err(CranRecordError::InvalidPackageName)?;
     let scope = match context {
         CranCatalogRecordContext::PackagesIndex => field(fields, "Path")
             .map(classify_path)
@@ -335,59 +336,9 @@ pub(super) fn observation_from_fields_with_context(
     fields: &[(&str, &str)],
     context: CranCatalogRecordContext,
 ) -> Result<ReleaseObservation, CranRecordError> {
-    reject_duplicate_fields(fields)?;
-    let package_value = required_field(fields, "Package")?;
-    let version_value = required_field(fields, "Version")?;
-    let package =
-        PackageName::new(package_value.trim()).map_err(CranRecordError::InvalidPackageName)?;
-    let version =
-        RPackageVersion::parse(version_value.trim()).map_err(CranRecordError::InvalidVersion)?;
-    let publication = field(fields, "Published")
-        .map(parse_publication_date)
-        .transpose()?;
-
-    let mut dependencies = Vec::new();
-    for (field_name, kind) in [
-        ("Depends", DependencyKind::Depends),
-        ("Imports", DependencyKind::Imports),
-        ("LinkingTo", DependencyKind::LinkingTo),
-        ("Suggests", DependencyKind::Suggests),
-        ("Enhances", DependencyKind::Enhances),
-    ] {
-        if let Some(value) = field(fields, field_name) {
-            // `split_terminator` drops only the terminal empty segment from
-            // a literal trailing comma, while preserving internal empties
-            // and whitespace-only entries for semantic validation, matching
-            // R's dependency splitter without allocating an intermediate
-            // collection.
-            for entry in value.split_terminator(',') {
-                let dependency = parse_dependency_entry(entry).map_err(|source| {
-                    CranRecordError::Dependency {
-                        field: field_name,
-                        entry: entry.trim().to_owned(),
-                        source,
-                    }
-                })?;
-                dependencies.push(
-                    DeclaredDependency::from_parts(
-                        kind,
-                        dependency.name,
-                        DependencySourceConstraint::Any,
-                        dependency.constraint,
-                    )
-                    .map_err(|error| CranRecordError::InvalidDependency(error.to_string()))?,
-                );
-            }
-        }
-    }
-
-    let metadata_fields = fields
-        .iter()
-        .filter(|(name, _)| !is_reserved_field(name))
-        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-        .collect();
-    let metadata =
-        ReleaseMetadata::new(metadata_fields).map_err(CranRecordError::InvalidMetadata)?;
+    let parsed = parse_description_fields(fields).map_err(map_description_error)?;
+    let package = parsed.package;
+    let version = parsed.version;
     if matches!(context, CranCatalogRecordContext::PackagesIndex)
         && let Some(path) = field(fields, "Path")
     {
@@ -406,9 +357,9 @@ pub(super) fn observation_from_fields_with_context(
         identity,
         observed_package: package,
         observed_version: version,
-        metadata,
-        publication,
-        declared_dependencies: dependencies,
+        metadata: parsed.metadata,
+        publication: parsed.publication,
+        declared_dependencies: parsed.dependencies,
         distributions: vec![Distribution {
             registry: RegistryId::new(CRAN_NAMESPACE).expect("the fixed CRAN registry is valid"),
             channel: DistributionChannel::new(SOURCE_CHANNEL)
@@ -418,6 +369,29 @@ pub(super) fn observation_from_fields_with_context(
             observed_metadata: DistributionMetadata::default(),
         }],
     })
+}
+
+fn map_description_error(error: DescriptionError) -> CranRecordError {
+    match error {
+        DescriptionError::MissingField(field) => CranRecordError::MissingField(field),
+        DescriptionError::DuplicateField(field) => CranRecordError::DuplicateField(field),
+        DescriptionError::InvalidPackageName(error) => CranRecordError::InvalidPackageName(error),
+        DescriptionError::InvalidVersion(error) => CranRecordError::InvalidVersion(error),
+        DescriptionError::InvalidMetadata(error) => CranRecordError::InvalidMetadata(error),
+        DescriptionError::InvalidPublicationDate { value, diagnostic } => {
+            CranRecordError::InvalidPublicationDate { value, diagnostic }
+        }
+        DescriptionError::InvalidDependency(error) => CranRecordError::InvalidDependency(error),
+        DescriptionError::Dependency {
+            field,
+            entry,
+            source,
+        } => CranRecordError::Dependency {
+            field,
+            entry,
+            source,
+        },
+    }
 }
 
 fn classify_path(value: &str) -> Result<CranCatalogRecordScope, CranRecordError> {
@@ -452,32 +426,6 @@ fn field<'a>(fields: &'a [(&str, &str)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| *value)
 }
 
-fn reject_duplicate_fields(fields: &[(&str, &str)]) -> Result<(), CranRecordError> {
-    let mut names = BTreeSet::new();
-    for (name, _) in fields {
-        let normalized = name.to_ascii_lowercase();
-        if !names.insert(normalized) {
-            return Err(CranRecordError::DuplicateField((*name).to_owned()));
-        }
-    }
-    Ok(())
-}
-
-fn is_reserved_field(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "package"
-            | "version"
-            | "depends"
-            | "imports"
-            | "linkingto"
-            | "suggests"
-            | "enhances"
-            | "md5sum"
-            | "published"
-    )
-}
-
 fn is_allpackages_transport_field(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
     normalized == "downloadurl"
@@ -485,40 +433,4 @@ fn is_allpackages_transport_field(name: &str) -> bool {
         || normalized == "repository"
         || normalized == "snapshot"
         || normalized.starts_with("sha256")
-}
-
-fn parse_publication_date(value: &str) -> Result<rsolve_core::ReleasePublication, CranRecordError> {
-    let value = value.trim();
-    let date = if value.len() == 10 {
-        PublicationDate::parse(value).map_err(|error| error.to_string())
-    } else {
-        parse_publication_datetime(value)
-    };
-    date.map(rsolve_core::ReleasePublication::new)
-        .map_err(|diagnostic| CranRecordError::InvalidPublicationDate {
-            value: value.to_owned(),
-            diagnostic,
-        })
-}
-
-fn parse_publication_datetime(value: &str) -> Result<PublicationDate, String> {
-    let (format, has_utc_suffix) = match value.len() {
-        19 => ("%Y-%m-%d %H:%M:%S", false),
-        23 => ("%Y-%m-%d %H:%M:%S UTC", true),
-        _ => return Err("Published datetime must use an accepted full-string spelling".into()),
-    };
-    if has_utc_suffix && !value.ends_with(" UTC") {
-        return Err("Published datetime must end with uppercase UTC".into());
-    }
-    let datetime =
-        jiff::civil::DateTime::strptime(format, value).map_err(|error| error.to_string())?;
-    let canonical = datetime.strftime(format).to_string();
-    if canonical != value {
-        return Err(
-            "Published datetime is not canonical (leap seconds and normalized values are rejected)"
-                .into(),
-        );
-    }
-    let date = datetime.date().strftime("%Y-%m-%d").to_string();
-    PublicationDate::parse(date).map_err(|error| error.to_string())
 }

@@ -4,6 +4,7 @@
 //! CLI orchestration.
 
 pub mod cran;
+mod package_description;
 pub mod r_universe;
 pub(crate) mod snapshot;
 pub mod source_control;

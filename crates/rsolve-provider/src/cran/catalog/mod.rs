@@ -2,21 +2,18 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
 use rsolve_core::{
-    DeclaredDependency, DependencyKind, DependencySourceConstraint, Distribution,
-    DistributionChannel, DistributionMetadata, PackageName, PackageNameError, PackageRelease,
-    PackageReleaseError, Provenance, PublicationDate, RPackageVersion, RPackageVersionError,
-    RegistryId, RelationOp, ReleaseAggregation, ReleaseIdentity, ReleaseMetadata,
-    ReleaseMetadataError, ReleaseObservation, VersionConstraint,
+    Distribution, DistributionChannel, DistributionMetadata, PackageName, PackageNameError,
+    PackageRelease, PackageReleaseError, Provenance, RPackageVersion, RPackageVersionError,
+    RegistryId, ReleaseAggregation, ReleaseIdentity, ReleaseMetadataError, ReleaseObservation,
 };
 
 use super::{DcfDocument, DcfError};
 
-mod dependency;
 mod import;
 #[cfg(test)]
 mod tests;
@@ -340,6 +337,10 @@ impl CranCatalog {
         self.candidates.is_empty()
     }
 }
+
+/// Parses one source-tree DESCRIPTION record using the same dependency and
+/// metadata semantics as CRAN index records. Identity and distribution
+/// evidence are intentionally omitted for the caller to supply.
 /// A failure while parsing the index as DCF syntax or converting parsed
 /// records into validated catalog entries.
 #[derive(Debug)]
@@ -491,29 +492,7 @@ impl fmt::Display for CranRecordError {
 
 impl Error for CranRecordError {}
 
-/// A malformed comma-separated dependency entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DependencyParseError {
-    EmptyEntry,
-    InvalidPackageName(PackageNameError),
-    InvalidConstraintSyntax,
-    MissingConstraintVersion,
-    InvalidVersion(RPackageVersionError),
-}
-
-impl fmt::Display for DependencyParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyEntry => f.write_str("dependency entry is empty"),
-            Self::InvalidPackageName(error) => error.fmt(f),
-            Self::InvalidConstraintSyntax => f.write_str("invalid version constraint syntax"),
-            Self::MissingConstraintVersion => f.write_str("version constraint has no version"),
-            Self::InvalidVersion(error) => error.fmt(f),
-        }
-    }
-}
-
-impl Error for DependencyParseError {}
+pub use crate::package_description::DependencyParseError;
 
 pub(super) fn catalog_from_observations_with_context<I>(
     observations: I,
