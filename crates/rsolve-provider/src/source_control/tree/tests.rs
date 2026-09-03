@@ -359,3 +359,21 @@ fn concurrent_capability_root_creation_converges_after_create_race() {
     }
     assert!(target.is_dir());
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_root_traversal_rejects_reparse_redirects() {
+    let root = tempfile::tempdir().unwrap();
+    let redirected = root.path().join("redirected");
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"do not touch").unwrap();
+    if std::os::windows::fs::symlink_dir(&outside, &redirected).is_err() {
+        return;
+    }
+
+    let result = DirectoryCapability::open_or_create(&redirected.join("child"));
+    assert!(result.is_err());
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"do not touch");
+    assert!(!outside.join("child").exists());
+}

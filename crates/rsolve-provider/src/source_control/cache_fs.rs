@@ -49,7 +49,12 @@ impl DirectoryCapability {
     pub(crate) fn open(path: &Path) -> Result<Self, CacheFsError> {
         #[cfg(windows)]
         {
-            let dir = Dir::open_ambient_dir(path, cap_std::ambient_authority()).map_err(map_io)?;
+            let (anchor, components) = windows_anchor_and_components(path)?;
+            let mut dir =
+                Dir::open_ambient_dir(&anchor, cap_std::ambient_authority()).map_err(map_io)?;
+            for name in &components {
+                dir = dir.open_dir_nofollow(name).map_err(map_io)?;
+            }
             return Ok(Self {
                 dir,
                 display_path: path.to_owned(),
@@ -88,8 +93,27 @@ impl DirectoryCapability {
     pub(crate) fn open_or_create(path: &Path) -> Result<Self, CacheFsError> {
         #[cfg(windows)]
         {
-            std::fs::create_dir_all(path).map_err(io_error)?;
-            return Self::open(path);
+            let (anchor, components) = windows_anchor_and_components(path)?;
+            let mut dir =
+                Dir::open_ambient_dir(&anchor, cap_std::ambient_authority()).map_err(map_io)?;
+            for name in &components {
+                match dir.open_dir_nofollow(name) {
+                    Ok(next) => dir = next,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        match dir.create_dir(name) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(map_io(error)),
+                        }
+                        dir = dir.open_dir_nofollow(name).map_err(map_io)?;
+                    }
+                    Err(error) => return Err(map_io(error)),
+                }
+            }
+            return Ok(Self {
+                dir,
+                display_path: path.to_owned(),
+            });
         }
         #[cfg(not(windows))]
         {
@@ -423,6 +447,36 @@ fn component_name(component: Component<'_>) -> Result<String, CacheFsError> {
             Err(CacheFsError::UnsafePath)
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_anchor_and_components(path: &Path) -> Result<(PathBuf, Vec<String>), CacheFsError> {
+    let mut components = path.components().peekable();
+    let anchor = match components.peek().copied() {
+        Some(Component::Prefix(prefix)) => {
+            let prefix = prefix.as_os_str().to_owned();
+            let mut anchor = PathBuf::from(prefix);
+            match components.next() {
+                Some(Component::Prefix(_)) => {}
+                _ => return Err(CacheFsError::UnsafePath),
+            }
+            match components.next() {
+                Some(Component::RootDir) => anchor.push(Path::new(r"\")),
+                _ => return Err(CacheFsError::UnsafePath),
+            }
+            anchor
+        }
+        Some(Component::RootDir) => {
+            components.next();
+            PathBuf::from(r"\")
+        }
+        _ => PathBuf::from("."),
+    };
+    let names = components
+        .filter(|component| !matches!(component, Component::CurDir))
+        .map(component_name)
+        .collect::<Result<_, _>>()?;
+    Ok((anchor, names))
 }
 
 fn map_io(error: io::Error) -> CacheFsError {
