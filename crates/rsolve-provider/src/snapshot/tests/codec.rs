@@ -326,3 +326,21 @@ fn header_rejects_observation_timestamp_generation_and_revision_mismatch() {
     old_encoding.generation = generation_id_from_header(&old_encoding);
     assert!(decode_header(&encode_header(&old_encoding).unwrap()).is_err());
 }
+
+#[test]
+fn header_accepts_parser_schema_three_but_rejects_unknown_schema_four() {
+    let dir = tempdir().unwrap();
+    let generation = SnapshotGenerationBuilder::new(input(), dir.path().join("valid.redb"))
+        .build()
+        .unwrap();
+
+    let mut schema_three = generation.header().clone();
+    schema_three.parser_schema = 3;
+    schema_three.generation = generation_id_from_header(&schema_three);
+    assert!(decode_header(&encode_header(&schema_three).unwrap()).is_ok());
+
+    let mut schema_four = schema_three;
+    schema_four.parser_schema = 4;
+    schema_four.generation = generation_id_from_header(&schema_four);
+    assert!(decode_header(&encode_header(&schema_four).unwrap()).is_err());
+}

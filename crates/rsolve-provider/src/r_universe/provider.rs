@@ -1475,6 +1475,50 @@ mod tests {
     }
 
     #[test]
+    fn old_parser_schema_is_incompatible_until_a_current_refresh_is_published() {
+        let (provider, _) = fixture_provider(
+            "https://custom.example/universe",
+            &[
+                (
+                    "https://custom.example/universe/api/ls",
+                    r#"["foo"]"#.into(),
+                ),
+                (
+                    "https://custom.example/universe/api/packages?limit=1",
+                    format!("[{}]", package_entry("foo")),
+                ),
+            ],
+        );
+        let registry = RegistryId::new("universe").unwrap();
+        let body = format!("[{}]", package_entry("foo"));
+        let catalog = RUniverseCatalog::from_json(&body, registry.clone()).unwrap();
+        let response = FetchedResponse {
+            endpoint: "https://custom.example/universe/api/packages?limit=1".into(),
+            body: body.into_bytes(),
+        };
+        let mut old_input =
+            snapshot_input(&registry, &catalog, &[response], "api-catalog".into()).unwrap();
+        old_input.parser_schema = 2;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(directory.path(), registry).unwrap();
+        store
+            .build_and_publish_with_endpoint(old_input, "https://custom.example/universe")
+            .unwrap();
+        assert!(matches!(
+            provider.open_compatible_offline(&store, None),
+            Err(RUniverseProviderError::OfflineIncompatible(_))
+        ));
+
+        provider.refresh_snapshot(&store, None).unwrap();
+        let current = provider.open_compatible_offline(&store, None).unwrap();
+        assert_eq!(
+            current.header().parser_schema,
+            crate::r_universe::RUNIVERSE_PARSER_SCHEMA
+        );
+        assert_eq!(current.header().parser_schema, 3);
+    }
+
+    #[test]
     fn compatible_coverage_accepts_supersets_and_rejects_partial_or_disjoint_scopes() {
         let package_foo = PackageName::new("foo").unwrap();
         let package_baz = PackageName::new("baz").unwrap();

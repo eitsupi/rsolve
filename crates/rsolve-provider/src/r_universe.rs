@@ -29,7 +29,7 @@ pub const RUNIVERSE_API_PROFILE: &str = "r-universe.v1";
 pub const RUNIVERSE_COMPATIBILITY_PROFILE: u32 = 1;
 
 /// Local parser revision for the R-universe catalog projection.
-pub const RUNIVERSE_PARSER_SCHEMA: u32 = 2;
+pub const RUNIVERSE_PARSER_SCHEMA: u32 = 3;
 
 /// Maximum source archive size accepted from the current package API.
 ///
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn local_profile_revisions_are_numeric() {
         assert_eq!(RUNIVERSE_COMPATIBILITY_PROFILE, 1);
-        assert_eq!(RUNIVERSE_PARSER_SCHEMA, 2);
+        assert_eq!(RUNIVERSE_PARSER_SCHEMA, 3);
     }
 
     #[test]

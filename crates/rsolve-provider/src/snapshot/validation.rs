@@ -86,12 +86,13 @@ pub(super) fn validate_header(header: &SnapshotHeaderV1) -> Result<(), SnapshotE
         // they cannot re-enter the cache through another load path.
         || header.normalization_policy != 2
         || header.compatibility_profile != 1
-        // Schema 2 is the R-universe source-artifact projection. CRAN still
-        // uses schema 1 and validates its own expected revision at its cache
-        // boundary; accepting this known provider revision here keeps the
-        // generic snapshot codec provider-neutral without accepting unknown
-        // schema values.
-        || !matches!(header.parser_schema, 1 | 2)
+        // Schema 2 is the previous R-universe source-artifact projection and
+        // schema 3 carries occurrence-specific Repository evidence. CRAN
+        // still uses schema 1 and validates its own expected revision at its
+        // cache boundary; accepting these known provider revisions here keeps
+        // the generic snapshot codec provider-neutral without accepting
+        // unknown schema values.
+        || !matches!(header.parser_schema, 1..=3)
     {
         return Err(SnapshotError::Invalid(
             "unknown snapshot header format or version".into(),
