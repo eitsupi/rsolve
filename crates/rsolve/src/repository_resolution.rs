@@ -373,7 +373,8 @@ fn resolve_composed_with_factory(
                     Ok(loader) => loader,
                     Err(
                         rsolve_provider::r_universe::RUniverseProviderError::OfflineMissing(_)
-                        | rsolve_provider::r_universe::RUniverseProviderError::OfflineIncompatible(_),
+                        | rsolve_provider::r_universe::RUniverseProviderError::OfflineIncompatible(_)
+                        | rsolve_provider::r_universe::RUniverseProviderError::OfflineCorrupt(_),
                     ) => provider
                         .refresh_snapshot(&store, scope.as_deref())
                         .map_err(RepositoryResolutionError::RUniverse)?,
@@ -931,6 +932,8 @@ mod tests {
         ru_creates: usize,
         ru_opens: usize,
         ru_refreshes: usize,
+        ru_refresh_scopes: Vec<Option<Vec<PackageName>>>,
+        ru_open_corrupt: bool,
     }
 
     struct FakeCranFactory {
@@ -1018,7 +1021,13 @@ mod tests {
             _store: &rsolve_provider::SnapshotStore,
             _allowlist: Option<&[PackageName]>,
         ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError> {
-            self.state.borrow_mut().ru_opens += 1;
+            let mut state = self.state.borrow_mut();
+            state.ru_opens += 1;
+            if state.ru_open_corrupt {
+                return Err(RUniverseProviderError::OfflineCorrupt(
+                    "fixture has a corrupt snapshot".into(),
+                ));
+            }
             if !self.compatible {
                 return Err(RUniverseProviderError::OfflineMissing(
                     "fixture has no compatible snapshot".into(),
@@ -1038,9 +1047,13 @@ mod tests {
         fn refresh_snapshot(
             &self,
             _store: &rsolve_provider::SnapshotStore,
-            _allowlist: Option<&[PackageName]>,
+            allowlist: Option<&[PackageName]>,
         ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError> {
-            self.state.borrow_mut().ru_refreshes += 1;
+            let mut state = self.state.borrow_mut();
+            state.ru_refreshes += 1;
+            state
+                .ru_refresh_scopes
+                .push(allowlist.map(|packages| packages.to_vec()));
             Ok(Box::new(self.snapshot.clone()))
         }
     }
@@ -1431,6 +1444,89 @@ mod tests {
         assert_eq!(state.borrow().ru_creates, 1);
         assert_eq!(state.borrow().ru_opens, 1);
         assert_eq!(state.borrow().ru_refreshes, 0);
+    }
+
+    #[test]
+    fn online_corrupt_r_universe_warm_open_refreshes_exact_scope() {
+        let state = fixture_state();
+        state.borrow_mut().ru_open_corrupt = true;
+        let result = run_with_factories(
+            composed(
+                vec![
+                    repository("cran", RegistrySpec::Cran, None),
+                    repository("universe", RegistrySpec::RUniverse, Some(&["root"])),
+                ],
+                vec![manifest_root(
+                    "root",
+                    Some("universe"),
+                    rsolve_core::RootExpansionPolicy::HardOnly,
+                )],
+            ),
+            Rc::clone(&state),
+            FakeCranFactory {
+                state: Rc::clone(&state),
+                snapshots: Vec::new(),
+                fail_after: None,
+                return_none: true,
+            },
+            FakeUniverseFactory {
+                state: Rc::clone(&state),
+                snapshot: snapshot(&[("root", &[])]),
+                compatible: true,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.resolution.packages().len(), 1);
+        assert_eq!(state.borrow().ru_opens, 1);
+        assert_eq!(state.borrow().ru_refreshes, 1);
+        assert_eq!(
+            state.borrow().ru_refresh_scopes,
+            vec![Some(vec![package("root")])]
+        );
+    }
+
+    #[test]
+    fn offline_corrupt_r_universe_warm_open_does_not_refresh() {
+        let state = fixture_state();
+        state.borrow_mut().ru_open_corrupt = true;
+        let result = run_with_factories(
+            composed(
+                vec![
+                    repository("cran", RegistrySpec::Cran, None),
+                    repository("universe", RegistrySpec::RUniverse, Some(&["root"])),
+                ],
+                vec![manifest_root(
+                    "root",
+                    Some("universe"),
+                    rsolve_core::RootExpansionPolicy::HardOnly,
+                )],
+            ),
+            Rc::clone(&state),
+            FakeCranFactory {
+                state: Rc::clone(&state),
+                snapshots: Vec::new(),
+                fail_after: None,
+                return_none: true,
+            },
+            FakeUniverseFactory {
+                state: Rc::clone(&state),
+                snapshot: snapshot(&[("root", &[])]),
+                compatible: true,
+            },
+            true,
+            false,
+        );
+        assert!(matches!(
+            result,
+            Err(RepositoryResolutionError::RUniverse(
+                RUniverseProviderError::OfflineCorrupt(_)
+            ))
+        ));
+        assert_eq!(state.borrow().ru_opens, 1);
+        assert_eq!(state.borrow().ru_refreshes, 0);
+        assert!(state.borrow().ru_refresh_scopes.is_empty());
     }
 
     #[test]
