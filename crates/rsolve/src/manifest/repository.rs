@@ -441,7 +441,7 @@ pub(super) fn validate_repository_id(id: &RepositoryId) -> Result<(), ManifestEr
     validate_named_id(id.as_str(), "repository")
 }
 
-pub(super) fn validate_selector(value: &str, context: &str) -> Result<(), ManifestError> {
+pub(crate) fn validate_selector(value: &str, context: &str) -> Result<(), ManifestError> {
     if value.is_empty()
         || value.len() > 1024
         || value.chars().any(|character| character.is_control())

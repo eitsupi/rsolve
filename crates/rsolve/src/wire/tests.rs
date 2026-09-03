@@ -44,7 +44,52 @@ fn package_record(name: &str, provenance: Provenance) -> LockedPackage {
         ],
         visible_repository_ids: Vec::new(),
         metadata_sha256: Sha256Digest::new("a".repeat(64)).unwrap(),
+        requested_git_source: None,
     }
+}
+
+#[test]
+fn direct_git_requested_selector_round_trips_with_resolved_identity() {
+    let url = rsolve_core::NormalizedGitUrl::new("https://example.test/project").unwrap();
+    let commit = rsolve_core::GitCommitId::new("0123456789012345678901234567890123456789").unwrap();
+    let identity = identity(
+        "gitpkg",
+        Provenance::GitCommit {
+            repository: url.clone(),
+            commit,
+            subdirectory: Some(RepositorySubdir::new("pkg").unwrap()),
+        },
+    );
+    let package = LockedPackage {
+        identity,
+        version: version("1.2.0"),
+        published_version_spelling: None,
+        dependencies: Vec::new(),
+        visible_repository_ids: Vec::new(),
+        metadata_sha256: Sha256Digest::new("a".repeat(64)).unwrap(),
+        requested_git_source: Some(LockedGitSource {
+            url,
+            selector: LockedGitSelector::Branch("main".into()),
+            subdirectory: Some(RepositorySubdir::new("pkg").unwrap()),
+            version_constraint: VersionConstraint::from_clause(RelationOp::Ge, version("1.0.0")),
+        }),
+    };
+    let lock = Lockfile::new(
+        Sha256Digest::new("b".repeat(64)).unwrap(),
+        VersionConstraint::from_clause(RelationOp::Ge, version("4.0")),
+        LockedResolution {
+            target: rsolve_core::ResolutionTarget::new(version("4.4.0")),
+            environment: EnvironmentId::new("default").unwrap(),
+            publication_cutoff: None,
+            packages: vec![package],
+        },
+    )
+    .unwrap();
+    let encoded = to_toml(&lock).unwrap();
+    let decoded = from_toml(&encoded).unwrap();
+    assert_eq!(decoded, lock);
+    assert!(encoded.contains("requested-git-source"));
+    assert!(encoded.contains("selector-value = \"main\""));
 }
 
 fn logical_lock() -> Lockfile {

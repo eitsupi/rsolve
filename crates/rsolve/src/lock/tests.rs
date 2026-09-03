@@ -201,6 +201,73 @@ fn composed_root(
 }
 
 #[test]
+fn direct_git_projection_retains_requested_intent_and_rejects_tampering() {
+    let url = rsolve_core::NormalizedGitUrl::new("https://example.test/repo").unwrap();
+    let commit = rsolve_core::GitCommitId::new("0123456789012345678901234567890123456789").unwrap();
+    let name = package("gitpkg");
+    let source = crate::manifest::ManifestSource::Git {
+        url: url.clone(),
+        selector: crate::manifest::GitSelector::Branch("main".into()),
+        subdirectory: Some("pkg".into()),
+    };
+    let composed = composed_environment(Vec::new(), vec![composed_root("gitpkg", source)]);
+    let version = version("1.2.0");
+    let identity = ReleaseIdentity::new(
+        name.clone(),
+        Provenance::GitCommit {
+            repository: url,
+            commit,
+            subdirectory: Some(rsolve_core::RepositorySubdir::new("pkg").unwrap()),
+        },
+    );
+    let release = PackageRelease::try_from(ReleaseObservation {
+        identity,
+        observed_package: name,
+        observed_version: version,
+        metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+        publication: None,
+        declared_dependencies: Vec::new(),
+        distributions: Vec::new(),
+    })
+    .unwrap();
+    let resolution = resolution_for_packages(vec![(release, Vec::new())]);
+    let lock = Lockfile::from_resolution_with_composed_environment(&resolution, &composed).unwrap();
+    let requested = lock.resolution.packages[0]
+        .requested_git_source
+        .as_ref()
+        .unwrap();
+    assert!(
+        matches!(requested.selector, LockedGitSelector::Branch(ref value) if value.as_ref() == "main")
+    );
+    assert_eq!(requested.subdirectory.as_ref().unwrap().as_str(), "pkg");
+    assert!(lock.resolution.packages[0].requested_git_source.is_some());
+    let generic_lock = Lockfile::from_resolution_with_applicability(
+        &resolution,
+        environment(),
+        None,
+        digest(),
+        VersionConstraint::unconstrained(),
+    )
+    .unwrap();
+    assert!(
+        generic_lock.resolution.packages[0]
+            .requested_git_source
+            .is_none()
+    );
+
+    let mut tampered = lock.clone();
+    tampered.resolution.packages[0]
+        .requested_git_source
+        .as_mut()
+        .unwrap()
+        .selector = LockedGitSelector::Tag("release".into());
+    assert!(matches!(
+        tampered.consume_composed_environment(&composed),
+        Err(LockError::ResolutionIntentMismatch { .. })
+    ));
+}
+
+#[test]
 fn direct_resolution_container_round_trips_empty_packages() {
     let lock = lockfile(Vec::new(), None).unwrap();
     assert_eq!(lock.resolution.packages, Vec::<LockedPackage>::new());
@@ -704,6 +771,7 @@ fn reader_rejects_registry_record_version_mismatch() {
         dependencies: Vec::new(),
         visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
+        requested_git_source: None,
     };
     assert!(matches!(
         lockfile(vec![package], None),
@@ -728,6 +796,7 @@ fn normalization_is_independent_of_package_edge_and_distribution_input_order() {
         dependencies: vec![edge("beta"), edge("alpha")],
         visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
+        requested_git_source: None,
     };
     let mut reversed = make(alpha.clone());
     reversed.dependencies.reverse();
@@ -1174,6 +1243,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         dependencies: Vec::new(),
         visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
+        requested_git_source: None,
     };
     let second_lock = LockedPackage {
         identity: second.identity().clone(),
@@ -1182,6 +1252,7 @@ fn distinct_identities_with_one_installed_name_are_rejected() {
         dependencies: Vec::new(),
         visible_repository_ids: Vec::new(),
         metadata_sha256: digest(),
+        requested_git_source: None,
     };
     assert!(matches!(
         lockfile(vec![first_lock, second_lock], None),
@@ -1215,6 +1286,7 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
                 dependencies: Vec::new(),
                 visible_repository_ids: Vec::new(),
                 metadata_sha256: digest(),
+                requested_git_source: None,
             },
             LockedPackage {
                 identity: bioconductor.clone(),
@@ -1223,6 +1295,7 @@ fn registry_and_bioconductor_locks_retain_exact_and_source_keys() {
                 dependencies: Vec::new(),
                 visible_repository_ids: Vec::new(),
                 metadata_sha256: digest(),
+                requested_git_source: None,
             },
         ],
         None,
@@ -1280,6 +1353,7 @@ fn visible_repository_ids_restore_repository_solver_keys_in_order() {
         dependencies: Vec::new(),
         visible_repository_ids: vec![repository.clone()],
         metadata_sha256: digest(),
+        requested_git_source: None,
     };
     let lock = lockfile(vec![locked], None).unwrap();
     let identities = lock.locked_identities().unwrap();

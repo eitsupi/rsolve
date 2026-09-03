@@ -17,8 +17,8 @@ use rsolve_core::{PackageName, PublicationDate, RPackageVersion, VersionConstrai
 use crate::filesystem::ExistingPathIdentity;
 use crate::lock::{canonical_lock_basename, legacy_composed_environment};
 use crate::manifest::{
-    ComposedEnvironment, Endpoint, ManifestError, RegistrySpec, is_remote_cran_root_intent,
-    load_manifest,
+    ComposedEnvironment, Endpoint, ManifestError, ManifestSource, RegistrySpec,
+    is_remote_cran_root_intent, load_manifest,
 };
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::ResolutionMetrics;
@@ -312,7 +312,10 @@ fn validate_composed_repository_selection(composed: &ComposedEnvironment) -> Res
         .iter()
         .filter(|repository| matches!(repository.registry(), RegistrySpec::Cran))
         .count();
-    if composed.roots.iter().any(is_remote_cran_root_intent) && cran_count != 1 {
+    if composed.roots.iter().any(|root| {
+        matches!(root.source, ManifestSource::Registry { .. }) && is_remote_cran_root_intent(root)
+    }) && cran_count != 1
+    {
         return Err(value_error(
             "remote composed resolutions require one repository of kind CRAN; additional R-universe repositories are allowed".into(),
         ));
@@ -641,13 +644,47 @@ fn run_manifest_lock_with_backend_progress_at(
         ));
     }
     let output = manifest_output_path(&manifest_path, &composed.environment)?;
-    // Direct sources are not acquired by this slice. Check them before any
-    // cache setup or provider operation so unsupported input fails closed.
-    composed
-        .clone()
-        .into_resolution_request()
-        .map_err(|error| value_error(format!("manifest composition failed: {error}")))?;
     validate_output_path(&output)?;
+    let composed = if command.offline && output.is_file() {
+        let bytes = fs::read_to_string(&output).map_err(|error| {
+            CliError::Operational(format!(
+                "cannot read existing lockfile {}: {error}",
+                output.display()
+            ))
+        })?;
+        let previous = from_toml(&bytes).map_err(|error| {
+            CliError::Operational(format!("existing lockfile is invalid: {error}"))
+        })?;
+        previous
+            .consume_composed_environment(&composed)
+            .map_err(|error| {
+                CliError::Operational(format!("existing lockfile is incompatible: {error}"))
+            })?;
+        let locked = previous.locked_identities().map_err(|error| {
+            CliError::Operational(format!("existing lockfile is invalid: {error}"))
+        })?;
+        document
+            .compose_environment_with_locked(
+                environment_name,
+                rsolve_core::ResolutionTarget::new(composed.target.r_version.clone()),
+                locked,
+            )
+            .map_err(|error| {
+                CliError::Operational(format!("locked environment composition failed: {error}"))
+            })?
+    } else {
+        composed
+    };
+    if composed.roots.iter().any(|root| {
+        matches!(
+            root.source,
+            ManifestSource::Url { .. } | ManifestSource::Path { .. }
+        )
+    }) {
+        return Err(value_error(
+            "manifest direct URL/path source requires acquisition".into(),
+        ));
+    }
     if let Some(metrics_output) = &command.metrics_output {
         validate_output_path(metrics_output)?;
         if destination_paths_equal(&output, metrics_output)?

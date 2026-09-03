@@ -30,7 +30,8 @@ pub use repository_preparation::{
 
 pub use lock::{
     ConsumedLockedGraph, EnvironmentId, EnvironmentIdError, LockError, LockedDependencyEdge,
-    LockedPackage, LockedResolution, Lockfile, consume_locked_graph,
+    LockedGitSelector, LockedGitSource, LockedPackage, LockedResolution, Lockfile,
+    consume_locked_graph,
 };
 pub use manifest::{
     ComposedEnvironment, ComposedRootIntent, DirectUrl, EffectiveRepository, Endpoint, GitSelector,

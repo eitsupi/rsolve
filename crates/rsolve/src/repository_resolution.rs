@@ -5,7 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::manifest::{ComposedEnvironment, ManifestError, RegistrySpec, RepositorySpec};
+use crate::manifest::{
+    ComposedEnvironment, ManifestError, ManifestSource, RegistrySpec, RepositorySpec,
+};
 use crate::metrics::ResolutionMetrics;
 use crate::orchestration::{
     CompositeCandidateLoader, CranResolutionError, RawCandidateLoader, RepositoryCandidateLoader,
@@ -19,7 +21,9 @@ use rsolve_provider::r_universe::{
 };
 
 mod demand;
+mod direct_source;
 use demand::{RepositoryDemandSource, initial_repository_demands, resolve_repository_demands};
+use direct_source::DirectGitError;
 
 /// The transport-free result of resolving a composed repository graph.
 pub(crate) struct RepositoryResolutionOutcome {
@@ -192,25 +196,26 @@ fn resolve_composed_with_factory(
     provider_factory: &dyn RUniverseProviderFactory,
     cran_factory: &dyn CranProviderFactory,
 ) -> Result<RepositoryResolutionOutcome, RepositoryResolutionError> {
-    composed
-        .clone()
-        .into_resolution_request()
-        .map_err(RepositoryResolutionError::Composition)?;
     validate_repository_set(&composed)?;
     plan_repository_acquisition(&composed.repositories, &composed.roots, &[])
         .map_err(RepositoryResolutionError::Composition)?;
-    let request = composed
-        .clone()
-        .into_resolution_request()
-        .map_err(RepositoryResolutionError::Composition)?;
+    let prepared_direct = direct_source::prepare(&composed, metadata_cache.root(), offline)
+        .map_err(RepositoryResolutionError::DirectGit)?;
+    let request = prepared_direct.request;
+    let direct_loader = prepared_direct.loader;
 
-    let needs_provider = composed
-        .roots
-        .iter()
-        .any(crate::manifest::is_remote_cran_root_intent);
+    let needs_provider = composed.roots.iter().any(|root| {
+        matches!(
+            root.source,
+            crate::manifest::ManifestSource::Registry { .. }
+        ) && crate::manifest::is_remote_cran_root_intent(root)
+    });
     if !needs_provider {
-        let empty = EmptyCandidateLoader;
-        return finish(request, &empty, progress);
+        if direct_loader.is_empty() {
+            let empty = EmptyCandidateLoader;
+            return finish(request, &empty, progress);
+        }
+        return finish(request, &direct_loader, progress);
     }
 
     let mut snapshots: Vec<Box<dyn RawCandidateLoader>> = Vec::new();
@@ -474,10 +479,15 @@ fn resolve_composed_with_factory(
             repository.packages(),
         ));
     }
-    let loader_refs = repository_loaders
-        .iter()
-        .map(|loader| loader as &dyn CandidateLoader)
-        .collect::<Vec<_>>();
+    let mut loader_refs = Vec::with_capacity(repository_loaders.len() + 1);
+    if !direct_loader.is_empty() {
+        loader_refs.push(&direct_loader as &dyn CandidateLoader);
+    }
+    loader_refs.extend(
+        repository_loaders
+            .iter()
+            .map(|loader| loader as &dyn CandidateLoader),
+    );
     let composite_loader = CompositeCandidateLoader::new(loader_refs);
     if let Some(progress) = &progress {
         progress(crate::progress::ProgressEvent::ResolveStarted);
@@ -833,11 +843,10 @@ fn validate_repository_set(
             },
         ));
     }
-    if composed
-        .roots
-        .iter()
-        .any(crate::manifest::is_remote_cran_root_intent)
-        && cran_count != 1
+    if composed.roots.iter().any(|root| {
+        matches!(root.source, ManifestSource::Registry { .. })
+            && crate::manifest::is_remote_cran_root_intent(root)
+    }) && cran_count != 1
     {
         return Err(RepositoryResolutionError::Composition(
             ManifestError::InvalidRegistry {
@@ -866,6 +875,7 @@ pub(crate) enum RepositoryResolutionError {
     Cran(CranResolutionError),
     RUniverse(rsolve_provider::r_universe::RUniverseProviderError),
     Candidate(rsolve_core::CandidateLoadError),
+    DirectGit(DirectGitError),
 }
 
 impl std::fmt::Display for RepositoryResolutionError {
@@ -878,6 +888,7 @@ impl std::fmt::Display for RepositoryResolutionError {
             Self::Candidate(error) => {
                 write!(formatter, "repository candidate loading failed: {error}")
             }
+            Self::DirectGit(error) => write!(formatter, "direct Git source failed: {error}"),
         }
     }
 }
@@ -890,6 +901,7 @@ impl std::error::Error for RepositoryResolutionError {
             Self::Cran(error) => Some(error),
             Self::RUniverse(error) => Some(error),
             Self::Candidate(error) => Some(error),
+            Self::DirectGit(error) => Some(error),
         }
     }
 }

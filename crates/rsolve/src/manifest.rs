@@ -354,12 +354,13 @@ mod wire;
 
 pub(crate) use compose::canonicalize_constraint;
 pub(crate) use compose::is_remote_cran_root_intent;
+pub(crate) use compose::parse_package_constraint;
 pub(crate) use compose::parse_r_constraint;
 pub use compose::{ComposedEnvironment, ComposedRootIntent};
-pub(crate) use repository::configured_registry_id_for;
 pub use repository::{
     EffectiveRepository, Endpoint, RegistryProvenancePolicy, RegistrySpec, RepositorySpec,
 };
+pub(crate) use repository::{configured_registry_id_for, validate_selector};
 pub use wire::{
     DirectUrl, GitSelector, ManifestDependencySpec, ManifestDocument, ManifestSource,
     discover_manifest, load_manifest, parse_manifest, read_manifest,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::parse_manifest;
 use crate::resolve_with_loader_with_publication_cutoff;
 use clap::Parser;
 use rsolve_core::{
@@ -6,7 +7,7 @@ use rsolve_core::{
     CandidateLoader, DeclaredDependency, DependencyKind, DependencySourceConstraint,
     PackageNamespace, PackageRelease, PreparedCandidate, Provenance, RegistryId, RelationOp,
     ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId, RepositoryOccurrence,
-    RepositoryRank, SolverKey, VersionConstraint,
+    RepositoryRank, Resolution, ResolvedPackage, SolverKey, VersionConstraint,
 };
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -510,6 +511,132 @@ fn manifest_without_repositories_supports_provider_free_resolution() {
         metrics_output: None,
     };
     run_lock_with_backend(command, &MatrixBackend).unwrap();
+}
+
+#[test]
+fn offline_manifest_reuses_compatible_direct_git_lock_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("rsolve.toml");
+    fs::write(
+        &manifest,
+        "[rsolve]\nschema=1\n[r]\nversion='*'\n[dependencies]\ngitpkg={version='>= 1.0',git='https://example.test/repo',branch='main'}\n",
+    )
+    .unwrap();
+    let document = parse_manifest(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    let target = rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap());
+    let composed = document
+        .compose_environment("default", target.clone())
+        .unwrap();
+    let url = rsolve_core::NormalizedGitUrl::new("https://example.test/repo").unwrap();
+    let commit = rsolve_core::GitCommitId::new("0123456789012345678901234567890123456789").unwrap();
+    let name = PackageName::new("gitpkg").unwrap();
+    let version = RPackageVersion::parse("1.2.0").unwrap();
+    let release = PackageRelease::try_from(ReleaseObservation {
+        identity: ReleaseIdentity::new(
+            name.clone(),
+            Provenance::GitCommit {
+                repository: url,
+                commit,
+                subdirectory: None,
+            },
+        ),
+        observed_package: name,
+        observed_version: version,
+        metadata: ReleaseMetadata::new(std::collections::BTreeMap::new()).unwrap(),
+        publication: None,
+        declared_dependencies: Vec::new(),
+        distributions: Vec::new(),
+    })
+    .unwrap();
+    let resolution = Resolution::new(
+        target.clone(),
+        vec![ResolvedPackage::new(
+            SolverKey::InstalledName(PackageName::new("gitpkg").unwrap()),
+            release,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    let lock = Lockfile::from_resolution_with_composed_environment(&resolution, &composed).unwrap();
+    fs::write(
+        directory.path().join("rsolve.lock"),
+        to_toml(&lock).unwrap(),
+    )
+    .unwrap();
+
+    struct CapturingBackend {
+        resolution: Resolution,
+        captured: std::cell::RefCell<Option<ComposedEnvironment>>,
+    }
+    impl ResolutionBackend for CapturingBackend {
+        fn resolve(
+            &self,
+            _manifest: Manifest,
+            _mirror: &str,
+            _cutoff: Option<PublicationDate>,
+            _metadata_cache: &MetadataCache,
+            _offline: bool,
+            _refresh_metadata: bool,
+        ) -> Result<ResolvedData, CliError> {
+            unreachable!("manifest path must use resolve_composed")
+        }
+
+        fn resolve_composed(
+            &self,
+            composed: ComposedEnvironment,
+            _metadata_cache: &MetadataCache,
+            _offline: bool,
+            _refresh_metadata: bool,
+            _progress: Option<ProgressCallback>,
+        ) -> Result<ResolvedData, CliError> {
+            self.captured.replace(Some(composed));
+            Ok(ResolvedData {
+                resolution: self.resolution.clone(),
+                warnings: Vec::new(),
+                metrics: ResolutionMetrics::default(),
+            })
+        }
+    }
+    let backend = CapturingBackend {
+        resolution,
+        captured: std::cell::RefCell::new(None),
+    };
+    let command = LockCommand {
+        r_version: "4.4.0".into(),
+        manifest: Some(manifest),
+        environment: None,
+        package: Vec::new(),
+        cran_mirror: None,
+        publication_cutoff: None,
+        output: None,
+        metadata_cache: Some(directory.path().join("metadata-cache")),
+        offline: true,
+        refresh_metadata: false,
+        metrics_output: None,
+    };
+    run_manifest_lock_with_backend_progress_at(
+        command,
+        RPackageVersion::parse("4.4.0").unwrap(),
+        &backend,
+        None,
+        directory.path(),
+        None,
+    )
+    .unwrap();
+    let captured = backend.captured.into_inner().unwrap();
+    let identity = captured
+        .locked
+        .get(&SolverKey::Exact(rsolve_core::ReleaseIdentity::new(
+            PackageName::new("gitpkg").unwrap(),
+            Provenance::GitCommit {
+                repository: rsolve_core::NormalizedGitUrl::new("https://example.test/repo")
+                    .unwrap(),
+                commit: rsolve_core::GitCommitId::new("0123456789012345678901234567890123456789")
+                    .unwrap(),
+                subdirectory: None,
+            },
+        )));
+    assert!(identity.is_some());
 }
 
 #[test]

@@ -279,7 +279,7 @@ pub(crate) fn parse_r_constraint(
     parse_constraint(input, field, ConstraintVersionKind::R)
 }
 
-fn parse_package_constraint(
+pub(crate) fn parse_package_constraint(
     input: &str,
     field: impl Into<String>,
 ) -> Result<VersionConstraint, ManifestError> {

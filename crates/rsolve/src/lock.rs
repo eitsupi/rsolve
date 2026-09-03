@@ -25,6 +25,25 @@ use crate::manifest::{
     RegistrySpec, RepositorySpec, canonicalize_constraint,
 };
 
+/// Requested direct Git source retained alongside its resolved identity.
+/// Mutable selector text is audit/intent data; graph semantics use the full
+/// commit in `Provenance::GitCommit`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockedGitSelector {
+    DefaultBranch,
+    Branch(Box<str>),
+    Tag(Box<str>),
+    Rev(Box<str>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedGitSource {
+    pub url: rsolve_core::NormalizedGitUrl,
+    pub selector: LockedGitSelector,
+    pub subdirectory: Option<rsolve_core::RepositorySubdir>,
+    pub version_constraint: rsolve_core::VersionConstraint,
+}
+
 /// An immutable, validated projection of a lockfile for direct consumption.
 ///
 /// This graph preserves the locked identities, versions, metadata digests, and
@@ -73,6 +92,7 @@ pub struct LockedPackage {
     /// artifact endpoint restriction.
     pub visible_repository_ids: Vec<rsolve_core::RepositoryId>,
     pub metadata_sha256: Sha256Digest,
+    pub requested_git_source: Option<LockedGitSource>,
 }
 
 /// One effective dependency edge in the selected lock graph.
@@ -124,6 +144,7 @@ impl LockedPackage {
             dependencies,
             visible_repository_ids: selected.visible_repository_ids().to_vec(),
             metadata_sha256: selected.release().metadata_digest().clone(),
+            requested_git_source: None,
         })
     }
 
@@ -161,6 +182,7 @@ impl LockedPackage {
             dependencies,
             visible_repository_ids: Vec::new(),
             metadata_sha256: release.metadata_digest().clone(),
+            requested_git_source: None,
         }
     }
 
@@ -184,6 +206,18 @@ impl LockedPackage {
             | Provenance::RBasePackage { .. }
             | Provenance::RegistryRelease { .. }
             | Provenance::BioconductorRelease { .. } => {}
+        }
+        if let Some(source) = &self.requested_git_source {
+            let valid_identity = matches!(
+                self.identity.provenance(),
+                Provenance::GitCommit { repository, subdirectory, .. }
+                    if repository == &source.url && subdirectory == &source.subdirectory
+            );
+            if !valid_identity || !source.version_constraint.satisfies(&self.version) {
+                return Err(LockError::ConflictingMetadata {
+                    identity: identity_key(&self.identity),
+                });
+            }
         }
         if let Some(spelling) = &self.published_version_spelling {
             let parsed = RPackageVersion::parse(spelling).map_err(|_| {
@@ -240,13 +274,57 @@ impl Lockfile {
         let resolution_intent_sha256 = composed
             .resolution_intent_digest()
             .map_err(LockError::Manifest)?;
-        let lock = Self::from_resolution_with_applicability(
+        let mut lock = Self::from_resolution_with_applicability(
             resolution,
             composed.environment.clone(),
             composed.published_before,
             resolution_intent_sha256,
             composed.r_requirement.clone(),
         )?;
+        for package in &mut lock.resolution.packages {
+            if let Some(root) = composed
+                .roots
+                .iter()
+                .find(|root| root.name == *package.identity.name())
+                && let ManifestSource::Git {
+                    url,
+                    selector,
+                    subdirectory,
+                } = &root.source
+            {
+                let Provenance::GitCommit {
+                    repository,
+                    subdirectory: identity_subdir,
+                    ..
+                } = package.identity.provenance()
+                else {
+                    return Err(LockError::ConflictingMetadata {
+                        identity: identity_key(&package.identity),
+                    });
+                };
+                let subdirectory = subdirectory
+                    .as_deref()
+                    .map(rsolve_core::RepositorySubdir::new)
+                    .transpose()
+                    .map_err(|error| {
+                        LockError::Manifest(ManifestError::InvalidDependencyField {
+                            name: root.name.to_string(),
+                            reason: error.to_string(),
+                        })
+                    })?;
+                if repository != url || identity_subdir != &subdirectory {
+                    return Err(LockError::ConflictingMetadata {
+                        identity: identity_key(&package.identity),
+                    });
+                }
+                package.requested_git_source = Some(LockedGitSource {
+                    url: url.clone(),
+                    selector: locked_git_selector(selector),
+                    subdirectory,
+                    version_constraint: canonicalize_constraint(&root.constraint),
+                });
+            }
+        }
         lock.consume_composed_environment(composed)?;
         Ok(lock)
     }
@@ -495,6 +573,56 @@ impl Lockfile {
                 ),
             })
             .collect::<Vec<_>>();
+        for root in &composed.roots {
+            if let ManifestSource::Git {
+                url, subdirectory, ..
+            } = &root.source
+            {
+                let Some(package) = self
+                    .resolution
+                    .packages
+                    .iter()
+                    .find(|package| package.identity.name() == &root.name)
+                else {
+                    continue;
+                };
+                let Some(requested) = &package.requested_git_source else {
+                    return Err(LockError::DirectRootMissing {
+                        name: root.name.to_string(),
+                    });
+                };
+                let ManifestSource::Git { selector, .. } = &root.source else {
+                    unreachable!();
+                };
+                let expected_selector = locked_git_selector(selector);
+                let expected_subdirectory = subdirectory
+                    .as_deref()
+                    .map(rsolve_core::RepositorySubdir::new)
+                    .transpose()
+                    .map_err(|error| {
+                        LockError::Manifest(ManifestError::InvalidDependencyField {
+                            name: root.name.to_string(),
+                            reason: error.to_string(),
+                        })
+                    })?;
+                if requested.url != *url
+                    || requested.selector != expected_selector
+                    || requested.subdirectory != expected_subdirectory
+                {
+                    return Err(LockError::ResolutionIntentMismatch {
+                        lock: self.resolution_intent_sha256.to_string(),
+                        composed: resolution_intent_sha256.to_string(),
+                    });
+                }
+                if canonicalize_constraint(&requested.version_constraint)
+                    != canonicalize_constraint(&root.constraint)
+                {
+                    return Err(LockError::DirectRootVersionMismatch {
+                        name: root.name.to_string(),
+                    });
+                }
+            }
+        }
         self.consume_roots(
             &composed.target,
             &composed.environment,
@@ -1075,6 +1203,21 @@ fn canonical_version(version: &RPackageVersion) -> String {
         .map(|component| component.to_string())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn locked_git_selector(selector: &crate::manifest::GitSelector) -> LockedGitSelector {
+    match selector {
+        crate::manifest::GitSelector::DefaultBranch => LockedGitSelector::DefaultBranch,
+        crate::manifest::GitSelector::Branch(value) => {
+            LockedGitSelector::Branch(value.clone().into_boxed_str())
+        }
+        crate::manifest::GitSelector::Tag(value) => {
+            LockedGitSelector::Tag(value.clone().into_boxed_str())
+        }
+        crate::manifest::GitSelector::Rev(value) => {
+            LockedGitSelector::Rev(value.clone().into_boxed_str())
+        }
+    }
 }
 
 fn identity_solver_keys(
