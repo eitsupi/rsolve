@@ -218,6 +218,17 @@ impl LockedPackage {
                     identity: identity_key(&self.identity),
                 });
             }
+            if let LockedGitSelector::Rev(value) = &source.selector
+                && let Ok(requested_commit) = rsolve_core::GitCommitId::new(value.as_ref())
+                && !matches!(
+                    self.identity.provenance(),
+                    Provenance::GitCommit { commit, .. } if commit == &requested_commit
+                )
+            {
+                return Err(LockError::ConflictingMetadata {
+                    identity: identity_key(&self.identity),
+                });
+            }
         }
         if let Some(spelling) = &self.published_version_spelling {
             let parsed = RPackageVersion::parse(spelling).map_err(|_| {

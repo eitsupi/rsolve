@@ -131,6 +131,10 @@ impl DirectGitCandidateLoader {
     pub(crate) fn is_empty(&self) -> bool {
         self.candidates.is_empty()
     }
+
+    pub(crate) fn releases_for_demand(&self) -> impl Iterator<Item = &rsolve_core::PackageRelease> {
+        self.candidates.iter().map(PreparedCandidate::release)
+    }
 }
 
 impl CandidateLoader for DirectGitCandidateLoader {

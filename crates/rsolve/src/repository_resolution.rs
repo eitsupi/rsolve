@@ -3,7 +3,7 @@
 //! This module owns only the orchestration boundary. Registry-specific
 //! parsing, transport, and snapshot formats remain in their provider crates.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{
     ComposedEnvironment, ManifestError, ManifestSource, RegistrySpec, RepositorySpec,
@@ -22,7 +22,10 @@ use rsolve_provider::r_universe::{
 
 mod demand;
 mod direct_source;
-use demand::{RepositoryDemandSource, initial_repository_demands, resolve_repository_demands};
+use demand::{
+    RepositoryDemandSource, initial_repository_demands_with_direct,
+    resolve_repository_demands_with_direct,
+};
 use direct_source::DirectGitError;
 
 /// The transport-free result of resolving a composed repository graph.
@@ -203,13 +206,18 @@ fn resolve_composed_with_factory(
         .map_err(RepositoryResolutionError::DirectGit)?;
     let request = prepared_direct.request;
     let direct_loader = prepared_direct.loader;
+    let direct_releases = direct_loader
+        .releases_for_demand()
+        .map(|release| (release.identity().name().clone(), release.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let initial_demands = initial_repository_demands_with_direct(
+        &composed.repositories,
+        &composed.roots,
+        &direct_releases,
+    );
+    validate_cran_demand_count(&composed.repositories, &initial_demands)?;
 
-    let needs_provider = composed.roots.iter().any(|root| {
-        matches!(
-            root.source,
-            crate::manifest::ManifestSource::Registry { .. }
-        ) && crate::manifest::is_remote_cran_root_intent(root)
-    });
+    let needs_provider = !initial_demands.is_empty();
     if !needs_provider {
         if direct_loader.is_empty() {
             let empty = EmptyCandidateLoader;
@@ -230,8 +238,6 @@ fn resolve_composed_with_factory(
         .repositories
         .iter()
         .position(|repository| matches!(repository.registry(), RegistrySpec::Cran));
-    let initial_demands = initial_repository_demands(&composed.repositories, &composed.roots);
-
     if let Some(index) = cran_index {
         let initial_optional = initial_demands
             .get(&index)
@@ -280,10 +286,13 @@ fn resolve_composed_with_factory(
             snapshots: &snapshots,
             snapshot_indices: &snapshot_indices,
         };
-        let plan = resolve_repository_demands(&composed.repositories, &composed.roots, &mut source)
-            .map_err(|error| {
-                RepositoryResolutionError::Cran(CranResolutionError::Refresh(error))
-            })?;
+        let plan = resolve_repository_demands_with_direct(
+            &composed.repositories,
+            &composed.roots,
+            &direct_releases,
+            &mut source,
+        )
+        .map_err(|error| RepositoryResolutionError::Cran(CranResolutionError::Refresh(error)))?;
         let mut prepared = false;
 
         if let Some(index) = cran_index {
@@ -857,6 +866,31 @@ fn validate_repository_set(
     Ok(())
 }
 
+fn validate_cran_demand_count(
+    repositories: &[RepositorySpec],
+    initial_demands: &BTreeMap<usize, BTreeSet<PackageName>>,
+) -> Result<(), RepositoryResolutionError> {
+    let cran_indices = repositories
+        .iter()
+        .enumerate()
+        .filter_map(|(index, repository)| {
+            matches!(repository.registry(), RegistrySpec::Cran).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let has_cran_demand = cran_indices
+        .iter()
+        .any(|index| initial_demands.contains_key(index));
+    if has_cran_demand && cran_indices.len() != 1 {
+        return Err(RepositoryResolutionError::Composition(
+            ManifestError::InvalidRegistry {
+                reason: "repository demands targeting CRAN require exactly one CRAN repository"
+                    .into(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 struct EmptyCandidateLoader;
 
 impl CandidateLoader for EmptyCandidateLoader {
@@ -909,7 +943,7 @@ impl std::error::Error for RepositoryResolutionError {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
 
     use super::*;
@@ -1917,6 +1951,21 @@ mod tests {
         };
         assert!(matches!(
             validate_repository_set(&invalid),
+            Err(RepositoryResolutionError::Composition(
+                ManifestError::InvalidRegistry { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn direct_git_cran_demand_rejects_ambiguous_cran_configuration() {
+        let repositories = vec![
+            repository("cran-one", RegistrySpec::Cran, None),
+            repository("cran-two", RegistrySpec::Cran, None),
+        ];
+        let demands = BTreeMap::from([(0, BTreeSet::from([package("dependency")]))]);
+        assert!(matches!(
+            validate_cran_demand_count(&repositories, &demands),
             Err(RepositoryResolutionError::Composition(
                 ManifestError::InvalidRegistry { .. }
             ))

@@ -203,7 +203,8 @@ fn composed_root(
 #[test]
 fn direct_git_projection_retains_requested_intent_and_rejects_tampering() {
     let url = rsolve_core::NormalizedGitUrl::new("https://example.test/repo").unwrap();
-    let commit = rsolve_core::GitCommitId::new("0123456789012345678901234567890123456789").unwrap();
+    let commit_text = "0123456789012345678901234567890123456789";
+    let commit = rsolve_core::GitCommitId::new(commit_text).unwrap();
     let name = package("gitpkg");
     let source = crate::manifest::ManifestSource::Git {
         url: url.clone(),
@@ -264,6 +265,34 @@ fn direct_git_projection_retains_requested_intent_and_rejects_tampering() {
     assert!(matches!(
         tampered.consume_composed_environment(&composed),
         Err(LockError::ResolutionIntentMismatch { .. })
+    ));
+
+    // A full-OID selector is a stronger lock fact than a symbolic selector:
+    // the stored revision must be the exact resolved Git identity.  Check
+    // both the valid SHA-1 spelling and a different full OID.
+    let mut pinned = lock.clone();
+    pinned.resolution.packages[0]
+        .requested_git_source
+        .as_mut()
+        .unwrap()
+        .selector = LockedGitSelector::Rev(commit_text.into());
+    assert!(pinned.validate().is_ok());
+    // Symbolic revision expressions remain valid lock intent; they are not
+    // full object IDs and therefore cannot be compared as commit identities.
+    pinned.resolution.packages[0]
+        .requested_git_source
+        .as_mut()
+        .unwrap()
+        .selector = LockedGitSelector::Rev("HEAD~1".into());
+    assert!(pinned.validate().is_ok());
+    pinned.resolution.packages[0]
+        .requested_git_source
+        .as_mut()
+        .unwrap()
+        .selector = LockedGitSelector::Rev("fedcba98765432100123456789abcdef01234567".into());
+    assert!(matches!(
+        pinned.validate(),
+        Err(LockError::ConflictingMetadata { .. })
     ));
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::manifest::{ComposedRootIntent, ManifestSource, RepositorySpec};
 use rsolve_core::{
@@ -27,26 +27,52 @@ pub(crate) trait RepositoryDemandSource {
     ) -> Result<Vec<PackageRelease>, CandidateLoadError>;
 }
 
-/// Route only the manifest registry roots without inspecting provider state.
-/// This is the coordinator's lazy-preparation seed; dependency expansion is
-/// performed by [`resolve_repository_demands`] once a source is available.
-pub(crate) fn initial_repository_demands(
+/// Seed repository preparation from registry roots and from the already
+/// acquired metadata of direct source roots.  This intentionally does not
+/// inspect any repository/provider state: it is safe to use when deciding
+/// whether a provider needs to be opened at all.
+pub(crate) fn initial_repository_demands_with_direct(
     repositories: &[RepositorySpec],
     roots: &[ComposedRootIntent],
+    direct_releases: &BTreeMap<PackageName, PackageRelease>,
 ) -> BTreeMap<usize, BTreeSet<PackageName>> {
-    let mut result = BTreeMap::new();
+    let mut result = BTreeMap::<usize, BTreeSet<PackageName>>::new();
     for root in roots {
-        let ManifestSource::Registry { repository } = &root.source else {
-            continue;
-        };
-        if !is_remote_root(root) {
-            continue;
-        }
-        for entry in eligible_entries(repositories, repository.as_ref(), &root.name) {
-            result
-                .entry(entry)
-                .or_insert_with(BTreeSet::new)
-                .insert(root.name.clone());
+        match &root.source {
+            ManifestSource::Registry { repository } => {
+                if !is_remote_root(root) {
+                    continue;
+                }
+                for entry in eligible_entries(repositories, repository.as_ref(), &root.name) {
+                    result.entry(entry).or_default().insert(root.name.clone());
+                }
+            }
+            ManifestSource::Git { .. } => {
+                let Some(release) = direct_releases.get(&root.name) else {
+                    continue;
+                };
+                for dependency in release.declared_dependencies() {
+                    let hard = matches!(
+                        dependency.kind,
+                        DependencyKind::Depends
+                            | DependencyKind::Imports
+                            | DependencyKind::LinkingTo
+                    );
+                    let promoted = root.expansion
+                        == rsolve_core::RootExpansionPolicy::DirectSuggests
+                        && dependency.kind == DependencyKind::Suggests;
+                    if !(hard || promoted) || !is_remote_name(dependency.package.name()) {
+                        continue;
+                    }
+                    let name = dependency.package.name();
+                    for entry in
+                        eligible_dependency_entries(repositories, dependency.package.source(), name)
+                    {
+                        result.entry(entry).or_default().insert(name.clone());
+                    }
+                }
+            }
+            ManifestSource::Url { .. } | ManifestSource::Path { .. } => {}
         }
     }
     result
@@ -55,25 +81,79 @@ pub(crate) fn initial_repository_demands(
 /// Expand source-aware roots and candidate dependency metadata to a stable
 /// repository/package demand plan. The source callback is the only operation
 /// allowed to inspect provider or snapshot state.
+#[allow(dead_code)]
 pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
     repositories: &[RepositorySpec],
     roots: &[ComposedRootIntent],
     source: &mut S,
 ) -> Result<RepositoryDemandPlan, CandidateLoadError> {
+    resolve_repository_demands_with_direct(repositories, roots, &BTreeMap::new(), source)
+}
+
+/// Expand registry demands while using already-acquired direct-source
+/// releases as metadata-only dependency seeds. Direct roots themselves are
+/// never routed to repositories; their declared dependencies are.
+pub(crate) fn resolve_repository_demands_with_direct<S: RepositoryDemandSource>(
+    repositories: &[RepositorySpec],
+    roots: &[ComposedRootIntent],
+    direct_releases: &BTreeMap<PackageName, PackageRelease>,
+    loader: &mut S,
+) -> Result<RepositoryDemandPlan, CandidateLoadError> {
     let mut entry_demands = BTreeMap::<usize, BTreeSet<PackageName>>::new();
-    let mut pending = Vec::<(PackageName, Option<RepositoryId>, bool)>::new();
+    let mut pending = Vec::<(PackageName, rsolve_core::DependencySourceConstraint, bool)>::new();
     let mut unrouted = BTreeSet::new();
     let mut discovered = BTreeSet::new();
 
     for root in roots {
-        let ManifestSource::Registry { repository } = &root.source else {
-            continue;
+        let repository = match &root.source {
+            ManifestSource::Registry { repository } => repository.clone(),
+            ManifestSource::Git { .. } => {
+                let Some(release) = direct_releases.get(&root.name) else {
+                    continue;
+                };
+                for dependency in release.declared_dependencies() {
+                    let hard = matches!(
+                        dependency.kind,
+                        DependencyKind::Depends
+                            | DependencyKind::Imports
+                            | DependencyKind::LinkingTo
+                    );
+                    let promoted = root.expansion
+                        == rsolve_core::RootExpansionPolicy::DirectSuggests
+                        && dependency.kind == DependencyKind::Suggests;
+                    if !(hard || promoted) || !is_remote_name(dependency.package.name()) {
+                        continue;
+                    }
+                    let dependency_name = dependency.package.name().clone();
+                    discovered.insert(dependency_name.clone());
+                    let dependency_entries = eligible_dependency_entries(
+                        repositories,
+                        dependency.package.source(),
+                        &dependency_name,
+                    );
+                    if dependency_entries.is_empty() {
+                        unrouted.insert(dependency_name.clone());
+                    } else {
+                        for entry in dependency_entries {
+                            entry_demands
+                                .entry(entry)
+                                .or_default()
+                                .insert(dependency_name.clone());
+                        }
+                        pending.push((dependency_name, dependency.package.source().clone(), false));
+                    }
+                }
+                continue;
+            }
+            ManifestSource::Url { .. } | ManifestSource::Path { .. } => continue,
         };
         if !is_remote_root(root) {
             continue;
         }
-        let scope = repository.clone();
-        let eligible = eligible_entries(repositories, scope.as_ref(), &root.name);
+        let source = repository
+            .map(|repository| rsolve_core::DependencySourceConstraint::Repository { repository })
+            .unwrap_or_default();
+        let eligible = eligible_dependency_entries(repositories, &source, &root.name);
         if eligible.is_empty() {
             discovered.insert(root.name.clone());
             unrouted.insert(root.name.clone());
@@ -87,7 +167,7 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
         }
         pending.push((
             root.name.clone(),
-            scope,
+            source,
             root.expansion == rsolve_core::RootExpansionPolicy::DirectSuggests,
         ));
     }
@@ -96,9 +176,10 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
     // A package first reached through a hard-only edge may later be reached as
     // a direct-suggest root; that stronger mode must get one additional walk
     // so its promoted Suggests are not silently lost.
-    let mut visited = BTreeMap::<(PackageName, Option<RepositoryId>), bool>::new();
-    while let Some((package, scope, promote_suggests)) = pending.pop() {
-        let key = (package.clone(), scope.clone());
+    let mut visited =
+        HashMap::<(PackageName, rsolve_core::DependencySourceConstraint), bool>::new();
+    while let Some((package, constraint, promote_suggests)) = pending.pop() {
+        let key = (package.clone(), constraint.clone());
         match visited.get(&key) {
             Some(strongest) if *strongest || !promote_suggests => continue,
             _ => {
@@ -106,13 +187,13 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
             }
         }
         discovered.insert(package.clone());
-        let eligible = eligible_entries(repositories, scope.as_ref(), &package);
+        let eligible = eligible_dependency_entries(repositories, &constraint, &package);
         if eligible.is_empty() {
             unrouted.insert(package);
             continue;
         }
         for entry in eligible {
-            let candidates = match source.load(entry, &package) {
+            let candidates = match loader.load(entry, &package) {
                 Ok(candidates) => candidates,
                 Err(error) if error.category() == CandidateLoadErrorCategory::NotFound => {
                     continue;
@@ -133,7 +214,11 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
                     }
                     let dependency_name = dependency.package.name().clone();
                     discovered.insert(dependency_name.clone());
-                    let dependency_entries = eligible_entries(repositories, None, &dependency_name);
+                    let dependency_entries = eligible_dependency_entries(
+                        repositories,
+                        dependency.package.source(),
+                        &dependency_name,
+                    );
                     if dependency_entries.is_empty() {
                         unrouted.insert(dependency_name.clone());
                         continue;
@@ -144,7 +229,7 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
                             .or_default()
                             .insert(dependency_name.clone());
                     }
-                    pending.push((dependency_name, None, false));
+                    pending.push((dependency_name, dependency.package.source().clone(), false));
                 }
             }
         }
@@ -155,6 +240,45 @@ pub(crate) fn resolve_repository_demands<S: RepositoryDemandSource>(
         unrouted,
         discovered,
     })
+}
+
+fn eligible_dependency_entries(
+    repositories: &[RepositorySpec],
+    source: &rsolve_core::DependencySourceConstraint,
+    package: &PackageName,
+) -> Vec<usize> {
+    match source {
+        rsolve_core::DependencySourceConstraint::Repository { repository } => {
+            eligible_entries(repositories, Some(repository), package)
+        }
+        rsolve_core::DependencySourceConstraint::Registry { namespace } => repositories
+            .iter()
+            .enumerate()
+            .filter(|(_, repository)| {
+                if !repository.package_allowed(package) {
+                    return false;
+                }
+                match repository.registry() {
+                    crate::manifest::RegistrySpec::Cran => namespace.as_str() == "cran",
+                    crate::manifest::RegistrySpec::CranLike {
+                        namespace: candidate,
+                    } => candidate == namespace,
+                    crate::manifest::RegistrySpec::RUniverse => false,
+                }
+            })
+            .map(|(index, _)| index)
+            .collect(),
+        rsolve_core::DependencySourceConstraint::Any => {
+            eligible_entries(repositories, None, package)
+        }
+        // A source-qualified dependency cannot be satisfied by an arbitrary
+        // registry.  Its dedicated backend/identity resolver owns these
+        // constraints; this planner must fail closed rather than silently
+        // routing them to CRAN or an R-universe.
+        rsolve_core::DependencySourceConstraint::Bioconductor { .. }
+        | rsolve_core::DependencySourceConstraint::Git { .. }
+        | rsolve_core::DependencySourceConstraint::Exact(_) => Vec::new(),
+    }
 }
 
 fn eligible_entries(
@@ -197,9 +321,9 @@ mod tests {
     use super::*;
     use crate::manifest::{Endpoint, RegistrySpec};
     use rsolve_core::{
-        DeclaredDependency, DependencySourceConstraint, PackageNamespace, Provenance,
-        RPackageVersion, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId,
-        RootExpansionPolicy, VersionConstraint,
+        DeclaredDependency, DependencySourceConstraint, GitCommitId, NormalizedGitUrl,
+        PackageNamespace, Provenance, RPackageVersion, ReleaseIdentity, ReleaseMetadata,
+        ReleaseObservation, RepositoryId, RootExpansionPolicy, VersionConstraint,
     };
 
     #[derive(Default)]
@@ -277,6 +401,41 @@ mod tests {
         .unwrap()
     }
 
+    fn direct_git_release(name: &str, dependencies: Vec<DeclaredDependency>) -> PackageRelease {
+        let name = package(name);
+        let version = RPackageVersion::parse("1.0.0").unwrap();
+        PackageRelease::try_from(ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                Provenance::GitCommit {
+                    repository: NormalizedGitUrl::new("https://git.example.test/project").unwrap(),
+                    commit: GitCommitId::new("0123456789012345678901234567890123456789").unwrap(),
+                    subdirectory: None,
+                },
+            ),
+            observed_package: name,
+            observed_version: version,
+            metadata: ReleaseMetadata::new(BTreeMap::new()).unwrap(),
+            publication: None,
+            declared_dependencies: dependencies,
+            distributions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn git_root(name: &str, expansion: RootExpansionPolicy) -> ComposedRootIntent {
+        ComposedRootIntent {
+            name: package(name),
+            constraint: VersionConstraint::unconstrained(),
+            source: ManifestSource::Git {
+                url: NormalizedGitUrl::new("https://git.example.test/project").unwrap(),
+                selector: crate::manifest::GitSelector::DefaultBranch,
+                subdirectory: None,
+            },
+            expansion,
+        }
+    }
+
     fn dependency(kind: DependencyKind, name: &str) -> DeclaredDependency {
         DeclaredDependency::from_parts(
             kind,
@@ -293,6 +452,96 @@ mod tests {
         roots: &[ComposedRootIntent],
     ) -> RepositoryDemandPlan {
         resolve_repository_demands(repositories, roots, source).unwrap()
+    }
+
+    #[test]
+    fn direct_git_import_is_seeded_and_routed_to_configured_repository() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let roots = vec![git_root("root", RootExpansionPolicy::HardOnly)];
+        let direct = BTreeMap::from([(
+            package("root"),
+            direct_git_release("root", vec![dependency(DependencyKind::Imports, "dep")]),
+        )]);
+        let initial = initial_repository_demands_with_direct(&repositories, &roots, &direct);
+        assert_eq!(initial[&0], BTreeSet::from([package("dep")]));
+
+        let mut source = ScriptedSource::default();
+        source
+            .releases
+            .insert((0, package("dep")), vec![release("dep", Vec::new())]);
+        let plan =
+            resolve_repository_demands_with_direct(&repositories, &roots, &direct, &mut source)
+                .unwrap();
+        assert_eq!(source.calls, vec![(0, package("dep"))]);
+        assert_eq!(plan.entry_demands[&0], BTreeSet::from([package("dep")]));
+        assert!(plan.discovered.contains(&package("dep")));
+    }
+
+    #[test]
+    fn source_qualified_direct_dependency_is_not_routed_to_arbitrary_registry() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let roots = vec![git_root("root", RootExpansionPolicy::HardOnly)];
+        let dependency = DeclaredDependency::from_parts(
+            DependencyKind::Imports,
+            package("dep"),
+            DependencySourceConstraint::Git {
+                repository: NormalizedGitUrl::new("https://other.example.test/project").unwrap(),
+            },
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap();
+        let direct = BTreeMap::from([(
+            package("root"),
+            direct_git_release("root", vec![dependency]),
+        )]);
+        let initial = initial_repository_demands_with_direct(&repositories, &roots, &direct);
+        assert!(initial.is_empty());
+        let mut source = ScriptedSource::default();
+        let plan =
+            resolve_repository_demands_with_direct(&repositories, &roots, &direct, &mut source)
+                .unwrap();
+        assert!(plan.entry_demands.is_empty());
+        assert_eq!(plan.unrouted, BTreeSet::from([package("dep")]));
+        assert!(plan.discovered.contains(&package("dep")));
+        assert!(source.calls.is_empty());
+    }
+
+    #[test]
+    fn direct_git_suggests_seed_only_under_direct_suggests_expansion() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let optional_dependency = dependency(DependencyKind::Suggests, "optional");
+        let hard_only_roots = vec![git_root("root", RootExpansionPolicy::HardOnly)];
+        let direct = BTreeMap::from([(
+            package("root"),
+            direct_git_release("root", vec![optional_dependency]),
+        )]);
+        assert!(
+            initial_repository_demands_with_direct(&repositories, &hard_only_roots, &direct)
+                .is_empty()
+        );
+
+        let expanded_roots = vec![git_root("root", RootExpansionPolicy::DirectSuggests)];
+        let initial =
+            initial_repository_demands_with_direct(&repositories, &expanded_roots, &direct);
+        assert_eq!(initial[&0], BTreeSet::from([package("optional")]));
+
+        let mut source = ScriptedSource::default();
+        let nested = release(
+            "optional",
+            vec![dependency(DependencyKind::Suggests, "nested")],
+        );
+        source
+            .releases
+            .insert((0, package("optional")), vec![nested]);
+        let plan = resolve_repository_demands_with_direct(
+            &repositories,
+            &expanded_roots,
+            &direct,
+            &mut source,
+        )
+        .unwrap();
+        assert!(plan.discovered.contains(&package("optional")));
+        assert!(!plan.discovered.contains(&package("nested")));
     }
 
     #[test]
