@@ -9,7 +9,13 @@ use std::process::{Command, Stdio};
 use rsolve_core::{GitCommitId, NormalizedGitUrl};
 use thiserror::Error;
 
+pub(crate) mod cache;
+
+pub use cache::{CachedGitSource, GitCacheError};
+
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_TREE_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BLOB_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 fn arg(value: impl AsRef<OsStr>) -> OsString {
     value.as_ref().to_os_string()
@@ -41,6 +47,16 @@ pub struct GitAcquisitionRequest {
     pub offline: bool,
 }
 
+/// A cache acquisition request. The cache owns its repository and source
+/// paths; callers provide only the Git identity and requested source subtree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitSourceRequest {
+    pub url: NormalizedGitUrl,
+    pub revision: GitRevisionRequest,
+    pub subdirectory: Option<rsolve_core::RepositorySubdir>,
+    pub offline: bool,
+}
+
 /// The immutable fact produced after exact selector resolution and object
 /// validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,10 +84,11 @@ impl GitAcquisition {
 /// through a shell.  Environment values are intentionally not exposed by the
 /// Debug implementation.
 #[derive(Clone, Eq, PartialEq)]
-struct GitCommand {
+pub(crate) struct GitCommand {
     executable: PathBuf,
     args: Vec<OsString>,
     env: Vec<(String, String)>,
+    output_limit: usize,
 }
 
 impl GitCommand {
@@ -80,12 +97,24 @@ impl GitCommand {
             executable: executable.to_path_buf(),
             args,
             env: sanitized_environment(),
+            output_limit: MAX_OUTPUT_BYTES,
         }
+    }
+
+    fn with_output_limit(executable: &Path, args: Vec<OsString>, output_limit: usize) -> Self {
+        let mut command = Self::new(executable, args);
+        command.output_limit = output_limit;
+        command
     }
 
     #[cfg(test)]
     fn args(&self) -> &[OsString] {
         &self.args
+    }
+
+    #[cfg(test)]
+    fn output_limit(&self) -> usize {
+        self.output_limit
     }
 
     fn environment_names(&self) -> impl Iterator<Item = &str> {
@@ -113,10 +142,10 @@ impl fmt::Debug for GitCommand {
 
 /// Captured output from one Git command.  The runner bounds both streams.
 #[derive(Clone, Eq, PartialEq)]
-struct GitCommandOutput {
+pub(crate) struct GitCommandOutput {
     pub status: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 impl fmt::Debug for GitCommandOutput {
@@ -131,13 +160,13 @@ impl fmt::Debug for GitCommandOutput {
 }
 
 /// Injectable command seam for deterministic protocol tests.
-trait GitCommandRunner {
+pub(crate) trait GitCommandRunner {
     fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError>;
 }
 
 /// Process-level failures before Git can report a protocol result.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
-enum GitRunnerError {
+pub(crate) enum GitRunnerError {
     #[error("Git executable is unavailable")]
     ExecutableUnavailable,
     #[error("Git process could not be started")]
@@ -150,7 +179,7 @@ enum GitRunnerError {
 
 /// The production direct-process runner.
 #[derive(Clone, Debug, Default)]
-struct SystemGitRunner;
+pub(crate) struct SystemGitRunner;
 
 impl GitCommandRunner for SystemGitRunner {
     fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
@@ -170,8 +199,9 @@ impl GitCommandRunner for SystemGitRunner {
         })?;
         let stdout = child.stdout.take().ok_or(GitRunnerError::Spawn)?;
         let stderr = child.stderr.take().ok_or(GitRunnerError::Spawn)?;
-        let stdout_reader = std::thread::spawn(|| read_bounded(stdout));
-        let stderr_reader = std::thread::spawn(|| read_bounded(stderr));
+        let output_limit = command.output_limit;
+        let stdout_reader = std::thread::spawn(move || read_bounded(stdout, output_limit));
+        let stderr_reader = std::thread::spawn(move || read_bounded(stderr, output_limit));
         let status = child.wait().map_err(|_| GitRunnerError::Spawn)?;
         let (stdout, stdout_exceeded) = stdout_reader
             .join()
@@ -186,14 +216,14 @@ impl GitCommandRunner for SystemGitRunner {
         }
         Ok(GitCommandOutput {
             status: status.code(),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout,
+            stderr,
         })
     }
 }
 
-fn read_bounded(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
-    let mut captured = Vec::with_capacity(MAX_OUTPUT_BYTES.min(8192));
+fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::with_capacity(limit.min(8192));
     let mut exceeded = false;
     let mut buffer = [0_u8; 8192];
     loop {
@@ -202,7 +232,7 @@ fn read_bounded(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
             Err(error) => return Err(error),
             Ok(read) => read,
         };
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(captured.len());
+        let remaining = limit.saturating_sub(captured.len());
         if remaining > 0 {
             captured.extend_from_slice(&buffer[..read.min(remaining)]);
         }
@@ -250,10 +280,12 @@ pub enum GitError {
     Transport,
     #[error("Git command failed")]
     CommandFailed,
+    #[error("Git command output exceeded the operation limit: {operation}")]
+    OutputTooLarge { operation: String },
 }
 
 /// Internal generic executor used by the production facade and unit fixtures.
-struct Backend<R = SystemGitRunner> {
+pub(crate) struct Backend<R = SystemGitRunner> {
     executable: PathBuf,
     runner: R,
 }
@@ -288,6 +320,29 @@ impl GitBackend {
     ) -> Result<GitCommitId, GitError> {
         self.inner.resolve(url, selector)
     }
+
+    /// Acquires a pinned/requested source through the per-URL cache and
+    /// publishes a backend-neutral immutable tree view. The cache owns all
+    /// repository and source paths; no caller-provided filesystem path is
+    /// accepted by this API.
+    pub fn acquire_cached(
+        &self,
+        cache_root: impl AsRef<Path>,
+        request: &GitSourceRequest,
+    ) -> Result<CachedGitSource, GitCacheError> {
+        let low_level = GitAcquisitionRequest {
+            url: request.url.clone(),
+            revision: request.revision.clone(),
+            repository_dir: PathBuf::new(),
+            offline: request.offline,
+        };
+        cache::acquire(
+            &self.inner,
+            cache_root.as_ref(),
+            &low_level,
+            request.subdirectory.as_ref(),
+        )
+    }
 }
 
 impl<R: GitCommandRunner> Backend<R> {
@@ -301,7 +356,7 @@ impl<R: GitCommandRunner> Backend<R> {
     /// Probes executable availability and the fixed fetch options used by the
     /// backend.
     pub fn probe(&self) -> Result<(), GitError> {
-        self.run_checked(vec![arg("--version")], "version")?;
+        self.run_checked(vec![arg("--version")], "version", MAX_OUTPUT_BYTES)?;
         let output = self
             .runner
             .run(&GitCommand::new(
@@ -310,11 +365,12 @@ impl<R: GitCommandRunner> Backend<R> {
             ))
             .map_err(|error| match error {
                 GitRunnerError::ExecutableUnavailable => GitError::GitExecutableUnavailable,
-                GitRunnerError::OutputTooLarge | GitRunnerError::Spawn | GitRunnerError::Read => {
-                    GitError::Transport
-                }
+                GitRunnerError::OutputTooLarge => GitError::Transport,
+                GitRunnerError::Spawn | GitRunnerError::Read => GitError::Transport,
             })?;
-        let help = format!("{}\n{}", output.stdout, output.stderr);
+        let mut help = output.stdout.clone();
+        help.push(b'\n');
+        help.extend_from_slice(&output.stderr);
         const REQUIRED_FETCH_OPTIONS: &[&str] = &[
             "--depth",
             "--no-tags",
@@ -322,10 +378,11 @@ impl<R: GitCommandRunner> Backend<R> {
             "--no-write-fetch-head",
             "--no-auto-maintenance",
         ];
-        if REQUIRED_FETCH_OPTIONS
-            .iter()
-            .any(|marker| !help.contains(marker))
-        {
+        if REQUIRED_FETCH_OPTIONS.iter().any(|marker| {
+            !help
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        }) {
             return Err(GitError::GitCapabilityUnsupported {
                 capability: "fetch options".to_owned(),
             });
@@ -444,9 +501,6 @@ impl<R: GitCommandRunner> Backend<R> {
         exact_refs: Vec<OsString>,
     ) -> Result<Vec<Advertisement>, GitError> {
         let mut args = config_args();
-        // `ls-remote` does not need a repository, but Git otherwise walks the
-        // process cwd and may discover a user workspace's local config.
-        // Supplying an explicit null git-dir prevents that discovery.
         args.push(arg("--git-dir"));
         args.push(arg(null_device()));
         args.push(arg("ls-remote"));
@@ -455,7 +509,7 @@ impl<R: GitCommandRunner> Backend<R> {
         }
         args.push(arg(url.to_string()));
         args.extend(exact_refs);
-        let output = self.run_checked(args, "remote advertisement")?;
+        let output = self.run_checked(args, "remote advertisement", MAX_OUTPUT_BYTES)?;
         parse_advertisement(&output.stdout)
     }
 
@@ -474,7 +528,7 @@ impl<R: GitCommandRunner> Backend<R> {
         if commit.as_str().len() == 64 {
             init.push(arg("--object-format=sha256"));
         }
-        let _ = self.run_checked(init, "initialize owned bare repository")?;
+        let _ = self.run_checked(init, "initialize owned bare repository", MAX_OUTPUT_BYTES)?;
         let namespace = match commit.algorithm() {
             rsolve_core::GitHashAlgorithm::Sha1 => "sha1",
             rsolve_core::GitHashAlgorithm::Sha256 => "sha256",
@@ -497,7 +551,8 @@ impl<R: GitCommandRunner> Backend<R> {
             arg(url.to_string()),
             target,
         ]);
-        self.run_checked(args, "fetch exact Git object").map(|_| ())
+        self.run_checked(args, "fetch exact Git object", MAX_OUTPUT_BYTES)
+            .map(|_| ())
     }
 
     fn verify_selector_stable(
@@ -522,6 +577,7 @@ impl<R: GitCommandRunner> Backend<R> {
         let object = commit.to_string();
         let type_output = self.run_checked(
             vec![
+                arg("--no-replace-objects"),
                 arg("--git-dir"),
                 repository_dir.as_os_str().to_os_string(),
                 arg("cat-file"),
@@ -529,8 +585,9 @@ impl<R: GitCommandRunner> Backend<R> {
                 arg(object),
             ],
             "verify Git object type",
+            MAX_OUTPUT_BYTES,
         )?;
-        if type_output.stdout.trim() != "commit" {
+        if type_output.stdout.as_slice().trim_ascii() != b"commit" {
             return Err(GitError::SelectorNotCommit);
         }
         Ok(())
@@ -540,15 +597,21 @@ impl<R: GitCommandRunner> Backend<R> {
         &self,
         args: Vec<OsString>,
         operation: &str,
+        output_limit: usize,
     ) -> Result<GitCommandOutput, GitError> {
         let output = self
             .runner
-            .run(&GitCommand::new(&self.executable, args))
+            .run(&GitCommand::with_output_limit(
+                &self.executable,
+                args,
+                output_limit,
+            ))
             .map_err(|error| match error {
                 GitRunnerError::ExecutableUnavailable => GitError::GitExecutableUnavailable,
-                GitRunnerError::OutputTooLarge | GitRunnerError::Spawn | GitRunnerError::Read => {
-                    GitError::Transport
-                }
+                GitRunnerError::OutputTooLarge => GitError::OutputTooLarge {
+                    operation: operation.to_owned(),
+                },
+                GitRunnerError::Spawn | GitRunnerError::Read => GitError::Transport,
             })?;
         if output.status == Some(0) {
             return Ok(output);
@@ -567,12 +630,18 @@ struct Advertisement {
     reference: String,
 }
 
-fn parse_advertisement(stdout: &str) -> Result<Vec<Advertisement>, GitError> {
+fn parse_advertisement(stdout: &[u8]) -> Result<Vec<Advertisement>, GitError> {
     let mut result = Vec::new();
-    for line in stdout.lines() {
-        let Some((oid, reference)) = line.split_once('\t') else {
+    for raw_line in stdout.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let Some(separator) = line.iter().position(|byte| *byte == b'\t') else {
             continue;
         };
+        let (oid, reference) = line.split_at(separator);
+        let reference = &reference[1..];
+        let oid = std::str::from_utf8(oid).map_err(|_| GitError::SelectorUnresolvable)?;
+        let reference =
+            std::str::from_utf8(reference).map_err(|_| GitError::SelectorUnresolvable)?;
         if oid.starts_with("ref:") || reference.is_empty() {
             continue;
         }
@@ -738,8 +807,8 @@ fn checked_revision(value: &str) -> Result<Option<&str>, GitError> {
     Ok(None)
 }
 
-fn classify_command_failure(_operation: &str, stderr: &str) -> GitError {
-    let lower = stderr.to_ascii_lowercase();
+fn classify_command_failure(_operation: &str, stderr: &[u8]) -> GitError {
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     if lower.contains("terminal prompts disabled")
         || lower.contains("could not read username")
         || lower.contains("authentication required")
@@ -811,514 +880,4 @@ fn discover_git_executable() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    #[derive(Default)]
-    struct FixtureRunner {
-        commands: RefCell<Vec<GitCommand>>,
-        outputs: RefCell<Vec<GitCommandOutput>>,
-    }
-
-    impl GitCommandRunner for FixtureRunner {
-        fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
-            self.commands.borrow_mut().push(command.clone());
-            Ok(self.outputs.borrow_mut().remove(0))
-        }
-    }
-
-    fn output(stdout: &str) -> GitCommandOutput {
-        GitCommandOutput {
-            status: Some(0),
-            stdout: stdout.to_owned(),
-            stderr: String::new(),
-        }
-    }
-
-    #[test]
-    fn bounded_reader_keeps_capture_at_limit_while_draining_input() {
-        let input = vec![b'x'; MAX_OUTPUT_BYTES + 1024];
-        let (captured, exceeded) = read_bounded(std::io::Cursor::new(input)).unwrap();
-        assert_eq!(captured.len(), MAX_OUTPUT_BYTES);
-        assert!(exceeded);
-    }
-
-    #[test]
-    fn bounded_reader_preserves_io_errors() {
-        struct FailingReader;
-        impl Read for FailingReader {
-            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::other("fixture read failure"))
-            }
-        }
-        assert!(read_bounded(FailingReader).is_err());
-    }
-
-    #[test]
-    fn probe_requires_every_fetch_safety_option() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![
-                output("git version 2.50\n"),
-                output("--depth --no-tags --no-recurse-submodules --no-write-fetch-head\n"),
-            ]),
-        };
-        assert_eq!(
-            Backend::new("git", runner).probe(),
-            Err(GitError::GitCapabilityUnsupported {
-                capability: "fetch options".to_owned()
-            })
-        );
-    }
-
-    #[test]
-    fn probe_accepts_nonzero_help_status_when_all_options_are_advertised() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![
-                output("git version 2.50\n"),
-                GitCommandOutput {
-                    status: Some(129),
-                    stdout: String::new(),
-                    stderr: "--depth --no-tags --no-recurse-submodules --no-write-fetch-head --no-auto-maintenance\n".to_owned(),
-                },
-            ]),
-        };
-        assert_eq!(Backend::new("git", runner).probe(), Ok(()));
-    }
-
-    fn failed_output(stderr: &str) -> GitCommandOutput {
-        GitCommandOutput {
-            status: Some(1),
-            stdout: String::new(),
-            stderr: stderr.to_owned(),
-        }
-    }
-
-    #[test]
-    fn default_branch_uses_exact_head_oid_after_symref_line() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(
-                "ref: refs/heads/main\tHEAD\n0123456789abcdef0123456789abcdef01234567\tHEAD\n",
-            )]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            backend
-                .resolve(&url, &GitSelector::DefaultBranch)
-                .unwrap()
-                .to_string(),
-            "0123456789abcdef0123456789abcdef01234567"
-        );
-    }
-
-    #[test]
-    fn parses_exact_branch_and_rejects_malicious_revision_without_runner() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(
-                "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n",
-            )]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        let commit = backend
-            .resolve(&url, &GitSelector::Branch("main".into()))
-            .unwrap();
-        assert_eq!(commit.to_string().len(), 40);
-        let error = backend.resolve(&url, &GitSelector::Rev("main~1".into()));
-        assert_eq!(error, Err(GitError::SelectorInvalid));
-    }
-
-    #[test]
-    fn accepts_peeled_annotated_tag() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1^{}\n",
-            )]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            backend
-                .resolve(&url, &GitSelector::Tag("v1".into()))
-                .unwrap()
-                .to_string(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        );
-    }
-
-    #[test]
-    fn same_revision_name_across_branch_and_tag_is_ambiguous() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/main\n",
-            )]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            backend.resolve(&url, &GitSelector::Rev("main".into())),
-            Err(GitError::SelectorAmbiguous)
-        );
-    }
-
-    #[test]
-    fn repeated_reference_with_different_oid_is_mutable_drift() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/main\n",
-            )]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            backend.resolve(&url, &GitSelector::Branch("main".into())),
-            Err(GitError::MutableReferenceChanged)
-        );
-    }
-
-    #[test]
-    fn credential_and_transport_failures_remain_typed() {
-        let credential_runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![failed_output(
-                "could not read Username because terminal prompts disabled",
-            )]),
-        };
-        let transport_runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![failed_output("connection timed out")]),
-        };
-        let rejected_runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![failed_output("authentication failed")]),
-        };
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            Backend::new("git", credential_runner).resolve(&url, &GitSelector::DefaultBranch),
-            Err(GitError::CredentialRequired)
-        );
-        assert_eq!(
-            Backend::new("git", transport_runner).resolve(&url, &GitSelector::DefaultBranch),
-            Err(GitError::Transport)
-        );
-        assert_eq!(
-            Backend::new("git", rejected_runner).resolve(&url, &GitSelector::DefaultBranch),
-            Err(GitError::CredentialRejected)
-        );
-    }
-
-    #[test]
-    fn rejects_non_network_url_before_runner() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(Vec::new()),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("file://example.test/repo").unwrap();
-        assert!(matches!(
-            backend.resolve(&url, &GitSelector::DefaultBranch),
-            Err(GitError::InvalidUrl { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_ssh_before_runner() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(Vec::new()),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("ssh://example.test/repo").unwrap();
-        assert_eq!(
-            backend.resolve(&url, &GitSelector::DefaultBranch),
-            Err(GitError::SshUnsupported)
-        );
-    }
-
-    #[test]
-    fn full_oid_revision_is_used_without_remote_advertisement() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(Vec::new()),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        let oid = "0123456789abcdef0123456789abcdef01234567";
-        assert_eq!(
-            backend
-                .resolve(&url, &GitSelector::Rev(oid.to_owned()))
-                .unwrap()
-                .to_string(),
-            oid
-        );
-    }
-
-    #[test]
-    fn exact_refs_revision_uses_only_the_advertised_ref() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(
-                "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n",
-            )]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            backend
-                .resolve(&url, &GitSelector::Rev("refs/heads/main".into()))
-                .unwrap()
-                .to_string(),
-            "0123456789abcdef0123456789abcdef01234567"
-        );
-    }
-
-    #[test]
-    fn short_revision_queries_only_exact_branch_and_tag_refs() {
-        struct RecordingRunner {
-            commands: Rc<RefCell<Vec<GitCommand>>>,
-        }
-        impl GitCommandRunner for RecordingRunner {
-            fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
-                self.commands.borrow_mut().push(command.clone());
-                Ok(output(
-                    "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n",
-                ))
-            }
-        }
-        let commands = Rc::new(RefCell::new(Vec::new()));
-        let backend = Backend::new(
-            "git",
-            RecordingRunner {
-                commands: Rc::clone(&commands),
-            },
-        );
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        backend
-            .resolve(&url, &GitSelector::Rev("main".into()))
-            .unwrap();
-        let recorded = commands.borrow();
-        let args = recorded[0].args();
-        assert!(args.contains(&arg("refs/heads/main")));
-        assert!(args.contains(&arg("refs/tags/main")));
-        assert!(args.contains(&arg("refs/tags/main^{}")));
-        assert!(!args.iter().any(|arg| arg == "main"));
-    }
-
-    #[test]
-    fn malformed_advertised_oid_is_unresolvable() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output("not-an-oid\trefs/heads/main\n")]),
-        };
-        let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        assert_eq!(
-            backend.resolve(&url, &GitSelector::Branch("main".into())),
-            Err(GitError::SelectorUnresolvable)
-        );
-    }
-
-    #[test]
-    fn command_debug_redacts_environment_values() {
-        let command = GitCommand::new(Path::new("git"), vec!["fetch".into()]);
-        let debug = format!("{command:?}");
-        assert!(!debug.contains("/dev/null"));
-        assert!(debug.contains("GIT_TERMINAL_PROMPT"));
-    }
-
-    #[test]
-    fn command_boundary_has_no_ambient_git_state_and_fixed_protocol_policy() {
-        let command = GitCommand::new(Path::new("git"), config_args());
-        let names = command.environment_names().collect::<Vec<_>>();
-        assert!(!names.contains(&"GIT_DIR"));
-        assert!(!names.contains(&"GIT_WORK_TREE"));
-        assert!(!names.contains(&"GIT_SSH_COMMAND"));
-        assert!(command.args().contains(&arg("protocol.allow=never")));
-        assert!(command.args().contains(&arg("protocol.https.allow=always")));
-        assert!(!command.args().contains(&arg("protocol.ssh.allow=always")));
-    }
-
-    #[test]
-    fn ls_remote_uses_explicit_isolated_git_dir() {
-        struct RecordingRunner {
-            commands: Rc<RefCell<Vec<GitCommand>>>,
-        }
-        impl GitCommandRunner for RecordingRunner {
-            fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
-                self.commands.borrow_mut().push(command.clone());
-                Ok(output("0123456789abcdef0123456789abcdef01234567\tHEAD\n"))
-            }
-        }
-        let commands = Rc::new(RefCell::new(Vec::new()));
-        let backend = Backend::new(
-            "git",
-            RecordingRunner {
-                commands: Rc::clone(&commands),
-            },
-        );
-        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
-        backend.resolve(&url, &GitSelector::DefaultBranch).unwrap();
-        let command = &commands.borrow()[0];
-        let git_dir = command
-            .args()
-            .windows(2)
-            .find(|window| window[0] == "--git-dir")
-            .expect("ls-remote must carry an isolated git-dir");
-        assert_eq!(git_dir[1], arg(null_device()));
-        assert!(!command.environment_names().any(|name| name == "GIT_DIR"));
-    }
-
-    #[test]
-    fn offline_pinned_object_miss_never_becomes_a_remote_operation() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![failed_output("missing object")]),
-        };
-        let backend = Backend::new("git", runner);
-        let request = GitAcquisitionRequest {
-            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
-            revision: GitRevisionRequest::Pinned(
-                GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
-            ),
-            repository_dir: std::env::temp_dir().join("rsolve-source-control-test.git"),
-            offline: true,
-        };
-        assert_eq!(backend.acquire(&request), Err(GitError::OfflineObjectMiss));
-    }
-
-    #[test]
-    fn fetched_non_commit_object_is_rejected() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![output(""), output(""), output("tree\n")]),
-        };
-        let backend = Backend::new("git", runner);
-        let request = GitAcquisitionRequest {
-            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
-            revision: GitRevisionRequest::Pinned(
-                GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
-            ),
-            repository_dir: std::env::temp_dir().join("rsolve-source-control-test.git"),
-            offline: false,
-        };
-        assert_eq!(backend.acquire(&request), Err(GitError::SelectorNotCommit));
-    }
-
-    #[test]
-    fn mutable_selector_is_rechecked_after_exact_fetch() {
-        let runner = FixtureRunner {
-            commands: RefCell::new(Vec::new()),
-            outputs: RefCell::new(vec![
-                output("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main\n"),
-                output(""),
-                output(""),
-                output("commit\n"),
-                output("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/main\n"),
-            ]),
-        };
-        let backend = Backend::new("git", runner);
-        let request = GitAcquisitionRequest {
-            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
-            revision: GitRevisionRequest::Requested(GitSelector::Branch("main".into())),
-            repository_dir: std::env::temp_dir().join("rsolve-source-control-test.git"),
-            offline: false,
-        };
-        assert_eq!(
-            backend.acquire(&request),
-            Err(GitError::MutableReferenceChanged)
-        );
-    }
-
-    #[test]
-    fn pinned_fetch_uses_a_stable_content_addressed_destination() {
-        struct RecordingRunner {
-            commands: Rc<RefCell<Vec<GitCommand>>>,
-            outputs: RefCell<Vec<GitCommandOutput>>,
-        }
-        impl GitCommandRunner for RecordingRunner {
-            fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
-                self.commands.borrow_mut().push(command.clone());
-                Ok(self.outputs.borrow_mut().remove(0))
-            }
-        }
-        let commands = Rc::new(RefCell::new(Vec::new()));
-        let runner = RecordingRunner {
-            commands: Rc::clone(&commands),
-            outputs: RefCell::new(vec![
-                output(""),
-                output(""),
-                output("commit\n"),
-                output(""),
-                output(""),
-                output("commit\n"),
-            ]),
-        };
-        let backend = Backend::new("git", runner);
-        let request = GitAcquisitionRequest {
-            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
-            revision: GitRevisionRequest::Pinned(
-                GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
-            ),
-            repository_dir: std::env::temp_dir().join("rsolve-source-control-test.git"),
-            offline: false,
-        };
-        backend.acquire(&request).unwrap();
-        backend.acquire(&request).unwrap();
-        let recorded = commands.borrow();
-        let first_target = recorded[1].args().last().unwrap();
-        let second_target = recorded[4].args().last().unwrap();
-        assert_eq!(first_target, second_target);
-        assert!(
-            first_target
-                .to_string_lossy()
-                .contains("refs/rsolve/acquire/sha1/")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_repository_path_is_losslessly_preserved_in_all_commands() {
-        use std::os::unix::ffi::OsStringExt;
-        struct RecordingRunner {
-            commands: Rc<RefCell<Vec<GitCommand>>>,
-        }
-        impl GitCommandRunner for RecordingRunner {
-            fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
-                self.commands.borrow_mut().push(command.clone());
-                Ok(output("commit\n"))
-            }
-        }
-        let commands = Rc::new(RefCell::new(Vec::new()));
-        let backend = Backend::new(
-            "git",
-            RecordingRunner {
-                commands: Rc::clone(&commands),
-            },
-        );
-        let repository_dir =
-            PathBuf::from(OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0x80]));
-        let request = GitAcquisitionRequest {
-            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
-            revision: GitRevisionRequest::Pinned(
-                GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
-            ),
-            repository_dir: repository_dir.clone(),
-            offline: false,
-        };
-        backend.acquire(&request).unwrap();
-        for command in commands.borrow().iter() {
-            assert!(command.args().windows(2).any(|window| {
-                window[0] == arg("--git-dir") && window[1] == repository_dir.as_os_str()
-            }));
-        }
-    }
-}
+mod tests;

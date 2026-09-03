@@ -5,3 +5,6 @@
 //! receive only owned, validated source-control facts.
 
 pub mod git;
+pub(crate) mod tree;
+
+pub use tree::{ImmutableSourceView, TreeError};
