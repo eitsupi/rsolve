@@ -1053,6 +1053,13 @@ mod tests {
         package_entry_with_commit(package, COMMIT)
     }
 
+    fn package_entry_with_repository(package: &str, repository: &str) -> String {
+        package_entry(package).replace(
+            "\"_dependencies\":[]}",
+            &format!("\"_dependencies\":[],\"Repository\":\"{repository}\"}}"),
+        )
+    }
+
     fn package_entry_with_commit(package: &str, commit: &str) -> String {
         format!(
             r#"{{"Package":"{package}","Version":"1.0.0","RemoteUrl":"https://github.com/example/{package}.git","RemoteSha":"{commit}","_type":"src","_status":"success","_file":"{package}_1.0.0.tar.gz","_fileid":"https://downloads.example.test/{package}_1.0.0.tar.gz","_sha256":"{ARTIFACT_SHA256}","_filesize":123,"_dependencies":[]}}"#
@@ -1428,7 +1435,10 @@ mod tests {
                 ),
                 (
                     "https://custom.example/universe/api/packages?limit=1",
-                    format!("[{}]", package_entry("foo")),
+                    format!(
+                        "[{}]",
+                        package_entry_with_repository("foo", "https://universe.example")
+                    ),
                 ),
             ],
         );
@@ -1453,6 +1463,13 @@ mod tests {
                     && source.size == Some(123)
                     && source.upstream_checksums.len() == 1
         ));
+        assert_eq!(
+            releases.observations()[0].release().distributions()[0]
+                .observed_metadata
+                .fields
+                .get("Repository"),
+            Some(&"https://universe.example".to_owned())
+        );
         let offline = provider.open_compatible(&store, None).unwrap();
         assert_eq!(offline.registry_id().as_str(), "universe");
     }

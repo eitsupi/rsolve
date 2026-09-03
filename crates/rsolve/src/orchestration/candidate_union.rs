@@ -88,6 +88,14 @@ mod tests {
     use std::collections::HashSet;
 
     fn distribution(channel: &str, locator: &str) -> Distribution {
+        distribution_with_metadata(channel, locator, DistributionMetadata::default())
+    }
+
+    fn distribution_with_metadata(
+        channel: &str,
+        locator: &str,
+        observed_metadata: DistributionMetadata,
+    ) -> Distribution {
         Distribution {
             registry: rsolve_core::RegistryId::new("registry").unwrap(),
             channel: DistributionChannel::new(channel).unwrap(),
@@ -97,7 +105,7 @@ mod tests {
                 upstream_checksums: Vec::new(),
                 size: None,
             })],
-            observed_metadata: DistributionMetadata::default(),
+            observed_metadata,
         }
     }
 
@@ -220,6 +228,72 @@ mod tests {
                 .occurrences()
                 .iter()
                 .map(|occurrence| occurrence.repository().as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn same_git_identity_merges_r_universe_occurrences_with_distinct_repository_evidence() {
+        let first_distribution = distribution_with_metadata(
+            "source",
+            "https://example.test/one.tar.gz",
+            DistributionMetadata {
+                fields: [("Repository".into(), "first".into())].into(),
+            },
+        );
+        let second_distribution = distribution_with_metadata(
+            "source",
+            "https://example.test/two.tar.gz",
+            DistributionMetadata {
+                fields: [("Repository".into(), "second".into())].into(),
+            },
+        );
+        let first_release = release(
+            "pkg",
+            "0123456789012345678901234567890123456789",
+            vec![first_distribution.clone()],
+        );
+        let second_release = release(
+            "pkg",
+            "0123456789012345678901234567890123456789",
+            vec![second_distribution.clone()],
+        );
+        let first = FixedLoader {
+            result: result(vec![candidate(
+                "first",
+                first_release,
+                vec![first_distribution.clone()],
+            )]),
+        };
+        let second = FixedLoader {
+            result: result(vec![candidate(
+                "second",
+                second_release,
+                vec![second_distribution.clone()],
+            )]),
+        };
+        let loaded = CompositeCandidateLoader::from_iter([
+            &first as &dyn CandidateLoader,
+            &second as &dyn CandidateLoader,
+        ])
+        .load(&SolverKey::InstalledName(PackageName::new("pkg").unwrap()))
+        .unwrap();
+        assert_eq!(loaded.candidates().len(), 1);
+        assert_eq!(loaded.candidates()[0].release().distributions().len(), 2);
+        assert_eq!(
+            loaded.candidates()[0]
+                .release()
+                .distributions()
+                .iter()
+                .map(|distribution| {
+                    distribution
+                        .observed_metadata
+                        .fields
+                        .get("Repository")
+                        .unwrap()
+                        .as_str()
+                })
                 .collect::<Vec<_>>(),
             vec!["first", "second"]
         );

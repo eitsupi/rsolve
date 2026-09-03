@@ -13,8 +13,8 @@ use rsolve::{
 use rsolve_core::{
     Artifact, Distribution, DistributionChannel, DistributionMetadata, EnvironmentId, GitCommitId,
     LockedIdentities, NormalizedGitUrl, PackageName, PackageRelease, Provenance, RPackageVersion,
-    ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId, Resolution,
-    ResolutionTarget, Sha256Digest, SolverKey, SourceArtifact, VersionConstraint,
+    ReleaseAggregation, ReleaseIdentity, ReleaseMetadata, ReleaseObservation, RepositoryId,
+    Resolution, ResolutionTarget, Sha256Digest, SolverKey, SourceArtifact, VersionConstraint,
 };
 use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
@@ -50,23 +50,45 @@ fn repository() -> RepositorySpec {
 }
 
 fn composed(repository: &RepositorySpec) -> ComposedEnvironment {
+    composed_repositories(std::slice::from_ref(repository))
+}
+
+fn composed_repositories(repositories: &[RepositorySpec]) -> ComposedEnvironment {
     ComposedEnvironment {
         environment: EnvironmentId::new("default").unwrap(),
         r_requirement: VersionConstraint::unconstrained(),
         published_before: None,
         target: ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
-        repositories: vec![repository.clone()],
+        repositories: repositories.to_vec(),
         roots: Vec::new(),
         locked: LockedIdentities::new(),
     }
 }
 
 fn archive(package: &str, version: &str) -> Vec<u8> {
+    archive_with_description(package, version, "fixture")
+}
+
+fn archive_with_description(package: &str, version: &str, description: &str) -> Vec<u8> {
+    archive_with_description_and_remote(
+        package,
+        version,
+        description,
+        &format!("https://example.test/{package}"),
+    )
+}
+
+fn archive_with_description_and_remote(
+    package: &str,
+    version: &str,
+    description: &str,
+    remote_url: &str,
+) -> Vec<u8> {
     let mut encoded = Vec::new();
     let encoder = GzEncoder::new(&mut encoded, Compression::default());
     let mut builder = Builder::new(encoder);
     let contents = format!(
-        "Package: {package}\nVersion: {version}\nDescription: fixture\nRemoteUrl: https://example.test/{package}\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n"
+        "Package: {package}\nVersion: {version}\nDescription: {description}\nRemoteUrl: {remote_url}\nRemoteSha: 0123456789abcdef0123456789abcdef01234567\n"
     );
     let mut header = Header::new_gnu();
     header.set_size(contents.len() as u64);
@@ -81,6 +103,49 @@ fn archive(package: &str, version: &str) -> Vec<u8> {
         .unwrap();
     builder.into_inner().unwrap().finish().unwrap();
     encoded
+}
+
+fn release_for_occurrence(
+    repository: &RepositorySpec,
+    package: &str,
+    locator: &str,
+    bytes: &[u8],
+    repository_metadata: &str,
+) -> PackageRelease {
+    let package_name = PackageName::new(package).unwrap();
+    let version = RPackageVersion::parse("1.0.0").unwrap();
+    let source = SourceArtifact {
+        locator: rsolve_core::ArtifactLocator::new(locator).unwrap(),
+        upstream_checksums: vec![rsolve_core::UpstreamChecksum::Sha256(
+            Sha256Digest::new(hex(&Sha256::digest(bytes))).unwrap(),
+        )],
+        size: Some(bytes.len() as u64),
+    };
+    PackageRelease::try_from(ReleaseObservation {
+        identity: ReleaseIdentity::new(
+            package_name.clone(),
+            Provenance::GitCommit {
+                repository: NormalizedGitUrl::new("https://example.test/shared").unwrap(),
+                commit: GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                subdirectory: None,
+            },
+        ),
+        observed_package: package_name,
+        observed_version: version,
+        metadata: ReleaseMetadata::from_pairs([("Title", "shared fixture")]).unwrap(),
+        publication: None,
+        declared_dependencies: Vec::new(),
+        distributions: vec![Distribution {
+            registry: repository.configured_registry_id().unwrap(),
+            channel: DistributionChannel::new("source").unwrap(),
+            snapshot: None,
+            artifacts: vec![Artifact::Source(source)],
+            observed_metadata: DistributionMetadata {
+                fields: [("Repository".into(), repository_metadata.into())].into(),
+            },
+        }],
+    })
+    .unwrap()
 }
 
 fn selected(
@@ -334,4 +399,89 @@ fn materialization_failure_is_typed_after_successful_acquisition() {
         fs::read_to_string(sentinel).unwrap(),
         "keep existing repository"
     );
+}
+
+#[test]
+fn materializes_first_priority_artifact_from_merged_r_universe_occurrences() {
+    let first = RepositorySpec::new(
+        RepositoryId::new("first").unwrap(),
+        RegistrySpec::RUniverse,
+        Endpoint::new("https://universe.example/first/").unwrap(),
+    )
+    .unwrap();
+    let second = RepositorySpec::new(
+        RepositoryId::new("second").unwrap(),
+        RegistrySpec::RUniverse,
+        Endpoint::new("https://universe.example/second/").unwrap(),
+    )
+    .unwrap();
+    let first_bytes = archive_with_description_and_remote(
+        "alpha",
+        "1.0.0",
+        "first",
+        "https://example.test/shared",
+    );
+    let second_bytes = archive_with_description_and_remote(
+        "alpha",
+        "1.0.0",
+        "second and longer",
+        "https://example.test/shared",
+    );
+    let first_locator = "https://download.example/alpha-first.tar.gz";
+    let second_locator = "https://download.example/alpha-second.tar.gz";
+    assert_ne!(first_bytes.len(), second_bytes.len());
+    let first_release = release_for_occurrence(
+        &first,
+        "alpha",
+        first_locator,
+        &first_bytes,
+        "https://universe.example/first",
+    );
+    let second_release = release_for_occurrence(
+        &second,
+        "alpha",
+        second_locator,
+        &second_bytes,
+        "https://universe.example/second",
+    );
+    let mut aggregation = ReleaseAggregation::new();
+    aggregation.observe_release(first_release).unwrap();
+    aggregation.observe_release(second_release).unwrap();
+    let merged = aggregation.releases().next().unwrap().clone();
+    assert_eq!(merged.distributions().len(), 2);
+    assert_eq!(merged.metadata().fields().len(), 1);
+
+    let selected = rsolve_core::ResolvedPackage::new(
+        SolverKey::InstalledName(PackageName::new("alpha").unwrap()),
+        merged,
+        Vec::new(),
+        vec![first.id().clone(), second.id().clone()],
+    );
+    let resolution = Resolution::new(
+        ResolutionTarget::new(RPackageVersion::parse_bare("4.4").unwrap()),
+        vec![selected],
+    );
+    let fetcher = FixtureFetcher {
+        archives: BTreeMap::from([(first_locator.to_owned(), first_bytes.clone())]),
+        calls: Cell::new(0),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let state = prepare_r_universe_project_repository_with_fetcher(
+        &project,
+        root.path().join("cache"),
+        &resolution,
+        &composed_repositories(&[first, second]),
+        ArtifactAcquisitionMode::Online,
+        &fetcher,
+    )
+    .unwrap();
+    let first_sha = hex(&Sha256::digest(&first_bytes));
+    assert_eq!(fetcher.calls.get(), 1);
+    assert_eq!(state.records().len(), 1);
+    assert_eq!(state.records()[0].artifact_sha256, first_sha);
+    assert_eq!(state.records()[0].size, first_bytes.len() as u64);
+    let packages =
+        fs::read_to_string(project.join(".rsolve/repository/src/contrib/PACKAGES")).unwrap();
+    assert!(packages.contains("Package: alpha"));
 }

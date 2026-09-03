@@ -171,6 +171,7 @@ fn parse_package(
     let source_artifact = parse_source_artifact(object, &package, &version)?;
 
     let mut metadata = BTreeMap::new();
+    let mut distribution_metadata = BTreeMap::new();
     for (field, value) in object {
         if matches!(
             field.as_str(),
@@ -184,6 +185,7 @@ fn parse_package(
                 | "Packaged"
                 | "Date/Publication"
                 | "Published"
+                | "Repository"
         ) {
             continue;
         }
@@ -204,6 +206,17 @@ fn parse_package(
         };
         metadata.insert(field.clone(), scalar);
     }
+    if let Some(value) = object.get("Repository") {
+        let scalar = match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            Value::Null | Value::Array(_) | Value::Object(_) => None,
+        };
+        if let Some(value) = scalar {
+            distribution_metadata.insert("Repository".to_owned(), value);
+        }
+    }
     let metadata = ReleaseMetadata::from_pairs(metadata)
         .map_err(|error| invalid_field("metadata", error.to_string()))?;
     let identity = rsolve_core::ReleaseIdentity::new(
@@ -219,7 +232,9 @@ fn parse_package(
         channel: DistributionChannel::new("source").expect("source is a valid channel"),
         snapshot: None,
         artifacts: vec![Artifact::Source(source_artifact)],
-        observed_metadata: DistributionMetadata::default(),
+        observed_metadata: DistributionMetadata {
+            fields: distribution_metadata,
+        },
     };
     PackageRelease::try_from(ReleaseObservation {
         identity,
@@ -669,6 +684,24 @@ mod tests {
                         Sha256Digest::new(ARTIFACT_SHA256).unwrap()
                     )]
         ));
+    }
+
+    #[test]
+    fn keeps_scalar_repository_as_distribution_evidence() {
+        let catalog = parse_catalog(
+            &response(&entry(",\"Repository\":\"https://universe.example\"")),
+            RegistryId::new(REGISTRY).unwrap(),
+        )
+        .unwrap();
+        let release = &catalog.releases()[0];
+        assert!(!release.metadata().fields().contains_key("Repository"));
+        assert_eq!(
+            release.distributions()[0]
+                .observed_metadata
+                .fields
+                .get("Repository"),
+            Some(&"https://universe.example".to_owned())
+        );
     }
 
     #[test]

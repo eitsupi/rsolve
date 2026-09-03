@@ -138,34 +138,45 @@ pub fn acquire_selected_artifact<F: ArtifactFetcher>(
     fetcher: &F,
 ) -> Result<MaterializationArtifact, ArtifactAcquisitionError> {
     let package = selected.name();
-    let repository_ids = composed
-        .repositories
-        .iter()
-        .filter(|repository| {
-            repository.package_allowed(package)
-                && matches!(
-                    repository.registry(),
-                    crate::manifest::RegistrySpec::RUniverse
-                )
-                && selected
-                    .visible_repository_ids()
-                    .iter()
-                    .any(|id| id == repository.id())
-        })
-        .map(|repository| repository.configured_registry_id())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ArtifactAcquisitionError::InvalidRepository {
-            reason: error.to_string(),
+    let mut artifact = None;
+    for repository_id in selected.visible_repository_ids() {
+        let Some(repository) = composed
+            .repositories
+            .iter()
+            .find(|repository| repository.id() == repository_id)
+        else {
+            continue;
+        };
+        if !repository.package_allowed(package)
+            || !matches!(
+                repository.registry(),
+                crate::manifest::RegistrySpec::RUniverse
+            )
+        {
+            continue;
+        }
+        let registry = repository.configured_registry_id().map_err(|error| {
+            ArtifactAcquisitionError::InvalidRepository {
+                reason: error.to_string(),
+            }
         })?;
-    let artifacts = selected
-        .distributions()
-        .iter()
-        .filter(|distribution| repository_ids.iter().any(|id| id == &distribution.registry))
-        .flat_map(source_artifacts)
-        .collect::<Vec<_>>();
-    let artifact = unique_artifact(package, artifacts)?;
+        let occurrence_artifacts = selected
+            .distributions()
+            .iter()
+            .filter(|distribution| distribution.registry == registry)
+            .flat_map(source_artifacts)
+            .collect::<Vec<_>>();
+        if occurrence_artifacts.is_empty() {
+            continue;
+        }
+        artifact = Some(unique_artifact(package, occurrence_artifacts)?.clone());
+        break;
+    }
+    let artifact = artifact.ok_or_else(|| ArtifactAcquisitionError::NoRUniverseArtifact {
+        package: ArtifactAcquisitionError::package_name(package),
+    })?;
     let expectation = expectation_for_release(selected.release())?;
-    let cached = match probe_artifact(cache_root.as_ref(), artifact, &expectation)? {
+    let cached = match probe_artifact(cache_root.as_ref(), &artifact, &expectation)? {
         Some(cached) => cached,
         None if mode == ArtifactAcquisitionMode::Offline => {
             return Err(ArtifactAcquisitionError::OfflineMiss {
@@ -183,7 +194,7 @@ pub fn acquire_selected_artifact<F: ArtifactFetcher>(
             }
             commit_source_artifact_with_expectation(
                 cache_root,
-                artifact,
+                &artifact,
                 &expectation,
                 response.reader,
             )?
@@ -326,10 +337,14 @@ mod tests {
     }
 
     fn repository() -> crate::manifest::RepositorySpec {
+        repository_named("universe", "https://custom.example/universe/")
+    }
+
+    fn repository_named(id: &str, endpoint: &str) -> crate::manifest::RepositorySpec {
         crate::manifest::RepositorySpec::new(
-            RepositoryId::new("universe").unwrap(),
+            RepositoryId::new(id).unwrap(),
             crate::manifest::RegistrySpec::RUniverse,
-            crate::manifest::Endpoint::new("https://custom.example/universe/").unwrap(),
+            crate::manifest::Endpoint::new(endpoint).unwrap(),
         )
         .unwrap()
     }
@@ -462,6 +477,69 @@ mod tests {
             locked: rsolve_core::LockedIdentities::new(),
         };
         (selected, composed)
+    }
+
+    fn selected_with_repository_distributions(
+        repositories: &[crate::manifest::RepositorySpec],
+        distributions: Vec<Distribution>,
+        visible_repository_ids: Vec<RepositoryId>,
+    ) -> (ResolvedPackage, crate::manifest::ComposedEnvironment) {
+        let package = PackageName::new("example").unwrap();
+        let version = rsolve_core::RPackageVersion::parse("1.0").unwrap();
+        let identity = ReleaseIdentity::new(
+            package.clone(),
+            Provenance::GitCommit {
+                repository: NormalizedGitUrl::new("https://example.test/project").unwrap(),
+                commit: GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                subdirectory: None,
+            },
+        );
+        let release = PackageRelease::try_from(ReleaseObservation {
+            identity,
+            observed_package: package.clone(),
+            observed_version: version.clone(),
+            metadata: ReleaseMetadata::from_pairs([("Title", "Example package")]).unwrap(),
+            publication: None,
+            declared_dependencies: Vec::new(),
+            distributions,
+        })
+        .unwrap();
+        let selected = ResolvedPackage::new(
+            SolverKey::InstalledName(package.clone()),
+            release,
+            Vec::new(),
+            visible_repository_ids,
+        );
+        let composed = crate::manifest::ComposedEnvironment {
+            environment: EnvironmentId::new("default").unwrap(),
+            r_requirement: VersionConstraint::unconstrained(),
+            published_before: None,
+            target: ResolutionTarget::new(rsolve_core::RPackageVersion::parse_bare("4.4").unwrap()),
+            repositories: repositories.to_vec(),
+            roots: Vec::new(),
+            locked: rsolve_core::LockedIdentities::new(),
+        };
+        (selected, composed)
+    }
+
+    fn occurrence_distribution(
+        repository: &crate::manifest::RepositorySpec,
+        locator: &str,
+        contents: &[u8],
+    ) -> Distribution {
+        Distribution {
+            registry: repository.configured_registry_id().unwrap(),
+            channel: DistributionChannel::new("source").unwrap(),
+            snapshot: None,
+            artifacts: vec![Artifact::Source(SourceArtifact {
+                locator: ArtifactLocator::new(locator).unwrap(),
+                upstream_checksums: vec![rsolve_core::UpstreamChecksum::Sha256(
+                    Sha256Digest::new(hex_lower(&sha2::Sha256::digest(contents))).unwrap(),
+                )],
+                size: Some(contents.len() as u64),
+            })],
+            observed_metadata: DistributionMetadata::default(),
+        }
     }
 
     fn hex_lower(bytes: &[u8]) -> String {
@@ -826,6 +904,185 @@ mod tests {
             ),
             Err(ArtifactAcquisitionError::AmbiguousArtifact { .. })
         ));
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn occurrence_artifact_selection_honors_priority_fallback_and_qualification() {
+        let first_repo = repository_named("first", "https://custom.example/first/");
+        let second_repo = repository_named("second", "https://custom.example/second/");
+        let first_bytes = archive("example", "1.0", "Description: first\n");
+        let second_bytes = archive("example", "1.0", "Description: second\n");
+        let first_locator = "https://download.example/first.tar.gz";
+        let second_locator = "https://download.example/second.tar.gz";
+        let repositories = [first_repo.clone(), second_repo.clone()];
+        let first_distribution = occurrence_distribution(&first_repo, first_locator, &first_bytes);
+        let second_distribution =
+            occurrence_distribution(&second_repo, second_locator, &second_bytes);
+
+        let (selected, composed) = selected_with_repository_distributions(
+            &repositories,
+            vec![first_distribution.clone(), second_distribution.clone()],
+            vec![first_repo.id().clone(), second_repo.id().clone()],
+        );
+        let cache = root();
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes: first_bytes.clone(),
+            calls: Cell::new(0),
+            locator: first_locator.into(),
+            failure: None,
+        };
+        let first_result = acquire_selected_artifact(
+            &cache,
+            &selected,
+            &composed,
+            ArtifactAcquisitionMode::Online,
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(
+            first_result.artifact.sha256.as_str(),
+            hex_lower(&sha2::Sha256::digest(&first_bytes))
+        );
+        assert_eq!(fetcher.calls.get(), 1);
+        std::fs::remove_dir_all(&cache).unwrap();
+
+        let (selected, composed) = selected_with_repository_distributions(
+            &repositories,
+            vec![first_distribution.clone(), second_distribution.clone()],
+            vec![second_repo.id().clone(), first_repo.id().clone()],
+        );
+        let cache = root();
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes: second_bytes.clone(),
+            calls: Cell::new(0),
+            locator: second_locator.into(),
+            failure: None,
+        };
+        let reversed = acquire_selected_artifact(
+            &cache,
+            &selected,
+            &composed,
+            ArtifactAcquisitionMode::Online,
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(
+            reversed.artifact.sha256.as_str(),
+            hex_lower(&sha2::Sha256::digest(&second_bytes))
+        );
+        assert_eq!(fetcher.calls.get(), 1);
+        std::fs::remove_dir_all(&cache).unwrap();
+
+        let (selected, composed) = selected_with_repository_distributions(
+            &repositories,
+            vec![second_distribution.clone()],
+            vec![first_repo.id().clone(), second_repo.id().clone()],
+        );
+        let cache = root();
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes: second_bytes.clone(),
+            calls: Cell::new(0),
+            locator: second_locator.into(),
+            failure: None,
+        };
+        let second_result = acquire_selected_artifact(
+            &cache,
+            &selected,
+            &composed,
+            ArtifactAcquisitionMode::Online,
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(
+            second_result.artifact.sha256.as_str(),
+            hex_lower(&sha2::Sha256::digest(&second_bytes))
+        );
+        std::fs::remove_dir_all(&cache).unwrap();
+
+        let (selected, composed) = selected_with_repository_distributions(
+            &repositories,
+            vec![first_distribution, second_distribution],
+            vec![second_repo.id().clone()],
+        );
+        let cache = root();
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes: second_bytes,
+            calls: Cell::new(0),
+            locator: second_locator.into(),
+            failure: None,
+        };
+        let qualified = acquire_selected_artifact(
+            &cache,
+            &selected,
+            &composed,
+            ArtifactAcquisitionMode::Online,
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(
+            qualified.artifact.sha256.as_str(),
+            hex_lower(&sha2::Sha256::digest(&fetcher.bytes))
+        );
+        assert_eq!(fetcher.calls.get(), 1);
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn occurrence_artifact_ambiguity_does_not_fall_back_to_lower_priority() {
+        let first_repo = repository_named("first", "https://custom.example/first/");
+        let second_repo = repository_named("second", "https://custom.example/second/");
+        let first_bytes = archive("example", "1.0", "Description: first\n");
+        let second_bytes = archive("example", "1.0", "Description: second\n");
+        let first_distributions = vec![
+            occurrence_distribution(
+                &first_repo,
+                "https://download.example/first-a.tar.gz",
+                &first_bytes,
+            ),
+            occurrence_distribution(
+                &first_repo,
+                "https://download.example/first-b.tar.gz",
+                &first_bytes,
+            ),
+        ];
+        let second_distribution = occurrence_distribution(
+            &second_repo,
+            "https://download.example/second.tar.gz",
+            &second_bytes,
+        );
+        let repositories = [first_repo, second_repo];
+        let (selected, composed) = selected_with_repository_distributions(
+            &repositories,
+            first_distributions
+                .into_iter()
+                .chain([second_distribution])
+                .collect(),
+            vec![repositories[0].id().clone(), repositories[1].id().clone()],
+        );
+        let cache = root();
+        let fetcher = FixtureFetcher {
+            status: 200,
+            bytes: second_bytes,
+            calls: Cell::new(0),
+            locator: "https://download.example/second.tar.gz".into(),
+            failure: None,
+        };
+        assert!(matches!(
+            acquire_selected_artifact(
+                &cache,
+                &selected,
+                &composed,
+                ArtifactAcquisitionMode::Online,
+                &fetcher,
+            ),
+            Err(ArtifactAcquisitionError::AmbiguousArtifact { .. })
+        ));
+        assert_eq!(fetcher.calls.get(), 0);
         std::fs::remove_dir_all(cache).unwrap();
     }
 
