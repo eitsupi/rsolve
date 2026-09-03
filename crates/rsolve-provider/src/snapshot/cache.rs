@@ -79,6 +79,22 @@ pub(crate) struct ViewValidationV1 {
     pub(crate) sources: Vec<ViewValidationSourceV1>,
 }
 
+/// A structurally validated view candidate. Coverage syntax is intentionally
+/// left opaque here; provider adapters own its interpretation.
+pub(crate) struct ViewCandidate {
+    pub(crate) loader: ReadOnlySnapshotCandidateLoader,
+    pub(crate) validation: ViewValidationV1,
+    pub(crate) state: String,
+    pub(crate) scope: String,
+    pub(crate) freshness: String,
+}
+
+pub(crate) struct ViewCandidateSet {
+    pub(crate) candidates: Vec<ViewCandidate>,
+    pub(crate) had_heads: bool,
+    pub(crate) invalid_candidates: bool,
+}
+
 struct ViewValidationInput {
     registry_id: String,
     compatibility_profile: u32,
@@ -400,6 +416,71 @@ impl SnapshotStore {
             })?;
         self.read_view_for_endpoint_locked(&refresh_lock, endpoint)
             .map(|result| result.map(|(head, loader)| (loader, validation_record(&head))))
+    }
+
+    /// Enumerate structurally valid view candidates while holding the store
+    /// refresh lock. Coverage compatibility remains a provider concern.
+    pub(crate) fn read_view_candidates(&self) -> Result<ViewCandidateSet, CandidateLoadError> {
+        let refresh_lock = self
+            .acquire_refresh_lock(RefreshLockMode::Blocking)
+            .map_err(|error| {
+                store_candidate_error(format!("unable to acquire snapshot refresh lock: {error}"))
+            })?;
+        self.read_view_candidates_locked(&refresh_lock)
+    }
+
+    fn read_view_candidates_locked(
+        &self,
+        refresh_lock: &RefreshLock,
+    ) -> Result<ViewCandidateSet, CandidateLoadError> {
+        let views = match fs::read_dir(self.root.join(VIEWS_DIR)) {
+            Ok(views) => views,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ViewCandidateSet {
+                    candidates: Vec::new(),
+                    had_heads: false,
+                    invalid_candidates: false,
+                });
+            }
+            Err(error) => {
+                return Err(store_candidate_error(format!(
+                    "unable to read snapshot views: {error}"
+                )));
+            }
+        };
+        let mut candidates = Vec::new();
+        let mut had_heads = false;
+        let mut invalid_candidates = false;
+        for entry in views {
+            let path = entry
+                .map_err(|error| {
+                    store_candidate_error(format!("unable to enumerate snapshot views: {error}"))
+                })?
+                .path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            had_heads = true;
+            let Some(view_key) = path.file_stem().and_then(|name| name.to_str()) else {
+                invalid_candidates = true;
+                continue;
+            };
+            match self.read_view_optional_locked(refresh_lock, view_key) {
+                Ok(Some((head, loader))) => candidates.push(ViewCandidate {
+                    state: head.coverage.state.clone(),
+                    scope: head.coverage.scope.clone(),
+                    freshness: head.coverage.freshness.clone(),
+                    validation: validation_record(&head),
+                    loader,
+                }),
+                Ok(None) | Err(_) => invalid_candidates = true,
+            }
+        }
+        Ok(ViewCandidateSet {
+            candidates,
+            had_heads,
+            invalid_candidates,
+        })
     }
 
     pub fn read_latest_view_optional(

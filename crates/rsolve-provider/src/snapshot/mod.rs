@@ -62,7 +62,7 @@ mod cache;
 pub(crate) use cache::SnapshotPublishError;
 pub(crate) use cache::SnapshotRefreshGuard;
 pub use cache::{SnapshotStore, SnapshotStoreError};
-pub(crate) use cache::{ViewValidationV1, view_key_for_parts, view_validation_revision_token};
+pub(crate) use cache::{ViewValidationV1, view_validation_revision_token};
 
 #[cfg(test)]
 mod tests;

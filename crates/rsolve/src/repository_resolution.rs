@@ -35,6 +35,12 @@ trait RUniverseSession {
         allowlist: Option<&[PackageName]>,
     ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError>;
 
+    fn open_compatible_offline(
+        &self,
+        store: &rsolve_provider::SnapshotStore,
+        allowlist: Option<&[PackageName]>,
+    ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError>;
+
     fn refresh_snapshot(
         &self,
         store: &rsolve_provider::SnapshotStore,
@@ -58,6 +64,15 @@ impl<T: rsolve_provider::r_universe::RUniverseTransport> RUniverseSession for RU
         allowlist: Option<&[PackageName]>,
     ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError> {
         RUniverseProvider::refresh_snapshot(self, store, allowlist)
+            .map(|loader| Box::new(loader) as Box<dyn RawCandidateLoader>)
+    }
+
+    fn open_compatible_offline(
+        &self,
+        store: &rsolve_provider::SnapshotStore,
+        allowlist: Option<&[PackageName]>,
+    ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError> {
+        RUniverseProvider::open_compatible_offline(self, store, allowlist)
             .map(|loader| Box::new(loader) as Box<dyn RawCandidateLoader>)
     }
 }
@@ -347,7 +362,7 @@ fn resolve_composed_with_factory(
                 .map_err(RepositoryResolutionError::RUniverse)?;
             let loader = if offline {
                 provider
-                    .open_compatible(&store, scope.as_deref())
+                    .open_compatible_offline(&store, scope.as_deref())
                     .map_err(RepositoryResolutionError::RUniverse)?
             } else if refresh_metadata {
                 provider
@@ -1010,6 +1025,14 @@ mod tests {
                 ));
             }
             Ok(Box::new(self.snapshot.clone()))
+        }
+
+        fn open_compatible_offline(
+            &self,
+            store: &rsolve_provider::SnapshotStore,
+            allowlist: Option<&[PackageName]>,
+        ) -> Result<Box<dyn RawCandidateLoader>, RUniverseProviderError> {
+            self.open_compatible(store, allowlist)
         }
 
         fn refresh_snapshot(

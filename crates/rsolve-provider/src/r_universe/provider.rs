@@ -25,6 +25,96 @@ pub const RUNIVERSE_NORMALIZATION_POLICY: u32 = 2;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CoverageScope {
+    All,
+    Packages(Vec<PackageName>),
+}
+
+impl CoverageScope {
+    fn from_allowlist(allowlist: Option<&[PackageName]>) -> Result<Self, RUniverseProviderError> {
+        Ok(match canonical_allowlist(allowlist)? {
+            Some(packages) => Self::Packages(packages),
+            None => Self::All,
+        })
+    }
+
+    fn encode(&self) -> String {
+        match self {
+            Self::All => "api-catalog".to_owned(),
+            Self::Packages(packages) => format!(
+                "api-catalog:packages={}",
+                packages
+                    .iter()
+                    .map(PackageName::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        if value == "api-catalog" {
+            return Ok(Self::All);
+        }
+        let encoded = value
+            .strip_prefix("api-catalog:packages=")
+            .ok_or_else(|| "unknown coverage scope encoding".to_owned())?;
+        if encoded.is_empty() {
+            return Err("package coverage scope is empty".to_owned());
+        }
+        let mut packages = encoded
+            .split(',')
+            .map(|package| PackageName::new(package).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let canonical = {
+            packages.sort();
+            if packages.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err("package coverage scope contains duplicates".to_owned());
+            }
+            format!(
+                "api-catalog:packages={}",
+                packages
+                    .iter()
+                    .map(PackageName::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        if canonical != value {
+            return Err("package coverage scope is not canonical".to_owned());
+        }
+        Ok(Self::Packages(packages))
+    }
+
+    fn covers(&self, requested: &Self) -> bool {
+        match (self, requested) {
+            (Self::All, _) => true,
+            (Self::Packages(_), Self::All) => false,
+            (Self::Packages(available), Self::Packages(requested)) => requested
+                .iter()
+                .all(|package| available.binary_search(package).is_ok()),
+        }
+    }
+
+    fn extra_package_count(&self, requested: &Self) -> usize {
+        match (self, requested) {
+            (Self::All, Self::All) => 0,
+            (Self::All, Self::Packages(_)) => usize::MAX,
+            (Self::Packages(_), Self::All) => usize::MAX,
+            (Self::Packages(available), Self::Packages(requested)) => {
+                available.len().saturating_sub(requested.len())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenMode {
+    Online,
+    Offline,
+}
+
 /// A transport-neutral HTTP response used by the R-universe provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RUniverseResponse {
@@ -143,6 +233,7 @@ pub enum RUniverseProviderError {
     Snapshot(String),
     OfflineMissing(String),
     OfflineIncompatible(String),
+    OfflineCorrupt(String),
 }
 
 impl fmt::Display for RUniverseProviderError {
@@ -201,6 +292,9 @@ impl fmt::Display for RUniverseProviderError {
             }
             Self::OfflineIncompatible(reason) => {
                 write!(f, "R-universe snapshot is incompatible: {reason}")
+            }
+            Self::OfflineCorrupt(reason) => {
+                write!(f, "R-universe snapshot candidate is corrupt: {reason}")
             }
         }
     }
@@ -285,66 +379,108 @@ impl<T: RUniverseTransport> RUniverseProvider<T> {
             .map_err(|error| RUniverseProviderError::Snapshot(error.to_string()))
     }
 
-    /// Open the exact compatible view only when its local interpretation profile
-    /// is compatible. This method never falls back to network acquisition.
+    /// Open the newest compatible current view for this endpoint, allowing a
+    /// complete coverage superset. This method never falls back to network
+    /// acquisition.
     pub fn open_compatible(
         &self,
         store: &SnapshotStore,
         allowlist: Option<&[PackageName]>,
     ) -> Result<ReadOnlySnapshotCandidateLoader, RUniverseProviderError> {
-        let expected_scope = coverage_scope(allowlist)?;
-        let view_key = super::super::snapshot::view_key_for_parts(
-            &self.registry_id,
-            "complete",
-            &expected_scope,
-            "current",
-            self.endpoint.as_ref(),
-        );
-        let (loader, validation) = match store
-            .read_view_with_validation(&view_key)
-            .map_err(|error| RUniverseProviderError::OfflineIncompatible(error.to_string()))?
-        {
-            Some(value) => value,
-            None => match store.has_view_heads() {
-                Ok(true) => {
-                    return Err(RUniverseProviderError::OfflineIncompatible(
-                        "no compatible snapshot view head exists for the provider request".into(),
-                    ));
+        self.open_compatible_with_mode(store, allowlist, OpenMode::Online)
+    }
+
+    /// Open a compatible local view for an offline operation. Unlike the
+    /// online warm-open path, a view validated for another endpoint may be
+    /// reused when its registry and coverage are compatible. The returned
+    /// loader retains the candidate's validation endpoint; the requested
+    /// endpoint is never reported as validated by this operation.
+    pub fn open_compatible_offline(
+        &self,
+        store: &SnapshotStore,
+        allowlist: Option<&[PackageName]>,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, RUniverseProviderError> {
+        self.open_compatible_with_mode(store, allowlist, OpenMode::Offline)
+    }
+
+    fn open_compatible_with_mode(
+        &self,
+        store: &SnapshotStore,
+        allowlist: Option<&[PackageName]>,
+        mode: OpenMode,
+    ) -> Result<ReadOnlySnapshotCandidateLoader, RUniverseProviderError> {
+        let expected_scope = CoverageScope::from_allowlist(allowlist)?;
+        let mut candidates = store
+            .read_view_candidates()
+            .map_err(|error| RUniverseProviderError::OfflineCorrupt(error.to_string()))?;
+        let mut corrupt = candidates.invalid_candidates;
+        let mut compatible = Vec::new();
+        for candidate in candidates.candidates.drain(..) {
+            let candidate_scope = match CoverageScope::parse(&candidate.scope) {
+                Ok(scope) => scope,
+                Err(_) => {
+                    corrupt = true;
+                    continue;
                 }
-                Ok(false) => {
-                    return Err(RUniverseProviderError::OfflineMissing(
-                        "snapshot view head is missing".into(),
-                    ));
-                }
-                Err(error) => {
-                    return Err(RUniverseProviderError::OfflineIncompatible(
-                        error.to_string(),
-                    ));
-                }
-            },
-        };
-        let header = loader.header();
-        if header.compatibility_profile != super::RUNIVERSE_COMPATIBILITY_PROFILE
-            || header.parser_schema != super::RUNIVERSE_PARSER_SCHEMA
-            || header.normalization_policy != RUNIVERSE_NORMALIZATION_POLICY
-            || header.coverage.scope != expected_scope
-            || validation.registry_id != self.registry_id.as_str()
-            || validation.generation != header.generation
-            || validation.compatibility_profile != header.compatibility_profile
-            || validation.parser_schema != header.parser_schema
-            || validation.normalization_policy != header.normalization_policy
-            || validation.effective_endpoint != self.endpoint.as_ref()
-        {
-            return Err(RUniverseProviderError::OfflineIncompatible(
-                "snapshot validation evidence does not match the provider request".into(),
+            };
+            let header = candidate.loader.header();
+            if header.compatibility_profile != super::RUNIVERSE_COMPATIBILITY_PROFILE
+                || header.parser_schema != super::RUNIVERSE_PARSER_SCHEMA
+                || header.normalization_policy != RUNIVERSE_NORMALIZATION_POLICY
+                || candidate.validation.registry_id != self.registry_id.as_str()
+                || candidate.validation.generation != header.generation
+                || candidate.validation.compatibility_profile != header.compatibility_profile
+                || candidate.validation.parser_schema != header.parser_schema
+                || candidate.validation.normalization_policy != header.normalization_policy
+                || candidate.state != "complete"
+                || candidate.freshness != "current"
+                || (mode == OpenMode::Online
+                    && candidate.validation.effective_endpoint != self.endpoint.as_ref())
+                || !candidate_scope.covers(&expected_scope)
+            {
+                continue;
+            }
+            compatible.push((candidate, candidate_scope));
+        }
+        compatible.sort_by(|left, right| {
+            let left_extra = left.1.extra_package_count(&expected_scope);
+            let right_extra = right.1.extra_package_count(&expected_scope);
+            right
+                .0
+                .validation
+                .refresh_sequence
+                .cmp(&left.0.validation.refresh_sequence)
+                .then_with(|| left_extra.cmp(&right_extra))
+                .then_with(|| {
+                    left.0
+                        .validation
+                        .effective_endpoint
+                        .cmp(&right.0.validation.effective_endpoint)
+                })
+                .then_with(|| {
+                    left.0
+                        .loader
+                        .header()
+                        .generation
+                        .cmp(&right.0.loader.header().generation)
+                })
+        });
+        if let Some((candidate, _)) = compatible.into_iter().next() {
+            return Ok(candidate.loader);
+        }
+        if corrupt {
+            return Err(RUniverseProviderError::OfflineCorrupt(
+                "no usable snapshot candidate remains after validation".into(),
             ));
         }
-        if header.coverage.state != "complete" {
-            return Err(RUniverseProviderError::OfflineIncompatible(
-                "snapshot coverage is not complete".into(),
+        if !candidates.had_heads {
+            return Err(RUniverseProviderError::OfflineMissing(
+                "snapshot view head is missing".into(),
             ));
         }
-        Ok(loader)
+        Err(RUniverseProviderError::OfflineIncompatible(
+            "no compatible snapshot view head exists for the provider request".into(),
+        ))
     }
 
     fn fetch(
@@ -741,18 +877,7 @@ fn snapshot_input(
 }
 
 fn coverage_scope(allowlist: Option<&[PackageName]>) -> Result<String, RUniverseProviderError> {
-    let packages = canonical_allowlist(allowlist)?;
-    Ok(match packages {
-        Some(packages) => format!(
-            "api-catalog:packages={}",
-            packages
-                .iter()
-                .map(PackageName::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        None => "api-catalog".into(),
-    })
+    Ok(CoverageScope::from_allowlist(allowlist)?.encode())
 }
 
 fn to_wire_release(release: &PackageRelease) -> Result<EligibleReleaseV1, RUniverseProviderError> {
@@ -975,6 +1100,50 @@ mod tests {
         let provider =
             RUniverseProvider::new(base, RegistryId::new("universe").unwrap(), transport).unwrap();
         (provider, requests)
+    }
+
+    #[test]
+    fn coverage_scope_is_strictly_canonical_and_provider_specific() {
+        assert_eq!(
+            CoverageScope::parse("api-catalog").unwrap(),
+            CoverageScope::All
+        );
+        let packages = CoverageScope::parse("api-catalog:packages=bar,foo").unwrap();
+        assert_eq!(
+            packages,
+            CoverageScope::Packages(vec![
+                PackageName::new("bar").unwrap(),
+                PackageName::new("foo").unwrap(),
+            ])
+        );
+        for value in [
+            "api-catalog:packages=foo,bar",
+            "api-catalog:packages=foo,foo",
+            "api-catalog:packages=",
+            "api-catalog:foo",
+        ] {
+            assert!(
+                CoverageScope::parse(value).is_err(),
+                "{value} must be rejected"
+            );
+        }
+        assert!(CoverageScope::All.covers(&packages));
+        assert!(!packages.covers(&CoverageScope::All));
+        assert!(packages.covers(&CoverageScope::Packages(vec![
+            PackageName::new("foo").unwrap()
+        ])));
+        assert!(!packages.covers(&CoverageScope::Packages(vec![
+            PackageName::new("zoo").unwrap()
+        ])));
+        assert_eq!(
+            CoverageScope::All.extra_package_count(&packages),
+            usize::MAX
+        );
+        assert_eq!(
+            CoverageScope::All.extra_package_count(&CoverageScope::All),
+            0
+        );
+        assert_eq!(packages.extra_package_count(&packages), 0);
     }
 
     #[test]
@@ -1289,6 +1458,218 @@ mod tests {
     }
 
     #[test]
+    fn compatible_coverage_accepts_supersets_and_rejects_partial_or_disjoint_scopes() {
+        let package_foo = PackageName::new("foo").unwrap();
+        let package_baz = PackageName::new("baz").unwrap();
+        let (provider, _) = fixture_provider(
+            "https://custom.example/universe",
+            &[
+                (
+                    "https://custom.example/universe/api/ls",
+                    r#"["foo","bar"]"#.into(),
+                ),
+                (
+                    "https://custom.example/universe/api/packages?limit=2",
+                    format!("[{},{}]", package_entry("foo"), package_entry("bar")),
+                ),
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("universe").unwrap()).unwrap();
+        provider.refresh_snapshot(&store, None).unwrap();
+        assert_eq!(
+            provider
+                .open_compatible(&store, Some(std::slice::from_ref(&package_foo)))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog"
+        );
+        assert_eq!(
+            provider
+                .open_compatible(&store, Some(&[package_foo.clone(), package_baz.clone()]))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog"
+        );
+
+        let subset_directory = tempfile::tempdir().unwrap();
+        let subset_store = SnapshotStore::open(
+            subset_directory.path(),
+            RegistryId::new("universe").unwrap(),
+        )
+        .unwrap();
+        let (subset_provider, _) = fixture_provider(
+            "https://custom.example/subset",
+            &[(
+                "https://custom.example/subset/api/packages/foo",
+                package_entry("foo"),
+            )],
+        );
+        subset_provider
+            .refresh_snapshot(&subset_store, Some(std::slice::from_ref(&package_foo)))
+            .unwrap();
+        assert!(matches!(
+            subset_provider
+                .open_compatible(&subset_store, Some(std::slice::from_ref(&package_baz))),
+            Err(RUniverseProviderError::OfflineIncompatible(_))
+        ));
+        assert!(matches!(
+            subset_provider.open_compatible(&subset_store, Some(&[package_foo, package_baz])),
+            Err(RUniverseProviderError::OfflineIncompatible(_))
+        ));
+        assert!(matches!(
+            subset_provider.open_compatible(&subset_store, None),
+            Err(RUniverseProviderError::OfflineIncompatible(_))
+        ));
+    }
+
+    #[test]
+    fn newer_complete_superset_is_preferred_over_older_subset() {
+        let foo = PackageName::new("foo").unwrap();
+        let (provider, _) = fixture_provider(
+            "https://custom.example/universe",
+            &[
+                (
+                    "https://custom.example/universe/api/packages/foo",
+                    package_entry("foo"),
+                ),
+                (
+                    "https://custom.example/universe/api/ls",
+                    r#"["foo","bar"]"#.into(),
+                ),
+                (
+                    "https://custom.example/universe/api/packages?limit=2",
+                    format!("[{},{}]", package_entry("foo"), package_entry("bar")),
+                ),
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("universe").unwrap()).unwrap();
+        provider
+            .refresh_snapshot(&store, Some(std::slice::from_ref(&foo)))
+            .unwrap();
+        provider.refresh_snapshot(&store, None).unwrap();
+        assert_eq!(
+            provider
+                .open_compatible(&store, Some(std::slice::from_ref(&foo)))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog"
+        );
+    }
+
+    #[test]
+    fn exact_package_refreshes_remain_independent_until_an_unrestricted_refresh() {
+        let foo = PackageName::new("foo").unwrap();
+        let bar = PackageName::new("bar").unwrap();
+        let (provider, requests) = fixture_provider(
+            "https://custom.example/universe",
+            &[
+                (
+                    "https://custom.example/universe/api/packages/foo",
+                    package_entry("foo"),
+                ),
+                (
+                    "https://custom.example/universe/api/packages/bar",
+                    package_entry("bar"),
+                ),
+                (
+                    "https://custom.example/universe/api/ls",
+                    r#"["bar","foo"]"#.into(),
+                ),
+                (
+                    "https://custom.example/universe/api/packages?limit=2",
+                    format!("[{},{}]", package_entry("foo"), package_entry("bar")),
+                ),
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::open(directory.path(), RegistryId::new("universe").unwrap()).unwrap();
+
+        provider
+            .refresh_snapshot(&store, Some(std::slice::from_ref(&foo)))
+            .unwrap();
+        assert_eq!(
+            requests.borrow().as_slice(),
+            ["https://custom.example/universe/api/packages/foo"]
+        );
+        requests.borrow_mut().clear();
+
+        provider
+            .refresh_snapshot(&store, Some(std::slice::from_ref(&bar)))
+            .unwrap();
+        assert_eq!(
+            requests.borrow().as_slice(),
+            ["https://custom.example/universe/api/packages/bar"]
+        );
+        requests.borrow_mut().clear();
+
+        assert_eq!(
+            provider
+                .open_compatible_offline(&store, Some(std::slice::from_ref(&foo)))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog:packages=foo"
+        );
+        assert_eq!(
+            provider
+                .open_compatible_offline(&store, Some(std::slice::from_ref(&bar)))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog:packages=bar"
+        );
+        assert!(matches!(
+            provider.open_compatible_offline(&store, Some(&[foo.clone(), bar.clone()])),
+            Err(RUniverseProviderError::OfflineIncompatible(_))
+        ));
+        assert!(matches!(
+            provider.open_compatible_offline(&store, None),
+            Err(RUniverseProviderError::OfflineIncompatible(_))
+        ));
+
+        provider.refresh_snapshot(&store, None).unwrap();
+        assert_eq!(
+            requests.borrow().as_slice(),
+            [
+                "https://custom.example/universe/api/ls",
+                "https://custom.example/universe/api/packages?limit=2"
+            ]
+        );
+        assert_eq!(
+            provider
+                .open_compatible_offline(&store, Some(&[foo.clone(), bar.clone()]))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog"
+        );
+        assert_eq!(
+            provider
+                .open_compatible_offline(&store, Some(std::slice::from_ref(&foo)))
+                .unwrap()
+                .header()
+                .coverage
+                .scope,
+            "api-catalog"
+        );
+        assert_eq!(store.read_view_candidates().unwrap().candidates.len(), 3);
+    }
+
+    #[test]
     fn snapshot_round_trip_preserves_distinct_git_identities_at_one_version() {
         let registry = RegistryId::new("universe").unwrap();
         let sha256_commit = "1".repeat(64);
@@ -1366,6 +1747,24 @@ mod tests {
             other.open_compatible(&store, Some(std::slice::from_ref(&package))),
             Err(RUniverseProviderError::OfflineIncompatible(_))
         ));
+        assert!(
+            other
+                .open_compatible_offline(&store, Some(std::slice::from_ref(&package)))
+                .is_ok()
+        );
+        let candidates = store.read_view_candidates().unwrap();
+        assert_eq!(candidates.candidates.len(), 1);
+        assert_eq!(
+            candidates.candidates[0].validation.effective_endpoint,
+            "https://custom.example/universe"
+        );
+        let offline = other
+            .open_compatible_offline(&store, Some(std::slice::from_ref(&package)))
+            .unwrap();
+        assert_eq!(
+            offline.header().sources[0].endpoint,
+            "https://custom.example/universe/api/packages/foo"
+        );
     }
 
     #[test]
@@ -1420,7 +1819,7 @@ mod tests {
         std::fs::write(view, b"{}").unwrap();
         assert!(matches!(
             provider.open_compatible(&invalid_store, None),
-            Err(RUniverseProviderError::OfflineIncompatible(_))
+            Err(RUniverseProviderError::OfflineCorrupt(_))
         ));
     }
 }
