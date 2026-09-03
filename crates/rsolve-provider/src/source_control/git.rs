@@ -1,16 +1,19 @@
 //! A non-interactive, argument-vector based system Git backend.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rsolve_core::{GitCommitId, NormalizedGitUrl};
 use thiserror::Error;
 
-static NEXT_FETCH_REF: AtomicU64 = AtomicU64::new(0);
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+fn arg(value: impl AsRef<OsStr>) -> OsString {
+    value.as_ref().to_os_string()
+}
 
 /// A Git selector owned by this backend rather than by the manifest layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,12 +70,12 @@ impl GitAcquisition {
 #[derive(Clone, Eq, PartialEq)]
 struct GitCommand {
     executable: PathBuf,
-    args: Vec<String>,
+    args: Vec<OsString>,
     env: Vec<(String, String)>,
 }
 
 impl GitCommand {
-    fn new(executable: &Path, args: Vec<String>) -> Self {
+    fn new(executable: &Path, args: Vec<OsString>) -> Self {
         Self {
             executable: executable.to_path_buf(),
             args,
@@ -81,7 +84,7 @@ impl GitCommand {
     }
 
     #[cfg(test)]
-    fn args(&self) -> &[String] {
+    fn args(&self) -> &[OsString] {
         &self.args
     }
 
@@ -213,8 +216,10 @@ fn read_bounded(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
 /// Typed failures at the Git source-control boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum GitError {
-    #[error("Git URL is not an allowed HTTPS or SSH URL: {url}")]
+    #[error("Git URL is not an allowed HTTPS URL: {url}")]
     InvalidUrl { url: String },
+    #[error("SSH Git transport is not supported by this backend")]
+    SshUnsupported,
     #[error("Git executable is unavailable")]
     GitExecutableUnavailable,
     #[error("Git executable lacks a required capability: {capability}")]
@@ -296,12 +301,12 @@ impl<R: GitCommandRunner> Backend<R> {
     /// Probes executable availability and the fixed fetch options used by the
     /// backend.
     pub fn probe(&self) -> Result<(), GitError> {
-        self.run_checked(vec!["--version".to_owned()], "version")?;
+        self.run_checked(vec![arg("--version")], "version")?;
         let output = self
             .runner
             .run(&GitCommand::new(
                 &self.executable,
-                vec!["fetch".to_owned(), "-h".to_owned()],
+                vec![arg("fetch"), arg("-h")],
             ))
             .map_err(|error| match error {
                 GitRunnerError::ExecutableUnavailable => GitError::GitExecutableUnavailable,
@@ -401,10 +406,10 @@ impl<R: GitCommandRunner> Backend<R> {
             return Ok(commit);
         }
         let lines = match selector {
-            GitSelector::DefaultBranch => self.run_ls_remote(url, true, vec!["HEAD".to_owned()])?,
+            GitSelector::DefaultBranch => self.run_ls_remote(url, true, vec![arg("HEAD")])?,
             GitSelector::Branch(name) => {
                 let name = checked_ref_component(name)?;
-                self.run_ls_remote(url, false, vec![format!("refs/heads/{name}")])?
+                self.run_ls_remote(url, false, vec![arg(format!("refs/heads/{name}"))])?
             }
             GitSelector::Tag(name) => {
                 let name = checked_ref_component(name)?;
@@ -412,22 +417,20 @@ impl<R: GitCommandRunner> Backend<R> {
                     url,
                     false,
                     vec![
-                        format!("refs/tags/{name}"),
-                        format!("refs/tags/{name}^{{}}"),
+                        arg(format!("refs/tags/{name}")),
+                        arg(format!("refs/tags/{name}^{{}}")),
                     ],
                 )?
             }
             GitSelector::Rev(revision) => {
                 let refspec = checked_revision(revision)?;
-                let refspecs = refspec
-                    .map(|value| vec![value.to_owned()])
-                    .unwrap_or_else(|| {
-                        vec![
-                            format!("refs/heads/{revision}"),
-                            format!("refs/tags/{revision}"),
-                            format!("refs/tags/{revision}^{{}}"),
-                        ]
-                    });
+                let refspecs = refspec.map(|value| vec![arg(value)]).unwrap_or_else(|| {
+                    vec![
+                        arg(format!("refs/heads/{revision}")),
+                        arg(format!("refs/tags/{revision}")),
+                        arg(format!("refs/tags/{revision}^{{}}")),
+                    ]
+                });
                 self.run_ls_remote(url, false, refspecs)?
             }
         };
@@ -438,19 +441,19 @@ impl<R: GitCommandRunner> Backend<R> {
         &self,
         url: &NormalizedGitUrl,
         symref: bool,
-        exact_refs: Vec<String>,
+        exact_refs: Vec<OsString>,
     ) -> Result<Vec<Advertisement>, GitError> {
         let mut args = config_args();
         // `ls-remote` does not need a repository, but Git otherwise walks the
         // process cwd and may discover a user workspace's local config.
         // Supplying an explicit null git-dir prevents that discovery.
-        args.push("--git-dir".to_owned());
-        args.push(null_device());
-        args.push("ls-remote".to_owned());
+        args.push(arg("--git-dir"));
+        args.push(arg(null_device()));
+        args.push(arg("ls-remote"));
         if symref {
-            args.push("--symref".to_owned());
+            args.push(arg("--symref"));
         }
-        args.push(url.to_string());
+        args.push(arg(url.to_string()));
         args.extend(exact_refs);
         let output = self.run_checked(args, "remote advertisement")?;
         parse_advertisement(&output.stdout)
@@ -463,34 +466,35 @@ impl<R: GitCommandRunner> Backend<R> {
         commit: &GitCommitId,
     ) -> Result<(), GitError> {
         let mut init = vec![
-            "--git-dir".to_owned(),
-            repository_dir.display().to_string(),
-            "init".to_owned(),
-            "--bare".to_owned(),
+            arg("--git-dir"),
+            repository_dir.as_os_str().to_os_string(),
+            arg("init"),
+            arg("--bare"),
         ];
         if commit.as_str().len() == 64 {
-            init.push("--object-format=sha256".to_owned());
+            init.push(arg("--object-format=sha256"));
         }
         let _ = self.run_checked(init, "initialize owned bare repository")?;
-        let target = format!(
-            "{commit}:refs/rsolve/acquire/{}",
-            NEXT_FETCH_REF.fetch_add(1, Ordering::Relaxed)
-        );
+        let namespace = match commit.algorithm() {
+            rsolve_core::GitHashAlgorithm::Sha1 => "sha1",
+            rsolve_core::GitHashAlgorithm::Sha256 => "sha256",
+        };
+        let target = arg(format!("{commit}:refs/rsolve/acquire/{namespace}/{commit}"));
         let mut args = config_args();
         args.extend([
-            "--git-dir".to_owned(),
-            repository_dir.display().to_string(),
-            "-c".to_owned(),
-            "gc.auto=0".to_owned(),
-            "-c".to_owned(),
-            "maintenance.auto=false".to_owned(),
-            "fetch".to_owned(),
-            "--depth=1".to_owned(),
-            "--no-tags".to_owned(),
-            "--no-recurse-submodules".to_owned(),
-            "--no-write-fetch-head".to_owned(),
-            "--no-auto-maintenance".to_owned(),
-            url.to_string(),
+            arg("--git-dir"),
+            repository_dir.as_os_str().to_os_string(),
+            arg("-c"),
+            arg("gc.auto=0"),
+            arg("-c"),
+            arg("maintenance.auto=false"),
+            arg("fetch"),
+            arg("--depth=1"),
+            arg("--no-tags"),
+            arg("--no-recurse-submodules"),
+            arg("--no-write-fetch-head"),
+            arg("--no-auto-maintenance"),
+            arg(url.to_string()),
             target,
         ]);
         self.run_checked(args, "fetch exact Git object").map(|_| ())
@@ -518,11 +522,11 @@ impl<R: GitCommandRunner> Backend<R> {
         let object = commit.to_string();
         let type_output = self.run_checked(
             vec![
-                "--git-dir".to_owned(),
-                repository_dir.display().to_string(),
-                "cat-file".to_owned(),
-                "-t".to_owned(),
-                object,
+                arg("--git-dir"),
+                repository_dir.as_os_str().to_os_string(),
+                arg("cat-file"),
+                arg("-t"),
+                arg(object),
             ],
             "verify Git object type",
         )?;
@@ -534,7 +538,7 @@ impl<R: GitCommandRunner> Backend<R> {
 
     fn run_checked(
         &self,
-        args: Vec<String>,
+        args: Vec<OsString>,
         operation: &str,
     ) -> Result<GitCommandOutput, GitError> {
         let output = self
@@ -672,7 +676,10 @@ fn select_advertised_commit(
 
 fn validate_url(url: &NormalizedGitUrl) -> Result<(), GitError> {
     let scheme = url.as_str().split_once("://").map(|(scheme, _)| scheme);
-    if !matches!(scheme, Some("https") | Some("ssh")) {
+    if scheme == Some("ssh") {
+        return Err(GitError::SshUnsupported);
+    }
+    if scheme != Some("https") {
         return Err(GitError::InvalidUrl {
             url: url.to_string(),
         });
@@ -760,23 +767,15 @@ fn sanitized_environment() -> Vec<(String, String)> {
         ("GIT_CONFIG_GLOBAL".to_owned(), null.clone()),
         ("GIT_CONFIG_SYSTEM".to_owned(), null),
         ("GIT_OPTIONAL_LOCKS".to_owned(), "0".to_owned()),
-        // This is a fixed, non-user-controlled command string. It keeps SSH
-        // non-interactive without accepting a caller-provided shell fragment.
-        (
-            "GIT_SSH_COMMAND".to_owned(),
-            "ssh -o BatchMode=yes".to_owned(),
-        ),
     ]
 }
 
-fn config_args() -> Vec<String> {
+fn config_args() -> Vec<OsString> {
     vec![
-        "-c".to_owned(),
-        "protocol.allow=never".to_owned(),
-        "-c".to_owned(),
-        "protocol.https.allow=always".to_owned(),
-        "-c".to_owned(),
-        "protocol.ssh.allow=always".to_owned(),
+        arg("-c"),
+        arg("protocol.allow=never"),
+        arg("-c"),
+        arg("protocol.https.allow=always"),
     ]
 }
 
@@ -944,7 +943,7 @@ mod tests {
             )]),
         };
         let backend = Backend::new("git", runner);
-        let url = NormalizedGitUrl::new("ssh://example.test/repo").unwrap();
+        let url = NormalizedGitUrl::new("https://example.test/repo").unwrap();
         assert_eq!(
             backend
                 .resolve(&url, &GitSelector::Tag("v1".into()))
@@ -1032,6 +1031,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ssh_before_runner() {
+        let runner = FixtureRunner {
+            commands: RefCell::new(Vec::new()),
+            outputs: RefCell::new(Vec::new()),
+        };
+        let backend = Backend::new("git", runner);
+        let url = NormalizedGitUrl::new("ssh://example.test/repo").unwrap();
+        assert_eq!(
+            backend.resolve(&url, &GitSelector::DefaultBranch),
+            Err(GitError::SshUnsupported)
+        );
+    }
+
+    #[test]
     fn full_oid_revision_is_used_without_remote_advertisement() {
         let runner = FixtureRunner {
             commands: RefCell::new(Vec::new()),
@@ -1094,9 +1107,9 @@ mod tests {
             .unwrap();
         let recorded = commands.borrow();
         let args = recorded[0].args();
-        assert!(args.contains(&"refs/heads/main".to_owned()));
-        assert!(args.contains(&"refs/tags/main".to_owned()));
-        assert!(args.contains(&"refs/tags/main^{}".to_owned()));
+        assert!(args.contains(&arg("refs/heads/main")));
+        assert!(args.contains(&arg("refs/tags/main")));
+        assert!(args.contains(&arg("refs/tags/main^{}")));
         assert!(!args.iter().any(|arg| arg == "main"));
     }
 
@@ -1128,26 +1141,10 @@ mod tests {
         let names = command.environment_names().collect::<Vec<_>>();
         assert!(!names.contains(&"GIT_DIR"));
         assert!(!names.contains(&"GIT_WORK_TREE"));
-        assert!(names.contains(&"GIT_SSH_COMMAND"));
-        assert_eq!(
-            command
-                .environment()
-                .iter()
-                .find(|(name, _)| name == "GIT_SSH_COMMAND")
-                .map(|(_, value)| value.as_str()),
-            Some("ssh -o BatchMode=yes")
-        );
-        assert!(command.args().contains(&"protocol.allow=never".to_owned()));
-        assert!(
-            command
-                .args()
-                .contains(&"protocol.https.allow=always".to_owned())
-        );
-        assert!(
-            command
-                .args()
-                .contains(&"protocol.ssh.allow=always".to_owned())
-        );
+        assert!(!names.contains(&"GIT_SSH_COMMAND"));
+        assert!(command.args().contains(&arg("protocol.allow=never")));
+        assert!(command.args().contains(&arg("protocol.https.allow=always")));
+        assert!(!command.args().contains(&arg("protocol.ssh.allow=always")));
     }
 
     #[test]
@@ -1176,7 +1173,7 @@ mod tests {
             .windows(2)
             .find(|window| window[0] == "--git-dir")
             .expect("ls-remote must carry an isolated git-dir");
-        assert_eq!(git_dir[1], null_device());
+        assert_eq!(git_dir[1], arg(null_device()));
         assert!(!command.environment_names().any(|name| name == "GIT_DIR"));
     }
 
@@ -1206,7 +1203,7 @@ mod tests {
         };
         let backend = Backend::new("git", runner);
         let request = GitAcquisitionRequest {
-            url: NormalizedGitUrl::new("ssh://example.test/repo").unwrap(),
+            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
             revision: GitRevisionRequest::Pinned(
                 GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
             ),
@@ -1239,5 +1236,89 @@ mod tests {
             backend.acquire(&request),
             Err(GitError::MutableReferenceChanged)
         );
+    }
+
+    #[test]
+    fn pinned_fetch_uses_a_stable_content_addressed_destination() {
+        struct RecordingRunner {
+            commands: Rc<RefCell<Vec<GitCommand>>>,
+            outputs: RefCell<Vec<GitCommandOutput>>,
+        }
+        impl GitCommandRunner for RecordingRunner {
+            fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(self.outputs.borrow_mut().remove(0))
+            }
+        }
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let runner = RecordingRunner {
+            commands: Rc::clone(&commands),
+            outputs: RefCell::new(vec![
+                output(""),
+                output(""),
+                output("commit\n"),
+                output(""),
+                output(""),
+                output("commit\n"),
+            ]),
+        };
+        let backend = Backend::new("git", runner);
+        let request = GitAcquisitionRequest {
+            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
+            revision: GitRevisionRequest::Pinned(
+                GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            ),
+            repository_dir: std::env::temp_dir().join("rsolve-source-control-test.git"),
+            offline: false,
+        };
+        backend.acquire(&request).unwrap();
+        backend.acquire(&request).unwrap();
+        let recorded = commands.borrow();
+        let first_target = recorded[1].args().last().unwrap();
+        let second_target = recorded[4].args().last().unwrap();
+        assert_eq!(first_target, second_target);
+        assert!(
+            first_target
+                .to_string_lossy()
+                .contains("refs/rsolve/acquire/sha1/")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_repository_path_is_losslessly_preserved_in_all_commands() {
+        use std::os::unix::ffi::OsStringExt;
+        struct RecordingRunner {
+            commands: Rc<RefCell<Vec<GitCommand>>>,
+        }
+        impl GitCommandRunner for RecordingRunner {
+            fn run(&self, command: &GitCommand) -> Result<GitCommandOutput, GitRunnerError> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(output("commit\n"))
+            }
+        }
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let backend = Backend::new(
+            "git",
+            RecordingRunner {
+                commands: Rc::clone(&commands),
+            },
+        );
+        let repository_dir =
+            PathBuf::from(OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0x80]));
+        let request = GitAcquisitionRequest {
+            url: NormalizedGitUrl::new("https://example.test/repo").unwrap(),
+            revision: GitRevisionRequest::Pinned(
+                GitCommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            ),
+            repository_dir: repository_dir.clone(),
+            offline: false,
+        };
+        backend.acquire(&request).unwrap();
+        for command in commands.borrow().iter() {
+            assert!(command.args().windows(2).any(|window| {
+                window[0] == arg("--git-dir") && window[1] == repository_dir.as_os_str()
+            }));
+        }
     }
 }
