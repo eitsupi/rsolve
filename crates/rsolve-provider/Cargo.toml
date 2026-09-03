@@ -19,6 +19,7 @@ tar = { workspace = true }
 ureq = { workspace = true }
 url = { workspace = true }
 jiff = { workspace = true }
+libc = { workspace = true }
 postcard = { workspace = true }
 redb = { workspace = true }
 cap-fs-ext = { workspace = true }

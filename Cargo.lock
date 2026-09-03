@@ -1020,6 +1020,7 @@ dependencies = [
  "fastrand",
  "flate2",
  "jiff",
+ "libc",
  "postcard",
  "rd-rds",
  "redb",

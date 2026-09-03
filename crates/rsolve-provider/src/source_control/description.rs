@@ -5,10 +5,15 @@
 //! release identity; Git URLs, revisions, and object storage remain outside
 //! this boundary.
 
-use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use cap_std::ambient_authority;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt as CapOpenOptionsExt;
+#[cfg(windows)]
+use cap_std::fs::OpenOptionsExt as CapWindowsOpenOptionsExt;
+use cap_std::fs::{Dir, OpenOptions};
 use rsolve_core::{
     PackageName, PackageRelease, PackageReleaseError, PackageRequirement, RPackageVersion,
     ReleaseIdentity, ReleaseObservation,
@@ -102,7 +107,7 @@ pub fn project_description(
     }
 
     let path = view.path().join("DESCRIPTION");
-    let bytes = read_description(&path)?;
+    let bytes = read_description(view.path(), &path)?;
     let document = DcfDocument::parse(&bytes)?;
     let record = match document.records() {
         [record] => record,
@@ -162,44 +167,49 @@ fn map_record_error(error: DescriptionError) -> DescriptionProjectionError {
     }
 }
 
-fn read_description(path: &Path) -> Result<Vec<u8>, DescriptionProjectionError> {
-    let file_type = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.file_type(),
+fn read_description(
+    directory_path: &Path,
+    display_path: &Path,
+) -> Result<Vec<u8>, DescriptionProjectionError> {
+    let directory = Dir::open_ambient_dir(directory_path, ambient_authority())
+        .map_err(|error| io_error(display_path, error))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match directory.open_with("DESCRIPTION", &options) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(DescriptionProjectionError::Missing {
-                path: path.to_owned(),
+                path: display_path.to_owned(),
             });
         }
-        Err(error) => return Err(io_error(path, error)),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(DescriptionProjectionError::Symlink {
+                path: display_path.to_owned(),
+            });
+        }
+        Err(error) => return Err(io_error(display_path, error)),
     };
-    if file_type.is_symlink() {
-        return Err(DescriptionProjectionError::Symlink {
-            path: path.to_owned(),
-        });
-    }
-    if !file_type.is_file() {
-        return Err(DescriptionProjectionError::NotRegular {
-            path: path.to_owned(),
-        });
-    }
-
-    let file = File::open(path).map_err(|error| io_error(path, error))?;
     if !file
         .metadata()
-        .map_err(|error| io_error(path, error))?
+        .map_err(|error| io_error(display_path, error))?
         .is_file()
     {
         return Err(DescriptionProjectionError::NotRegular {
-            path: path.to_owned(),
+            path: display_path.to_owned(),
         });
     }
     let mut bytes = Vec::new();
     file.take(MAX_DESCRIPTION_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| io_error(path, error))?;
+        .map_err(|error| io_error(display_path, error))?;
     if bytes.len() as u64 > MAX_DESCRIPTION_BYTES {
         return Err(DescriptionProjectionError::TooLarge {
-            path: path.to_owned(),
+            path: display_path.to_owned(),
             limit: MAX_DESCRIPTION_BYTES,
         });
     }

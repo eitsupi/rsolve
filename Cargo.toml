@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 deb822-fast = "0.2"
 md-5 = "0.10"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+libc = "0.2"
 percent-encoding = "2.3.2"
 rd-rds = "0.4.0"
 pubgrub = "0.4"
