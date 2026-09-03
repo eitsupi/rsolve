@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::constraints::{RootRequirement, VersionConstraint};
+use crate::constraints::{DependencySourceConstraint, RootRequirement, VersionConstraint};
 use crate::identity::ReleaseIdentity;
 use crate::names::{BioconductorRelease, PackageName, PackageNamespace, RepositoryId};
 use crate::publication::PublicationCutoff;
@@ -84,5 +84,22 @@ impl ResolutionRequest {
     pub fn with_optional_publication_cutoff(mut self, cutoff: Option<PublicationCutoff>) -> Self {
         self.publication_cutoff = cutoff;
         self
+    }
+
+    /// Returns the exact identity selected by an exact root for this package,
+    /// if any.
+    ///
+    /// Ordinary dependency declarations use [`DependencySourceConstraint::Any`]
+    /// and are normally resolved through the installed-name subject. An exact
+    /// root is an explicit exception: its identity is the only
+    /// candidate that may satisfy an unqualified dependency on the same
+    /// package. Source-qualified dependencies retain their own meaning.
+    pub fn exact_root_identity(&self, name: &PackageName) -> Option<&ReleaseIdentity> {
+        self.roots.iter().find_map(|root| {
+            (root.package.name() == name).then(|| match root.package.source() {
+                DependencySourceConstraint::Exact(identity) => Some(identity),
+                _ => None,
+            })?
+        })
     }
 }

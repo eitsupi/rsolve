@@ -612,9 +612,13 @@ fn assignment_basis(
         return AssignmentBasis::OnlyStaticallyCompatible;
     }
     if request.roots.iter().any(|requirement| {
-        dependency_key(requirement.package.name(), requirement.package.source())
-            .as_ref()
-            .is_some_and(|key| key == subject)
+        dependency_key(
+            request,
+            requirement.package.name(),
+            requirement.package.source(),
+        )
+        .as_ref()
+        .is_some_and(|key| key == subject)
             && requirement
                 .package
                 .constraint()
@@ -686,9 +690,13 @@ fn difference_for_candidate(
         });
     }
     if let Some(requirement) = difference.request.roots.iter().find(|requirement| {
-        dependency_key(requirement.package.name(), requirement.package.source())
-            .as_ref()
-            .is_some_and(|key| key == difference.subject)
+        dependency_key(
+            difference.request,
+            requirement.package.name(),
+            requirement.package.source(),
+        )
+        .as_ref()
+        .is_some_and(|key| key == difference.subject)
             && !requirement
                 .package
                 .constraint()
@@ -717,7 +725,11 @@ fn difference_for_candidate(
         .iter()
         .filter(|dependency| dependency.package.name().as_str() != "R")
         .filter_map(|dependency| {
-            let key = dependency_key(dependency.package.name(), dependency.package.source())?;
+            let key = dependency_key(
+                difference.request,
+                dependency.package.name(),
+                dependency.package.source(),
+            )?;
             let assigned = difference
                 .selected_packages
                 .iter()
@@ -808,12 +820,19 @@ fn root_expansion_for_package(
         .unwrap_or(RootExpansionPolicy::HardOnly)
 }
 
-fn dependency_key(name: &PackageName, source: &DependencySourceConstraint) -> Option<SolverKey> {
+fn dependency_key(
+    request: &ResolutionRequest,
+    name: &PackageName,
+    source: &DependencySourceConstraint,
+) -> Option<SolverKey> {
     if name.as_str() == "R" && !matches!(source, DependencySourceConstraint::Git { .. }) {
         return Some(SolverKey::R);
     }
     Some(match source {
-        DependencySourceConstraint::Any => SolverKey::InstalledName(name.clone()),
+        DependencySourceConstraint::Any => request.exact_root_identity(name).map_or_else(
+            || SolverKey::InstalledName(name.clone()),
+            |identity| SolverKey::Exact(identity.clone()),
+        ),
         DependencySourceConstraint::Registry { namespace } => SolverKey::Registry {
             namespace: namespace.clone(),
             name: name.clone(),

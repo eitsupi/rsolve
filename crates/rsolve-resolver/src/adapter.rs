@@ -413,7 +413,13 @@ impl<'a> Provider<'a> {
             return Ok(SolverKey::R);
         }
         Ok(match &package.source() {
-            DependencySourceConstraint::Any => SolverKey::InstalledName(package.name().clone()),
+            DependencySourceConstraint::Any => self
+                .request
+                .exact_root_identity(package.name())
+                .map_or_else(
+                    || SolverKey::InstalledName(package.name().clone()),
+                    |identity| SolverKey::Exact(identity.clone()),
+                ),
             DependencySourceConstraint::Registry { namespace } => SolverKey::Registry {
                 namespace: namespace.clone(),
                 name: package.name().clone(),
@@ -1199,6 +1205,285 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    struct ExactFixtureLoader {
+        candidates: Vec<PreparedCandidate>,
+    }
+
+    impl CandidateLoader for ExactFixtureLoader {
+        fn releases(
+            &self,
+            subject: &SolverKey,
+        ) -> Result<Vec<PreparedCandidate>, CandidateLoadError> {
+            Ok(self
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.is_eligible_for(subject))
+                .cloned()
+                .collect())
+        }
+
+        fn load(
+            &self,
+            subject: &SolverKey,
+        ) -> Result<rsolve_core::CandidateLoadResult, CandidateLoadError> {
+            Ok(rsolve_core::CandidateLoadResult::new(
+                self.releases(subject)?,
+                Vec::new(),
+            ))
+        }
+    }
+
+    fn direct_fixture_release(
+        name: &str,
+        version: &str,
+        dependencies: Vec<rsolve_core::DeclaredDependency>,
+    ) -> PreparedCandidate {
+        let name = rsolve_core::PackageName::new(name).unwrap();
+        let version = RPackageVersion::parse(version).unwrap();
+        let release = PackageRelease::try_from(rsolve_core::ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                rsolve_core::Provenance::GitCommit {
+                    repository: rsolve_core::NormalizedGitUrl::new(format!(
+                        "https://example.test/{name}"
+                    ))
+                    .unwrap(),
+                    commit: rsolve_core::GitCommitId::new(
+                        "0123456789012345678901234567890123456789",
+                    )
+                    .unwrap(),
+                    subdirectory: None,
+                },
+            ),
+            observed_package: name,
+            observed_version: version,
+            metadata: rsolve_core::ReleaseMetadata::default(),
+            publication: None,
+            declared_dependencies: dependencies,
+            distributions: Vec::new(),
+        })
+        .unwrap();
+        PreparedCandidate::new(
+            release,
+            rsolve_core::NonRepositoryExposure::ExactOnly,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn repository_fixture_release(name: &str, version: &str) -> PreparedCandidate {
+        let name = rsolve_core::PackageName::new(name).unwrap();
+        let version = RPackageVersion::parse(version).unwrap();
+        let release = PackageRelease::try_from(rsolve_core::ReleaseObservation {
+            identity: ReleaseIdentity::new(
+                name.clone(),
+                rsolve_core::Provenance::RegistryRelease {
+                    namespace: rsolve_core::PackageNamespace::new("cran").unwrap(),
+                    version: version.clone(),
+                },
+            ),
+            observed_package: name,
+            observed_version: version,
+            metadata: rsolve_core::ReleaseMetadata::default(),
+            publication: None,
+            declared_dependencies: Vec::new(),
+            distributions: Vec::new(),
+        })
+        .unwrap();
+        let occurrence = rsolve_core::RepositoryOccurrence::new(
+            rsolve_core::RepositoryId::new("universe").unwrap(),
+            rsolve_core::RegistryId::new("cran").unwrap(),
+            rsolve_core::CandidateAvailability::Available,
+            rsolve_core::CandidateCurrentness::Current,
+            rsolve_core::RepositoryRank::new(0),
+            Vec::new(),
+        )
+        .unwrap();
+        PreparedCandidate::new(
+            release,
+            rsolve_core::NonRepositoryExposure::None,
+            vec![occurrence],
+        )
+        .unwrap()
+    }
+
+    fn exact_root(candidate: &PreparedCandidate) -> rsolve_core::RootRequirement {
+        rsolve_core::RootRequirement {
+            package: rsolve_core::PackageRequirement::new(
+                candidate.identity().name().clone(),
+                DependencySourceConstraint::Exact(candidate.identity().clone()),
+                VersionConstraint::unconstrained(),
+            )
+            .unwrap(),
+            expansion: RootExpansionPolicy::HardOnly,
+        }
+    }
+
+    #[test]
+    fn any_dependency_is_projected_to_a_direct_exact_root() {
+        let dependency = rsolve_core::DeclaredDependency::from_parts(
+            rsolve_core::DependencyKind::Imports,
+            rsolve_core::PackageName::new("dep").unwrap(),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Ge,
+                RPackageVersion::parse("1.0.0").unwrap(),
+            ),
+        )
+        .unwrap();
+        let root = direct_fixture_release("root", "1.0.0", vec![dependency]);
+        let dep = direct_fixture_release("dep", "1.2.0", Vec::new());
+        let request = ResolutionRequest::new(
+            vec![exact_root(&root), exact_root(&dep)],
+            rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            VersionConstraint::unconstrained(),
+            rsolve_core::LockedIdentities::new(),
+        );
+        let loader = ExactFixtureLoader {
+            candidates: vec![root, dep],
+        };
+        let result = solve(
+            &loader,
+            &crate::DefaultCandidatePreference,
+            &crate::Unlocked,
+            &request,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .packages()
+                .iter()
+                .map(|package| package.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["dep", "root"]
+        );
+    }
+
+    #[test]
+    fn any_dependency_prefers_direct_exact_root_over_a_different_repository_identity() {
+        let dependency = rsolve_core::DeclaredDependency::from_parts(
+            rsolve_core::DependencyKind::Imports,
+            rsolve_core::PackageName::new("dep").unwrap(),
+            DependencySourceConstraint::Any,
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap();
+        let root = direct_fixture_release("root", "1.0.0", vec![dependency]);
+        let direct_dep = direct_fixture_release("dep", "1.2.0", Vec::new());
+        let repository_dep = repository_fixture_release("dep", "9.0.0");
+        let direct_identity = direct_dep.identity().clone();
+        let request = ResolutionRequest::new(
+            vec![exact_root(&root), exact_root(&direct_dep)],
+            rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            VersionConstraint::unconstrained(),
+            rsolve_core::LockedIdentities::new(),
+        );
+        let loader = ExactFixtureLoader {
+            candidates: vec![root, direct_dep, repository_dep],
+        };
+        let result = solve(
+            &loader,
+            &crate::DefaultCandidatePreference,
+            &crate::Unlocked,
+            &request,
+        )
+        .unwrap();
+        let resolved_dep = result
+            .packages()
+            .iter()
+            .find(|package| package.name().as_str() == "dep")
+            .expect("direct dependency package is resolved");
+        assert_eq!(resolved_dep.release().identity(), &direct_identity);
+    }
+
+    #[test]
+    fn direct_exact_root_still_applies_any_dependency_version_constraints() {
+        let dependency = rsolve_core::DeclaredDependency::from_parts(
+            rsolve_core::DependencyKind::Imports,
+            rsolve_core::PackageName::new("dep").unwrap(),
+            DependencySourceConstraint::Any,
+            VersionConstraint::from_clause(
+                rsolve_core::RelationOp::Ge,
+                RPackageVersion::parse("2.0.0").unwrap(),
+            ),
+        )
+        .unwrap();
+        let root = direct_fixture_release("root", "1.0.0", vec![dependency]);
+        let dep = direct_fixture_release("dep", "1.2.0", Vec::new());
+        let request = ResolutionRequest::new(
+            vec![exact_root(&root), exact_root(&dep)],
+            rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            VersionConstraint::unconstrained(),
+            rsolve_core::LockedIdentities::new(),
+        );
+        let loader = ExactFixtureLoader {
+            candidates: vec![root, dep],
+        };
+        assert!(
+            solve(
+                &loader,
+                &crate::DefaultCandidatePreference,
+                &crate::Unlocked,
+                &request,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_repository_dependency_is_not_redirected_to_an_exact_root() {
+        let identity = ReleaseIdentity::new(
+            rsolve_core::PackageName::new("dep").unwrap(),
+            rsolve_core::Provenance::GitCommit {
+                repository: rsolve_core::NormalizedGitUrl::new("https://example.test/dep").unwrap(),
+                commit: rsolve_core::GitCommitId::new("0123456789012345678901234567890123456789")
+                    .unwrap(),
+                subdirectory: None,
+            },
+        );
+        let request = ResolutionRequest::new(
+            vec![rsolve_core::RootRequirement {
+                package: rsolve_core::PackageRequirement::new(
+                    identity.name().clone(),
+                    DependencySourceConstraint::Exact(identity),
+                    VersionConstraint::unconstrained(),
+                )
+                .unwrap(),
+                expansion: RootExpansionPolicy::HardOnly,
+            }],
+            rsolve_core::ResolutionTarget::new(RPackageVersion::parse("4.4.0").unwrap()),
+            VersionConstraint::unconstrained(),
+            rsolve_core::LockedIdentities::new(),
+        );
+        let loader = ExactFixtureLoader {
+            candidates: Vec::new(),
+        };
+        let provider = Provider {
+            loader: &loader,
+            preference: &crate::DefaultCandidatePreference,
+            lock_policy: &crate::Unlocked,
+            request: &request,
+            cache: RefCell::new(HashMap::new()),
+            interner: RefCell::new(CandidateInterner::default()),
+        };
+        let repository = rsolve_core::RepositoryId::new("universe").unwrap();
+        let requirement = rsolve_core::PackageRequirement::new(
+            rsolve_core::PackageName::new("dep").unwrap(),
+            DependencySourceConstraint::Repository {
+                repository: repository.clone(),
+            },
+            VersionConstraint::unconstrained(),
+        )
+        .unwrap();
+        assert_eq!(
+            provider.subject_for_package(&requirement).unwrap(),
+            SolverKey::Repository {
+                repository,
+                name: rsolve_core::PackageName::new("dep").unwrap(),
+            }
+        );
     }
 
     #[test]

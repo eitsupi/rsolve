@@ -65,6 +65,13 @@ pub(crate) fn initial_repository_demands_with_direct(
                         continue;
                     }
                     let name = dependency.package.name();
+                    if direct_root_override(
+                        direct_releases,
+                        dependency.package.name(),
+                        dependency.package.source(),
+                    ) {
+                        continue;
+                    }
                     for entry in
                         eligible_dependency_entries(repositories, dependency.package.source(), name)
                     {
@@ -126,6 +133,13 @@ pub(crate) fn resolve_repository_demands_with_direct<S: RepositoryDemandSource>(
                     }
                     let dependency_name = dependency.package.name().clone();
                     discovered.insert(dependency_name.clone());
+                    if direct_root_override(
+                        direct_releases,
+                        dependency.package.name(),
+                        dependency.package.source(),
+                    ) {
+                        continue;
+                    }
                     let dependency_entries = eligible_dependency_entries(
                         repositories,
                         dependency.package.source(),
@@ -214,6 +228,13 @@ pub(crate) fn resolve_repository_demands_with_direct<S: RepositoryDemandSource>(
                     }
                     let dependency_name = dependency.package.name().clone();
                     discovered.insert(dependency_name.clone());
+                    if direct_root_override(
+                        direct_releases,
+                        dependency.package.name(),
+                        dependency.package.source(),
+                    ) {
+                        continue;
+                    }
                     let dependency_entries = eligible_dependency_entries(
                         repositories,
                         dependency.package.source(),
@@ -279,6 +300,15 @@ fn eligible_dependency_entries(
         | rsolve_core::DependencySourceConstraint::Git { .. }
         | rsolve_core::DependencySourceConstraint::Exact(_) => Vec::new(),
     }
+}
+
+fn direct_root_override(
+    direct_releases: &BTreeMap<PackageName, PackageRelease>,
+    package: &PackageName,
+    source: &rsolve_core::DependencySourceConstraint,
+) -> bool {
+    matches!(source, rsolve_core::DependencySourceConstraint::Any)
+        && direct_releases.contains_key(package)
 }
 
 fn eligible_entries(
@@ -474,6 +504,58 @@ mod tests {
                 .unwrap();
         assert_eq!(source.calls, vec![(0, package("dep"))]);
         assert_eq!(plan.entry_demands[&0], BTreeSet::from([package("dep")]));
+        assert!(plan.discovered.contains(&package("dep")));
+    }
+
+    #[test]
+    fn direct_git_dependency_on_another_direct_root_is_not_demanded() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let roots = vec![
+            git_root("root", RootExpansionPolicy::HardOnly),
+            git_root("dep", RootExpansionPolicy::HardOnly),
+        ];
+        let direct = BTreeMap::from([
+            (
+                package("root"),
+                direct_git_release("root", vec![dependency(DependencyKind::Imports, "dep")]),
+            ),
+            (package("dep"), direct_git_release("dep", Vec::new())),
+        ]);
+
+        let initial = initial_repository_demands_with_direct(&repositories, &roots, &direct);
+        assert!(initial.is_empty());
+
+        let mut source = ScriptedSource::default();
+        let plan =
+            resolve_repository_demands_with_direct(&repositories, &roots, &direct, &mut source)
+                .unwrap();
+        assert!(plan.entry_demands.is_empty());
+        assert!(plan.unrouted.is_empty());
+        assert!(source.calls.is_empty());
+    }
+
+    #[test]
+    fn repository_candidate_any_dependency_on_direct_root_is_not_demanded() {
+        let repositories = vec![repository("cran", RegistrySpec::Cran, None)];
+        let roots = vec![
+            root("root", None, RootExpansionPolicy::HardOnly),
+            git_root("dep", RootExpansionPolicy::HardOnly),
+        ];
+        let direct = BTreeMap::from([(package("dep"), direct_git_release("dep", Vec::new()))]);
+        let mut source = ScriptedSource::default();
+        source.releases.insert(
+            (0, package("root")),
+            vec![release(
+                "root",
+                vec![dependency(DependencyKind::Imports, "dep")],
+            )],
+        );
+
+        let plan =
+            resolve_repository_demands_with_direct(&repositories, &roots, &direct, &mut source)
+                .unwrap();
+        assert_eq!(source.calls, vec![(0, package("root"))]);
+        assert_eq!(plan.entry_demands[&0], BTreeSet::from([package("root")]));
         assert!(plan.discovered.contains(&package("dep")));
     }
 
