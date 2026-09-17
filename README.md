@@ -82,3 +82,7 @@ RSOLVE_CRAN_MIRROR=https://cran.rstudio.com \
 
 The example is separate from the top-level binary, which is currently a
 no-op. Results can change as the live CRAN catalog changes.
+
+## License
+
+rsolve is licensed under the [MIT License](LICENSE).
